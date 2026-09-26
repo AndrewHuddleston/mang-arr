@@ -1,18 +1,47 @@
 {% extends "base.html" %}
-{% block title %}Wanted - mang-arr{% endblock %}
-{% block page_title %}Wanted: Missing{% endblock %}
-{% block body %}
-<div class="toolbar">
-  <p class="muted" style="margin:0;flex:1">{{ rows|length }} series with missing chapters. The worker fetches them each cycle; a chapter stays here while no reachable source has it. Chapters you do not want can be ignored from the series page.</p>
-  <form method="post" action="/wanted/search"><button {% if not rows %}disabled{% endif %}><svg class="ic sm"><use href="#i-search"/></svg>Search all wanted now</button></form>
+{% import "macros.html" as m %}
+{% block title %}Missing - mang-arr{% endblock %}
+
+{% block toolbar %}
+<div class="page-toolbar">
+  <div class="toolbar-section left">
+    <form method="post" action="/wanted/search" class="toolbar-form" id="search-all-form"><button class="toolbar-button" id="search-missing" data-label-all="Search All" data-label-selected="Search Selected" {% if not rows %}disabled{% endif %} title="Search the sources for every wanted chapter">{{ m.icon('search') }}<span class="toolbar-label">Search All</span></button></form>
+    {{ m.toolbar_separator() }}
+    {{ m.toolbar_button('Select All', 'check', attrs='id="select-all-btn"', disabled=(not rows)) }}
+  </div>
+  <div class="toolbar-section right">
+    <span class="toolbar-count">{{ rows|length }} series</span>
+    {{ m.toolbar_menu('Filter', 'filter', 'wanted-filter', [('all', 'All'), ('failed', 'With failures'), ('clean', 'Without failures')], 'all') }}
+  </div>
 </div>
-<div class="tablewrap"><table class="list">
-<thead><tr><th>Series</th><th class="num">Wanted</th><th>Chapters</th><th class="num">Failed</th><th>Last failure</th><th>Checked</th></tr></thead>
+{% endblock %}
+
+{% block body %}
+{% if not rows %}
+<div class="alert info">No missing chapters. Every listed chapter is on disk.</div>
+{% else %}
+<div class="table-container"><table class="table missing" id="missing-table">
+<thead><tr>
+  <th class="col-select">{{ m.check(none, false, '1', 'select-all', 'primary', 'aria-label="Select all"') }}</th>
+  <th>Series</th><th class="num">Missing</th><th>Chapters</th><th class="num">Failed</th><th>Last failure</th><th class="col-date">Last Checked</th><th class="col-actions"></th>
+</tr></thead>
 <tbody>
 {% for r in rows %}
-<tr><td><a href="/series/{{ r.id }}">{{ r.title }}</a></td><td class="num want">{{ r.wanted }}</td>
-<td class="small muted">{{ r.numbers }}</td><td class="num {% if r.failed %}err{% endif %}">{{ r.failed }}</td><td class="small err">{{ r.last_reason or '' }}</td><td class="muted nowrap">{{ r.last_resolved|ago }}</td></tr>
+<tr data-id="{{ r.id }}" data-failed="{{ r.failed or 0 }}">
+  <td class="col-select">{{ m.check(none, false, '1', none, 'primary', 'data-select="' ~ r.id ~ '" aria-label="Select ' ~ r.title ~ '"') }}</td>
+  <td><a href="/series/{{ r.id }}">{{ r.title }}</a></td>
+  <td class="num text-danger">{{ r.wanted }}</td>
+  <td class="muted chapters">{{ r.numbers }}</td>
+  <td class="num {% if r.failed %}text-danger{% endif %}">{{ r.failed or 0 }}</td>
+  <td class="text-danger small">{{ r.last_reason or '' }}</td>
+  <td class="col-date nowrap">{{ r.last_resolved|ago }}</td>
+  <td class="col-actions">
+    <form method="post" action="/series/{{ r.id }}/refresh" class="iconform" data-async="refresh" data-id="{{ r.id }}"><input type="hidden" name="download" value="1"><button class="iconbtn" title="Search for this series' missing chapters">{{ m.icon('search') }}</button></form>
+    <a class="iconbtn" href="/series/{{ r.id }}" title="Open series">{{ m.icon('interactive') }}</a>
+  </td>
+</tr>
 {% endfor %}
-{% if not rows %}<tr><td colspan="6" class="muted">Nothing missing. Every listed chapter is on disk.</td></tr>{% endif %}
 </tbody></table></div>
+<div class="help-text">The worker fetches wanted chapters on every refresh; a chapter stays here while no reachable source has it. Chapters you do not want can be ignored from the series page.</div>
+{% endif %}
 {% endblock %}

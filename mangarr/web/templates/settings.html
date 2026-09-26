@@ -1,63 +1,77 @@
 {% extends "base.html" %}
+{% import "macros.html" as m %}
 {% block title %}Settings - mang-arr{% endblock %}
-{% block page_title %}Settings{% endblock %}
-{% block body %}
-<p class="muted">Stored in the database; environment variables are the defaults. Changes apply to the next job.</p>
-<form method="post" action="/settings" class="settings-form">
 
-<section class="card" id="sources">
-  <h2>Sources</h2>
-  <p class="muted small">From Suwayomi. <b>Disabled</b> sources are still searched (so a series that exists only there is reported) but never downloaded from. <b>Throttled</b> sources get one chapter at a time and lose close calls.</p>
-  <div class="tablewrap"><table class="list small">
-  <thead><tr><th>Source</th><th>Language</th><th>Disabled</th><th>Throttled</th></tr></thead>
+{% block toolbar %}
+<div class="page-toolbar">
+  <div class="toolbar-section left">
+    <button class="toolbar-button" form="settings-form" title="Save changes">{{ m.icon('save') }}<span class="toolbar-label">Save Changes</span></button>
+    {{ m.toolbar_separator() }}
+    <button class="toolbar-button" form="settings-form" name="action" value="test-komga">{{ m.icon('check-circle') }}<span class="toolbar-label">Test Komga</span></button>
+    <button class="toolbar-button" form="settings-form" name="action" value="test-notify">{{ m.icon('rss') }}<span class="toolbar-label">Test Notify</span></button>
+  </div>
+  <div class="toolbar-section right">
+    <nav class="settings-nav" aria-label="Settings sections"><a href="#sources">Sources</a><a href="#scheduling">Scheduling</a><a href="#komga">Komga</a><a href="#notifications">Notifications</a><a href="#security">Security</a></nav>
+  </div>
+</div>
+{% endblock %}
+
+{% block body %}
+<div class="help-text">Stored in the database; environment variables are the defaults. Changes apply to the next job.</div>
+<form method="post" action="/settings" class="settings-form form" id="settings-form">
+
+<fieldset class="fieldset" id="sources">
+  <legend class="legend">Sources</legend>
+  <div class="help-text">From Suwayomi. <b>Disabled</b> sources are still searched (so a series that exists only there is reported) but never downloaded from. <b>Throttled</b> sources get one chapter at a time and lose close calls.</div>
+  <div class="table-container"><table class="table">
+  <thead><tr><th>Source</th><th>Language</th><th class="col-check">Disabled</th><th class="col-check">Throttled</th></tr></thead>
   <tbody>
   {% for s in sources %}
   <tr><td>{{ s.name }}</td><td class="muted">{{ s.lang }}</td>
-  <td><input type="checkbox" name="unusable_sources" value="{{ s.name|lower }}" aria-label="Disable {{ s.name }}" {% if s.name|lower in v.unusable_sources %}checked{% endif %}></td>
-  <td><input type="checkbox" name="throttled_sources" value="{{ s.name|lower }}" aria-label="Throttle {{ s.name }}" {% if s.name|lower in v.throttled_sources %}checked{% endif %}></td></tr>
+  <td class="col-check">{{ m.check('unusable_sources', (s.name|lower in v.unusable_sources), s.name|lower, none, 'danger', 'aria-label="Disable ' ~ s.name ~ '"') }}</td>
+  <td class="col-check">{{ m.check('throttled_sources', (s.name|lower in v.throttled_sources), s.name|lower, none, 'warning', 'aria-label="Throttle ' ~ s.name ~ '"') }}</td></tr>
   {% endfor %}
-  {% if not sources %}<tr><td colspan="4" class="err">Suwayomi unreachable - source list unavailable</td></tr>{% endif %}
+  {% if not sources %}<tr><td colspan="4" class="text-danger">Suwayomi unreachable - source list unavailable</td></tr>{% endif %}
   </tbody></table></div>
-</section>
+</fieldset>
 
-<section class="card" id="scheduling">
-  <h2>Scheduling &amp; matching</h2>
-  <div class="field"><span class="lbl">Refresh every (hours)</span><input name="refresh_hours" value="{{ v.refresh_hours }}" size="6"></div>
-  <div class="field"><span class="lbl">Delay between chapters on rate-limited sources (s)</span><input name="throttled_delay_seconds" value="{{ v.throttled_delay_seconds }}" size="6"><span class="muted small">a steady pause stays under the site's limit; bursts get HTTP 429 and long backoffs</span></div>
-  <div class="field"><span class="lbl">Re-check complete finished series every (days)</span><input name="recheck_finished_days" value="{{ v.recheck_finished_days }}" size="6"><span class="muted small">a finished series with nothing missing rarely changes; 0 = every pass</span></div>
-  <div class="field"><span class="lbl">Minimum pages for a fractional chapter</span><input name="min_pages" value="{{ v.min_pages }}" size="6"><span class="help">below this a "Chapter 12.5" is treated as a notice image and skipped</span></div>
-</section>
+<fieldset class="fieldset" id="scheduling">
+  <legend class="legend">Scheduling &amp; Matching</legend>
+  {% call m.form_group('Refresh Interval', 'Hours between automatic refreshes of every monitored series', 'refresh_hours') %}<input class="input" id="refresh_hours" name="refresh_hours" value="{{ v.refresh_hours }}"><span class="input-unit">hours</span>{% endcall %}
+  {% call m.form_group('Throttled Delay', 'Seconds between chapters on rate-limited sources; a steady pause stays under the site\'s limit, bursts get HTTP 429 and long backoffs', 'throttled_delay_seconds') %}<input class="input" id="throttled_delay_seconds" name="throttled_delay_seconds" value="{{ v.throttled_delay_seconds }}"><span class="input-unit">seconds</span>{% endcall %}
+  {% call m.form_group('Re-check Finished Series', 'Days between checks of a finished series with nothing missing; 0 = every pass', 'recheck_finished_days') %}<input class="input" id="recheck_finished_days" name="recheck_finished_days" value="{{ v.recheck_finished_days }}"><span class="input-unit">days</span>{% endcall %}
+  {% call m.form_group('Minimum Pages', 'Below this a "Chapter 12.5" is treated as a notice image and skipped', 'min_pages') %}<input class="input" id="min_pages" name="min_pages" value="{{ v.min_pages }}"><span class="input-unit">pages</span>{% endcall %}
+</fieldset>
 
-<section class="card" id="komga">
-  <h2>Komga</h2>
-  <div class="field"><span class="lbl">URL</span><input name="komga_url" value="{{ v.komga_url }}" placeholder="http://komga:25600"></div>
-  <div class="field"><span class="lbl">API key</span><input name="komga_api_key" type="password" value="{{ v.komga_api_key }}" placeholder="Komga: account menu → API keys" autocomplete="off"></div>
-  <div class="field"><span class="lbl">Library id</span><input name="komga_library_id" value="{{ v.komga_library_id }}" placeholder="optional: scan only this library"></div>
-  {% if komga_test %}<p class="{{ 'muted' if komga_ok else 'err' }}" style="margin-top:8px">Komga: {{ komga_test }}</p>{% endif %}
-</section>
+<fieldset class="fieldset" id="komga">
+  <legend class="legend">Komga</legend>
+  {% call m.form_group('URL', none, 'komga_url') %}<input class="input" id="komga_url" name="komga_url" value="{{ v.komga_url }}" placeholder="http://komga:25600">{% endcall %}
+  {% call m.form_group('API Key', 'Komga: account menu → API keys', 'komga_api_key') %}<input class="input" id="komga_api_key" name="komga_api_key" type="password" value="{{ v.komga_api_key }}" autocomplete="off">{% endcall %}
+  {% call m.form_group('Library Id', 'Optional: scan only this library', 'komga_library_id') %}<input class="input" id="komga_library_id" name="komga_library_id" value="{{ v.komga_library_id }}">{% endcall %}
+  {% if komga_test %}<div class="alert {{ 'success' if komga_ok else 'danger' }}">Komga: {{ komga_test }}</div>{% endif %}
+</fieldset>
 
-<section class="card" id="notifications">
-  <h2>Notifications</h2>
-  <div class="field"><span class="lbl">Pushover app token</span><input name="pushover_token" type="password" value="{{ v.pushover_token }}" autocomplete="off"></div>
-  <div class="field"><span class="lbl">Pushover user key</span><input name="pushover_user" type="password" value="{{ v.pushover_user }}" autocomplete="off"></div>
-  <div class="field"><span class="lbl">Webhook URL</span><input name="webhook_url" value="{{ v.webhook_url }}" placeholder="POST {title, message, kind} as JSON"></div>
-</section>
+<fieldset class="fieldset" id="notifications">
+  <legend class="legend">Notifications</legend>
+  {% call m.form_group('Pushover App Token', none, 'pushover_token') %}<input class="input" id="pushover_token" name="pushover_token" type="password" value="{{ v.pushover_token }}" autocomplete="off">{% endcall %}
+  {% call m.form_group('Pushover User Key', none, 'pushover_user') %}<input class="input" id="pushover_user" name="pushover_user" type="password" value="{{ v.pushover_user }}" autocomplete="off">{% endcall %}
+  {% call m.form_group('Webhook URL', 'POST {title, message, kind} as JSON', 'webhook_url') %}<input class="input" id="webhook_url" name="webhook_url" value="{{ v.webhook_url }}">{% endcall %}
+</fieldset>
 
-<section class="card" id="security">
-  <h2>Security</h2>
-  <div class="field"><span class="lbl">Login method</span><div class="radios">
-    <label><input type="radio" name="auth_method" value="forms" {% if v.auth_method != 'basic' %}checked{% endif %}> login page</label>
-    <label><input type="radio" name="auth_method" value="basic" {% if v.auth_method == 'basic' %}checked{% endif %}> browser prompt (basic auth)</label>
-  </div></div>
-  <div class="field"><span class="lbl">Web username</span><input name="auth_user" value="{{ v.auth_user }}" placeholder="empty = no login"></div>
-  <div class="field"><span class="lbl">Web password</span><input name="auth_password" type="password" value="{{ v.auth_password }}" autocomplete="new-password"><span class="help">Stored secrets show as ********; leave that as it is to keep the value, or clear the field to remove it.</span></div>
-  <div class="field"><span class="lbl">API key</span><input name="api_key" value="{{ v.api_key }}"><span class="help">send as <code>X-Api-Key</code> header (or <code>?apikey=</code>) to use the JSON API when a login is set</span></div>
-</section>
+<fieldset class="fieldset" id="security">
+  <legend class="legend">Security</legend>
+  {% call m.form_group('Authentication') %}
+    <select class="input select" name="auth_method"><option value="forms" {% if v.auth_method != 'basic' %}selected{% endif %}>Forms (login page)</option><option value="basic" {% if v.auth_method == 'basic' %}selected{% endif %}>Basic (browser prompt)</option></select>
+  {% endcall %}
+  {% call m.form_group('Username', 'Empty = no login', 'auth_user') %}<input class="input" id="auth_user" name="auth_user" value="{{ v.auth_user }}">{% endcall %}
+  {% call m.form_group('Password', 'Stored secrets show as ********; leave that as it is to keep the value, or clear the field to remove it', 'auth_password') %}<input class="input" id="auth_password" name="auth_password" type="password" value="{{ v.auth_password }}" autocomplete="new-password">{% endcall %}
+  {% call m.form_group('API Key', 'Send as X-Api-Key header (or ?apikey=) to use the JSON API when a login is set', 'api_key') %}<input class="input" id="api_key" name="api_key" value="{{ v.api_key }}">{% endcall %}
+</fieldset>
 
-<div class="savebar">
-  <button>Save</button>
-  <button name="action" value="test-komga" class="alt">Save &amp; test Komga</button>
-  <button name="action" value="test-notify" class="alt">Save &amp; send test notification</button>
+<div class="form-actions">
+  <button class="button primary">Save Changes</button>
+  <button name="action" value="test-komga" class="button">Save &amp; test Komga</button>
+  <button name="action" value="test-notify" class="button">Save &amp; send test notification</button>
 </div>
 </form>
 {% endblock %}

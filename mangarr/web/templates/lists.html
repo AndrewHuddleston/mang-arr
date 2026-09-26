@@ -1,11 +1,22 @@
 {% extends "base.html" %}
-{% block title %}Lists - mang-arr{% endblock %}
-{% block page_title %}Import Lists{% endblock %}
-{% block body %}
-<p class="muted">Series from these sources are added automatically on each sync (at most {{ cap }} new series per sync). A series you delete with <i>exclude from import lists</i> ticked, or any reference in the exclusions below, is never added back.</p>
+{% import "macros.html" as m %}
+{% block title %}Import Lists - mang-arr{% endblock %}
 
-<div class="tablewrap"><table class="list">
-<thead><tr><th>Name</th><th>Kind</th><th>Source</th><th>Every</th><th>Adds</th><th>Last sync</th><th>Result</th><th></th></tr></thead>
+{% block toolbar %}
+<div class="page-toolbar">
+  <div class="toolbar-section left">
+    {{ m.toolbar_button('Add List', 'plus', href='#add-list') }}
+    {{ m.toolbar_button('Exclusions', 'ignore', href='#exclusions') }}
+  </div>
+  <div class="toolbar-section right"><span class="toolbar-count">{{ rows|length }} lists</span></div>
+</div>
+{% endblock %}
+
+{% block body %}
+<div class="help-text">Series from these sources are added automatically on each sync (at most {{ cap }} new series per sync). A series you delete with <i>Add List Exclusion</i> ticked, or any reference in the exclusions below, is never added back.</div>
+
+<div class="table-container"><table class="table lists">
+<thead><tr><th>Name</th><th>Kind</th><th>Source</th><th>Every</th><th>Adds</th><th>Last sync</th><th>Result</th><th class="col-actions"></th></tr></thead>
 <tbody>
 {% for r in rows %}
 <tr class="{% if not r.enabled %}dim{% endif %}">
@@ -15,73 +26,68 @@
   <td class="muted">{{ '%g'|format(r.sync_hours) }} h</td>
   <td class="small muted">{{ 'download' if r.download else 'no download' }}, {{ 'monitored' if r.monitored else 'unmonitored' }}</td>
   <td class="muted">{{ r.last_sync|ago }}{% if r.enabled %}<div class="small">next {{ (r.next_sync|ago) if r.next_sync else 'now' }}</div>{% endif %}</td>
-  <td class="small {% if r.last_result and r.last_result.startswith('error') %}err{% endif %}">{{ r.last_result or '-' }}</td>
-  <td class="act"><div class="actions">
-    <form method="post" action="/lists/{{ r.id }}/sync"><button class="small" {% if r.name in busy %}disabled title="a sync is queued or running"{% endif %}>Sync now</button></form>
-    <form method="post" action="/lists/{{ r.id }}/toggle"><button class="alt small">{{ 'Disable' if r.enabled else 'Enable' }}</button></form>
-    <form method="post" action="/lists/{{ r.id }}/delete" data-name="{{ r.name }}" onsubmit="return confirm('Delete list ' + this.dataset.name + '? Series it added stay tracked.')"><button class="danger small">Delete</button></form>
-  </div></td>
+  <td class="small {% if r.last_result and r.last_result.startswith('error') %}text-danger{% endif %}">{{ r.last_result or '-' }}</td>
+  <td class="col-actions">
+    <form method="post" action="/lists/{{ r.id }}/sync" class="iconform"><button class="iconbtn" title="Sync now" {% if r.name in busy %}disabled{% endif %}>{{ m.icon('refresh') }}</button></form>
+    <form method="post" action="/lists/{{ r.id }}/toggle" class="iconform"><button class="iconbtn" title="{{ 'Disable' if r.enabled else 'Enable' }}">{{ m.icon('bookmark' if r.enabled else 'bookmark-off') }}</button></form>
+    <form method="post" action="/lists/{{ r.id }}/delete" class="iconform" data-name="{{ r.name }}" onsubmit="return confirm('Delete list ' + this.dataset.name + '? Series it added stay tracked.')"><button class="iconbtn" title="Delete">{{ m.icon('delete') }}</button></form>
+  </td>
 </tr>
 {% endfor %}
 {% if not rows %}<tr><td colspan="8" class="muted">No lists yet.</td></tr>{% endif %}
 </tbody></table></div>
 
-<section class="card" style="margin-top:18px">
-<h2>Add a list</h2>
-<form method="post" action="/lists/add" class="settings-form" id="addlist">
-<div class="field"><span class="lbl">Kind</span><select name="kind" id="kind">
-  {% for k, label in kinds.items() %}<option value="{{ k }}">{{ label }}</option>{% endfor %}
-</select></div>
-<div class="field"><span class="lbl">Name</span><input name="name" placeholder="optional; made from the source if blank"></div>
+<fieldset class="fieldset" id="add-list">
+<legend class="legend">Add a list</legend>
+<form method="post" action="/lists/add" class="settings-form form" id="addlist">
+{% call m.form_group('Kind', none, 'kind') %}<select name="kind" id="kind" class="input select">{% for k, label in kinds.items() %}<option value="{{ k }}">{{ label }}</option>{% endfor %}</select>{% endcall %}
+{% call m.form_group('Name', 'Optional; made from the source if blank', 'list-name') %}<input class="input" id="list-name" name="name">{% endcall %}
 
 <div data-kind="anilist_user" class="kindblock">
-  <div class="field"><span class="lbl">AniList username</span><input name="username" placeholder="public profile name"></div>
-  <div class="field"><span class="lbl">Statuses</span><div class="radios">
-    {% for s in statuses %}<label class="small"><input type="checkbox" name="statuses" value="{{ s }}" {% if s in ['CURRENT', 'PLANNING'] %}checked{% endif %}> {{ s|lower }}</label>{% endfor %}
-  </div></div>
+  {% call m.form_group('AniList username', 'Public profile name', 'username') %}<input class="input" id="username" name="username">{% endcall %}
+  {% call m.form_group('Statuses') %}<div class="check-row">{% for s in statuses %}<label class="check-inline">{{ m.check('statuses', (s in ['CURRENT', 'PLANNING']), s) }} {{ s|lower }}</label>{% endfor %}</div>{% endcall %}
 </div>
 
 <div data-kind="anilist_top" class="kindblock">
-  <div class="field"><span class="lbl">Chart</span><select name="sort">{% for s in sorts %}<option value="{{ s }}">{{ s|replace('_DESC', '')|lower }}</option>{% endfor %}</select></div>
-  <div class="field"><span class="lbl">Top</span><input name="limit" value="50" size="4"><span class="help">1-100</span></div>
-  <div class="field"><span class="lbl">Country</span><select name="country"><option value="">any</option>{% for c in countries %}<option value="{{ c }}">{{ c }}</option>{% endfor %}</select></div>
-  <div class="field"><span class="lbl">Minimum chapters</span><input name="min_chapters" value="0" size="4"><span class="help">0 = no minimum; series whose count is not known yet pass</span></div>
-  <p class="muted small">Manga format only, no adult titles.</p>
+  {% call m.form_group('Chart', none, 'sort') %}<select name="sort" id="sort" class="input select">{% for s in sorts %}<option value="{{ s }}">{{ s|replace('_DESC', '')|lower }}</option>{% endfor %}</select>{% endcall %}
+  {% call m.form_group('Top', '1-100', 'limit') %}<input class="input" id="limit" name="limit" value="50">{% endcall %}
+  {% call m.form_group('Country', none, 'country') %}<select name="country" id="country" class="input select"><option value="">any</option>{% for c in countries %}<option value="{{ c }}">{{ c }}</option>{% endfor %}</select>{% endcall %}
+  {% call m.form_group('Minimum chapters', '0 = no minimum; series whose count is not known yet pass', 'min_chapters') %}<input class="input" id="min_chapters" name="min_chapters" value="0">{% endcall %}
+  <div class="help-text">Manga format only, no adult titles.</div>
 </div>
 
 <div data-kind="url_text" class="kindblock">
-  <div class="field"><span class="lbl">URL</span><input name="url" placeholder="https://.../manga.txt"></div>
-  <p class="muted small">One title per line (or an <code>anilist:123</code> / <code>mangadex:uuid</code> reference); blank lines and lines starting with <code>#</code> are ignored. Titles without a single exact database match are listed for review, not added.</p>
+  {% call m.form_group('URL', 'One title per line (or an anilist:123 / mangadex:uuid reference); blank lines and lines starting with # are ignored. Titles without a single exact database match are listed for review, not added.', 'url') %}<input class="input" id="url" name="url" placeholder="https://.../manga.txt">{% endcall %}
 </div>
 
-<div class="field"><span class="lbl">Sync every (hours)</span><input name="sync_hours" value="24" size="6"></div>
-<div class="field"><span class="lbl">Options</span><div class="radios">
-  <label><input type="checkbox" name="download" value="1" checked> download chapters when adding</label>
-  <label><input type="checkbox" name="monitored" value="1" checked> monitor added series</label>
-  <label><input type="checkbox" name="sync_now" value="1" checked> sync now</label>
-</div></div>
-<div class="actions" style="margin-top:10px"><button>Add list</button></div>
+{% call m.form_group('Sync every', none, 'sync_hours') %}<input class="input" id="sync_hours" name="sync_hours" value="24"><span class="input-unit">hours</span>{% endcall %}
+{% call m.form_group('Options') %}<div class="check-row">
+  <label class="check-inline">{{ m.check('download', true) }} download chapters when adding</label>
+  <label class="check-inline">{{ m.check('monitored', true) }} monitor added series</label>
+  <label class="check-inline">{{ m.check('sync_now', true) }} sync now</label>
+</div>{% endcall %}
+<div class="form-actions"><button class="button primary">Add list</button></div>
 </form>
-</section>
+</fieldset>
 
-<section class="card">
-<h2>Exclusions</h2>
-<p class="muted small">References that lists must never add. Deleting a series with <i>exclude from import lists</i> ticked adds one here.</p>
-<div class="tablewrap"><table class="list small">
-<thead><tr><th>Reference</th><th>Title</th><th>Reason</th><th>Added</th><th></th></tr></thead>
+<fieldset class="fieldset" id="exclusions">
+<legend class="legend">Exclusions</legend>
+<div class="help-text">References that lists must never add. Deleting a series with <i>Add List Exclusion</i> ticked adds one here.</div>
+<div class="table-container"><table class="table">
+<thead><tr><th>Reference</th><th>Title</th><th>Reason</th><th>Added</th><th class="col-actions"></th></tr></thead>
 <tbody>
 {% for x in exclusions %}
 <tr><td><code>{{ x.ref }}</code></td><td>{{ x.title or '' }}</td><td class="muted">{{ x.reason or '' }}</td><td class="muted">{{ x.created_at|ago }}</td>
-<td class="act"><form method="post" action="/lists/exclusions/{{ x.ref }}/delete"><button class="ghost small">remove</button></form></td></tr>
+<td class="col-actions"><form method="post" action="/lists/exclusions/{{ x.ref }}/delete" class="iconform"><button class="iconbtn" title="Remove">{{ m.icon('x') }}</button></form></td></tr>
 {% endfor %}
 {% if not exclusions %}<tr><td colspan="5" class="muted">none</td></tr>{% endif %}
 </tbody></table></div>
-<form method="post" action="/lists/exclusions/add" class="toolbar" style="margin-top:12px">
-  <input name="ref" placeholder="anilist:123 or mangadex:uuid" required aria-label="Reference">
-  <input name="title" placeholder="title (optional)" aria-label="Title">
-  <button class="alt">Exclude</button>
+<form method="post" action="/lists/exclusions/add" class="inline-form">
+  <input class="input" name="ref" placeholder="anilist:123 or mangadex:uuid" required aria-label="Reference">
+  <input class="input" name="title" placeholder="title (optional)" aria-label="Title">
+  <button class="button">Exclude</button>
 </form>
-</section>
+</fieldset>
 {% endblock %}
 {% block script %}<script>
 (function(){

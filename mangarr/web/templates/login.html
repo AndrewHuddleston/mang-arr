@@ -8,16 +8,17 @@
 <link rel="stylesheet" href="/static/style.css">
 </head>
 <body class="login">
+{% include "icons.html" %}
 <main class="login-box">
-  <div class="brand"><span class="brand-mark">M</span><span class="brand-name">mang-arr</span></div>
-  {% if error %}<p class="err">{{ error }}</p>{% endif %}
-  <form method="post" action="/login" class="col">
+  <div class="brand"><span class="brand-mark"><svg class="ic"><use href="#i-logo"/></svg></span><span class="brand-name">mang-arr</span></div>
+  {% if error %}<div class="alert danger">{{ error }}</div>{% endif %}
+  <form method="post" action="/login" class="form login-form">
     <input type="hidden" name="next" value="{{ next }}">
-    <input name="username" placeholder="username" aria-label="Username" autocomplete="username" autofocus required>
-    <input name="password" type="password" placeholder="password" aria-label="Password" autocomplete="current-password" required>
-    <button>Sign in</button>
+    <input class="input" name="username" placeholder="Username" aria-label="Username" autocomplete="username" autofocus required>
+    <input class="input" name="password" type="password" placeholder="Password" aria-label="Password" autocomplete="current-password" required>
+    <button class="button primary large">Sign in</button>
   </form>
-  <p class="muted small" style="margin:14px 0 0">mang-arr {{ version }}</p>
+  <div class="login-footer">mang-arr {{ version }}</div>
 </main>
 </body>
 </html>

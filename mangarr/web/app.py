@@ -364,7 +364,7 @@ def index(request: Request, q: str = ""):
         rows = db.series_rows(con)
     if q:
         rows = [r for r in rows if q.lower() in r["title"].lower()]
-    return page(request, "index.html", rows=rows, q=q)
+    return page(request, "index.html", rows=rows, q=q, library_root=config.LIBRARY_ROOT)
 
 
 @app.get("/series/{series_id}")
@@ -522,8 +522,9 @@ def add_page(request: Request, term: str = ""):
         if pick and pick.ref not in [c.ref for c in cands]:
             cands.insert(0, pick)
     with db.connect() as con:
-        tracked = {r["ref"] for r in con.execute("SELECT ref FROM series")}
-    return page(request, "add.html", term=term, pick=pick, cands=cands, tracked=tracked, error=error)
+        tracked = {r["ref"]: r["id"] for r in con.execute("SELECT ref, id FROM series")}
+    return page(request, "add.html", term=term, pick=pick, cands=cands, tracked=tracked, error=error,
+                library_root=config.LIBRARY_ROOT)
 
 
 def _series_from_ref(ref: str, title: str = "", aliases: list[str] | None = None) -> model.Series:
@@ -659,7 +660,8 @@ def wanted_search():
 
 @app.get("/activity")
 def activity_page(request: Request):
-    return page(request, "activity.html", jobs=runner.jobs()[:50], squeue=_suwayomi_queue())
+    jobs_, squeue = runner.jobs()[:50], _suwayomi_queue()
+    return page(request, "activity.html", jobs=jobs_, squeue=squeue, queue=views.queue_rows(jobs_, squeue))
 
 
 @app.get("/activity/history")

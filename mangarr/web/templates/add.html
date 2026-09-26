@@ -1,58 +1,129 @@
 {% extends "base.html" %}
-{% block title %}Add New - mang-arr{% endblock %}
-{% block page_title %}Add New{% endblock %}
+{% import "macros.html" as m %}
+{% block title %}Add New Series - mang-arr{% endblock %}
+{% block body_class %}add-new{% endblock %}
 {% block body %}
-<form method="get" action="/add" class="toolbar" role="search">
-  <span class="searchbox" style="flex:1;max-width:640px"><svg class="ic" aria-hidden="true"><use href="#i-search"/></svg>
-    <input type="search" name="term" value="{{ term }}" placeholder="Search by title (English, romaji, or original)" aria-label="Search title" style="width:100%" autofocus></span>
-  <button>Search</button>
+<form method="get" action="/add" class="search-container" role="search">
+  <div class="search-icon-container">{{ m.icon('search') }}</div>
+  <input type="search" name="term" class="input search-input" value="{{ term }}" placeholder="eg. Solo Leveling, anilist:105398" aria-label="Search title" autofocus autocomplete="off">
+  <a class="button clear-lookup" href="/add" title="Clear">{{ m.icon('x') }}</a>
 </form>
-{% if error %}<p class="err">{{ error }}</p>{% endif %}
-{% if term %}
-  {% if pick %}<p class="muted">Exact match: <b>{{ pick.title }}</b> <span class="small">({{ pick.ref }})</span></p>
-  {% elif cands %}<p class="muted">No single exact match - pick the right one:</p>
-  {% else %}<p class="muted">Nothing on AniList or MangaDex. Western webtoons are often missing: add it by exact title below.</p>{% endif %}
-  <div class="results">
-  {% for c in cands %}
-    <article class="result {% if pick and c.ref == pick.ref %}pick{% endif %}">
-      {% if pick and c.ref == pick.ref %}<span class="exact">exact match</span>{% endif %}
-      <div class="art">{% if c.cover %}<img src="{{ c.cover }}" alt="">{% else %}<svg class="ic"><use href="#i-image"/></svg>{% endif %}</div>
-      <div class="body">
-        <div class="ttl">{{ c.title }}</div>
-        <div class="ref">{{ c.ref }}</div>
-        {% set alts = c.titles|reject('equalto', c.title)|list %}
-        {% if alts %}<div class="alt">{{ alts[:4]|join(' · ') }}</div>{% endif %}
-        <div class="badges">
-          <span class="tag {{ c.status|status_class }}">{{ c.status|status_label }}</span>
-          {% if c.format %}<span class="tag">{{ c.format|replace('_', ' ')|lower }}</span>{% endif %}
-          {% if c.country %}<span class="tag">{{ c.country }}</span>{% endif %}
-          <span class="tag">{{ c.chapters or '?' }} ch</span>
-          {% if c.ref in tracked %}<span class="tag info">already tracked</span>{% endif %}
-        </div>
-        {% if c.ref not in tracked %}
-        <form method="post" action="/add">
-          <input type="hidden" name="ref" value="{{ c.ref }}">
-          <label><input type="checkbox" name="download" value="1" checked> download missing chapters now</label>
-          <button>Add</button>
-        </form>
-        {% endif %}
-      </div>
-    </article>
-  {% endfor %}
-  </div>
-{% else %}
-<p class="muted">Type a title (English, romaji or original) to search AniList and MangaDex. Pick the right result to track it; every Suwayomi source is then searched for its chapters.</p>
+
+{% if error %}
+<div class="message"><div class="help-text-large">Failed to load search results, please try again.</div><div class="alert danger">{{ error }}</div></div>
 {% endif %}
 
-<details class="card" style="margin-top:18px" {% if term and not cands %}open{% endif %}>
-  <summary>Can't find it? Add by exact title (no metadata)</summary>
-  <p class="muted small">For series no database has (some Western webtoons). The typed title is the series; sources must spell it exactly (or one of the aliases). Chapter counts, cover, genres and status will be empty.</p>
-  <form method="post" action="/add" class="col">
-    <input type="hidden" name="ref" value="manual">
-    <input name="title" value="{{ term }}" placeholder="exact title as the sources spell it" aria-label="Title">
-    <input name="alias" placeholder="other exact titles, separated by |" aria-label="Aliases">
-    <label><input type="checkbox" name="download" value="1" checked> download missing chapters now</label>
-    <div><button>Add</button></div>
-  </form>
-</details>
+{% if term and not error %}
+  {% if cands %}
+  <div class="search-results">
+  {% for c in cands %}
+    {% set is_pick = pick and c.ref == pick.ref %}
+    {% set existing = c.ref in tracked %}
+    <div class="search-result {% if is_pick %}pick{% endif %}"
+         data-ref="{{ c.ref }}" data-title="{{ c.title }}" data-year="{{ c.year or '' }}" data-cover="{{ c.cover or '' }}"
+         data-overview="{{ c.description|plain }}" data-kind="{{ c.kind }}" data-network="{{ network_line(c) }}">
+      {% if existing %}<a class="result-underlay" href="/series/{{ tracked[c.ref] }}" aria-label="Open {{ c.title }}"></a>
+      {% else %}<button type="button" class="result-underlay" data-add aria-label="Add {{ c.title }}"></button>{% endif %}
+      <div class="result-overlay">
+        <div class="result-poster">{{ m.poster_img(c.cover) }}</div>
+        <div class="result-content">
+          <div class="result-title-row">
+            <div class="result-title">{{ c.title }}{% if c.year %} <span class="result-year">({{ c.year }})</span>{% endif %}</div>
+            <div class="result-icons">
+              {% if is_pick %}{{ m.label('Exact match', 'primary', 'large') }}{% endif %}
+              {% if existing %}<span class="already-exists" title="Already in your library">{{ m.icon('check-circle') }}</span>{% endif %}
+              {% if c.anilist_id %}<a class="result-link external" href="https://anilist.co/manga/{{ c.anilist_id }}" target="_blank" rel="noopener noreferrer" title="Open on AniList (new tab)">{{ m.icon('external') }}</a>
+              {% elif c.mangadex_id %}<a class="result-link external" href="https://mangadex.org/title/{{ c.mangadex_id }}" target="_blank" rel="noopener noreferrer" title="Open on MangaDex (new tab)">{{ m.icon('external') }}</a>{% endif %}
+            </div>
+          </div>
+          <div class="result-labels">
+            {{ m.ilabel('network', network_line(c), text_class='plain') }}
+            {% if c.genres %}{{ m.ilabel('profile', c.genres[:4]|join(', '), text_class='plain') }}{% endif %}
+            {{ m.label((c.chapters ~ ' chapters') if c.chapters else 'chapter count unknown', 'default', 'large') }}
+            {% if c.status|status_class == 'ended' %}{{ m.label('Ended', 'danger', 'large') }}
+            {% elif c.status|status_class == 'continuing' %}{{ m.label('Continuing', 'info', 'large') }}
+            {% elif c.status %}{{ m.label(c.status|status_label, 'warning', 'large') }}{% endif %}
+            {% if existing %}{{ m.label('Already tracked', 'success', 'large') }}{% endif %}
+          </div>
+          {% set alts = c.titles|reject('equalto', c.title)|list %}
+          {% if alts %}<div class="result-alt">{{ alts[:4]|join(' · ') }}</div>{% endif %}
+          <div class="result-overview">{{ c.description|snippet(520) }}</div>
+        </div>
+      </div>
+    </div>
+  {% endfor %}
+  </div>
+  {% else %}
+  <div class="message">
+    <div class="no-results">Couldn't find any results for '{{ term }}'</div>
+    <div>Western webtoons are often missing from AniList and MangaDex. You can add it by its exact title instead.</div>
+  </div>
+  {% endif %}
+{% elif not error %}
+<div class="message">
+  <div class="help-text-large">It's easy to add a new series, just start typing the name of the series you want to add.</div>
+  <div>You can also search using the AniList id of a series, e.g. 'anilist:105398', or a MangaDex uuid, e.g. 'mangadex:…'.</div>
+</div>
+{% endif %}
+
+<div class="message cant-find">
+  <div>Can't find what you're looking for?</div>
+  <div><button type="button" class="button" data-open-modal="manual-modal">Add by exact title</button></div>
+</div>
+
+{# -- Add New Series modal (Sonarr AddNewSeriesModalContent) -------------- #}
+{% call m.modal('add-modal', 'large') %}
+<form method="post" action="/add" id="add-form" class="form">
+  <input type="hidden" name="ref" value="">
+  <div class="modal-header" id="add-modal-title"><span data-field="title"></span> <span class="result-year" data-field="year"></span></div>
+  <div class="modal-body">
+    <div class="add-container">
+      <div class="add-poster" data-field="poster"></div>
+      <div class="add-info">
+        <div class="add-overview" data-field="overview"></div>
+        {% call m.form_group('Root Folder', 'The library folder for this series, taken from its title') %}
+          <input type="text" class="input read-only" readonly value="{{ library_root }}" data-field="rootfolder" data-root="{{ library_root }}">
+        {% endcall %}
+        {% call m.form_group('Monitor', 'Monitored series get new chapters automatically on every refresh', 'add-monitored') %}
+          <select name="monitored" class="input select" id="add-monitored"><option value="1" selected>All chapters</option><option value="0">None (do not monitor)</option></select>
+        {% endcall %}
+        {% call m.form_group('Series Type') %}
+          <input type="text" class="input read-only" readonly value="" data-field="network">
+        {% endcall %}
+      </div>
+    </div>
+  </div>
+  <div class="modal-footer add-footer">
+    <label class="search-label-container"><span class="search-label">Start search for missing chapters</span>{{ m.check('download', true, '1', 'add-download') }}</label>
+    <button type="submit" class="button success add-button">Add <span data-field="title"></span></button>
+  </div>
+</form>
+{% endcall %}
+
+{# -- Manual add modal: the same shape, with a title field ---------------- #}
+{% call m.modal('manual-modal', 'medium') %}
+<form method="post" action="/add" id="manual-form" class="form">
+  <input type="hidden" name="ref" value="manual">
+  <div class="modal-header" id="manual-modal-title">Add by exact title</div>
+  <div class="modal-body">
+    <div class="alert info">For series no database has (some Western webtoons). The typed title is the series; sources must spell it exactly (or one of the aliases). Chapter counts, cover, genres and status will be empty.</div>
+    {% call m.form_group('Title', 'Exactly as the sources spell it', 'manual-title') %}
+      <input type="text" name="title" class="input" id="manual-title" value="{{ term }}" required>
+    {% endcall %}
+    {% call m.form_group('Aliases', 'Other exact titles, separated by |', 'manual-alias') %}
+      <input type="text" name="alias" class="input" id="manual-alias" placeholder="Title Two | Title Three">
+    {% endcall %}
+    {% call m.form_group('Root Folder') %}
+      <input type="text" class="input read-only" readonly value="{{ library_root }}">
+    {% endcall %}
+    {% call m.form_group('Monitor', none, 'manual-monitored') %}
+      <select name="monitored" class="input select" id="manual-monitored"><option value="1" selected>All chapters</option><option value="0">None (do not monitor)</option></select>
+    {% endcall %}
+  </div>
+  <div class="modal-footer add-footer">
+    <label class="search-label-container"><span class="search-label">Start search for missing chapters</span>{{ m.check('download', true, '1', 'manual-download') }}</label>
+    <button type="submit" class="button success add-button">Add series</button>
+  </div>
+</form>
+{% endcall %}
 {% endblock %}

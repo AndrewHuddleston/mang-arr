@@ -1,94 +1,199 @@
 {% extends "base.html" %}
+{% import "macros.html" as m %}
 {% block title %}Series - mang-arr{% endblock %}
-{% block page_title %}Series{% endblock %}
-{% block body %}
-<div class="toolbar">
-  <form method="get" action="/" role="search">
-    <span class="searchbox"><svg class="ic" aria-hidden="true"><use href="#i-search"/></svg>
-      <input type="search" id="series-search" name="q" value="{{ q }}" placeholder="Search series" aria-label="Search series" autocomplete="off"></span>
-  </form>
-  <label class="small muted">Sort <select id="series-sort" aria-label="Sort by">
-    <option value="title">Title</option><option value="status">Status</option><option value="progress">Progress</option>
-    <option value="wanted">Wanted</option><option value="checked">Last checked</option><option value="added">Added</option>
-  </select></label>
-  <button type="button" id="series-dir" class="ghost small" data-dir="asc" aria-label="Toggle sort direction" title="Sort direction">&#9652;</button>
-  <label class="small muted">Filter <select id="series-filter" aria-label="Filter">
-    <option value="all">All</option><option value="monitored">Monitored</option><option value="unmonitored">Unmonitored</option>
-    <option value="wanted">Wanted</option><option value="continuing">Continuing</option><option value="ended">Ended</option>
-  </select></label>
-  <span class="grow"></span>
-  <span class="count" id="series-count" data-total="{{ rows|length }}">{{ rows|length }} series</span>
-  <div class="seg" role="group" aria-label="View">
-    <button type="button" data-setview="posters" aria-pressed="true" title="Posters"><svg class="ic sm"><use href="#i-grid"/></svg></button>
-    <button type="button" data-setview="table" aria-pressed="false" title="Table"><svg class="ic sm"><use href="#i-list"/></svg></button>
-  </div>
-  <a class="btn" href="/add">+ Add New</a>
-</div>
 
+{% block toolbar %}
+<div class="page-toolbar">
+  <div class="toolbar-section left">
+    {{ m.toolbar_button('Update All', 'refresh', form='/activity/refresh-all', title='Re-check every monitored series and download what is missing') }}
+    {{ m.toolbar_button('Search Wanted', 'search', form='/wanted/search', disabled=(not rows), title='Search every wanted chapter now') }}
+    {{ m.toolbar_separator() }}
+    {{ m.toolbar_button('Add New', 'plus', href='/add') }}
+    {{ m.toolbar_button('Library Import', 'import', href='/import') }}
+  </div>
+  <div class="toolbar-section right">
+    <span class="toolbar-count" id="series-count" data-total="{{ rows|length }}">{{ rows|length }} series</span>
+    {{ m.toolbar_menu('View', 'posters', 'view-menu', [('posters', 'Posters'), ('overview', 'Overview'), ('table', 'Table')], 'posters') }}
+    {{ m.toolbar_menu('Sort', 'sort', 'sort-menu', [('title', 'Title'), ('status', 'Status'), ('progress', 'Chapters'), ('wanted', 'Wanted'), ('checked', 'Last checked'), ('added', 'Added')], 'title') }}
+    {{ m.toolbar_menu('Filter', 'filter', 'filter-menu', [('all', 'All'), ('monitored', 'Monitored Only'), ('unmonitored', 'Unmonitored Only'), ('continuing', 'Continuing Only'), ('ended', 'Ended Only'), ('wanted', 'Missing Chapters')], 'all') }}
+    <button type="button" id="series-dir" data-dir="asc" hidden aria-hidden="true"></button>
+  </div>
+</div>
+{% endblock %}
+
+{% block body_class %}series-index{% endblock %}
+{% block body %}
 {% macro attrs(r) -%}
 data-id="{{ r.id }}" data-title="{{ r.title }}" data-alt="{{ r.romaji or '' }} {{ r.native or '' }}" data-status="{{ r.status|status_class }}"
 data-progress="{{ progress(r.have, r.listed) }}" data-wanted="{{ r.wanted }}" data-monitored="{{ 1 if r.monitored else 0 }}"
-data-checked="{{ r.last_resolved or '' }}" data-added="{{ r.added_at or '' }}"
+data-checked="{{ r.last_resolved or '' }}" data-added="{{ r.added_at or '' }}" data-path="{{ library_root }}/{{ r.folder or r.title }}" data-cover="{{ r.cover or '' }}" data-have="{{ r.have }}"
 {%- endmacro %}
-{% macro bar(r) -%}
-{% set pct = progress(r.have, r.listed) %}
-<div class="progress {% if r.wanted %}warn{% elif not r.listed %}info{% endif %}" role="progressbar" aria-valuenow="{{ pct }}" aria-valuemin="0" aria-valuemax="100" title="{{ r.have }} of {{ r.listed }} chapters"><span class="fill" style="width:{{ pct }}%"></span><span class="txt">{{ r.have }}/{{ r.listed }}</span></div>
+{% macro actions(r) -%}
+<form method="post" action="/series/{{ r.id }}/refresh" class="iconform" data-async="refresh" data-id="{{ r.id }}"><input type="hidden" name="download" value="0"><button class="iconbtn" title="Refresh series (re-check sources)" aria-label="Refresh {{ r.title }}">{{ m.icon('refresh') }}</button></form>
+<form method="post" action="/series/{{ r.id }}/refresh" class="iconform" data-async="refresh" data-id="{{ r.id }}"><input type="hidden" name="download" value="1"><button class="iconbtn" title="Search for missing chapters" aria-label="Search {{ r.title }}">{{ m.icon('search') }}</button></form>
+<button type="button" class="iconbtn" data-edit="{{ r.id }}" title="Edit series" aria-label="Edit {{ r.title }}">{{ m.icon('edit') }}</button>
 {%- endmacro %}
 {% macro monform(r) -%}
 <form method="post" action="/series/{{ r.id }}/monitor" class="iconform" data-async="monitor" data-id="{{ r.id }}">
   <input type="hidden" name="monitored" value="{{ 0 if r.monitored else 1 }}">
-  <button type="submit" class="{{ 'monitored' if r.monitored }}" title="{{ 'Monitored: click to unmonitor' if r.monitored else 'Unmonitored: click to monitor' }}" aria-label="{{ 'Monitored: click to unmonitor' if r.monitored else 'Unmonitored: click to monitor' }}"><svg class="ic mon"><use href="{{ '#i-bookmark' if r.monitored else '#i-bookmark-off' }}"/></svg></button>
+  <button type="submit" class="iconbtn monitor-toggle {{ 'monitored' if r.monitored }}" title="{{ 'Monitored: click to unmonitor' if r.monitored else 'Unmonitored: click to monitor' }}" aria-label="{{ 'Monitored: click to unmonitor' if r.monitored else 'Unmonitored: click to monitor' }}">{{ m.icon('bookmark' if r.monitored else 'bookmark-off') }}</button>
 </form>
 {%- endmacro %}
 
 <div class="views" data-view="posters">
+  {# -- Posters (Sonarr SeriesIndexPoster) -------------------------------- #}
   <div class="view-posters">
-    <div class="grid" data-items>
+    <div class="posters" data-items>
     {% for r in rows %}
-      <a class="poster {% if not r.monitored %}dim{% endif %}" href="/series/{{ r.id }}" {{ attrs(r) }}>
-        <div class="art">
-          {% if r.cover %}<img src="{{ r.cover }}" alt="" loading="lazy">{% else %}<div class="noart"><svg class="ic"><use href="#i-image"/></svg>no cover</div>{% endif %}
-          <span class="ribbon {{ r.status|status_class }}">{{ r.status|status_label }}</span>
-          {% if not r.monitored %}<svg class="ic unmon" aria-label="unmonitored"><use href="#i-bookmark-off"/></svg>{% endif %}
+      <div class="poster-item {% if not r.monitored %}dim{% endif %}" {{ attrs(r) }}>
+        <div class="poster-container" title="{{ r.title }}">
+          <span class="poster-controls label">{{ actions(r) }}</span>
+          {% if r.status|status_class == 'ended' %}<span class="poster-status ended" title="Ended"></span>{% endif %}
+          {% if not r.monitored %}<span class="poster-unmonitored" title="Unmonitored">{{ m.icon('bookmark-off', 'sm') }}</span>{% endif %}
+          <a class="poster-link" href="/series/{{ r.id }}">{{ m.poster_img(r.cover) }}</a>
         </div>
-        <div class="meta">
-          <span class="ttl" title="{{ r.title }}">{{ r.title }}</span>
-          <div class="sub"><span>{{ r.primary_source or 'no source' }}</span>{% if r.wanted %}<span class="want">{{ r.wanted }} wanted</span>{% endif %}</div>
-          {{ bar(r) }}
-        </div>
-      </a>
+        {{ m.series_progress(r, 'medium', true) }}
+        <div class="poster-title" title="{{ r.title }}">{{ r.title }}</div>
+        <div class="poster-info">{{ r.primary_source or 'no source' }}</div>
+      </div>
     {% endfor %}
     </div>
   </div>
 
-  <div class="view-table tablewrap">
-    <table class="list">
+  {# -- Overview (Sonarr SeriesIndexOverview) ----------------------------- #}
+  <div class="view-overview">
+    <div class="overviews" data-items>
+    {% for r in rows %}
+      <div class="overview-item {% if not r.monitored %}dim{% endif %}" {{ attrs(r) }}>
+        <div class="overview-poster">
+          <div class="poster-container">
+            {% if r.status|status_class == 'ended' %}<span class="poster-status ended" title="Ended"></span>{% endif %}
+            <a class="poster-link" href="/series/{{ r.id }}">{{ m.poster_img(r.cover) }}</a>
+          </div>
+          {{ m.series_progress(r, 'medium', true) }}
+        </div>
+        <div class="overview-info">
+          <div class="overview-title-row">
+            <a class="overview-title" href="/series/{{ r.id }}">{{ r.title }}</a>
+            <div class="overview-actions">{{ actions(r) }}</div>
+          </div>
+          <div class="overview-details">
+            <a class="overview-text" href="/series/{{ r.id }}">{{ r.description|snippet(420) or 'No description.' }}</a>
+            <div class="overview-infos">
+              <div class="info-row">{{ m.icon('bookmark' if r.monitored else 'bookmark-off', 'sm') }}<span>{{ 'Monitored' if r.monitored else 'Unmonitored' }}</span></div>
+              <div class="info-row" title="Primary source">{{ m.icon('network', 'sm') }}<span>{{ r.primary_source or 'no source' }}</span></div>
+              <div class="info-row" title="Type">{{ m.icon('profile', 'sm') }}<span>{{ row_kind(r) }}{% if row_language(r) %} · {{ row_language(r) }}{% endif %}</span></div>
+              <div class="info-row" title="Last checked">{{ m.icon('calendar', 'sm') }}<span>{{ r.last_resolved|ago }}</span></div>
+              <div class="info-row" title="Added">{{ m.icon('plus', 'sm') }}<span>{{ r.added_at|ago }}</span></div>
+              <div class="info-row" title="Path">{{ m.icon('folder', 'sm') }}<span class="truncate">{{ library_root }}/{{ r.folder or r.title }}</span></div>
+            </div>
+          </div>
+        </div>
+      </div>
+    {% endfor %}
+    </div>
+  </div>
+
+  {# -- Table (Sonarr SeriesIndexTable) ----------------------------------- #}
+  <div class="view-table table-container">
+    <table class="table series-table">
       <thead><tr>
-        <th></th>
+        <th class="col-status"></th>
         <th class="sortable" data-sort="title">Title</th>
-        <th title="Monitored"></th>
+        <th>Type</th>
+        <th>Source</th>
+        <th class="sortable col-progress" data-sort="progress">Chapters</th>
+        <th class="num sortable" data-sort="wanted">Missing</th>
         <th class="sortable" data-sort="status">Status</th>
-        <th class="sortable" data-sort="progress" style="width:170px">Chapters</th>
-        <th class="num sortable" data-sort="wanted">Wanted</th>
-        <th>Primary source</th>
-        <th class="sortable" data-sort="checked">Last checked</th>
+        <th class="sortable" data-sort="checked">Last Checked</th>
+        <th class="sortable" data-sort="added">Added</th>
+        <th class="col-actions"></th>
       </tr></thead>
       <tbody data-items>
       {% for r in rows %}
         <tr class="{% if not r.monitored %}dim{% endif %}" {{ attrs(r) }}>
-          <td class="cover">{% if r.cover %}<img class="thumb" src="{{ r.cover }}" alt="" loading="lazy">{% else %}<span class="thumb none"><svg class="ic sm"><use href="#i-image"/></svg></span>{% endif %}</td>
-          <td><a href="/series/{{ r.id }}">{{ r.title }}</a>{% if r.last_error %} <span class="err" title="{{ r.last_error }}">!</span>{% endif %}</td>
-          <td>{{ monform(r) }}</td>
-          <td><span class="tag {{ r.status|status_class }}">{{ r.status|status_label }}</span></td>
-          <td>{{ bar(r) }}</td>
-          <td class="num {% if r.wanted %}want{% endif %}">{{ r.wanted }}</td>
+          <td class="col-status">{{ monform(r) }}<span class="status-icon" title="{{ r.status|status_label }}">{{ m.icon('ended' if r.status|status_class == 'ended' else 'continuing', 'sm') }}</span></td>
+          <td class="col-title"><a href="/series/{{ r.id }}">{{ r.title }}</a>{% if r.last_error %} <span class="error-mark" title="{{ r.last_error }}">{{ m.icon('warning', 'sm') }}</span>{% endif %}</td>
+          <td>{{ row_kind(r) }}</td>
           <td class="muted">{{ r.primary_source or '-' }}</td>
-          <td class="muted nowrap">{{ r.last_resolved|ago }}</td>
+          <td class="col-progress">{{ m.series_progress(r, 'medium', true) }}</td>
+          <td class="num {% if r.wanted %}text-danger{% endif %}">{{ r.wanted }}</td>
+          <td>{{ r.status|status_label }}</td>
+          <td class="nowrap">{{ r.last_resolved|ago }}</td>
+          <td class="nowrap">{{ r.added_at|ago }}</td>
+          <td class="col-actions">{{ actions(r) }}</td>
         </tr>
       {% endfor %}
       </tbody>
     </table>
   </div>
 </div>
-{% if not rows %}<p class="empty">Nothing tracked yet. <a href="/add">Add a series</a>, <a href="/import">import what Suwayomi already downloaded</a>, or set up an <a href="/lists">import list</a>.</p>{% endif %}
+
+{% if rows %}
+{% set st = index_stats(rows) %}
+<div class="index-footer">
+  <div class="legend-list">
+    <div class="legend-item"><span class="legend-color primary"></span><span>Continuing (All chapters downloaded)</span></div>
+    <div class="legend-item"><span class="legend-color success"></span><span>Ended (All chapters downloaded)</span></div>
+    <div class="legend-item"><span class="legend-color danger"></span><span>Missing Chapters (Series monitored)</span></div>
+    <div class="legend-item"><span class="legend-color warning"></span><span>Missing Chapters (Series not monitored)</span></div>
+    <div class="legend-item"><span class="legend-color purple"></span><span>Downloading</span></div>
+  </div>
+  <div class="statistics">
+    <dl class="description-list"><dt>Series</dt><dd>{{ st.series }}</dd><dt>Ended</dt><dd>{{ st.ended }}</dd><dt>Continuing</dt><dd>{{ st.continuing }}</dd></dl>
+    <dl class="description-list"><dt>Monitored</dt><dd>{{ st.monitored }}</dd><dt>Unmonitored</dt><dd>{{ st.unmonitored }}</dd></dl>
+    <dl class="description-list"><dt>Chapters</dt><dd>{{ st.chapters }}</dd><dt>Files</dt><dd>{{ st.files }}</dd><dt>Missing</dt><dd>{{ st.wanted }}</dd></dl>
+  </div>
+</div>
+{% else %}
+<div class="no-series">
+  <div class="message">No series have been added yet.</div>
+  <div class="buttons"><a class="button primary" href="/add">Add New Series</a> <a class="button" href="/import">Import Existing Series</a> <a class="button" href="/lists">Import Lists</a></div>
+</div>
+{% endif %}
+
+{# -- Edit Series modal (Sonarr EditSeriesModalContent), one instance filled by JS -- #}
+{% call m.modal('edit-modal', 'medium') %}
+<form method="post" action="/series/0/monitor" id="edit-form" class="form">
+  <div class="modal-header" id="edit-modal-title">Edit - <span data-field="title"></span></div>
+  <div class="modal-body">
+    {% call m.form_group('Monitored', 'Download new chapters as they are listed by the sources', 'edit-monitored') %}
+      <input type="hidden" name="monitored" value="1">
+      {{ m.check(none, true, '1', 'edit-monitored', 'primary', 'data-sync="monitored"') }}
+    {% endcall %}
+    {% call m.form_group('Path', 'Where chapters are placed in the library. Set by the folder name; not editable.') %}
+      <input type="text" class="input read-only" readonly data-field="path" value="">
+    {% endcall %}
+    {% call m.form_group('Notes') %}
+      <textarea class="input read-only" readonly rows="2" data-field="notes"></textarea>
+    {% endcall %}
+  </div>
+  <div class="modal-footer">
+    <button type="button" class="button danger delete-button" data-open-delete>Delete</button>
+    <button type="button" class="button" data-close-modal>Cancel</button>
+    <button type="submit" class="button primary">Save</button>
+  </div>
+</form>
+{% endcall %}
+
+{# -- Delete Series modal (Sonarr DeleteSeriesModalContent) --------------- #}
+{% call m.modal('delete-modal', 'medium') %}
+<form method="post" action="/series/0/delete" id="delete-form" class="form" data-title="">
+  <div class="modal-header" id="delete-modal-title">Delete - <span data-field="title"></span></div>
+  <div class="modal-body">
+    <div class="path-container">{{ m.icon('folder', 'sm') }} <span data-field="path"></span></div>
+    {% call m.form_group('Add List Exclusion', 'Prevent series from being added to mang-arr by import lists') %}
+      {{ m.check('exclude', false, '1', 'delete-exclude') }}
+    {% endcall %}
+    {% call m.form_group('Delete Files', 'Delete the series folder and every chapter file in it', 'delete-files') %}
+      {{ m.check('files', false, '1', 'delete-files', 'danger') }}
+    {% endcall %}
+    <div class="delete-files-message" hidden>The series folder <b data-field="path"></b> and all of its contents will be deleted.<div class="delete-count"><span data-field="have"></span> chapter files</div></div>
+  </div>
+  <div class="modal-footer">
+    <button type="button" class="button" data-close-modal>Close</button>
+    <button type="submit" class="button danger">Delete</button>
+  </div>
+</form>
+{% endcall %}
 {% endblock %}

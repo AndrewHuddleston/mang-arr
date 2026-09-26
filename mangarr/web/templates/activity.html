@@ -1,38 +1,50 @@
 {% extends "base.html" %}
+{% import "macros.html" as m %}
 {% block title %}Queue - mang-arr{% endblock %}
-{% block page_title %}Activity: Queue{% endblock %}
-{% block body %}
-{% set active = jobs|selectattr('status', 'in', ['queued', 'running'])|list|length %}
-<div class="toolbar">
-  <span class="muted">{{ active }} active job{{ 's' if active != 1 }} · this page refreshes every 10 s</span>
-  <span class="grow"></span>
-  <a class="btn ghost small" href="/activity/history">History</a>
-  <form method="post" action="/activity/refresh-all"><button><svg class="ic sm"><use href="#i-refresh"/></svg>Refresh all now</button></form>
+
+{% block toolbar %}
+{% set active = queue|selectattr('status', 'in', ['queued', 'running'])|list|length %}
+<div class="page-toolbar">
+  <div class="toolbar-section left">
+    {{ m.toolbar_button('Refresh', 'refresh', href='/activity', title='Reload the queue') }}
+    {{ m.toolbar_separator() }}
+    {{ m.toolbar_button('Update All', 'rss', form='/activity/refresh-all', title='Queue a refresh of every monitored series') }}
+    {{ m.toolbar_button('Search Wanted', 'search', form='/wanted/search') }}
+  </div>
+  <div class="toolbar-section right">
+    <span class="toolbar-count" id="queue-count">{{ active }} active</span>
+    {{ m.toolbar_menu('Filter', 'filter', 'queue-filter', [('all', 'All'), ('active', 'Queued & Running'), ('done', 'Finished'), ('failed', 'Failed')], 'all') }}
+  </div>
 </div>
+{% endblock %}
 
-<h2>Jobs</h2>
-<div class="tablewrap"><table class="list" id="jobs">
-<thead><tr><th>#</th><th>Kind</th><th>What</th><th>Status</th><th>Progress / result</th><th>When</th><th></th></tr></thead>
+{% block body %}
+{% if squeue.error %}<div class="alert warning">Suwayomi download queue unavailable: {{ squeue.error }}</div>{% endif %}
+{% if not queue %}
+<div class="alert info">The queue is empty. Nothing has run since start and Suwayomi is not downloading anything.</div>
+{% else %}
+<div class="table-container"><table class="table queue" id="jobs">
+<thead><tr><th class="col-icon"></th><th>Series</th><th>Chapter</th><th>Title / result</th><th>Client</th><th>Kind</th><th class="col-progress">Progress</th><th>Status</th><th class="col-date">When</th><th class="col-actions"></th></tr></thead>
 <tbody>
-{% for j in jobs %}
-<tr class="job-{{ j.status }}"><td class="muted">{{ j.id }}</td><td>{{ j.kind }}</td>
-<td>{% if j.series_id %}<a href="/series/{{ j.series_id }}">{{ j.title }}</a>{% else %}{{ j.title }}{% endif %}</td>
-<td><span class="tag {{ j.status }}">{{ j.status }}</span></td><td class="small">{{ j.message or j.progress }}</td>
-<td class="muted nowrap">{{ (j.finished_at or j.started_at or j.queued_at)|ago }}</td>
-<td class="act">{% if j.status in ['queued','running'] %}<form method="post" action="/activity/cancel/{{ j.id }}"><button class="ghost small">cancel</button></form>{% endif %}</td></tr>
+{% for j in queue %}
+{% set st = 'active' if j.status in ['queued', 'running'] else ('failed' if j.status == 'failed' else 'done') %}
+<tr class="queue-row job-{{ j.status }}" data-status="{{ st }}">
+  <td class="col-icon queue-status {{ j.status }}" title="{{ j.status }}">
+    {% if j.status == 'running' %}{{ m.icon('spinner', 'sm spin') }}{% elif j.status == 'queued' %}{{ m.icon('clock', 'sm') }}{% elif j.status == 'failed' %}{{ m.icon('warning', 'sm') }}{% elif j.status == 'cancelled' %}{{ m.icon('ignore', 'sm') }}{% else %}{{ m.icon('check-circle', 'sm') }}{% endif %}
+  </td>
+  <td>{% if j.series_id %}<a href="/series/{{ j.series_id }}">{{ j.title }}</a>{% else %}{{ j.title }}{% endif %}</td>
+  <td class="nowrap">{{ j.chapter or '-' }}</td>
+  <td class="small message">{{ j.message }}</td>
+  <td class="muted">{{ j.client }}</td>
+  <td>{{ j.kind }}</td>
+  <td class="col-progress">{% if j.progress is not none %}{{ m.progress_bar(j.progress, 'purple', 'medium', j.progress ~ '%', j.progress ~ '%') }}{% elif j.status == 'running' %}{{ m.progress_bar(100, 'purple', 'medium', 'running', none, 'indeterminate') }}{% endif %}</td>
+  <td>{{ m.label(j.status, 'info' if j.status == 'running' else 'danger' if j.status == 'failed' else 'success' if j.status == 'done' else 'default') }}</td>
+  <td class="col-date nowrap">{{ j.at|ago if j.at else '-' }}</td>
+  <td class="col-actions">{% if j.cancel %}<form method="post" action="{{ j.cancel }}" class="iconform"><button class="iconbtn" title="Remove from queue">{{ m.icon('x') }}</button></form>{% endif %}</td>
+</tr>
 {% endfor %}
-{% if not jobs %}<tr><td colspan="7" class="muted">no jobs since start</td></tr>{% endif %}
 </tbody></table></div>
-
-<h2>Suwayomi download queue <span class="muted small" style="text-transform:none;letter-spacing:0">({{ squeue.state|lower }}, {{ squeue.count }} item{{ 's' if squeue.count != 1 }})</span></h2>
-{% if squeue.error %}<p class="err">{{ squeue.error }}</p>{% endif %}
-<div class="tablewrap"><table class="list small" id="squeue">
-<thead><tr><th>Series</th><th>Chapter</th><th>State</th><th style="width:260px">Progress</th><th>Tries</th></tr></thead>
-<tbody>
-{% for x in squeue["items"] %}<tr><td>{{ x.manga }}</td><td>{{ x.chapter }}</td><td><span class="tag {{ 'running' if x.state == 'DOWNLOADING' else 'failed' if x.state == 'ERROR' else 'queued' }}">{{ x.state|lower }}</span></td>
-<td><div class="qprog"><div class="progress info" role="progressbar" aria-valuenow="{{ x.progress }}" aria-valuemin="0" aria-valuemax="100"><span class="fill" style="width:{{ x.progress }}%"></span><span class="txt">{{ x.progress }}%</span></div></div></td>
-<td class="muted">{{ x.tries }}</td></tr>{% endfor %}
-{% if not squeue["items"] %}<tr><td colspan="5" class="muted">{{ 'Suwayomi is not downloading anything' if not squeue.error else 'unavailable' }}</td></tr>{% endif %}
-</tbody></table></div>
+<div class="help-text">Suwayomi's own download queue is {{ squeue.state|lower }} ({{ squeue.count }} item{{ 's' if squeue.count != 1 }}). This page refreshes every 10 s while something runs.</div>
+{% endif %}
 {% endblock %}
 {% block main_attrs %}data-reload="10000"{% endblock %}

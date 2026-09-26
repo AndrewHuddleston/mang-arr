@@ -1,40 +1,51 @@
 {% extends "base.html" %}
+{% import "macros.html" as m %}
 {% block title %}Library Import - mang-arr{% endblock %}
-{% block page_title %}Library Import{% endblock %}
-{% block body %}
-<div class="toolbar">
-  <p class="muted" style="margin:0;flex:1">Registers what Suwayomi has already downloaded under <code>{{ staging }}</code>. Each folder is looked up on AniList/MangaDex; exact matches are adopted as-is, the rest need a choice. Files are never moved: the library gets hard links.</p>
-  <form method="post" action="/import/scan"><button {% if scanning %}disabled{% endif %}><svg class="ic sm"><use href="#i-refresh"/></svg>{{ 'Scanning…' if scanning else 'Scan staging folders' }}</button></form>
+
+{% block toolbar %}
+<div class="page-toolbar">
+  <div class="toolbar-section left">
+    <form method="post" action="/import/scan" class="toolbar-form"><button class="toolbar-button" {% if scanning %}disabled{% endif %}>{{ m.icon('refresh') }}<span class="toolbar-label">{{ 'Scanning…' if scanning else 'Scan Folders' }}</span></button></form>
+    {{ m.toolbar_separator() }}
+    <button class="toolbar-button" form="import-form" {% if items is none %}disabled{% endif %}>{{ m.icon('import') }}<span class="toolbar-label">Import Selected</span></button>
+  </div>
+  <div class="toolbar-section right">
+    {% if items is not none %}<span class="toolbar-count">{{ items|length }} folders</span>{% endif %}
+  </div>
 </div>
+{% endblock %}
+
+{% block body %}
+<div class="help-text">Registers what Suwayomi has already downloaded under <code>{{ staging }}</code>. Each folder is looked up on AniList/MangaDex; exact matches are adopted as-is, the rest need a choice. Files are never moved: the library gets hard links.</div>
 
 {% if items is none %}
-  <p class="empty">No scan yet.{% if scanning %} One is running - this page refreshes.{% endif %}</p>
+  <div class="alert info">No scan yet.{% if scanning %} One is running - this page refreshes.{% endif %} Press <b>Scan Folders</b> to look through the staging folders.</div>
 {% else %}
-<div class="stats">
-  <div class="stat"><b>{{ items|length }}</b><span class="lbl">folders</span></div>
-  <div class="stat have"><b>{{ n_ok }}</b><span class="lbl">identified</span></div>
-  <div class="stat wanted"><b>{{ n_review }}</b><span class="lbl">need a choice</span></div>
-  <div class="stat"><b>{{ n_tracked }}</b><span class="lbl">already tracked</span></div>
+<div class="index-footer stats-only">
+  <div class="statistics">
+    <dl class="description-list"><dt>Folders</dt><dd>{{ items|length }}</dd><dt>Identified</dt><dd>{{ n_ok }}</dd></dl>
+    <dl class="description-list"><dt>Need a choice</dt><dd>{{ n_review }}</dd><dt>Already tracked</dt><dd>{{ n_tracked }}</dd></dl>
+  </div>
 </div>
-<form method="post" action="/import/apply">
-<div class="tablewrap"><table class="list small">
-<thead><tr><th>Source</th><th>Folder</th><th class="num">Chapters</th><th>Identified as</th><th>Action</th></tr></thead>
+<form method="post" action="/import/apply" id="import-form">
+<div class="table-container"><table class="table import">
+<thead><tr><th>Source</th><th>Folder</th><th class="num">Chapters</th><th>Series</th><th>Action</th></tr></thead>
 <tbody>
 {% for it in items %}
 <tr>
   <td>{{ it.source }}</td>
-  <td>{{ it.folder_name }}{% if it.unparsed %} <span class="muted">(+{{ it.unparsed|length }} unnumbered{% if it.seasons %}, season-numbered{% endif %})</span>{% endif %}</td>
+  <td>{{ m.icon('folder', 'sm') }} {{ it.folder_name }}{% if it.unparsed %} <span class="muted">(+{{ it.unparsed|length }} unnumbered{% if it.seasons %}, season-numbered{% endif %})</span>{% endif %}</td>
   <td class="num">{{ it.numbers|length }}</td>
   <td>
     {% if it.series %}<b>{{ it.series.title }}</b> <span class="muted">{{ it.series.ref }}</span>
-    {% else %}<span class="err">no exact match</span>{% endif %}
+    {% else %}{{ m.label('no exact match', 'warning') }}{% endif %}
   </td>
   <td>
-    {% if it.tracked %}<span class="tag info">tracked</span>
+    {% if it.tracked %}{{ m.label('tracked', 'success') }}
     {% elif it.series %}
-      <label><input type="checkbox" name="adopt_{{ loop.index0 }}" value="1" checked> adopt</label>
+      <label class="check-inline">{{ m.check('adopt_' ~ loop.index0, true) }} adopt</label>
     {% else %}
-      <select name="choice_{{ loop.index0 }}" aria-label="Choice for {{ it.folder_name }}">
+      <select name="choice_{{ loop.index0 }}" class="input select" aria-label="Choice for {{ it.folder_name }}">
         <option value="skip">skip</option>
         {% for c in it.candidates[:6] %}<option value="{{ c.ref }}">{{ c.title }} ({{ c.format or '?' }} {{ c.country or '?' }}, {{ c.chapters or '?' }} ch)</option>{% endfor %}
         <option value="manual">as-is: "{{ it.folder_name }}" (no metadata)</option>
@@ -44,7 +55,7 @@
 </tr>
 {% endfor %}
 </tbody></table></div>
-<div class="actions" style="margin-top:12px"><button>Adopt selected</button> <span class="muted small">then chapters are linked into the library and a refresh finds what is missing</span></div>
+<div class="form-actions"><button class="button primary">Import Selected</button> <span class="help-text inline">then chapters are linked into the library and a refresh finds what is missing</span></div>
 </form>
 {% endif %}
 {% endblock %}

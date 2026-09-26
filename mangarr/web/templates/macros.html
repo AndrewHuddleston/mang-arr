@@ -1,0 +1,88 @@
+{# Shared building blocks, mirroring Sonarr's components: ProgressBar, Label,
+   PageToolbarButton / ToolbarMenuButton, Modal (header / body / footer). #}
+
+{% macro icon(name, size='') -%}
+<svg class="ic {{ size }}" aria-hidden="true"><use href="#i-{{ name }}"/></svg>
+{%- endmacro %}
+
+{# Sonarr ProgressBar: kind = primary|success|warning|danger|purple|info; size = small|medium|large #}
+{% macro progress_bar(pct, kind='primary', size='medium', text=none, title=none, extra='') -%}
+<div class="progress {{ size }} {{ extra }}" role="progressbar" aria-valuenow="{{ pct }}" aria-valuemin="0" aria-valuemax="100"{% if title %} title="{{ title }}"{% endif %}>
+  <div class="progress-bar {{ kind }}" style="width:{{ pct }}%"></div>
+  {% if text is not none %}<div class="progress-text">{{ text }}</div>{% endif %}
+</div>
+{%- endmacro %}
+
+{# Sonarr's series progress: have / listed with its colour rule #}
+{% macro series_progress(r, size='medium', detailed=true) -%}
+{% set pct = progress(r.have, r.listed) if r.listed else 100 %}
+{{ progress_bar(pct, progress_kind(r.status, r.monitored, pct), size, (r.have ~ ' / ' ~ r.listed) if detailed else none, r.have ~ ' of ' ~ r.listed ~ ' chapters on disk' ~ (', ' ~ r.wanted ~ ' wanted' if r.wanted else '')) }}
+{%- endmacro %}
+
+{# Label with an icon and a text span (Sonarr's series-details labels) #}
+{% macro ilabel(icon_name, text, kind='default', size='large', title=none, text_class='') -%}
+<span class="label {{ kind }} {{ size }}"{% if title %} title="{{ title }}"{% endif %}>{{ icon(icon_name, 'sm') }}<span class="lbl-text {{ text_class }}">{{ text }}</span></span>
+{%- endmacro %}
+
+{# Sonarr Label: kind = default|primary|success|warning|danger|info|purple|disabled|inverse; size = small|medium|large #}
+{% macro label(text, kind='default', size='medium', outline=false, title=none, extra='') -%}
+<span class="label {{ kind }} {{ size }} {% if outline %}outline{% endif %} {{ extra }}"{% if title %} title="{{ title }}"{% endif %}>{{ text }}</span>
+{%- endmacro %}
+
+{# PageToolbarButton: an icon over a small label, 60px wide. `form` posts, `href` links, otherwise a plain button. #}
+{% macro toolbar_button(label_text, icon_name, href=none, form=none, hidden=none, disabled=false, attrs='', title=none, kind='') -%}
+{% if form %}
+<form method="post" action="{{ form }}" class="toolbar-form">{% for k, v in (hidden or {}).items() %}<input type="hidden" name="{{ k }}" value="{{ v }}">{% endfor %}
+  <button class="toolbar-button {{ kind }}" {% if disabled %}disabled{% endif %} {{ attrs|safe }}{% if title %} title="{{ title }}"{% endif %}>{{ icon(icon_name) }}<span class="toolbar-label">{{ label_text }}</span></button></form>
+{% elif href %}
+<a class="toolbar-button {{ kind }} {% if disabled %}disabled{% endif %}" href="{{ href }}" {{ attrs|safe }}{% if title %} title="{{ title }}"{% endif %}>{{ icon(icon_name) }}<span class="toolbar-label">{{ label_text }}</span></a>
+{% else %}
+<button type="button" class="toolbar-button {{ kind }}" {% if disabled %}disabled{% endif %} {{ attrs|safe }}{% if title %} title="{{ title }}"{% endif %}>{{ icon(icon_name) }}<span class="toolbar-label">{{ label_text }}</span></button>
+{% endif %}
+{%- endmacro %}
+
+{# ToolbarMenuButton + MenuContent: a dropdown of selectable items. items = [(value, text)] #}
+{% macro toolbar_menu(label_text, icon_name, id, items, selected=none, attrs='') -%}
+<details class="menu" id="{{ id }}" {{ attrs|safe }}>
+  <summary class="toolbar-button menu-button">{{ icon(icon_name) }}<span class="toolbar-label">{{ label_text }}</span></summary>
+  <div class="menu-content" role="menu">
+    {% for value, text in items %}<button type="button" class="menu-item" role="menuitemradio" data-value="{{ value }}" aria-checked="{{ 'true' if value == selected else 'false' }}"><span>{{ text }}</span>{{ icon('check', 'sm') }}</button>{% endfor %}
+  </div>
+</details>
+{%- endmacro %}
+
+{% macro toolbar_separator() -%}<span class="toolbar-separator" aria-hidden="true"></span>{%- endmacro %}
+
+{# Modal shell: size = small|medium|large|extra-large. Body markup goes in the caller. #}
+{% macro modal(id, size='medium', extra='') -%}
+<div class="modal-backdrop" id="{{ id }}" hidden>
+  <div class="modal {{ size }} {{ extra }}" role="dialog" aria-modal="true" aria-labelledby="{{ id }}-title">
+    <div class="modal-content">
+      <button type="button" class="modal-close" data-close-modal aria-label="Close">{{ icon('x') }}</button>
+      {{ caller() }}
+    </div>
+  </div>
+</div>
+{%- endmacro %}
+
+{# Sonarr FormGroup: label left (150px, bold, right-aligned on wide screens), input + help right #}
+{% macro form_group(label_text, help=none, for_id=none) -%}
+<div class="form-group">
+  <label class="form-label" {% if for_id %}for="{{ for_id }}"{% endif %}>{{ label_text }}</label>
+  <div class="form-input">{{ caller() }}{% if help %}<div class="help-text">{{ help }}</div>{% endif %}</div>
+</div>
+{%- endmacro %}
+
+{# Sonarr CheckInput look: the real checkbox stays for forms, the box is drawn by CSS #}
+{% macro check(name, checked=false, value='1', id=none, kind='primary', attrs='') -%}
+<label class="check-input {{ kind }}"><input type="checkbox" {% if name %}name="{{ name }}"{% endif %} value="{{ value }}" {% if id %}id="{{ id }}"{% endif %} {% if checked %}checked{% endif %} {{ attrs|safe }}><span class="check-box">{{ icon('check', 'sm') }}</span></label>
+{%- endmacro %}
+
+{# A link that leaves mang-arr: new tab, no referrer, external-link icon after the text #}
+{% macro ext(href, text, cls='', title=none) -%}
+<a class="external {{ cls }}" href="{{ href }}" target="_blank" rel="noopener noreferrer"{% if title %} title="{{ title }}"{% endif %}>{{ text }}{{ icon('external', 'sm ext-icon') }}</a>
+{%- endmacro %}
+
+{% macro poster_img(src, alt='', cls='poster-image') -%}
+{% if src %}<img class="{{ cls }}" src="{{ src }}" alt="{{ alt }}" loading="lazy">{% else %}<div class="{{ cls }} poster-none">{{ icon('image') }}<span>no cover</span></div>{% endif %}
+{%- endmacro %}
