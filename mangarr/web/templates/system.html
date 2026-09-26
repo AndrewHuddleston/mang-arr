@@ -28,6 +28,22 @@
 </table>
 <p class="muted small">Version {{ version }}{% if update.latest %} · latest release {{ update.latest }}{% endif %}{% if update.error %} · update check: {{ update.error }}{% endif %}</p>
 
+<h2>Backups <span class="muted small">(daily, {{ backups|length }} kept in the data folder)</span></h2>
+<div class="bar">
+  <form method="post" action="/system/backups/create"><button class="alt small">Back up now</button></form>
+  <form method="post" action="/system/backups/upload" enctype="multipart/form-data" onsubmit="return confirm('Replace the live database with this file? The current one is saved first.')">
+    <input type="file" name="file" accept=".db" required> <button class="alt small">Restore from file</button></form>
+</div>
+<table class="list small">
+<thead><tr><th>Backup</th><th class="num">Size</th><th>Taken</th><th></th></tr></thead>
+{% for b in backups %}<tr><td><a href="/system/backups/{{ b.name }}">{{ b.name }}</a></td><td class="num">{{ (b.size / 1048576)|round(1) }} MB</td><td class="muted">{{ b.mtime|ago }}</td>
+<td class="actions">
+  <form method="post" action="/system/backups/{{ b.name }}/restore" onsubmit="return confirm('Restore {{ b.name }}? The current database is saved first.')"><button class="alt small">restore</button></form>
+  <form method="post" action="/system/backups/{{ b.name }}/delete" onsubmit="return confirm('Delete {{ b.name }}?')"><button class="danger small">delete</button></form>
+</td></tr>{% endfor %}
+{% if not backups %}<tr><td colspan="4" class="muted">no backups yet</td></tr>{% endif %}
+</table>
+
 <h2>Sources (from Suwayomi)</h2>
 <table class="list small">
 {% for s in sources %}<tr><td>{{ s.name }}</td><td class="muted">{{ s.lang }}</td>

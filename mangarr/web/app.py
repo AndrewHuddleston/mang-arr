@@ -18,7 +18,6 @@ from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, Resp
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel, Field
-from starlette.background import BackgroundTask
 
 from .. import (
     __version__,
@@ -62,6 +61,7 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         log.error("could not open the database at %s: %s", config.DB_PATH, e)
     updates.start_background()
+    backup.start_background()
     log.info("mang-arr %s web started (staging %s, library %s)", __version__, config.STAGING_ROOT,
              config.LIBRARY_ROOT)
     yield
@@ -473,17 +473,21 @@ def system_page(request: Request):
     except SuwayomiError as e:
         sources, suwayomi_ok = [], False
         log.error("system page: suwayomi unreachable: %s", e)
+    backups = backup.listing()
     tasks = [
         {"name": "Refresh all monitored series", "every": f"{settings.get('refresh_hours')} h",
          "next": scheduler.next_at if scheduler else None, "action": "/activity/refresh-all"},
         {"name": "Update check", "every": "24 h", "action": "/system/update-check",
          "next": (updates.status()["checkedAt"] or time.time()) + updates.INTERVAL},
+        {"name": "Database backup", "every": f"{backup.INTERVAL_HOURS:g} h (keep {backup.KEEP})",
+         "action": "/system/backups/create",
+         "next": (backups[0]["mtime"] + backup.INTERVAL_HOURS * 3600) if backups else None},
     ]
     return page(request, "system.html", sources=sources, suwayomi_ok=suwayomi_ok, cfg=_config_view(),
                 log_lines=_tail_log(200), uptime=_ago(STARTED), notify_ok=notify.configured(),
                 komga_ok=komga.configured(), metrics_ok=metrics.AVAILABLE, copied=library.COPIED,
                 next_refresh=(scheduler.next_at if scheduler else None),
-                checks=health.run(client, force=True), tasks=tasks)
+                checks=health.run(client, force=True), tasks=tasks, backups=backups)
 
 
 @app.post("/system/update-check")
@@ -495,21 +499,87 @@ def system_update_check():
 
 
 @app.get("/system/backup")
-def system_backup():
-    """A consistent copy of the database (SQLite online backup), as a download."""
-    import shutil
-    import sqlite3
+def system_backup_create_and_download():
+    """Take a backup now and download it."""
+    p = backup.create("download")
+    return FileResponse(p, filename=os.path.basename(p), media_type="application/x-sqlite3")
+
+
+@app.post("/system/backups/create")
+def system_backups_create():
+    p = backup.create("manual")
+    return _flash("/system", f"backup written: {os.path.basename(p)}")
+
+
+@app.get("/system/backups/{name}")
+def system_backups_download(name: str):
+    try:
+        p = backup.path_of(name)
+    except (ValueError, FileNotFoundError) as e:
+        raise HTTPException(404, str(e)) from e
+    return FileResponse(p, filename=name, media_type="application/x-sqlite3")
+
+
+@app.post("/system/backups/{name}/delete")
+def system_backups_delete(name: str):
+    try:
+        backup.delete(name)
+    except (ValueError, FileNotFoundError) as e:
+        return _flash("/system", str(e))
+    return _flash("/system", f"deleted {name}")
+
+
+def _restore_guard() -> str | None:
+    if runner.current or any(j.status == "queued" for j in runner.jobs()):
+        return "cannot restore while a job is queued or running (cancel it on the Activity page first)"
+    return None
+
+
+@app.post("/system/backups/{name}/restore")
+def system_backups_restore(name: str):
+    if (why := _restore_guard()):
+        return _flash("/system", why)
+    try:
+        msg = backup.restore(backup.path_of(name))
+    except (ValueError, FileNotFoundError) as e:
+        return _flash("/system", f"restore refused: {e}")
+    return _flash("/system", msg)
+
+
+@app.post("/system/backups/upload")
+async def system_backups_upload(request: Request):
+    if (why := _restore_guard()):
+        return _flash("/system", why)
+    form = await request.form()
+    up = form.get("file")
+    if up is None or not getattr(up, "filename", ""):
+        return _flash("/system", "choose a .db file to restore")
     import tempfile
-    tmp = tempfile.NamedTemporaryFile(prefix="mangarr-", suffix=".db", delete=False)
-    tmp.close()
-    with db.connect() as con:
-        dst = sqlite3.connect(tmp.name)
-        con.backup(dst)
-        dst.close()
-    name = f"mangarr-backup-{time.strftime('%Y%m%d-%H%M%S')}.db"
-    log.info("backup written: %s (%d bytes)", name, os.path.getsize(tmp.name))
-    return FileResponse(tmp.name, filename=name, media_type="application/x-sqlite3",
-                        background=BackgroundTask(shutil.os.remove, tmp.name))
+    tmp = tempfile.NamedTemporaryFile(prefix="mangarr-upload-", suffix=".db", delete=False)
+    try:
+        while chunk := await up.read(1 << 20):
+            tmp.write(chunk)
+        tmp.close()
+        msg = backup.restore(tmp.name)
+    except ValueError as e:
+        return _flash("/system", f"restore refused: {e}")
+    finally:
+        try:
+            os.remove(tmp.name)
+        except OSError:
+            pass
+    return _flash("/system", msg)
+
+
+@app.get("/api/v1/system/backup")
+def api_backups():
+    return backup.listing()
+
+
+@app.post("/api/v1/system/backup")
+def api_backups_create():
+    p = backup.create("api")
+    return {"name": os.path.basename(p), "size": os.path.getsize(p)}
 
 
 @app.post("/system/notify-test")
