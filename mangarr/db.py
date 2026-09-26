@@ -117,6 +117,12 @@ MIGRATIONS = [
       created_at      TEXT NOT NULL
     );
     """,
+    # 8: details for the series page (genres, first publication year, demographic)
+    """
+    ALTER TABLE series ADD COLUMN genres TEXT NOT NULL DEFAULT '[]';
+    ALTER TABLE series ADD COLUMN year INTEGER;
+    ALTER TABLE series ADD COLUMN demographic TEXT;
+    """,
 ]
 
 
@@ -177,7 +183,8 @@ def upsert_series(con, s: Series) -> int:
         title=s.title, romaji=s.romaji, english=s.english, native=s.native,
         synonyms=json.dumps(s.synonyms), country=s.country, status=s.status,
         format=s.format, expected=s.chapters, authors=json.dumps(s.authors),
-        cover=s.cover, description=(s.description or None), volumes=s.volumes)
+        cover=s.cover, description=(s.description or None), volumes=s.volumes,
+        genres=json.dumps(s.genres), year=s.year, demographic=s.demographic)
     row = con.execute("SELECT id, folder FROM series WHERE ref=?", (s.ref,)).fetchone()
     if row:
         sets = ", ".join(f"{k}=?" for k in fields)
@@ -204,11 +211,28 @@ def series_to_model(row) -> Series:
         country=row["country"], status=row["status"], chapters=row["expected"],
         cover=row["cover"], authors=json.loads(row["authors"] or "[]"),
         description=row["description"] if "description" in row.keys() else None,
-        volumes=row["volumes"] if "volumes" in row.keys() else None)
+        volumes=row["volumes"] if "volumes" in row.keys() else None,
+        genres=json.loads(row["genres"] or "[]") if "genres" in row.keys() else [],
+        year=row["year"] if "year" in row.keys() else None,
+        demographic=row["demographic"] if "demographic" in row.keys() else None)
 
 
 def get_series(con, series_id: int):
     return con.execute("SELECT * FROM series WHERE id=?", (series_id,)).fetchone()
+
+
+def series_size(con, series_id: int) -> tuple[int, int]:
+    """(bytes on disk, files) of the chapters this series has in the library."""
+    total = files = 0
+    for r in con.execute("SELECT library_path FROM chapter WHERE series_id=? AND status='have'", (series_id,)):
+        p = r["library_path"]
+        if p:
+            try:
+                total += os.path.getsize(p)
+                files += 1
+            except OSError:
+                pass
+    return total, files
 
 
 def get_series_by_ref(con, ref: str):

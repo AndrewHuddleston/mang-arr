@@ -134,6 +134,9 @@ def chapter_label(number: float, name: str | None) -> str | None:
     plain = re.fullmatch(r"(?:chapter|chap|ch|episode|ep|#)?\.?\s*0*(\d+(?:\.\d+)?)\s*[:.\-]?\s*", n, re.I)
     if plain and float(plain.group(1)) == number:
         return None
+    lead = re.match(r"(?:chapter|chap|ch|episode|ep|#)?\.?\s*0*(\d+(?:\.\d+)?)\s*[:.\-–]\s*(.+)$", n, re.I)
+    if lead and float(lead.group(1)) == number:
+        n = lead.group(2).strip()
     return safe_title(n)[:80]
 
 

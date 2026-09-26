@@ -57,7 +57,9 @@ class ParseTest(unittest.TestCase):
         self.assertIsNone(chapter_label(12.0, "Chapter 12"))
         self.assertIsNone(chapter_label(12.0, "Ch.12"))
         self.assertIsNone(chapter_label(12.5, "Chapter 12.5"))
-        self.assertEqual(chapter_label(12.0, "Chapter 12: The Storm"), "Chapter 12_ The Storm")
+        self.assertEqual(chapter_label(12.0, "Chapter 12: The Storm"), "The Storm")
+        self.assertEqual(chapter_label(133.0, "Chapter 133 - [Part 2] Ep.65"), "[Part 2] Ep.65")
+        self.assertEqual(chapter_label(5.0, "The Storm"), "The Storm")
         self.assertEqual(chapter_filename(1.0, "S1 - Episode 0"), "Chapter 001.0 - S1 - Episode 0.cbz")
         self.assertEqual(ranges([1.0, 2.0, 3.0, 5.5]), "1-3, 5.5")
 

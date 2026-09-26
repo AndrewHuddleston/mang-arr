@@ -168,9 +168,10 @@ class ListsTest(unittest.TestCase):
         self.assertIn("list bad:", cm.output[0])
 
     def test_migration_number(self):
-        self.assertEqual(len(db.MIGRATIONS), 7)
         with db.connect(self.path) as con:
-            self.assertEqual(con.execute("PRAGMA user_version").fetchone()[0], 7)
+            self.assertEqual(con.execute("PRAGMA user_version").fetchone()[0], len(db.MIGRATIONS))
+            tables = {r[0] for r in con.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        self.assertIn("import_list", tables)
 
 
 if __name__ == "__main__":
