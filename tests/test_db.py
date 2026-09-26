@@ -63,5 +63,24 @@ class DbTest(unittest.TestCase):
         self.assertEqual(s.ref, "manual:Let's Play")
 
 
+
+class RetryScheduleTest(unittest.TestCase):
+    def test_failed_chapters_back_off(self):
+        with tempfile.TemporaryDirectory() as tmp, db.connect(os.path.join(tmp, "r.db")) as con:
+            sid = db.upsert_series(con, Series(anilist_id=9, english="R"))
+            db.save_plan(con, sid, plan_with([1, 2]), 1)
+            db.set_status(con, sid, 1.0, "failed", "boom")           # 1st failure: retry next pass
+            self.assertEqual(db.wanted(con, sid), [1.0, 2.0])
+            db.set_status(con, sid, 1.0, "failed", "boom")           # 2nd: a day later
+            self.assertEqual(db.wanted(con, sid), [2.0])
+            row = next(c for c in db.chapters(con, sid) if c["number"] == 1.0)
+            self.assertEqual(row["tries"], 2)
+            self.assertIn("next attempt after", row["reason"])
+            db.save_plan(con, sid, plan_with([1, 2]), 1)              # re-resolve keeps the schedule
+            self.assertEqual(next(c for c in db.chapters(con, sid) if c["number"] == 1.0)["status"], "failed")
+            db.set_status(con, sid, 1.0, "have")                       # success resets
+            self.assertEqual(next(c for c in db.chapters(con, sid) if c["number"] == 1.0)["tries"], 0)
+
+
 if __name__ == "__main__":
     unittest.main()

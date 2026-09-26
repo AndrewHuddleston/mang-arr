@@ -126,18 +126,27 @@ def resolve(client: Client, series: Series, sources: list[Source] | None = None)
     return plan
 
 
+_unreachable: dict[str, tuple[float, str]] = {}   # source id -> (when, why); skip it for a while
+UNREACHABLE_TTL = 3600
+
+
 def _search_source(client, src, series, titles, rejected):
     """Best accepted hit on one source, trying each title until one lands.
-    Returns SourceMatch, None (no acceptable hit) or str (unreachable)."""
+    Returns SourceMatch, None (no acceptable hit) or str (unreachable). A
+    source that could not be reached is not asked again for an hour."""
+    import time
     seen_ids: set[int] = set()
+    known = _unreachable.get(src.id)
+    if known and time.monotonic() - known[0] < UNREACHABLE_TTL:
+        return known[1] + " (skipped: unreachable earlier)"
     for q in titles:
         try:
             hits = client.search(src, q)
         except SuwayomiError as e:
             msg = str(e)
-            if "unreachable" in msg.lower() or "resolve" in msg.lower() or "hostname" in msg.lower():
-                return "DNS/network"
-            return msg[:60]
+            why = "DNS/network" if any(k in msg.lower() for k in ("unreachable", "resolve", "hostname")) else msg[:60]
+            _unreachable[src.id] = (time.monotonic(), why)
+            return why
         log.debug("%s search %r -> %d hit(s)", src.name, q, len(hits))
         scored = []
         for h in hits:

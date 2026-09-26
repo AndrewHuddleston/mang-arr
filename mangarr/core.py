@@ -153,8 +153,12 @@ def _set_library_entries(client: Client, plan: Plan, primary_manga_id: int) -> N
 def download_wanted(con, client: Client, series_id: int, plan: Plan,
                     should_cancel: Callable[[], bool] | None = None,
                     progress: Callable[[str], None] | None = None) -> dict:
-    have_on_disk = {r["number"] for r in db.chapters(con, series_id) if r["status"] == "have"}
-    wanted = [n for n in plan.wanted() if n not in have_on_disk]
+    rows = {r["number"]: r for r in db.chapters(con, series_id)}
+    have_on_disk = {n for n, r in rows.items() if r["status"] == "have"}
+    later = {n for n, r in rows.items() if r["status"] == "failed" and r["next_try"] and r["next_try"] > db.now()}
+    wanted = [n for n in plan.wanted() if n not in have_on_disk and n not in later]
+    if later:
+        log.info("%s: %d failed chapter(s) not due for another attempt yet", plan.series.title, len(later))
     if not wanted:
         log.info("%s: nothing to download", plan.series.title)
         return {}

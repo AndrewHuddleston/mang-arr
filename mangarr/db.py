@@ -123,6 +123,11 @@ MIGRATIONS = [
     ALTER TABLE series ADD COLUMN year INTEGER;
     ALTER TABLE series ADD COLUMN demographic TEXT;
     """,
+    # 9: retry schedule for failed chapters (do not hammer a source every pass)
+    """
+    ALTER TABLE chapter ADD COLUMN tries INTEGER NOT NULL DEFAULT 0;
+    ALTER TABLE chapter ADD COLUMN next_try TEXT;
+    """,
 ]
 
 
@@ -305,12 +310,14 @@ def save_plan(con, series_id: int, plan, primary_manga_id: int | None) -> None:
             (series_id, m.manga_id, m.source.name, m.title, m.author, m.match, m.author_ok,
              len(m.chapters), m.max, m.note or None, int(m.manga_id == primary_manga_id), now()))
     rows = {r["number"]: r for r in con.execute(
-        "SELECT number, status, library_path FROM chapter WHERE series_id=?", (series_id,))}
+        "SELECT number, status, library_path, next_try FROM chapter WHERE series_id=?", (series_id,))}
     keep = {"have", "ignored"}
     for n, m in plan.assignment.items():
         prev = rows.get(n)
         if prev and prev["status"] in keep:
             continue                         # on disk already, or told to ignore; keep as is
+        if prev and prev["status"] == "failed" and prev["next_try"] and prev["next_try"] > now():
+            continue                         # scheduled for a later attempt; leave it alone
         others = [c.source.name for c in plan.candidates.get(n, []) if c.manga_id != m.manga_id]
         reason = (f"available on {m.source.name}" + (" (rate-limited source: slow)" if m.source.throttled else "")
                   + (f" (also {', '.join(others[:3])})" if others else "")
@@ -358,11 +365,28 @@ def set_have(con, series_id: int, number: float, staging_path: str | None,
         (series_id, number, source_name, staging_path, library_path, now()))
 
 
+RETRY_HOURS = (0, 24, 72, 168)      # after the 1st failure: next pass; then 1 day, 3 days, a week (cap)
+
+
 def set_status(con, series_id: int, number: float, status: str, reason: str | None = None) -> None:
-    """Change a chapter's status with a reason (cleared for have)."""
+    """Change a chapter's status with a reason (cleared for have). A failure
+    bumps the try count and schedules the next attempt further out each time;
+    success or a fresh 'wanted' resets the schedule."""
     if status == "have":
         reason = None
-    con.execute("UPDATE chapter SET status=?, reason=?, updated_at=? WHERE series_id=? AND number=?",
+    if status == "failed":
+        row = con.execute("SELECT tries FROM chapter WHERE series_id=? AND number=?", (series_id, number)).fetchone()
+        tries = (row["tries"] if row else 0) + 1
+        hours = RETRY_HOURS[min(tries, len(RETRY_HOURS)) - 1]
+        next_try = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(time.time() + hours * 3600))
+        if hours:
+            reason = f"{reason or 'download failed'} (failed {tries}x; next attempt after {next_try[:16]})"
+        con.execute("UPDATE chapter SET status='failed', reason=?, tries=?, next_try=?, updated_at=?"
+                    " WHERE series_id=? AND number=?",
+                    ((reason or None) and reason[:300], tries, next_try if hours else None, now(), series_id, number))
+        return
+    reset = ", tries=0, next_try=NULL" if status in ("have", "wanted") else ""
+    con.execute(f"UPDATE chapter SET status=?, reason=?, updated_at=?{reset} WHERE series_id=? AND number=?",
                 (status, (reason or None) and reason[:300], now(), series_id, number))
 
 
@@ -371,9 +395,10 @@ def chapters(con, series_id: int):
 
 
 def wanted(con, series_id: int) -> list[float]:
+    """Chapters to try now: wanted, plus failed ones whose retry time has come."""
     return [r["number"] for r in con.execute(
-        "SELECT number FROM chapter WHERE series_id=? AND status IN ('wanted','failed') ORDER BY number",
-        (series_id,))]
+        "SELECT number FROM chapter WHERE series_id=? AND (status='wanted' OR (status='failed'"
+        " AND (next_try IS NULL OR next_try <= ?))) ORDER BY number", (series_id, now()))]
 
 
 def sources(con, series_id: int):

@@ -32,6 +32,8 @@ log = logging.getLogger(__name__)
 STALL_SECS = 600
 # and never waited on longer than this in total
 CHUNK_CAP_SECS = 3 * 3600
+# every try errored out faster than this: a dead chapter, not rate limiting
+INSTANT_FAIL_SECS = 45
 
 
 class Cancelled(Exception):
@@ -155,7 +157,9 @@ def _download_source(client, manga_id, todo, batch, label, source_name, patient,
                + (", rate-limited source: one at a time" if throttled else "") + ")")
         client.enqueue(ids)
         client.start()
+        t_start = time.monotonic()
         outcome = _wait(client, ids, cancel)
+        instant = outcome == "stalled" and time.monotonic() - t_start < INSTANT_FAIL_SECS
         if outcome in ("stalled", "timeout", "cancelled"):
             try:
                 client.dequeue(ids)                  # leave nothing of ours behind
@@ -165,6 +169,18 @@ def _download_source(client, manga_id, todo, batch, label, source_name, patient,
             raise Cancelled()
         have = client.downloaded_ids(manga_id)
         got = [c for c in chunk if c.id in have]
+        if instant and not got:
+            # Suwayomi gave up on every try within seconds: the source has no
+            # working pages for these chapters ("All CDN attempts failed"),
+            # which no amount of waiting fixes. Do not back off; fail them.
+            for c in chunk:
+                failed.append(c.number)
+                why[c.number] = "the source has no working pages for this chapter (failed instantly on every try)"
+            log.warning("%s: %s has no working pages for ch %s - not retrying this run", label, source_name,
+                        ranges([c.number for c in chunk]))
+            i += len(chunk)
+            time.sleep(2)
+            continue
         if outcome in ("stalled", "timeout") and not got:
             size = 1
             backoff = min(max_backoff, (backoff or 30) * 2)
