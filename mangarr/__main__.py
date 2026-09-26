@@ -105,7 +105,8 @@ def show_plan(plan: Plan) -> None:
 def cmd_search(a):
     _, cands = metadata.lookup(a.query)
     if not cands:
-        out("nothing on AniList or MangaDex."); return 1
+        out("nothing on AniList or MangaDex.")
+        return 1
     print_candidates(cands)
     return 0
 
@@ -140,7 +141,8 @@ def cmd_add(a):
 def _find(con, text):
     rows = db.find_series(con, text)
     if not rows:
-        out(f"no tracked series matches {text!r}"); return None
+        out(f"no tracked series matches {text!r}")
+        return None
     if len(rows) > 1:
         out("several match; use the id:")
         for r in rows:
@@ -199,7 +201,8 @@ def cmd_status(a):
     with db.connect() as con:
         rows = db.series_rows(con)
     if not rows:
-        out("no series tracked yet."); return 0
+        out("no series tracked yet.")
+        return 0
     out(f"{'ID':>4} {'SERIES':<44} {'HAVE':>5} {'LISTED':>6} {'WANTED':>6}  {'STATUS':<9} PRIMARY")
     for r in rows:
         out(f"{r['id']:>4} {r['title'][:44]:<44} {r['have']:>5} {r['listed']:>6} {r['wanted']:>6}"
@@ -258,7 +261,8 @@ def main(argv=None):
     sub = p.add_subparsers(dest="cmd", required=True)
 
     s = sub.add_parser("search", help="database candidates for a title")
-    s.add_argument("query"); s.set_defaults(fn=cmd_search)
+    s.add_argument("query")
+    s.set_defaults(fn=cmd_search)
 
     for name, fn, help_ in (("resolve", cmd_resolve, "dry run: where each chapter would come from"),
                             ("add", cmd_add, "track a series and download what is missing")):
@@ -276,18 +280,23 @@ def main(argv=None):
 
     s = sub.add_parser("refresh", help="re-resolve tracked series and fetch new chapters")
     s.add_argument("series", nargs="?", help="title fragment or id (default: all)")
-    s.add_argument("--no-download", action="store_true"); s.set_defaults(fn=cmd_refresh)
+    s.add_argument("--no-download", action="store_true")
+    s.set_defaults(fn=cmd_refresh)
 
     s = sub.add_parser("import", help="link downloaded chapters into the library")
-    s.add_argument("series", nargs="?"); s.set_defaults(fn=cmd_import)
+    s.add_argument("series", nargs="?")
+    s.set_defaults(fn=cmd_import)
 
     s = sub.add_parser("adopt", help="register what Suwayomi already downloaded")
     s.add_argument("--only", help="folder name fragment")
-    s.add_argument("--dry-run", action="store_true"); s.set_defaults(fn=cmd_adopt)
+    s.add_argument("--dry-run", action="store_true")
+    s.set_defaults(fn=cmd_adopt)
 
-    s = sub.add_parser("status", help="tracked series"); s.set_defaults(fn=cmd_status)
+    s = sub.add_parser("status", help="tracked series")
+    s.set_defaults(fn=cmd_status)
     s = sub.add_parser("show", help="one series in detail")
-    s.add_argument("series"); s.set_defaults(fn=cmd_show)
+    s.add_argument("series")
+    s.set_defaults(fn=cmd_show)
 
     s = sub.add_parser("daemon", help="background worker: refresh every N hours")
     s.add_argument("--interval", type=float, metavar="HOURS")
@@ -295,7 +304,8 @@ def main(argv=None):
     s.set_defaults(fn=cmd_daemon)
 
     s = sub.add_parser("serve", help="web UI + API + background worker")
-    s.add_argument("--host", default="0.0.0.0"); s.add_argument("--port", type=int, default=6789)
+    s.add_argument("--host", default="0.0.0.0")
+    s.add_argument("--port", type=int, default=6789)
     s.set_defaults(fn=cmd_serve)
 
     a = p.parse_args(argv)

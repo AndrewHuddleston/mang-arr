@@ -1,7 +1,18 @@
 import unittest
 
-from mangarr.matching import (ACCEPTED, AUTHOR_AGREE, AUTHOR_DIFFER, AUTHOR_UNKNOWN, EXACT,
-                              EXACT_BASE, NONE, author_level, match_level, norm, query_score)
+from mangarr.matching import (
+    ACCEPTED,
+    AUTHOR_AGREE,
+    AUTHOR_DIFFER,
+    AUTHOR_UNKNOWN,
+    EXACT,
+    EXACT_BASE,
+    NONE,
+    author_level,
+    match_level,
+    norm,
+    query_score,
+)
 
 
 class NormTest(unittest.TestCase):

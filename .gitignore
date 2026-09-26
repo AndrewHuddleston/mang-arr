@@ -5,3 +5,6 @@ __pycache__/
 *.db
 *.db-*
 .env
+dist/
+build/
+.ruff_cache/

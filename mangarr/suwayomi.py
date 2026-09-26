@@ -73,7 +73,8 @@ class Client:
                     d = json.load(r)
                 if "errors" in d:
                     msg = d["errors"][0]["message"].split("\n")[0][:200]
-                    log.debug("suwayomi %s %s -> error in %.1fs: %s", op, variables or "", time.monotonic() - t0, msg)
+                    log.debug("suwayomi %s %s -> error in %.1fs: %s", op, variables or "",
+                              time.monotonic() - t0, msg)
                     raise SuwayomiError(msg)
                 log.debug("suwayomi %s %s -> ok in %.1fs", op, variables or "", time.monotonic() - t0)
                 return d["data"]

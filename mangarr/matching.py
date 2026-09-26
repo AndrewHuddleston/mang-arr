@@ -53,7 +53,7 @@ def match_level(candidate: str | None, known_titles: list[str]) -> tuple[int, st
     cb = norm(strip_disambiguator(candidate))
     if cb and cb in known:
         return EXACT_BASE, known[cb]
-    for k, original in known.items():
+    for _k, original in known.items():
         kb = norm(strip_disambiguator(original))
         if kb and kb == c:
             return EXACT_BASE, original

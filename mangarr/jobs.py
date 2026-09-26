@@ -127,7 +127,8 @@ class Scheduler:
 
     def start(self) -> None:
         self._thread.start()
-        log.info("scheduler started: refresh all every %.1fh, first in %.0fs", self.interval / 3600, self.first_after)
+        log.info("scheduler started: refresh all every %.1fh, first in %.0fs",
+                 self.interval / 3600, self.first_after)
 
     def trigger(self) -> Job:
         self.next_at = time.time() + self.interval
@@ -145,7 +146,8 @@ class Scheduler:
             except Exception as e:
                 log.debug("scheduler could not read settings: %s", e)
             if time.time() >= self.next_at:
-                if any(j.kind == "refresh-all" and j.status in ("queued", "running") for j in self.runner.jobs()):
+                if any(j.kind == "refresh-all" and j.status in ("queued", "running")
+                       for j in self.runner.jobs()):
                     log.info("scheduled refresh skipped: one is already queued or running")
                     self.next_at = time.time() + self.interval
                     continue

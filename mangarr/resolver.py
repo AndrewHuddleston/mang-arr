@@ -12,7 +12,7 @@ import statistics
 from dataclasses import dataclass, field
 
 from . import config
-from .matching import (ACCEPTED, AUTHOR_DIFFER, author_level, match_level)
+from .matching import ACCEPTED, AUTHOR_DIFFER, author_level, match_level
 from .model import Series
 from .suwayomi import Chapter, Client, Source, SuwayomiError
 

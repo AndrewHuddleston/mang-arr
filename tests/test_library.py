@@ -2,8 +2,14 @@ import os
 import tempfile
 import unittest
 
-from mangarr.library import (chapter_filename, link_into_library, parse_number, parse_season,
-                             safe_title, scan_series_dir)
+from mangarr.library import (
+    chapter_filename,
+    link_into_library,
+    parse_number,
+    parse_season,
+    safe_title,
+    scan_series_dir,
+)
 
 
 class ParseTest(unittest.TestCase):

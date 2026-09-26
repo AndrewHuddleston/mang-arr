@@ -60,7 +60,8 @@ def _to_series(m: dict) -> Series:
         primary = next(iter(title_map.values()))
         if not romaji:
             romaji = primary
-    native = next((t.get(k) for t in [title_map, *alts] for k in ("ja", "ko", "zh", "zh-hk") if t.get(k)), None)
+    native = next((t.get(k) for t in [title_map, *alts] for k in ("ja", "ko", "zh", "zh-hk") if t.get(k)),
+                  None)
     synonyms = []
     for t in alts:
         for k, v in t.items():
