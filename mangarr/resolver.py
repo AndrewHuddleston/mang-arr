@@ -151,7 +151,7 @@ def _search_source(client, src, series, titles, rejected, log):
         elif not chapters:
             m.note = "lists no chapters"
         log(f"  {src.name:<26} {m.title[:34]:<34} {len(chapters):>4} ch, max {m.max:<6g}"
-            f" {'[' + m.note + ']' if m.note else ''}")
+            f" id={hit['id']:<6} {'[' + m.note + ']' if m.note else ''}")
         return m
     return None
 

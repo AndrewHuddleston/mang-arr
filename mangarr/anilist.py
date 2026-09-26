@@ -37,7 +37,7 @@ _BY_ID = "query($id: Int) { Media(id: $id, type: MANGA) { %s } }" % _FIELDS
 
 @dataclass
 class Series:
-    anilist_id: int
+    anilist_id: int | None          # None for a manually identified series
     romaji: str | None
     english: str | None
     native: str | None
@@ -136,6 +136,13 @@ def search(query: str, limit: int = 8) -> list[Series]:
                             0 if s.format in ("MANGA", "ONE_SHOT") else 1,
                             -s.popularity))
     return out
+
+
+def manual(title: str, *aliases: str) -> Series:
+    """A series AniList does not have (most Western webtoons). Its identity
+    is the typed title; strict matching still applies to source hits."""
+    return Series(anilist_id=None, romaji=None, english=title.strip(), native=None,
+                  synonyms=[a.strip() for a in aliases if a.strip()])
 
 
 def by_id(anilist_id: int) -> Series | None:

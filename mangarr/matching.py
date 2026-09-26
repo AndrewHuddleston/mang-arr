@@ -52,9 +52,16 @@ def match_level(candidate: str | None, known_titles: list[str]) -> tuple[int, st
     return NONE, None
 
 
+_NO_AUTHOR = {"unknown", "n a", "none", "anonymous", "various", "author"}
+
+
 def name_tokens(name: str | None) -> set[str]:
-    """Surname/given-name tokens, order-independent, for author comparison."""
-    return {t for t in norm(name).split() if len(t) > 1}
+    """Surname/given-name tokens, order-independent, for author comparison.
+    Placeholders sources use when they have no author yield no tokens."""
+    n = norm(name)
+    if not n or n in _NO_AUTHOR:
+        return set()
+    return {t for t in n.split() if len(t) > 1}
 
 
 # Author agreement. Sources are sloppy about authors (romanisation, native

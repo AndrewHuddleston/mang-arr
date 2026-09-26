@@ -14,6 +14,8 @@ def log(msg: str = "") -> None:
 
 
 def pick_series(a) -> anilist.Series | None:
+    if a.manual:
+        return anilist.manual(a.query, *(a.alias or []))
     if a.anilist:
         s = anilist.by_id(a.anilist)
         if not s:
@@ -48,8 +50,11 @@ def _print_candidates(cands):
 
 
 def describe(series: anilist.Series) -> None:
-    log(f"{series.title}  [AniList {series.anilist_id}]  {series.format} {series.country}"
-        f"  {series.status}  {series.chapters or '?'} chapters")
+    if series.anilist_id is None:
+        log(f"{series.title}  [manual: no metadata, exact title only]")
+    else:
+        log(f"{series.title}  [AniList {series.anilist_id}]  {series.format} {series.country}"
+            f"  {series.status}  {series.chapters or '?'} chapters")
     if series.authors:
         log(f"  by {', '.join(series.authors[:3])}")
     log(f"  titles: {' | '.join(series.titles[:6])}")
@@ -116,8 +121,8 @@ def cmd_add(a):
     if not p:
         return 1
     with db.connect() as con:
-        db.upsert_series(con, series)
-        db.save_plan(con, plan, p.manga_id)
+        series_id = db.upsert_series(con, series)
+        db.save_plan(con, series_id, plan, p.manga_id)
     for m in plan.matches:
         client.set_in_library(m.manga_id, m.manga_id == p.manga_id)
     log(f"\ntracking {series.title}; {p.source.name} entry is in the Suwayomi library.")
@@ -129,7 +134,7 @@ def cmd_add(a):
     log(f"\ndownloading {len(wanted)} chapter(s):")
     results = downloader.download(client, plan, log=log)
     with db.connect() as con:
-        db.record_results(con, series.anilist_id, results)
+        db.record_results(con, series_id, results)
     ok = sum(1 for r in results.values() if r == "ok")
     log(f"\nFINISHED: {ok} downloaded, {len(results) - ok} failed")
     return 0
@@ -157,6 +162,10 @@ def main(argv=None):
         s = sub.add_parser(name, help=help_)
         s.add_argument("query", nargs="?", default="")
         s.add_argument("--anilist", type=int, help="AniList id, when the title is ambiguous")
+        s.add_argument("--manual", action="store_true",
+                       help="no metadata lookup; the typed title is the series (Western webtoons)")
+        s.add_argument("--alias", action="append", metavar="TITLE",
+                       help="with --manual: another exact title sources may use (repeatable)")
         if name == "add":
             s.add_argument("--no-download", action="store_true")
         s.set_defaults(fn=fn)
