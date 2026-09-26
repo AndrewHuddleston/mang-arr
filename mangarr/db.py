@@ -157,8 +157,10 @@ def series_rows(con):
         "SELECT s.*, "
         " (SELECT COUNT(*) FROM chapter c WHERE c.series_id=s.id AND c.status!='junk') AS listed,"
         " (SELECT COUNT(*) FROM chapter c WHERE c.series_id=s.id AND c.status='have') AS have,"
-        " (SELECT COUNT(*) FROM chapter c WHERE c.series_id=s.id AND c.status IN ('wanted','failed')) AS wanted,"
-        " (SELECT source_name FROM series_source ss WHERE ss.series_id=s.id AND ss.is_primary=1) AS primary_source"
+        " (SELECT COUNT(*) FROM chapter c WHERE c.series_id=s.id AND c.status IN ('wanted','failed'))"
+        "   AS wanted,"
+        " (SELECT source_name FROM series_source ss WHERE ss.series_id=s.id AND ss.is_primary=1)"
+        "   AS primary_source"
         " FROM series s ORDER BY s.title COLLATE NOCASE").fetchall()
 
 

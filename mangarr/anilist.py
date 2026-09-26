@@ -33,8 +33,9 @@ _FIELDS = """
   staff(perPage: 4, sort: RELEVANCE) { edges { role node { name { full native } } } }
 """
 
-_SEARCH = "query($q: String, $n: Int) { Page(page: 1, perPage: $n) { media(search: $q, type: MANGA) { %s } } }" % _FIELDS
-_BY_ID = "query($id: Int) { Media(id: $id, type: MANGA) { %s } }" % _FIELDS
+_SEARCH = ("query($q: String, $n: Int) { Page(page: 1, perPage: $n) {"  # noqa: UP031
+           " media(search: $q, type: MANGA) { %s } } }" % _FIELDS)
+_BY_ID = "query($id: Int) { Media(id: $id, type: MANGA) { %s } }" % _FIELDS  # noqa: UP031
 
 
 def _post(query: str, variables: dict, retries: int = 3) -> dict:

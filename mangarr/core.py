@@ -222,7 +222,7 @@ def apply_adopt(con, items: list[AdoptItem]) -> tuple[int, int]:
         if it.series:
             by_ref.setdefault(it.series.ref, []).append(it)
     n_chapters = 0
-    for ref, group in by_ref.items():
+    for _ref, group in by_ref.items():
         series = group[0].series
         series_id = db.upsert_series(con, series)
         for it in group:

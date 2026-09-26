@@ -2,8 +2,41 @@
 name = "mang-arr"
 version = "0.1.0"
 description = "Sonarr for manga, on top of Suwayomi and Komga"
+readme = "README.md"
+license = { text = "MIT" }
+authors = [{ name = "Andrew Huddleston" }]
 requires-python = ">=3.10"
 dependencies = []
+keywords = ["manga", "suwayomi", "komga", "automation", "sonarr"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Web Environment",
+    "Environment :: Console",
+    "Intended Audience :: End Users/Desktop",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Internet :: WWW/HTTP",
+    "Topic :: Multimedia :: Graphics",
+]
+
+[project.optional-dependencies]
+web = [
+    "fastapi>=0.110",
+    "uvicorn>=0.27",
+    "jinja2>=3.1",
+    "python-multipart>=0.0.9",
+]
+
+[project.urls]
+Homepage = "https://github.com/AndrewHuddleston/mang-arr"
+Repository = "https://github.com/AndrewHuddleston/mang-arr"
+Issues = "https://github.com/AndrewHuddleston/mang-arr/issues"
 
 [project.scripts]
 mangarr = "mangarr.__main__:main"
@@ -14,3 +47,16 @@ build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
 include = ["mangarr*"]
+
+[tool.setuptools.package-data]
+"mangarr.web" = ["templates/*", "static/*"]
+
+[tool.ruff]
+line-length = 110
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["E501"]   # long literal titles in test data

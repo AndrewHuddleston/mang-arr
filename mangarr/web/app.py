@@ -54,7 +54,8 @@ def _job_refresh(series_id: int, download: bool):
     def run(job: jobs.Job):
         with db.connect() as con:
             o = core.refresh_series(con, client, series_id, download=download)
-        return f"{len(o.plan.chapters)} listed, {o.downloaded} downloaded, {o.failed} failed, {o.imported} imported"
+        return (f"{len(o.plan.chapters)} listed, {o.downloaded} downloaded, {o.failed} failed,"
+                f" {o.imported} imported")
     return run
 
 
@@ -85,7 +86,8 @@ def _job_refresh_all(job: jobs.Job):
             errors += 1
             log.error("refresh-all: %s: %s: %s", r["title"], type(e).__name__, e)
             with db.connect() as con:
-                con.execute("UPDATE series SET last_error=? WHERE id=?", (f"{type(e).__name__}: {e}"[:300], r["id"]))
+                con.execute("UPDATE series SET last_error=? WHERE id=?",
+                            (f"{type(e).__name__}: {e}"[:300], r["id"]))
         done += 1
     msg = f"{done} series, {downloaded} downloaded, {imported} imported, {errors} errors"
     if imported:
@@ -110,7 +112,8 @@ def _startup():
 # -- pages --------------------------------------------------------------------
 
 def page(request: Request, name: str, **ctx):
-    ctx.update(request=request, version=__version__, current=runner.current, flash=request.query_params.get("m"))
+    ctx.update(request=request, version=__version__, current=runner.current,
+               flash=request.query_params.get("m"))
     return templates.TemplateResponse(request, name, ctx)
 
 
@@ -131,7 +134,8 @@ def series_page(request: Request, series_id: int):
             raise HTTPException(404, "no such series")
         srcs = db.sources(con, series_id)
         chs = db.chapters(con, series_id)
-        events = con.execute("SELECT * FROM event WHERE series_id=? ORDER BY id DESC LIMIT 15", (series_id,)).fetchall()
+        events = con.execute("SELECT * FROM event WHERE series_id=? ORDER BY id DESC LIMIT 15",
+                             (series_id,)).fetchall()
     by: dict[str, list] = {}
     for c in chs:
         by.setdefault(c["status"], []).append(c["number"])
@@ -329,7 +333,8 @@ def api_log(lines: int = 200):
 
 def _suwayomi_queue() -> dict:
     try:
-        d = client.gq("{ downloadStatus { state queue { state progress tries manga { title } chapter { name } } } }",
+        d = client.gq("{ downloadStatus { state queue { state progress tries"
+                      " manga { title } chapter { name } } } }",
                       timeout=20, retries=1)["downloadStatus"]
         return {"state": d["state"], "items": [
             {"manga": x["manga"]["title"], "chapter": x["chapter"]["name"], "state": x["state"],

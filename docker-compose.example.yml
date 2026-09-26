@@ -1,0 +1,53 @@
+# mang-arr with (optionally) its own Suwayomi.
+#
+# Copy to docker-compose.yml and edit the two host paths below. Keep the
+# Suwayomi download tree and the mang-arr library on the SAME filesystem:
+# the library is built from hard links to Suwayomi's files, so nothing is
+# stored twice. On different filesystems mang-arr falls back to copying.
+#
+#   /data/manga/downloads   Suwayomi writes here; its "mangas" subfolder -> /staging (read)
+#   /data/manga/library     mang-arr links here    -> /library   (write) -> Komga reads it
+#
+# mang-arr runs as uid:gid 1000:1000 here, so ./config and the library must
+# be writable by that user and the download tree readable by it. Make sure
+# it matches the user Suwayomi writes files as (chown -R 1000:1000 /data/manga).
+
+services:
+  mangarr:
+    image: ghcr.io/andrewhuddleston/mang-arr:latest
+    container_name: mangarr
+    user: "1000:1000"
+    ports:
+      - "6789:6789"
+    volumes:
+      - ./config:/config                             # database + log
+      - /data/manga/downloads/mangas:/staging        # Suwayomi's <Source>/<Series>/*.cbz tree
+      - /data/manga/library:/library                 # per-series hard-link tree for Komga
+    environment:
+      MANGARR_SUWAYOMI_URL: http://suwayomi:4567     # or http://your-host:4567 if Suwayomi runs elsewhere
+      MANGARR_REFRESH_HOURS: "6"                     # re-check every monitored series this often
+      MANGARR_LOG_LEVEL: INFO                        # DEBUG logs every request and match decision
+      # Optional: push a notification when new chapters land or a refresh fails.
+      # MANGARR_PUSHOVER_TOKEN: your-app-token
+      # MANGARR_PUSHOVER_USER: your-user-key
+      # MANGARR_WEBHOOK_URL: https://example.invalid/hook   # generic JSON POST instead of / as well as Pushover
+    depends_on:
+      - suwayomi
+    restart: unless-stopped
+
+  # Delete this service if you already run Suwayomi; point
+  # MANGARR_SUWAYOMI_URL at it and mount its download tree as /staging.
+  suwayomi:
+    image: ghcr.io/suwayomi/suwayomi-server:stable
+    container_name: suwayomi
+    ports:
+      - "4567:4567"
+    volumes:
+      - ./suwayomi:/home/suwayomi/.local/share/Tachidesk           # settings, extensions, database
+      - /data/manga/downloads:/home/suwayomi/.local/share/Tachidesk/downloads
+    environment:
+      TZ: Etc/UTC
+      # mang-arr reads .cbz files; make sure "save chapters as CBZ" is on
+      # (Suwayomi settings -> Downloads, or DOWNLOAD_AS_CBZ=true).
+      DOWNLOAD_AS_CBZ: "true"
+    restart: unless-stopped
