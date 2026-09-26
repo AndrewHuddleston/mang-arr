@@ -129,13 +129,16 @@ def _job_refresh(series_id: int, download: bool):
     return run
 
 
-def _job_add(series: model.Series, download: bool):
+def _job_add(series: model.Series, download: bool, monitored: bool = True):
     def run(job: jobs.Job):
         with db.connect() as con:
-            o = core.add_series(con, client, series, download=download, should_cancel=lambda: job.cancel,
-                                progress=lambda m: setattr(job, "progress", m))
+            o = core.add_series(con, client, series, download=download and monitored,
+                                should_cancel=lambda: job.cancel, progress=lambda m: setattr(job, "progress", m))
+            if not monitored:
+                db.set_monitored(con, o.series_id, False)
         job.series_id = o.series_id
-        return f"{len(o.plan.chapters)} listed, {o.downloaded} downloaded, {o.imported} imported"
+        return f"{len(o.plan.chapters)} listed, {o.downloaded} downloaded, {o.imported} imported" + \
+            ("" if monitored else " (unmonitored)")
     return run
 
 
@@ -540,23 +543,24 @@ def _series_from_ref(ref: str, title: str = "", aliases: list[str] | None = None
     return s
 
 
-def _queue_add(series: model.Series, download: bool) -> jobs.Job | str:
+def _queue_add(series: model.Series, download: bool, monitored: bool = True) -> jobs.Job | str:
     with db.connect() as con:
         if db.get_series_by_ref(con, series.ref):
             return "already tracked"
     for j in runner.jobs():
         if j.kind == "add" and j.title == series.title and j.status in ("queued", "running"):
             return f"already queued as job #{j.id}"
-    return runner.submit("add", series.title, _job_add(series, download))
+    return runner.submit("add", series.title, _job_add(series, download, monitored))
 
 
 @app.post("/add")
-def add_submit(ref: str = Form(...), download: str = Form("1"), title: str = Form(""), alias: str = Form("")):
+def add_submit(ref: str = Form(...), download: str = Form("1"), title: str = Form(""), alias: str = Form(""),
+               monitored: str = Form("1")):
     try:
         series = _series_from_ref(ref, title, [a for a in alias.split("|") if a.strip()])
     except ValueError as e:
         return _flash("/add", str(e))
-    job = _queue_add(series, download == "1")
+    job = _queue_add(series, download == "1", monitored in ("1", "true", "on"))
     if isinstance(job, str):
         return _flash("/add", f"{series.title}: {job}")
     return _flash("/activity", f"{series.title} queued as job #{job.id}")
@@ -874,6 +878,7 @@ class AddBody(BaseModel):
     title: str = ""
     aliases: list[str] = []
     download: bool = True
+    monitored: bool = True
 
 
 @app.get("/api/v1/system/status")
@@ -907,7 +912,7 @@ def api_series_add(body: AddBody):
         series = _series_from_ref(body.ref, body.title, body.aliases)
     except ValueError as e:
         raise HTTPException(400, str(e)) from e
-    job = _queue_add(series, body.download)
+    job = _queue_add(series, body.download, body.monitored)
     if isinstance(job, str):
         raise HTTPException(409, f"{series.title}: {job}")
     return job.as_dict()
