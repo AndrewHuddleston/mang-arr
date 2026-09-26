@@ -90,6 +90,11 @@ MIGRATIONS = [
     ALTER TABLE chapter ADD COLUMN name TEXT;
     ALTER TABLE chapter ADD COLUMN uploaded TEXT;
     """,
+    # 6: series description and volume count from the metadata provider (for the UI)
+    """
+    ALTER TABLE series ADD COLUMN description TEXT;
+    ALTER TABLE series ADD COLUMN volumes INTEGER;
+    """,
 ]
 
 
@@ -150,7 +155,7 @@ def upsert_series(con, s: Series) -> int:
         title=s.title, romaji=s.romaji, english=s.english, native=s.native,
         synonyms=json.dumps(s.synonyms), country=s.country, status=s.status,
         format=s.format, expected=s.chapters, authors=json.dumps(s.authors),
-        cover=s.cover)
+        cover=s.cover, description=(s.description or None), volumes=s.volumes)
     row = con.execute("SELECT id, folder FROM series WHERE ref=?", (s.ref,)).fetchone()
     if row:
         sets = ", ".join(f"{k}=?" for k in fields)
@@ -175,7 +180,9 @@ def series_to_model(row) -> Series:
         romaji=row["romaji"], english=row["english"], native=row["native"],
         synonyms=json.loads(row["synonyms"] or "[]"), format=row["format"],
         country=row["country"], status=row["status"], chapters=row["expected"],
-        cover=row["cover"], authors=json.loads(row["authors"] or "[]"))
+        cover=row["cover"], authors=json.loads(row["authors"] or "[]"),
+        description=row["description"] if "description" in row.keys() else None,
+        volumes=row["volumes"] if "volumes" in row.keys() else None)
 
 
 def get_series(con, series_id: int):
