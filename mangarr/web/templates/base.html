@@ -17,6 +17,7 @@
   <a href="/settings" {% if request.url.path.startswith('/settings') %}class="on"{% endif %}>Settings</a>
   <a href="/system" {% if request.url.path.startswith('/system') %}class="on"{% endif %}>System</a>
   <span class="spacer"></span>
+  <a id="health" href="/system" class="health {% if health_errors %}bad{% elif health_warnings %}warn{% else %}ok{% endif %}" title="backend health (System page)">{% if health_errors %}{{ health_errors }} problem{{ 's' if health_errors != 1 }}{% elif health_warnings %}{{ health_warnings }} warning{{ 's' if health_warnings != 1 }}{% else %}healthy{% endif %}</a>
   <span id="status" class="muted">{% if current %}running: {{ current.kind }} {{ current.title }}{% endif %}</span>
 </nav>
 <main>
@@ -31,6 +32,12 @@ async function poll(){
     const r = await fetch('/api/v1/system/status'); const d = await r.json();
     const el = document.getElementById('status');
     el.textContent = d.job ? `running: ${d.job.kind} ${d.job.title} ${d.job.progress||''}` : '';
+    const h = document.getElementById('health');
+    if (h && d.health) {
+      h.className = 'health ' + (d.health.errors ? 'bad' : d.health.warnings ? 'warn' : 'ok');
+      h.textContent = d.health.errors ? `${d.health.errors} problem${d.health.errors===1?'':'s'}`
+                    : d.health.warnings ? `${d.health.warnings} warning${d.health.warnings===1?'':'s'}` : 'healthy';
+    }
   }catch(e){}
 }
 setInterval(poll, 5000);

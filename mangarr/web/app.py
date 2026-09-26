@@ -216,8 +216,10 @@ async def _unhandled(request: Request, exc: Exception):
 # -- pages --------------------------------------------------------------------
 
 def page(request: Request, name: str, **ctx):
+    h = health.summary(client)
     ctx.update(request=request, version=__version__, current=runner.current,
-               flash=request.query_params.get("m"), update=updates.status())
+               flash=request.query_params.get("m"), update=updates.status(),
+               health_errors=h["errors"], health_warnings=h["warnings"])
     return templates.TemplateResponse(request, name, ctx)
 
 
@@ -480,7 +482,8 @@ def system_page(request: Request):
     return page(request, "system.html", sources=sources, suwayomi_ok=suwayomi_ok, cfg=_config_view(),
                 log_lines=_tail_log(200), uptime=_ago(STARTED), notify_ok=notify.configured(),
                 komga_ok=komga.configured(), metrics_ok=metrics.AVAILABLE, copied=library.COPIED,
-                next_refresh=(scheduler.next_at if scheduler else None), checks=health.run(client), tasks=tasks)
+                next_refresh=(scheduler.next_at if scheduler else None),
+                checks=health.run(client, force=True), tasks=tasks)
 
 
 @app.post("/system/update-check")
@@ -578,9 +581,11 @@ class AddBody(BaseModel):
 
 @app.get("/api/v1/system/status")
 def api_status():
+    h = health.summary(client)
     return {"version": __version__, "uptime": int(time.time() - STARTED),
             "job": runner.current.as_dict() if runner.current else None,
-            "nextRefresh": scheduler.next_at if scheduler else None, "update": updates.status()}
+            "nextRefresh": scheduler.next_at if scheduler else None, "update": updates.status(),
+            "health": {"errors": h["errors"], "warnings": h["warnings"]}}
 
 
 @app.get("/api/v1/series")
