@@ -41,12 +41,12 @@
   {% endfor %}
   </div>
 {% else %}
-<p class="muted">Type a title to search AniList and MangaDex. Pick a result to track it; chapters are then searched on every Suwayomi source.</p>
+<p class="muted">Type a title (English, romaji or original) to search AniList and MangaDex. Pick the right result to track it; every Suwayomi source is then searched for its chapters.</p>
 {% endif %}
 
-<section class="card" style="margin-top:18px">
-  <h2>Add by exact title (no metadata)</h2>
-  <p class="muted small">For series no database has. The typed title is the series; sources must spell it exactly (or one of the aliases).</p>
+<details class="card" style="margin-top:18px" {% if term and not cands %}open{% endif %}>
+  <summary>Can't find it? Add by exact title (no metadata)</summary>
+  <p class="muted small">For series no database has (some Western webtoons). The typed title is the series; sources must spell it exactly (or one of the aliases). Chapter counts, cover, genres and status will be empty.</p>
   <form method="post" action="/add" class="col">
     <input type="hidden" name="ref" value="manual">
     <input name="title" value="{{ term }}" placeholder="exact title as the sources spell it" aria-label="Title">
@@ -54,5 +54,5 @@
     <label><input type="checkbox" name="download" value="1" checked> download missing chapters now</label>
     <div><button>Add</button></div>
   </form>
-</section>
+</details>
 {% endblock %}

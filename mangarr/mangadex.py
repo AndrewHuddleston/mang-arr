@@ -94,7 +94,7 @@ def _to_series(m: dict) -> Series:
     )
 
 
-def search(query: str, limit: int = 8) -> list[Series]:
+def search(query: str, limit: int = 12) -> list[Series]:
     params = [("title", query), ("limit", str(limit)), ("order[relevance]", "desc"),
               ("includes[]", "author"), ("includes[]", "artist"), ("includes[]", "cover_art"),
               ("contentRating[]", "safe"), ("contentRating[]", "suggestive"),

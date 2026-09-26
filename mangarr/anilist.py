@@ -101,7 +101,7 @@ def _to_series(m: dict) -> Series:
     )
 
 
-def search(query: str, limit: int = 8) -> list[Series]:
+def search(query: str, limit: int = 12) -> list[Series]:
     """AniList candidates for a typed title, best match first."""
     d = _post(_SEARCH, {"q": query, "n": limit})
     media = ((d.get("data") or {}).get("Page") or {}).get("media") or []
