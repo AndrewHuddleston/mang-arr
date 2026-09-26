@@ -77,6 +77,10 @@ def show_plan(plan: Plan) -> None:
         per.setdefault(m.source.name, []).append(n)
     for name in used:
         log(f"  {name:<26} provides {len(per[name]):>4}: {ranges(per[name])}")
+    if plan.junk:
+        junk = sorted(plan.junk)
+        srcs = sorted(set(m.source.name for m, _ in plan.junk.values()))
+        log(f"  {'junk, skipped':<26} {len(junk):>13}: {ranges(junk)}  ({', '.join(srcs)}; 1-{max(p for _, p in plan.junk.values())} pages each)")
     wanted = plan.wanted()
     log()
     log(f"  chapters listed: {len(plan.chapters)}  on disk: {len(plan.have())}"

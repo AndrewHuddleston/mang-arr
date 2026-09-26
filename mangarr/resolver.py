@@ -60,6 +60,7 @@ class Plan:
     rejected: list[Rejected]
     unreachable: list[tuple[Source, str]]
     assignment: dict[float, SourceMatch]     # chapter number -> source that will provide it
+    junk: dict[float, tuple[SourceMatch, int]] = field(default_factory=dict)  # dropped: too few pages
 
     @property
     def usable(self) -> list[SourceMatch]:
@@ -107,7 +108,31 @@ def resolve(client: Client, series: Series, sources: list[Source] | None = None,
 
     _trust(series, matches, log)
     assignment = _assign(matches)
-    return Plan(series, matches, rejected, unreachable, assignment)
+    plan = Plan(series, matches, rejected, unreachable, assignment)
+    _prune_junk(client, plan, log)
+    return plan
+
+
+def _prune_junk(client: Client, plan: Plan, log) -> None:
+    """Drop fractional chapters that turn out to be a handful of pages:
+    notices and ads, not chapters. Every fractional chapter is probed, not
+    just single-source ones - aggregators (Bato, Manganato) scrape the same
+    upstream and list the same junk, so agreement between them proves nothing."""
+    suspects = [n for n in plan.assignment if n != int(n)]
+    if not suspects:
+        return
+    log(f"  checking {len(suspects)} fractional chapter(s) for junk ...")
+    for n in sorted(suspects):
+        m = plan.assignment[n]
+        ch = next((c for c in m.chapters if c.number == n), None)
+        if ch is None or ch.downloaded:
+            continue
+        pages = client.page_count(ch.id)
+        if pages is not None and pages < config.MIN_PAGES:
+            plan.junk[n] = (m, pages)
+            del plan.assignment[n]
+    if plan.junk:
+        log(f"  dropped {len(plan.junk)} as junk (<{config.MIN_PAGES} pages)")
 
 
 def _search_source(client, src, series, titles, rejected, log):

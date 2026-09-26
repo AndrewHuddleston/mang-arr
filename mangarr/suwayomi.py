@@ -107,6 +107,16 @@ class Client:
                     {"id": manga_id})
         return {c["id"] for c in d["manga"]["chapters"]["nodes"] if c["isDownloaded"]}
 
+    def page_count(self, chapter_id: int) -> int | None:
+        """How many pages a chapter has (fetches the page list from the
+        source). None when the source will not say."""
+        try:
+            d = self.gq('mutation($id: Int!) { fetchChapterPages(input: {chapterId: $id}) { pages } }',
+                        {"id": chapter_id}, timeout=60, retries=1)
+            return len(d["fetchChapterPages"]["pages"])
+        except SuwayomiError:
+            return None
+
     def set_in_library(self, manga_id: int, in_library: bool) -> None:
         self.gq('mutation($id: Int!, $v: Boolean!) {'
                 ' updateManga(input: {id: $id, patch: {inLibrary: $v}}) { manga { id } } }',

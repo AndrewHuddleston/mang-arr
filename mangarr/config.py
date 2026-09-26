@@ -28,6 +28,11 @@ THROTTLED_SOURCES = {
 # title and its chapters are not trusted.
 DISAGREE = 1.5
 
+# A fractional chapter (1.1, 29.5) that only one source lists is probed before
+# it is wanted. Real chapters run 20-130 pages; Manganato lists dozens of
+# 1-5 page notice images as "Chapter 1.1", "Chapter 2.3" and so on.
+MIN_PAGES = 8
+
 # Download pacing per source: how many chapters to queue in Suwayomi at once.
 BATCH_DEFAULT = 4
 BATCH_THROTTLED = 1
