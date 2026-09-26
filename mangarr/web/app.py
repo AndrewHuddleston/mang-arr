@@ -439,6 +439,26 @@ def chapter_download(series_id: int, number: float, manga_id: int = Form(...)):
     return _flash(f"/series/{series_id}", f"download of chapter {number:g} from {src['source_name']} queued")
 
 
+@app.get("/api/v1/series/{series_id}/chapter/{number}")
+def api_chapter(series_id: int, number: float):
+    """One chapter: its row, file size, and the history events that mention it."""
+    with db.connect() as con:
+        r = db.get_series(con, series_id)
+        if not r:
+            raise HTTPException(404)
+        c = con.execute("SELECT * FROM chapter WHERE series_id=? AND number=?", (series_id, number)).fetchone()
+        if not c:
+            raise HTTPException(404, "no such chapter")
+        needle = f"ch {number:g}"
+        events = [dict(e) for e in con.execute(
+            "SELECT at, kind, message FROM event WHERE series_id=? AND (message LIKE ? OR message LIKE ?)"
+            " ORDER BY id DESC LIMIT 20", (series_id, f"%{needle}:%", f"%chapter {number:g}%"))]
+    d = dict(c)
+    d["size"] = os.path.getsize(c["library_path"]) if c["library_path"] and os.path.exists(c["library_path"]) else None
+    d["events"] = events
+    return d
+
+
 @app.get("/api/v1/series/{series_id}/chapter/{number}/releases")
 def api_chapter_releases(series_id: int, number: float):
     with db.connect() as con:
