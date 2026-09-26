@@ -1,0 +1,16 @@
+[project]
+name = "mang-arr"
+version = "0.1.0"
+description = "Sonarr for manga, on top of Suwayomi and Komga"
+requires-python = ">=3.10"
+dependencies = []
+
+[project.scripts]
+mangarr = "mangarr.__main__:main"
+
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["mangarr*"]
