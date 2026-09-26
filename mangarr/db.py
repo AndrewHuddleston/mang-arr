@@ -1,8 +1,8 @@
 """SQLite store: which series are tracked, which source entries belong to
 them, and the state of every chapter.
 
-A series has an internal id. Most also carry an AniList id; a series added
-manually (typed title only, for the Western webtoons AniList lacks) has none.
+Schema changes are applied as numbered migrations against PRAGMA
+user_version, so an existing database upgrades in place.
 """
 import json
 import os
@@ -11,60 +11,86 @@ import time
 from contextlib import contextmanager
 
 from . import config
+from .model import Series
 
-SCHEMA = """
-CREATE TABLE IF NOT EXISTS series (
-  id              INTEGER PRIMARY KEY AUTOINCREMENT,
-  anilist_id      INTEGER UNIQUE,
-  title           TEXT NOT NULL,
-  romaji          TEXT, english TEXT, native TEXT,
-  synonyms        TEXT NOT NULL DEFAULT '[]',
-  country         TEXT, status TEXT, format TEXT,
-  expected        INTEGER,            -- AniList chapter count, if known
-  authors         TEXT NOT NULL DEFAULT '[]',
-  cover           TEXT,
-  monitored       INTEGER NOT NULL DEFAULT 1,
-  added_at        TEXT NOT NULL,
-  last_resolved   TEXT
-);
-CREATE TABLE IF NOT EXISTS series_source (
-  series_id       INTEGER NOT NULL REFERENCES series(id) ON DELETE CASCADE,
-  manga_id        INTEGER NOT NULL,   -- Suwayomi's id for this source entry
-  source_name     TEXT NOT NULL,
-  title           TEXT NOT NULL,
-  author          TEXT,
-  match_level     INTEGER NOT NULL,
-  author_level    INTEGER NOT NULL,
-  chapter_count   INTEGER NOT NULL,
-  max_chapter     REAL NOT NULL,
-  note            TEXT,               -- why it is not used, if it is not
-  is_primary      INTEGER NOT NULL DEFAULT 0,
-  seen_at         TEXT NOT NULL,
-  PRIMARY KEY (series_id, manga_id)
-);
-CREATE TABLE IF NOT EXISTS chapter (
-  series_id       INTEGER NOT NULL REFERENCES series(id) ON DELETE CASCADE,
-  number          REAL NOT NULL,
-  status          TEXT NOT NULL,      -- wanted | have | failed | unavailable
-  manga_id        INTEGER,            -- source entry chosen for it
-  source_name     TEXT,
-  updated_at      TEXT NOT NULL,
-  PRIMARY KEY (series_id, number)
-);
-"""
+MIGRATIONS = [
+    # 1: initial schema
+    """
+    CREATE TABLE series (
+      id              INTEGER PRIMARY KEY AUTOINCREMENT,
+      ref             TEXT NOT NULL UNIQUE,   -- anilist:123 | mangadex:uuid | manual:title
+      anilist_id      INTEGER UNIQUE,
+      mangadex_id     TEXT UNIQUE,
+      title           TEXT NOT NULL,
+      romaji          TEXT, english TEXT, native TEXT,
+      synonyms        TEXT NOT NULL DEFAULT '[]',
+      country         TEXT, status TEXT, format TEXT,
+      expected        INTEGER,                -- chapter count when the series is finished and known
+      authors         TEXT NOT NULL DEFAULT '[]',
+      cover           TEXT,
+      monitored       INTEGER NOT NULL DEFAULT 1,
+      added_at        TEXT NOT NULL,
+      last_resolved   TEXT,
+      last_error      TEXT
+    );
+    CREATE TABLE series_source (
+      series_id       INTEGER NOT NULL REFERENCES series(id) ON DELETE CASCADE,
+      manga_id        INTEGER NOT NULL,       -- Suwayomi's id for this source entry
+      source_name     TEXT NOT NULL,
+      title           TEXT NOT NULL,
+      author          TEXT,
+      match_level     INTEGER NOT NULL,
+      author_level    INTEGER NOT NULL,
+      chapter_count   INTEGER NOT NULL,
+      max_chapter     REAL NOT NULL,
+      note            TEXT,                   -- why it is not used, if it is not
+      is_primary      INTEGER NOT NULL DEFAULT 0,
+      folder          TEXT,                   -- staging folder, once known
+      seen_at         TEXT NOT NULL,
+      PRIMARY KEY (series_id, manga_id)
+    );
+    CREATE TABLE chapter (
+      series_id       INTEGER NOT NULL REFERENCES series(id) ON DELETE CASCADE,
+      number          REAL NOT NULL,
+      status          TEXT NOT NULL,          -- wanted | have | failed | junk | unavailable
+      manga_id        INTEGER,                -- source entry chosen for it
+      source_name     TEXT,
+      staging_path    TEXT,                   -- Suwayomi's file
+      library_path    TEXT,                   -- the hard link Komga reads
+      pages           INTEGER,
+      updated_at      TEXT NOT NULL
+    , PRIMARY KEY (series_id, number)
+    );
+    CREATE TABLE event (
+      id              INTEGER PRIMARY KEY AUTOINCREMENT,
+      at              TEXT NOT NULL,
+      series_id       INTEGER,
+      kind            TEXT NOT NULL,          -- added | resolved | downloaded | imported | failed | review
+      message         TEXT NOT NULL
+    );
+    """,
+]
 
 
 def now() -> str:
     return time.strftime("%Y-%m-%d %H:%M:%S")
 
 
+def migrate(con: sqlite3.Connection) -> None:
+    version = con.execute("PRAGMA user_version").fetchone()[0]
+    for i, sql in enumerate(MIGRATIONS[version:], start=version + 1):
+        con.executescript(sql)
+        con.execute(f"PRAGMA user_version = {i}")
+    con.commit()
+
+
 @contextmanager
 def connect(path: str = config.DB_PATH):
-    os.makedirs(os.path.dirname(path), exist_ok=True)
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
     con = sqlite3.connect(path)
     con.row_factory = sqlite3.Row
     con.execute("PRAGMA foreign_keys = ON")
-    con.executescript(SCHEMA)
+    migrate(con)
     try:
         yield con
         con.commit()
@@ -72,28 +98,70 @@ def connect(path: str = config.DB_PATH):
         con.close()
 
 
-def upsert_series(con, s) -> int:
+def event(con, kind: str, message: str, series_id: int | None = None) -> None:
+    con.execute("INSERT INTO event (at, series_id, kind, message) VALUES (?,?,?,?)",
+                (now(), series_id, kind, message))
+
+
+# -- series -----------------------------------------------------------------
+
+def upsert_series(con, s: Series) -> int:
     """Insert or refresh a series; returns its internal id."""
     fields = dict(
+        anilist_id=s.anilist_id, mangadex_id=s.mangadex_id,
         title=s.title, romaji=s.romaji, english=s.english, native=s.native,
         synonyms=json.dumps(s.synonyms), country=s.country, status=s.status,
         format=s.format, expected=s.chapters, authors=json.dumps(s.authors),
-        cover=s.cover, last_resolved=now())
-    if s.anilist_id is not None:
-        row = con.execute("SELECT id FROM series WHERE anilist_id=?", (s.anilist_id,)).fetchone()
-    else:
-        row = con.execute("SELECT id FROM series WHERE anilist_id IS NULL AND lower(title)=lower(?)",
-                          (s.title,)).fetchone()
+        cover=s.cover)
+    row = con.execute("SELECT id FROM series WHERE ref=?", (s.ref,)).fetchone()
     if row:
         sets = ", ".join(f"{k}=?" for k in fields)
         con.execute(f"UPDATE series SET {sets} WHERE id=?", (*fields.values(), row["id"]))
         return row["id"]
-    cols = ", ".join(["anilist_id", *fields, "added_at"])
+    cols = ", ".join(["ref", *fields, "added_at"])
     marks = ", ".join("?" for _ in range(len(fields) + 2))
     cur = con.execute(f"INSERT INTO series ({cols}) VALUES ({marks})",
-                      (s.anilist_id, *fields.values(), now()))
+                      (s.ref, *fields.values(), now()))
     return cur.lastrowid
 
+
+def series_to_model(row) -> Series:
+    return Series(
+        anilist_id=row["anilist_id"], mangadex_id=row["mangadex_id"],
+        romaji=row["romaji"], english=row["english"], native=row["native"],
+        synonyms=json.loads(row["synonyms"] or "[]"), format=row["format"],
+        country=row["country"], status=row["status"], chapters=row["expected"],
+        cover=row["cover"], authors=json.loads(row["authors"] or "[]"))
+
+
+def get_series(con, series_id: int):
+    return con.execute("SELECT * FROM series WHERE id=?", (series_id,)).fetchone()
+
+
+def find_series(con, text: str):
+    """Rows whose title contains the text (case-insensitive), or the id."""
+    if text.isdigit():
+        r = get_series(con, int(text))
+        return [r] if r else []
+    return con.execute("SELECT * FROM series WHERE title LIKE ? COLLATE NOCASE ORDER BY title",
+                       (f"%{text}%",)).fetchall()
+
+
+def series_rows(con):
+    return con.execute(
+        "SELECT s.*, "
+        " (SELECT COUNT(*) FROM chapter c WHERE c.series_id=s.id AND c.status!='junk') AS listed,"
+        " (SELECT COUNT(*) FROM chapter c WHERE c.series_id=s.id AND c.status='have') AS have,"
+        " (SELECT COUNT(*) FROM chapter c WHERE c.series_id=s.id AND c.status IN ('wanted','failed')) AS wanted,"
+        " (SELECT source_name FROM series_source ss WHERE ss.series_id=s.id AND ss.is_primary=1) AS primary_source"
+        " FROM series s ORDER BY s.title COLLATE NOCASE").fetchall()
+
+
+def delete_series(con, series_id: int) -> None:
+    con.execute("DELETE FROM series WHERE id=?", (series_id,))
+
+
+# -- plan / chapters ---------------------------------------------------------
 
 def save_plan(con, series_id: int, plan, primary_manga_id: int | None) -> None:
     con.execute("DELETE FROM series_source WHERE series_id=?", (series_id,))
@@ -104,27 +172,55 @@ def save_plan(con, series_id: int, plan, primary_manga_id: int | None) -> None:
             " VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
             (series_id, m.manga_id, m.source.name, m.title, m.author, m.match, m.author_ok,
              len(m.chapters), m.max, m.note or None, int(m.manga_id == primary_manga_id), now()))
-    have = plan.have()
+    have_rows = {r["number"]: r for r in con.execute(
+        "SELECT number, status, library_path FROM chapter WHERE series_id=?", (series_id,))}
     for n, m in plan.assignment.items():
-        status = "have" if n in have else "wanted"
+        prev = have_rows.get(n)
+        if prev and prev["status"] == "have":
+            continue                         # on disk already; keep its paths
         con.execute(
             "INSERT INTO chapter (series_id, number, status, manga_id, source_name, updated_at)"
             " VALUES (?,?,?,?,?,?)"
             " ON CONFLICT(series_id, number) DO UPDATE SET status=excluded.status,"
             " manga_id=excluded.manga_id, source_name=excluded.source_name, updated_at=excluded.updated_at",
-            (series_id, n, status, m.manga_id, m.source.name, now()))
+            (series_id, n, "wanted", m.manga_id, m.source.name, now()))
+    for n, (m, pages) in plan.junk.items():
+        con.execute(
+            "INSERT INTO chapter (series_id, number, status, manga_id, source_name, pages, updated_at)"
+            " VALUES (?,?,?,?,?,?,?)"
+            " ON CONFLICT(series_id, number) DO UPDATE SET status='junk', pages=excluded.pages,"
+            " updated_at=excluded.updated_at WHERE chapter.status!='have'",
+            (series_id, n, "junk", m.manga_id, m.source.name, pages, now()))
+    con.execute("UPDATE series SET last_resolved=?, last_error=NULL WHERE id=?", (now(), series_id))
 
 
-def record_results(con, series_id: int, results: dict) -> None:
-    for n, r in results.items():
-        con.execute("UPDATE chapter SET status=?, updated_at=? WHERE series_id=? AND number=?",
-                    ("have" if r == "ok" else "failed", now(), series_id, n))
+def set_have(con, series_id: int, number: float, staging_path: str | None,
+             library_path: str | None, source_name: str | None = None) -> None:
+    con.execute(
+        "INSERT INTO chapter (series_id, number, status, source_name, staging_path, library_path, updated_at)"
+        " VALUES (?,?,'have',?,?,?,?)"
+        " ON CONFLICT(series_id, number) DO UPDATE SET status='have',"
+        " staging_path=COALESCE(excluded.staging_path, chapter.staging_path),"
+        " library_path=COALESCE(excluded.library_path, chapter.library_path),"
+        " source_name=COALESCE(excluded.source_name, chapter.source_name), updated_at=excluded.updated_at",
+        (series_id, number, source_name, staging_path, library_path, now()))
 
 
-def series_rows(con):
-    return con.execute(
-        "SELECT s.*, "
-        " (SELECT COUNT(*) FROM chapter c WHERE c.series_id=s.id) AS listed,"
-        " (SELECT COUNT(*) FROM chapter c WHERE c.series_id=s.id AND c.status='have') AS have,"
-        " (SELECT COUNT(*) FROM chapter c WHERE c.series_id=s.id AND c.status IN ('wanted','failed')) AS wanted"
-        " FROM series s ORDER BY s.title COLLATE NOCASE").fetchall()
+def set_status(con, series_id: int, number: float, status: str) -> None:
+    con.execute("UPDATE chapter SET status=?, updated_at=? WHERE series_id=? AND number=?",
+                (status, now(), series_id, number))
+
+
+def chapters(con, series_id: int):
+    return con.execute("SELECT * FROM chapter WHERE series_id=? ORDER BY number", (series_id,)).fetchall()
+
+
+def wanted(con, series_id: int) -> list[float]:
+    return [r["number"] for r in con.execute(
+        "SELECT number FROM chapter WHERE series_id=? AND status IN ('wanted','failed') ORDER BY number",
+        (series_id,))]
+
+
+def sources(con, series_id: int):
+    return con.execute("SELECT * FROM series_source WHERE series_id=? ORDER BY is_primary DESC, source_name",
+                       (series_id,)).fetchall()

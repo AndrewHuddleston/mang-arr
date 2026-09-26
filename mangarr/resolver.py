@@ -10,7 +10,7 @@ import statistics
 from dataclasses import dataclass, field
 
 from . import config
-from .anilist import Series
+from .model import Series
 from .matching import (ACCEPTED, AUTHOR_AGREE, AUTHOR_DIFFER, NONE, author_level, match_level)
 from .suwayomi import Chapter, Client, Source, SuwayomiError
 

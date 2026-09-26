@@ -1,19 +1,18 @@
-"""AniList lookup: the series database.
+"""AniList lookup: the primary series database.
 
-A series is identified by its AniList ID. AniList gives every title the
-series is known by (romaji, English, native, synonyms), which is what makes
-searching the download sources reliable, plus the country of origin (reading
-direction), status and - for finished series - the real chapter count.
+AniList gives every title a series is known by (romaji, English, native,
+synonyms), the country of origin (reading direction), status and - for
+finished series - the real chapter count. It covers Japanese, Korean and
+Chinese comics well and Western webtoons poorly; see mangadex.py for those.
 """
 import json
-import re
 import time
 import urllib.error
 import urllib.request
-from dataclasses import dataclass, field
 
 from . import config
 from .matching import query_score
+from .model import Series
 
 _FIELDS = """
   id
@@ -35,47 +34,6 @@ _SEARCH = "query($q: String, $n: Int) { Page(page: 1, perPage: $n) { media(searc
 _BY_ID = "query($id: Int) { Media(id: $id, type: MANGA) { %s } }" % _FIELDS
 
 
-@dataclass
-class Series:
-    anilist_id: int | None          # None for a manually identified series
-    romaji: str | None
-    english: str | None
-    native: str | None
-    synonyms: list[str] = field(default_factory=list)
-    format: str | None = None
-    country: str | None = None
-    status: str | None = None
-    chapters: int | None = None
-    volumes: int | None = None
-    adult: bool = False
-    popularity: int = 0
-    cover: str | None = None
-    description: str | None = None
-    authors: list[str] = field(default_factory=list)
-
-    @property
-    def title(self) -> str:
-        return self.english or self.romaji or self.native or "?"
-
-    @property
-    def titles(self) -> list[str]:
-        """Every name the series is known by, best first, no duplicates."""
-        out, seen = [], set()
-        for t in [self.romaji, self.english, self.native, *self.synonyms]:
-            if t and t.lower() not in seen:
-                seen.add(t.lower())
-                out.append(t)
-        return out
-
-    @property
-    def search_titles(self) -> list[str]:
-        """Titles worth typing into a source search: Latin script ones first;
-        the native title last, as only MangaDex-style sources index it."""
-        latin = [t for t in self.titles if re.search(r"[A-Za-z]", t)]
-        other = [t for t in self.titles if t not in latin]
-        return latin + other
-
-
 def _post(query: str, variables: dict, retries: int = 3) -> dict:
     body = json.dumps({"query": query, "variables": variables}).encode()
     last: Exception | None = None
@@ -83,7 +41,7 @@ def _post(query: str, variables: dict, retries: int = 3) -> dict:
         req = urllib.request.Request(
             config.ANILIST_URL, body,
             {"Content-Type": "application/json", "Accept": "application/json",
-             "User-Agent": "mang-arr/0.1"})
+             "User-Agent": config.USER_AGENT})
         try:
             with urllib.request.urlopen(req, timeout=30) as r:
                 return json.load(r)
@@ -91,6 +49,8 @@ def _post(query: str, variables: dict, retries: int = 3) -> dict:
             if e.code == 429:            # 30 requests/minute
                 time.sleep(int(e.headers.get("Retry-After", "10")))
                 continue
+            if e.code == 404:            # unknown id
+                return {}
             last = e
             if e.code >= 500:
                 time.sleep(3)
@@ -136,13 +96,6 @@ def search(query: str, limit: int = 8) -> list[Series]:
                             0 if s.format in ("MANGA", "ONE_SHOT") else 1,
                             -s.popularity))
     return out
-
-
-def manual(title: str, *aliases: str) -> Series:
-    """A series AniList does not have (most Western webtoons). Its identity
-    is the typed title; strict matching still applies to source hits."""
-    return Series(anilist_id=None, romaji=None, english=title.strip(), native=None,
-                  synonyms=[a.strip() for a in aliases if a.strip()])
 
 
 def by_id(anilist_id: int) -> Series | None:
