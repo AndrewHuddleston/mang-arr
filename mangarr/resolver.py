@@ -65,6 +65,7 @@ class Plan:
     unreachable: list[tuple[Source, str]]
     assignment: dict[float, SourceMatch]     # chapter number -> source that will provide it
     junk: dict[float, tuple[SourceMatch, int]] = field(default_factory=dict)  # dropped: too few pages
+    candidates: dict[float, list[SourceMatch]] = field(default_factory=dict)  # every usable source per chapter, best first
 
     @property
     def usable(self) -> list[SourceMatch]:
@@ -112,8 +113,9 @@ def resolve(client: Client, series: Series, sources: list[Source] | None = None)
         matches.append(found)
 
     _trust(series, matches)
-    assignment = _assign(matches)
-    plan = Plan(series, matches, rejected, unreachable, assignment)
+    candidates = _assign(matches)
+    assignment = {n: c[0] for n, c in candidates.items()}
+    plan = Plan(series, matches, rejected, unreachable, assignment, candidates=candidates)
     _prune_junk(client, plan)
     log.info("%s: %d chapters listed from %d source(s), %d on disk per Suwayomi, %d wanted, %d junk",
              series.title, len(plan.chapters), len({m.manga_id for m in assignment.values()}),
@@ -191,13 +193,14 @@ def _trust(series: Series, matches: list[SourceMatch]) -> None:
             log.warning("%s: %s - not trusted", m.source.name, m.note)
 
 
-def _assign(matches: list[SourceMatch]) -> dict[float, SourceMatch]:
-    """Each chapter goes to the best-ranked source that lists it."""
+def _assign(matches: list[SourceMatch]) -> dict[float, list[SourceMatch]]:
+    """Every usable source that lists each chapter, best-ranked first. The
+    first is used; the rest are fallbacks when a download fails."""
     ranked = sorted((m for m in matches if m.usable), key=SourceMatch.rank)
-    out: dict[float, SourceMatch] = {}
+    out: dict[float, list[SourceMatch]] = {}
     for m in ranked:
         for n in m.numbers:
-            out.setdefault(n, m)
+            out.setdefault(n, []).append(m)
     return out
 
 
@@ -220,6 +223,7 @@ def _prune_junk(client: Client, plan: Plan) -> None:
         if pages is not None and pages < config.MIN_PAGES:
             plan.junk[n] = (m, pages)
             del plan.assignment[n]
+            plan.candidates.pop(n, None)
     if plan.junk:
         log.info("dropped %d junk chapter(s): %s", len(plan.junk), ranges(sorted(plan.junk)))
 

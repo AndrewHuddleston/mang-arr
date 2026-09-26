@@ -56,6 +56,10 @@ DISAGREE = 1.5
 # notice images as "Chapter 1.1", "Chapter 2.3" and so on.
 MIN_PAGES = 8
 
-# Download pacing per source: how many chapters to queue in Suwayomi at once.
+# Download pacing per source: how many chapters to queue in Suwayomi at once,
+# and how long to keep backing off (doubling from 60s) before giving up on a
+# source - shorter when another source can supply the same chapters.
 BATCH_DEFAULT = 4
 BATCH_THROTTLED = 1
+BACKOFF_MAX = 300
+BACKOFF_MAX_WITH_FALLBACK = 60
