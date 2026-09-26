@@ -63,6 +63,12 @@ def run(client: Client, force: bool = False) -> list[Check]:
             out.append(Check("ok", "Sources", f"{len(enabled)} enabled, {len(sources) - len(enabled)} disabled"))
         elif not sources:
             out.append(Check("error", "Sources", "Suwayomi has no English sources installed"))
+        slow = [s.name for s in sources if s.throttled and not s.unusable]
+        if slow:
+            out.append(Check("ok", "Rate-limited sources",
+                             f"{', '.join(slow)}: the site limits requests, so chapters only it has download one at "
+                             f"a time with pauses and retries (Settings: delay between chapters). Other sources "
+                             f"are preferred whenever they list the chapter."))
     except SuwayomiError as e:
         out.append(Check("error", "Suwayomi", f"unreachable at {config.SUWAYOMI_URL}: {e}"))
 

@@ -42,7 +42,8 @@ class Outcome:
 # -- add / refresh ------------------------------------------------------------
 
 def add_series(con, client: Client, series: Series, download: bool = True, do_import: bool = True,
-               series_id: int | None = None, should_cancel: Callable[[], bool] | None = None) -> Outcome:
+               series_id: int | None = None, should_cancel: Callable[[], bool] | None = None,
+               progress: Callable[[str], None] | None = None) -> Outcome:
     """Track a series: resolve it, remember the plan, fetch what is missing,
     link the results into the library. With series_id (a refresh) the row
     must still exist afterwards, or the work is abandoned."""
@@ -64,14 +65,15 @@ def add_series(con, client: Client, series: Series, download: bool = True, do_im
     if do_import:
         out.imported += import_series(con, series_id, client)
     if download and p:
-        out.results = download_wanted(con, client, series_id, plan, should_cancel)
+        out.results = download_wanted(con, client, series_id, plan, should_cancel, progress)
         if do_import:
             out.imported += import_series(con, series_id, client)
     return out
 
 
 def refresh_series(con, client: Client, series_id: int, download: bool = True,
-                   should_cancel: Callable[[], bool] | None = None) -> Outcome:
+                   should_cancel: Callable[[], bool] | None = None,
+                   progress: Callable[[str], None] | None = None) -> Outcome:
     """Re-check a tracked series. Metadata is refreshed first (status,
     chapter count, new synonyms) and falls back to the stored row when the
     provider is unavailable."""
@@ -87,7 +89,8 @@ def refresh_series(con, client: Client, series_id: int, download: bool = True,
                 log.debug("%s: metadata refreshed (%s, %s ch)", series.title, series.status, series.chapters)
         except (metadata.LookupError_, ValueError) as e:
             log.warning("%s: metadata refresh failed, using stored record: %s", row["title"], e)
-    return add_series(con, client, series, download=download, series_id=series_id, should_cancel=should_cancel)
+    return add_series(con, client, series, download=download, series_id=series_id, should_cancel=should_cancel,
+                      progress=progress)
 
 
 def _resolve_summary(plan: Plan) -> str:
@@ -129,14 +132,16 @@ def _set_library_entries(client: Client, plan: Plan, primary_manga_id: int) -> N
 
 
 def download_wanted(con, client: Client, series_id: int, plan: Plan,
-                    should_cancel: Callable[[], bool] | None = None) -> dict:
+                    should_cancel: Callable[[], bool] | None = None,
+                    progress: Callable[[str], None] | None = None) -> dict:
     have_on_disk = {r["number"] for r in db.chapters(con, series_id) if r["status"] == "have"}
     wanted = [n for n in plan.wanted() if n not in have_on_disk]
     if not wanted:
         log.info("%s: nothing to download", plan.series.title)
         return {}
     reasons: dict = {}
-    results = downloader.download(client, plan, only=set(wanted), should_cancel=should_cancel, reasons=reasons)
+    results = downloader.download(client, plan, only=set(wanted), should_cancel=should_cancel, reasons=reasons,
+                                  progress=progress)
     for n, r in results.items():
         m = plan.assignment.get(n)
         metrics.record_download(m.source.name if m else "?", r)

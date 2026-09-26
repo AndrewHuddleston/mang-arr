@@ -37,7 +37,8 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python }}
-      # The core is stdlib-only; the tests need nothing installed.
+      # The core is stdlib-only; the web tests need the extras (they skip without them).
+      - run: pip install -e ".[web]" httpx
       - run: python -m unittest discover -s tests -v
 
   package:

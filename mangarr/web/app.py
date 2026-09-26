@@ -117,7 +117,8 @@ def _job_refresh(series_id: int, download: bool):
         try:
             with db.connect() as con:
                 o = core.refresh_series(con, client, series_id, download=download,
-                                        should_cancel=lambda: job.cancel)
+                                        should_cancel=lambda: job.cancel,
+                                        progress=lambda m: setattr(job, "progress", m))
         except core.Gone as e:
             return str(e)
         except Exception as e:
@@ -131,7 +132,8 @@ def _job_refresh(series_id: int, download: bool):
 def _job_add(series: model.Series, download: bool):
     def run(job: jobs.Job):
         with db.connect() as con:
-            o = core.add_series(con, client, series, download=download, should_cancel=lambda: job.cancel)
+            o = core.add_series(con, client, series, download=download, should_cancel=lambda: job.cancel,
+                                progress=lambda m: setattr(job, "progress", m))
         job.series_id = o.series_id
         return f"{len(o.plan.chapters)} listed, {o.downloaded} downloaded, {o.imported} imported"
     return run
@@ -170,10 +172,12 @@ def _job_refresh_all(job: jobs.Job):
         if job.cancel:
             job.progress = f"cancelled after {done} of {len(rows)}"
             break
-        job.progress = f"{i}/{len(rows)}: {r['title']}"
+        head = f"{i}/{len(rows)}: {r['title']}"
+        job.progress = head
         try:
             with db.connect() as con:
-                o = core.refresh_series(con, client, r["id"], download=True, should_cancel=lambda: job.cancel)
+                o = core.refresh_series(con, client, r["id"], download=True, should_cancel=lambda: job.cancel,
+                                        progress=lambda m, head=head: setattr(job, "progress", f"{head} - {m}"))
             downloaded += o.downloaded
             imported += o.imported
         except core.Gone:
@@ -198,10 +202,12 @@ def _job_search_wanted(job: jobs.Job):
     for i, r in enumerate(rows, 1):
         if job.cancel:
             break
-        job.progress = f"{i}/{len(rows)}: {r['title']}"
+        head = f"{i}/{len(rows)}: {r['title']}"
+        job.progress = head
         try:
             with db.connect() as con:
-                o = core.refresh_series(con, client, r["id"], download=True, should_cancel=lambda: job.cancel)
+                o = core.refresh_series(con, client, r["id"], download=True, should_cancel=lambda: job.cancel,
+                                        progress=lambda m, head=head: setattr(job, "progress", f"{head} - {m}"))
             got += o.downloaded
         except core.Gone:
             continue

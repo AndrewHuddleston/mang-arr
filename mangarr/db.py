@@ -312,8 +312,9 @@ def save_plan(con, series_id: int, plan, primary_manga_id: int | None) -> None:
         if prev and prev["status"] in keep:
             continue                         # on disk already, or told to ignore; keep as is
         others = [c.source.name for c in plan.candidates.get(n, []) if c.manga_id != m.manga_id]
-        reason = f"available on {m.source.name}" + (f" (also {', '.join(others[:3])})" if others else "") + \
-            "; not downloaded yet - waiting for a download pass"
+        reason = (f"available on {m.source.name}" + (" (rate-limited source: slow)" if m.source.throttled else "")
+                  + (f" (also {', '.join(others[:3])})" if others else "")
+                  + "; not downloaded yet - waiting for a download pass")
         con.execute(
             "INSERT INTO chapter (series_id, number, status, manga_id, source_name, reason, updated_at)"
             " VALUES (?,?,?,?,?,?,?)"

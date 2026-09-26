@@ -3,13 +3,17 @@ import time
 import unittest
 from unittest import mock
 
-from mangarr.web import app as web
+try:
+    from mangarr.web import app as web
+except ImportError:                      # web extras not installed
+    web = None
 
 
 def row(title, status="RELEASING", wanted=0, monitored=1, last=None):
     return {"title": title, "status": status, "wanted": wanted, "monitored": monitored, "last_resolved": last}
 
 
+@unittest.skipIf(web is None, "web extras not installed")
 class PassTest(unittest.TestCase):
     def test_order_and_skip(self):
         now = time.strftime("%Y-%m-%d %H:%M:%S")

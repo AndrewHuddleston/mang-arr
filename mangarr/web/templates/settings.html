@@ -23,6 +23,7 @@
 <section class="card" id="scheduling">
   <h2>Scheduling &amp; matching</h2>
   <div class="field"><span class="lbl">Refresh every (hours)</span><input name="refresh_hours" value="{{ v.refresh_hours }}" size="6"></div>
+  <div class="field"><span class="lbl">Delay between chapters on rate-limited sources (s)</span><input name="throttled_delay_seconds" value="{{ v.throttled_delay_seconds }}" size="6"><span class="muted small">a steady pause stays under the site's limit; bursts get HTTP 429 and long backoffs</span></div>
   <div class="field"><span class="lbl">Re-check complete finished series every (days)</span><input name="recheck_finished_days" value="{{ v.recheck_finished_days }}" size="6"><span class="muted small">a finished series with nothing missing rarely changes; 0 = every pass</span></div>
   <div class="field"><span class="lbl">Minimum pages for a fractional chapter</span><input name="min_pages" value="{{ v.min_pages }}" size="6"><span class="help">below this a "Chapter 12.5" is treated as a notice image and skipped</span></div>
 </section>
