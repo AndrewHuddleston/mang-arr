@@ -39,8 +39,19 @@ DEFAULTS: dict[str, object] = {
     "komga_library_id": "",
     "auth_user": "",
     "auth_password": "",
+    "api_key": "",           # X-Api-Key for the JSON API when a web login is set; generated on first start
 }
 SECRET_KEYS = {"pushover_token", "pushover_user", "komga_api_key", "auth_password"}
+
+
+def ensure_api_key(con: sqlite3.Connection) -> str:
+    """Create the API key on first start; returns it."""
+    import secrets as _secrets
+    v = all_values(con)
+    if not v["api_key"]:
+        set_many(con, {"api_key": _secrets.token_hex(16)})
+        v = all_values(con)
+    return str(v["api_key"])
 
 _cache: dict[str, object] = {}
 _loaded_at = 0.0

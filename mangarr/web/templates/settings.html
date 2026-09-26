@@ -37,6 +37,7 @@
 <label>Web username <input name="auth_user" value="{{ v.auth_user }}" placeholder="empty = no login"></label>
 <label>Web password <input name="auth_password" type="password" value="" placeholder="{{ 'set - leave blank to keep' if v.auth_password else '' }}"></label>
 <p class="muted small">Secrets are never shown again once saved. To clear one, enter a single space.</p>
+<label>API key <input name="api_key" value="{{ v.api_key }}"> <span class="muted small">send as <code>X-Api-Key</code> header (or <code>?apikey=</code>) to use the JSON API when a login is set</span></label>
 
 <div class="actions">
   <button>Save</button>

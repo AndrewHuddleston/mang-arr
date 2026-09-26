@@ -14,10 +14,11 @@ from collections import deque
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Form, HTTPException, Request
-from fastapi.responses import JSONResponse, RedirectResponse, Response
+from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel, Field
+from starlette.background import BackgroundTask
 
 from .. import __version__, config, core, db, jobs, komga, library, metadata, metrics, model, notify, settings
 from ..resolver import ranges
@@ -40,6 +41,11 @@ async def lifespan(app: FastAPI):
         runner.start()
         scheduler = jobs.Scheduler(runner, _job_refresh_all)
         scheduler.start()
+    try:
+        with db.connect() as con:
+            settings.ensure_api_key(con)
+    except Exception as e:
+        log.error("could not open the database at %s: %s", config.DB_PATH, e)
     log.info("mang-arr %s web started (staging %s, library %s)", __version__, config.STAGING_ROOT,
              config.LIBRARY_ROOT)
     yield
@@ -165,7 +171,10 @@ async def basic_auth(request: Request, call_next):
     if user and request.url.path not in OPEN_PATHS:
         header = request.headers.get("authorization", "")
         ok = False
-        if header.startswith("Basic "):
+        api_key = request.headers.get("x-api-key") or request.query_params.get("apikey")
+        if api_key and v["api_key"] and secrets.compare_digest(api_key, str(v["api_key"])):
+            ok = True
+        elif header.startswith("Basic "):
             try:
                 given = base64.b64decode(header[6:]).decode("utf-8", "replace")
                 u, _, p = given.partition(":")
@@ -450,6 +459,24 @@ def system_page(request: Request):
                 log_lines=_tail_log(200), uptime=_ago(STARTED), notify_ok=notify.configured(),
                 komga_ok=komga.configured(), metrics_ok=metrics.AVAILABLE, copied=library.COPIED,
                 next_refresh=(scheduler.next_at if scheduler else None))
+
+
+@app.get("/system/backup")
+def system_backup():
+    """A consistent copy of the database (SQLite online backup), as a download."""
+    import shutil
+    import sqlite3
+    import tempfile
+    tmp = tempfile.NamedTemporaryFile(prefix="mangarr-", suffix=".db", delete=False)
+    tmp.close()
+    with db.connect() as con:
+        dst = sqlite3.connect(tmp.name)
+        con.backup(dst)
+        dst.close()
+    name = f"mangarr-backup-{time.strftime('%Y%m%d-%H%M%S')}.db"
+    log.info("backup written: %s (%d bytes)", name, os.path.getsize(tmp.name))
+    return FileResponse(tmp.name, filename=name, media_type="application/x-sqlite3",
+                        background=BackgroundTask(shutil.os.remove, tmp.name))
 
 
 @app.post("/system/notify-test")
