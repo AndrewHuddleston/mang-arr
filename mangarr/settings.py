@@ -37,6 +37,7 @@ DEFAULTS: dict[str, object] = {
     "komga_url": "",
     "komga_api_key": "",
     "komga_library_id": "",
+    "auth_method": "forms",  # forms (login page) | basic (browser prompt); active only when auth_user is set
     "auth_user": "",
     "auth_password": "",
     "api_key": "",           # X-Api-Key for the JSON API when a web login is set; generated on first start

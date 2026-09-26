@@ -185,7 +185,7 @@ def cmd_import(a):
         rows = [_find(con, a.series)] if a.series else db.series_rows(con)
         for r in rows:
             if r:
-                n = core.import_series(con, r["id"])
+                n = core.import_series(con, r["id"], Client())
                 out(f"  {r['title']}: {n} newly linked")
     return 0
 

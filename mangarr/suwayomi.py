@@ -41,6 +41,7 @@ class Chapter:
     name: str | None
     scanlator: str | None
     downloaded: bool
+    uploaded: str | None = None      # ISO date the source published it, when known
 
 
 class Client:
@@ -113,7 +114,7 @@ class Client:
             'mutation($id: Int!) {'
             ' fetchMangaAndChapters(input: {id: $id, fetchManga: true, fetchChapters: true})'
             ' { manga { id title author artist status inLibrary }'
-            '   chapters { id name chapterNumber scanlator isDownloaded } } }',
+            '   chapters { id name chapterNumber scanlator isDownloaded uploadDate } } }',
             {"id": manga_id}, timeout=240, retries=1)
         r = d["fetchMangaAndChapters"]
         return r["manga"], dedupe(r["chapters"])
@@ -121,7 +122,7 @@ class Client:
     def chapters(self, manga_id: int) -> list[Chapter]:
         """Chapter list from Suwayomi's cache (no source fetch)."""
         d = self.gq('query($id: Int!) { manga(id: $id) { chapters { nodes'
-                    ' { id name chapterNumber scanlator isDownloaded } } } }', {"id": manga_id})
+                    ' { id name chapterNumber scanlator isDownloaded uploadDate } } } }', {"id": manga_id})
         return dedupe(d["manga"]["chapters"]["nodes"])
 
     def downloaded_ids(self, manga_id: int) -> set[int]:
@@ -178,17 +179,25 @@ def dedupe(raw: list[dict]) -> list[Chapter]:
     for c in raw:
         cov.setdefault(c.get("scanlator") or "", set()).add(c["chapterNumber"])
     rank = {s: i for i, s in enumerate(sorted(cov, key=lambda s: (-len(cov[s]), s)))}
-    from .library import parse_season, season_number
     best: dict[float, dict] = {}
     for c in raw:
         n = float(c["chapterNumber"])
-        se = parse_season(c.get("name") or "")
-        if se:                                      # "S2 - Episode 5": sources number these
-            n = season_number(*se)                  # inconsistently, the name is the truth
         if n < 0:                                   # Suwayomi uses -1 for "unknown"
             continue
         s = c.get("scanlator") or ""
         if n not in best or rank[s] < rank[best[n].get("scanlator") or ""]:
             best[n] = c
-    return sorted((Chapter(c["id"], n, c.get("name"), c.get("scanlator"), bool(c.get("isDownloaded")))
+    return sorted((Chapter(c["id"], n, c.get("name"), c.get("scanlator"), bool(c.get("isDownloaded")),
+                           _iso_date(c.get("uploadDate")))
                    for n, c in best.items()), key=lambda c: c.number)
+
+
+def _iso_date(ms) -> str | None:
+    """Suwayomi gives upload dates as epoch milliseconds (0 = unknown)."""
+    try:
+        ms = int(ms or 0)
+    except (TypeError, ValueError):
+        return None
+    if ms <= 0:
+        return None
+    return time.strftime("%Y-%m-%d", time.gmtime(ms / 1000))

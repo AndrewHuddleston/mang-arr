@@ -42,3 +42,6 @@ pre.log{background:#0d0f12;border:1px solid var(--line);border-radius:8px;paddin
 tr.job-failed td{color:var(--bad)}tr.job-running td{color:var(--accent)}
 tr.wanted td:nth-child(2){color:var(--warn)}tr.failed td:nth-child(2),tr.junk td:nth-child(2){color:var(--bad)}
 @media (max-width:700px){.head{flex-direction:column}input[type=search]{min-width:0;width:100%}}
+body.login{display:flex;align-items:center;justify-content:center;min-height:100vh}
+.login-box{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:28px 32px;width:340px;text-align:center}
+.login-box h1{margin-bottom:16px}.login-box form.col{max-width:none}.login-box input{min-width:0}

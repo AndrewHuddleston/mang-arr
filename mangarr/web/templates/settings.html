@@ -34,6 +34,10 @@
 <label>Webhook URL <input name="webhook_url" value="{{ v.webhook_url }}" placeholder="POST {title, message, kind} as JSON"></label>
 
 <h2>Security</h2>
+<label>Login method
+  <label><input type="radio" name="auth_method" value="forms" {% if v.auth_method != 'basic' %}checked{% endif %}> login page</label>
+  <label><input type="radio" name="auth_method" value="basic" {% if v.auth_method == 'basic' %}checked{% endif %}> browser prompt (basic auth)</label>
+</label>
 <label>Web username <input name="auth_user" value="{{ v.auth_user }}" placeholder="empty = no login"></label>
 <label>Web password <input name="auth_password" type="password" value="" placeholder="{{ 'set - leave blank to keep' if v.auth_password else '' }}"></label>
 <p class="muted small">Secrets are never shown again once saved. To clear one, enter a single space.</p>

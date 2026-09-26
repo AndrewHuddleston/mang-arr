@@ -85,6 +85,11 @@ MIGRATIONS = [
     """
     ALTER TABLE chapter ADD COLUMN reason TEXT;
     """,
+    # 5: the chapter's title and release date as the source lists them (for the UI)
+    """
+    ALTER TABLE chapter ADD COLUMN name TEXT;
+    ALTER TABLE chapter ADD COLUMN uploaded TEXT;
+    """,
 ]
 
 
@@ -267,6 +272,12 @@ def save_plan(con, series_id: int, plan, primary_manga_id: int | None) -> None:
             " ON CONFLICT(series_id, number) DO UPDATE SET status='junk', pages=excluded.pages,"
             " reason=excluded.reason, updated_at=excluded.updated_at WHERE chapter.status NOT IN ('have','ignored')",
             (series_id, n, "junk", m.manga_id, m.source.name, pages, reason, now()))
+    # title and release date from the source that lists each chapter, whatever its status
+    for n, m in plan.assignment.items():
+        ch = next((c for c in m.chapters if c.number == n), None)
+        if ch and (ch.name or ch.uploaded):
+            con.execute("UPDATE chapter SET name=COALESCE(?, name), uploaded=COALESCE(?, uploaded)"
+                        " WHERE series_id=? AND number=?", (ch.name, ch.uploaded, series_id, n))
     # a chapter that was wanted but that no trusted source lists any more is
     # not wanted, it is unavailable - it comes back if a source lists it again
     still = set(plan.assignment) | set(plan.junk)

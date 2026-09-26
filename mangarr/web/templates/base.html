@@ -19,6 +19,7 @@
   <span class="spacer"></span>
   <a id="health" href="/system" class="health {% if health_errors %}bad{% elif health_warnings %}warn{% else %}ok{% endif %}" title="backend health (System page)">{% if health_errors %}{{ health_errors }} problem{{ 's' if health_errors != 1 }}{% elif health_warnings %}{{ health_warnings }} warning{{ 's' if health_warnings != 1 }}{% else %}healthy{% endif %}</a>
   <span id="status" class="muted">{% if current %}running: {{ current.kind }} {{ current.title }}{% endif %}</span>
+  {% if logged_in %}<form method="post" action="/logout" class="inline"><button class="alt small">sign out</button></form>{% endif %}
 </nav>
 <main>
 {% if update and update.updateAvailable %}<div class="flash">mang-arr {{ update.latest }} is available (running {{ update.current }}). <a href="{{ update.url }}">Release notes</a></div>{% endif %}

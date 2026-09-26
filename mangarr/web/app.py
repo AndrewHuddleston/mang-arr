@@ -5,6 +5,8 @@ Pages:   /  /series/{id}  /add  /import  /wanted  /activity  /settings  /system
 API:     /api/v1/...  (mirrors the pages; used by the pages' live updates)
 """
 import base64
+import hashlib
+import hmac
 import logging
 import os
 import secrets
@@ -180,29 +182,98 @@ def _job_search_wanted(job: jobs.Job):
 
 # -- middleware / errors -------------------------------------------------------
 
+SESSION_COOKIE = "mangarr_session"
+SESSION_DAYS = 30
+
+
+def _session_secret(v: dict) -> bytes:
+    return f"{v['api_key']}|{v['auth_password']}".encode()
+
+
+def _make_session(v: dict) -> str:
+    exp = int(time.time()) + SESSION_DAYS * 86400
+    payload = f"{v['auth_user']}|{exp}"
+    sig = hmac.new(_session_secret(v), payload.encode(), hashlib.sha256).hexdigest()
+    return f"{payload}|{sig}"
+
+
+def _session_ok(v: dict, cookie: str | None) -> bool:
+    if not cookie:
+        return False
+    try:
+        user, exp, sig = cookie.rsplit("|", 2)
+    except ValueError:
+        return False
+    if user != v["auth_user"] or int(exp) < time.time():
+        return False
+    want = hmac.new(_session_secret(v), f"{user}|{exp}".encode(), hashlib.sha256).hexdigest()
+    return secrets.compare_digest(sig, want)
+
+
+def _basic_ok(v: dict, header: str) -> bool:
+    if not header.startswith("Basic "):
+        return False
+    try:
+        given = base64.b64decode(header[6:]).decode("utf-8", "replace")
+        u, _, p = given.partition(":")
+        return secrets.compare_digest(u, v["auth_user"]) and secrets.compare_digest(p, v["auth_password"])
+    except Exception:
+        return False
+
+
 @app.middleware("http")
-async def basic_auth(request: Request, call_next):
-    """Optional HTTP basic auth (Settings -> Security)."""
+async def authentication(request: Request, call_next):
+    """Optional login (Settings -> Security): 'forms' shows a login page and
+    keeps a signed session cookie; 'basic' uses the browser prompt. The API
+    key works with either. Monitoring endpoints and static files stay open."""
     v = settings.all_values()
-    user, password = v["auth_user"], v["auth_password"]
-    if user and request.url.path not in OPEN_PATHS:
-        header = request.headers.get("authorization", "")
-        ok = False
+    path = request.url.path
+    if v["auth_user"] and path not in OPEN_PATHS and not path.startswith(("/static/", "/login", "/logout")):
         api_key = request.headers.get("x-api-key") or request.query_params.get("apikey")
-        if api_key and v["api_key"] and secrets.compare_digest(api_key, str(v["api_key"])):
-            ok = True
-        elif header.startswith("Basic "):
-            try:
-                given = base64.b64decode(header[6:]).decode("utf-8", "replace")
-                u, _, p = given.partition(":")
-                ok = secrets.compare_digest(u, user) and secrets.compare_digest(p, password)
-            except Exception:
-                ok = False
+        ok = bool(api_key and v["api_key"] and secrets.compare_digest(api_key, str(v["api_key"])))
+        ok = ok or _basic_ok(v, request.headers.get("authorization", ""))
+        ok = ok or _session_ok(v, request.cookies.get(SESSION_COOKIE))
         if not ok:
-            log.warning("unauthorised request to %s from %s", request.url.path,
+            log.warning("unauthenticated request to %s from %s", path,
                         request.client.host if request.client else "?")
+            wants_html = "text/html" in request.headers.get("accept", "") and not path.startswith("/api/")
+            if v["auth_method"] == "forms" and wants_html:
+                return RedirectResponse(f"/login?next={urllib.parse.quote(str(request.url.path))}", 303)
             return Response("authentication required", 401, headers={"WWW-Authenticate": 'Basic realm="mang-arr"'})
     return await call_next(request)
+
+
+@app.get("/login")
+def login_page(request: Request, next: str = "/"):
+    v = settings.all_values()
+    if not v["auth_user"] or _session_ok(v, request.cookies.get(SESSION_COOKIE)):
+        return RedirectResponse(next if next.startswith("/") else "/", 303)
+    return templates.TemplateResponse(request, "login.html", {"request": request, "next": next,
+                                                              "version": __version__, "error": None})
+
+
+@app.post("/login")
+def login_submit(request: Request, username: str = Form(""), password: str = Form(""), next: str = Form("/")):
+    v = settings.all_values()
+    if not (secrets.compare_digest(username, v["auth_user"]) and secrets.compare_digest(password, v["auth_password"])):
+        log.warning("failed login for %r from %s", username, request.client.host if request.client else "?")
+        time.sleep(1)                                    # slow down guessing
+        return templates.TemplateResponse(request, "login.html", {"request": request, "next": next,
+                                                                  "version": __version__,
+                                                                  "error": "wrong username or password"},
+                                          status_code=401)
+    resp = RedirectResponse(next if next.startswith("/") else "/", 303)
+    resp.set_cookie(SESSION_COOKIE, _make_session(v), max_age=SESSION_DAYS * 86400, httponly=True,
+                    samesite="lax")
+    log.info("login: %s from %s", username, request.client.host if request.client else "?")
+    return resp
+
+
+@app.post("/logout")
+def logout():
+    resp = RedirectResponse("/login", 303)
+    resp.delete_cookie(SESSION_COOKIE)
+    return resp
 
 
 @app.exception_handler(Exception)
@@ -218,9 +289,11 @@ async def _unhandled(request: Request, exc: Exception):
 
 def page(request: Request, name: str, **ctx):
     h = health.summary(client)
+    v = settings.all_values()
     ctx.update(request=request, version=__version__, current=runner.current,
                flash=request.query_params.get("m"), update=updates.status(),
-               health_errors=h["errors"], health_warnings=h["warnings"])
+               health_errors=h["errors"], health_warnings=h["warnings"],
+               logged_in=bool(v["auth_user"] and v["auth_method"] == "forms"))
     return templates.TemplateResponse(request, name, ctx)
 
 
@@ -421,7 +494,7 @@ async def import_apply(request: Request):
         linked = 0
         for sid in ids:
             with db.connect() as con:
-                linked += core.import_series(con, sid)
+                linked += core.import_series(con, sid, client)
         _adopt_scan["items"] = None
         return f"adopted {len(ids)} series ({n_ch} chapters), linked {linked} files"
 

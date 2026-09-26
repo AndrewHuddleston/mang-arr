@@ -62,11 +62,11 @@ def add_series(con, client: Client, series: Series, download: bool = True, do_im
     if p:
         _set_library_entries(client, plan, p.manga_id)
     if do_import:
-        out.imported += import_series(con, series_id)
+        out.imported += import_series(con, series_id, client)
     if download and p:
         out.results = download_wanted(con, client, series_id, plan, should_cancel)
         if do_import:
-            out.imported += import_series(con, series_id)
+            out.imported += import_series(con, series_id, client)
     return out
 
 
@@ -190,10 +190,10 @@ def delete_series(con, client: Client, series_id: int, delete_library: bool = Fa
 
 # -- import ------------------------------------------------------------------
 
-def series_staging_dirs(con, series_id: int) -> list[tuple[str, str]]:
-    """[(source name, folder)] where Suwayomi has written this series - only
-    for source entries the plan trusts (an entry noted as 'author differs' or
-    'too long' must not feed the library)."""
+def series_staging_dirs(con, series_id: int) -> list[tuple[str, str, int | None]]:
+    """[(source name, folder, Suwayomi manga id)] where Suwayomi has written
+    this series - only for source entries the plan trusts (an entry noted as
+    'author differs' or 'too long' must not feed the library)."""
     out = []
     for s in db.sources(con, series_id):
         if s["note"]:
@@ -201,20 +201,35 @@ def series_staging_dirs(con, series_id: int) -> list[tuple[str, str]]:
         folder = s["folder"] or os.path.join(library.config.STAGING_ROOT, s["source_name"],
                                              library.safe_title(s["title"]))
         if os.path.isdir(folder):
-            out.append((s["source_name"], folder))
+            out.append((s["source_name"], folder, s["manga_id"]))
     return out
 
 
-def import_series(con, series_id: int) -> int:
+def import_series(con, series_id: int, client: Client | None = None) -> int:
     """Link every staged chapter into <library>/<folder>/. Returns how many
-    chapters were newly linked."""
+    chapters were newly linked. Files whose name carries no global chapter
+    number (season episodes) are matched through Suwayomi's chapter list."""
     row = db.get_series(con, series_id)
     title, folder = row["title"], row["folder"]
     known = {r["number"]: dict(r) for r in db.chapters(con, series_id)}
     linked = 0
-    for source_name, staging in series_staging_dirs(con, series_id):
+    for source_name, staging, manga_id in series_staging_dirs(con, series_id):
         found, unparsed = library.scan_series_dir(staging)
-        if unparsed:
+        if unparsed and client is not None and manga_id is not None:
+            try:
+                names = library.suwayomi_name_map(client.chapters(manga_id))
+            except SuwayomiError as e:
+                names = {}
+                log.warning("%s: cannot list chapters of %s entry to match %d unnamed file(s): %s",
+                            title, source_name, len(unparsed), e)
+            for path in unparsed:
+                stem = os.path.splitext(os.path.basename(path))[0].lower()
+                n = names.get(stem)
+                if n is not None and n not in found:
+                    found[n] = path
+                else:
+                    log.debug("%s: no chapter matches file %s", title, os.path.basename(path))
+        elif unparsed:
             log.debug("%s: %d file(s) in %s without a chapter number", title, len(unparsed), staging)
         for n, path in found.items():
             prev = known.get(n)
@@ -222,9 +237,10 @@ def import_series(con, series_id: int) -> int:
                 continue
             if prev and prev["library_path"] and os.path.exists(prev["library_path"]):
                 continue
-            expected = os.path.join(library.library_dir(folder), library.chapter_filename(n))
+            label = prev["name"] if prev and "name" in prev.keys() else None
+            expected = os.path.join(library.library_dir(folder), library.chapter_filename(n, label))
             ours = bool(prev and prev["library_path"] == expected)
-            dst = library.link_into_library(path, folder, n, replace=ours)
+            dst = library.link_into_library(path, folder, n, replace=ours, label=label)
             if dst is None:
                 continue
             db.set_have(con, series_id, n, path, dst, source_name)

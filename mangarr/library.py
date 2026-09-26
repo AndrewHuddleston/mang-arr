@@ -30,41 +30,19 @@ _VOLUME_ONLY = re.compile(r"(?<![A-Za-z])vol(?:ume)?\.?\s*\d+", re.I)
 _LASTNUM = re.compile(r"(\d+(?:\.\d+)?)(?!.*\d)")
 
 
-# Season-numbered webtoons ("S2 - Episode 5") get one number per episode that
-# sorts by season then episode and can never collide with a real chapter
-# number: SEASON_BASE * season + episode.
-SEASON_BASE = 100000
-
-
-def season_number(season: int, episode: float) -> float:
-    return SEASON_BASE * season + episode
-
-
-def split_season(number: float) -> tuple[int, float] | None:
-    """(season, episode) for a season number, else None."""
-    if number < SEASON_BASE:
-        return None
-    season = int(number // SEASON_BASE)
-    return season, round(number - SEASON_BASE * season, 2)
-
-
-def fmt_number(number: float) -> str:
-    """'12', '12.5', or 'S2E5' for display."""
-    se = split_season(number)
-    if se:
-        return f"S{se[0]}E{se[1]:g}"
-    return f"{number:g}"
-
-
 def parse_number(filename: str) -> float | None:
-    """Chapter number in a file name, or None when there is no chapter number
-    (volume-only files are not chapters). Season-numbered files yield a
-    season number (see season_number)."""
+    """Chapter number in a file name, or None when there is none (volume-only
+    files are not chapters; season-numbered files such as 'S2 - Episode 5'
+    carry no global number - import resolves those through Suwayomi's own
+    chapter listing, see suwayomi_name_map)."""
     stem = os.path.splitext(os.path.basename(filename))[0]
-    ms = _SEASON.search(stem)
-    if ms:
-        return season_number(int(ms.group(1)), float(ms.group(2)))
     m = _KEYWORD.search(stem)
+    if m and not (_SEASON.search(stem) and _SEASON.search(stem).start() <= m.start()):
+        return float(m.group(1))
+    if _SEASON.search(stem):
+        return None
+    if m:
+        return float(m.group(1))
     if m:
         return float(m.group(1))
     if _VOLUME_ONLY.search(stem):
@@ -136,17 +114,37 @@ def unique_folder(title: str, taken: set[str], suffix: str) -> str:
     return safe_title(f"{base} ({suffix})")
 
 
-def chapter_filename(number: float) -> str:
+def chapter_filename(number: float, label: str | None = None) -> str:
     """'Chapter 012.0.cbz' - fixed width so Komga sorts 12 before 12.5 and
     before 100, and .5 chapters sort after their integer. Two decimals only
-    when the number needs them (5.25). Season numbers become
-    'S02 - Episode 005.0.cbz'."""
-    se = split_season(number)
-    if se:
-        return f"S{se[0]:02d} - Episode {se[1]:05.1f}.cbz"
-    if round(number, 1) != round(number, 2):
-        return f"Chapter {number:06.2f}.cbz"
-    return f"Chapter {number:05.1f}.cbz"
+    when the number needs them (5.25). A label (the source's chapter title
+    when it says more than the number, e.g. 'S2 - Episode 5') is appended:
+    'Chapter 012.0 - S2 - Episode 5.cbz'."""
+    base = f"Chapter {number:06.2f}" if round(number, 1) != round(number, 2) else f"Chapter {number:05.1f}"
+    label = chapter_label(number, label)
+    return f"{base} - {label}.cbz" if label else f"{base}.cbz"
+
+
+def chapter_label(number: float, name: str | None) -> str | None:
+    """The part of a source chapter name worth keeping in the file name:
+    None for 'Chapter 12' / 'Ch.12' / 'Episode 12', the name otherwise."""
+    if not name:
+        return None
+    n = re.sub(r"\s+", " ", name).strip()
+    plain = re.fullmatch(r"(?:chapter|chap|ch|episode|ep|#)?\.?\s*0*(\d+(?:\.\d+)?)\s*[:.\-]?\s*", n, re.I)
+    if plain and float(plain.group(1)) == number:
+        return None
+    return safe_title(n)[:80]
+
+
+def suwayomi_name_map(chapters) -> dict[str, float]:
+    """{file stem as Suwayomi writes it: chapter number} so files whose name
+    carries no global number (season episodes) can still be matched."""
+    out = {}
+    for c in chapters:
+        stem = f"{c.scanlator}_{c.name}" if c.scanlator else (c.name or "")
+        out[safe_title(stem).lower()] = c.number
+    return out
 
 
 def library_dir(folder: str, root: str | None = None) -> str:
@@ -158,7 +156,7 @@ COPIED = 0          # chapters copied because a hard link was impossible
 
 
 def link_into_library(src_path: str, folder: str, number: float, root: str | None = None,
-                      replace: bool = False) -> str | None:
+                      replace: bool = False, label: str | None = None) -> str | None:
     """Hard-link a staged chapter into the library. Copies when the two
     trees are on different filesystems or mounts (logged once). Returns the
     library path, or None when a different file already sits there and
@@ -166,7 +164,7 @@ def link_into_library(src_path: str, folder: str, number: float, root: str | Non
     global _copy_warned, COPIED
     d = library_dir(folder, root)
     os.makedirs(d, exist_ok=True)
-    dst = os.path.join(d, chapter_filename(number))
+    dst = os.path.join(d, chapter_filename(number, label))
     if os.path.exists(dst):
         if os.path.samefile(src_path, dst):
             return dst

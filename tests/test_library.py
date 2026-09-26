@@ -4,12 +4,13 @@ import unittest
 
 from mangarr.library import (
     chapter_filename,
-    fmt_number,
+    chapter_label,
     link_into_library,
     parse_number,
     parse_season,
     safe_title,
     scan_series_dir,
+    suwayomi_name_map,
 )
 from mangarr.resolver import ranges
 
@@ -43,13 +44,28 @@ class ParseTest(unittest.TestCase):
                 self.assertEqual(parse_number(name), want)
 
     def test_season_based(self):
-        self.assertEqual(parse_number("Official_S2 - Episode 5.0.cbz"), 200005.0)
+        # a season episode has no global number in its name: import matches it via Suwayomi
+        self.assertIsNone(parse_number("Official_S2 - Episode 5.0.cbz"))
         self.assertEqual(parse_season("Official_S2 - Episode 5.0.cbz"), (2, 5.0))
-        self.assertEqual(chapter_filename(200005.0), "S02 - Episode 005.0.cbz")
-        self.assertEqual(parse_number(chapter_filename(200005.0)), 200005.0)
-        self.assertEqual(fmt_number(200005.0), "S2E5")
-        self.assertEqual(ranges([100000.0, 100001.0, 100002.0, 200000.0]), "S1E0-S1E2, S2E0")
-        self.assertLess(chapter_filename(100012.0), chapter_filename(200001.0))
+        # ... and once in the library the number leads and the label follows
+        name = chapter_filename(131.0, "S2 - Episode 5")
+        self.assertEqual(name, "Chapter 131.0 - S2 - Episode 5.cbz")
+        self.assertEqual(parse_number(name), 131.0)
+
+    def test_labels(self):
+        self.assertIsNone(chapter_label(12.0, "Chapter 12"))
+        self.assertIsNone(chapter_label(12.0, "Ch.12"))
+        self.assertIsNone(chapter_label(12.5, "Chapter 12.5"))
+        self.assertEqual(chapter_label(12.0, "Chapter 12: The Storm"), "Chapter 12_ The Storm")
+        self.assertEqual(chapter_filename(1.0, "S1 - Episode 0"), "Chapter 001.0 - S1 - Episode 0.cbz")
+        self.assertEqual(ranges([1.0, 2.0, 3.0, 5.5]), "1-3, 5.5")
+
+    def test_suwayomi_name_map(self):
+        from mangarr.suwayomi import Chapter
+        m = suwayomi_name_map([Chapter(1, 131.0, "S2 - Episode 5", "Official", False),
+                               Chapter(2, 1.0, "Chapter 1", None, False)])
+        self.assertEqual(m["official_s2 - episode 5"], 131.0)
+        self.assertEqual(m["chapter 1"], 1.0)
 
     def test_no_number(self):
         self.assertIsNone(parse_number("Official_Prologue.cbz"))
