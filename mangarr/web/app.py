@@ -137,9 +137,34 @@ def _job_add(series: model.Series, download: bool):
     return run
 
 
+def plan_pass(rows) -> tuple[list, int]:
+    """Order a refresh pass: series with missing chapters first (so downloads
+    start at once), then the rest; finished series with nothing missing are
+    skipped until recheck_finished_days have passed. Returns (rows, skipped)."""
+    days = float(settings.get("recheck_finished_days") or 0)
+    cutoff = time.time() - days * 86400
+    keep, skipped = [], 0
+    for r in rows:
+        if not r["monitored"]:
+            continue
+        if days and r["status"] == "FINISHED" and not r["wanted"] and r["last_resolved"]:
+            try:
+                last = time.mktime(time.strptime(r["last_resolved"], "%Y-%m-%d %H:%M:%S"))
+            except ValueError:
+                last = 0
+            if last > cutoff:
+                skipped += 1
+                continue
+        keep.append(r)
+    keep.sort(key=lambda r: (0 if r["wanted"] else 1, r["title"].lower()))
+    return keep, skipped
+
+
 def _job_refresh_all(job: jobs.Job):
     with db.connect() as con:
-        rows = [r for r in db.series_rows(con) if r["monitored"]]
+        rows, skipped = plan_pass(db.series_rows(con))
+    log.info("refresh pass: %d series (%d with missing chapters first), %d finished series skipped until due",
+             len(rows), sum(1 for r in rows if r["wanted"]), skipped)
     done = downloaded = imported = errors = 0
     for i, r in enumerate(rows, 1):
         if job.cancel:
@@ -158,7 +183,8 @@ def _job_refresh_all(job: jobs.Job):
             log.error("refresh-all: %s: %s: %s", r["title"], type(e).__name__, e)
             _record_error(r["id"], e)
         done += 1
-    msg = f"{done} series, {downloaded} downloaded, {imported} imported, {errors} errors"
+    msg = f"{done} series, {downloaded} downloaded, {imported} imported, {errors} errors" + \
+        (f", {skipped} complete finished series skipped" if skipped else "")
     if imported:
         notify.send("mang-arr: new chapters", msg, "new")
     return msg

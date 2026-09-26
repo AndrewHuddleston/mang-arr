@@ -28,6 +28,7 @@ log = logging.getLogger(__name__)
 
 DEFAULTS: dict[str, object] = {
     "refresh_hours": config.REFRESH_HOURS,
+    "recheck_finished_days": 7.0,   # a finished series with nothing missing is re-checked this often
     "min_pages": config.MIN_PAGES,
     "unusable_sources": sorted(config.UNUSABLE_SOURCES),
     "throttled_sources": sorted(config.THROTTLED_SOURCES),
