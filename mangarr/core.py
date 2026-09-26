@@ -47,7 +47,7 @@ def add_series(con, client: Client, series: Series, download: bool = True, do_im
     """Track a series: resolve it, remember the plan, fetch what is missing,
     link the results into the library. With series_id (a refresh) the row
     must still exist afterwards, or the work is abandoned."""
-    plan = resolve(client, series)
+    plan = resolve(client, series, reliability=db.reliability(con))
     if series_id is not None and not db.get_series(con, series_id):
         raise Gone(f"{series.title} was deleted during the refresh")
     series_id = db.upsert_series(con, series)
@@ -168,6 +168,8 @@ def download_wanted(con, client: Client, series_id: int, plan: Plan,
     for n, r in results.items():
         m = plan.assignment.get(n)
         metrics.record_download(m.source.name if m else "?", r)
+        if m:
+            db.record_source_result(con, m.source.name, "ok" if r == "ok" else "failed")
         if r != "ok":
             db.set_status(con, series_id, n, "failed", reasons.get(n, "download failed"))
     ok = sum(1 for r in results.values() if r == "ok")
@@ -228,6 +230,7 @@ def download_chapter(con, client: Client, series_id: int, number: float, manga_i
             continue
         ok, failed, why = downloader.download_one(client, s["manga_id"], ch, title, s["source_name"])
         metrics.record_download(s["source_name"], "ok" if ok else "failed")
+        db.record_source_result(con, s["source_name"], "ok" if ok else "failed")
         if ok:
             db.set_status(con, series_id, number, "wanted", None)     # import_series flips it to have
             con.execute("UPDATE chapter SET manga_id=?, source_name=?, name=COALESCE(?, name),"
@@ -333,6 +336,14 @@ def import_series(con, series_id: int, client: Client | None = None) -> int:
             if prev and prev["status"] == "junk":
                 continue
             if prev and prev["library_path"] and os.path.exists(prev["library_path"]):
+                continue
+            ok, detail = library.verify_archive(path)
+            if not ok:
+                moved = library.quarantine(path)
+                db.set_status(con, series_id, n, "failed", f"{source_name}: bad file ({detail}); set aside as "
+                              f"{os.path.basename(moved)}, will be fetched again")
+                db.record_source_result(con, source_name, "corrupt")
+                log.warning("%s: ch %g from %s is unusable (%s); quarantined %s", title, n, source_name, detail, moved)
                 continue
             label = prev["name"] if prev and "name" in prev.keys() else None
             expected = os.path.join(library.library_dir(folder), library.chapter_filename(n, label))

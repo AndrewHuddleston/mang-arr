@@ -128,6 +128,18 @@ MIGRATIONS = [
     ALTER TABLE chapter ADD COLUMN tries INTEGER NOT NULL DEFAULT 0;
     ALTER TABLE chapter ADD COLUMN next_try TEXT;
     """,
+    # 10: per-source download outcomes, so the ranking learns which sources deliver
+    """
+    CREATE TABLE source_stats (
+      source_name     TEXT PRIMARY KEY,
+      ok              INTEGER NOT NULL DEFAULT 0,
+      failed          INTEGER NOT NULL DEFAULT 0,
+      corrupt         INTEGER NOT NULL DEFAULT 0,
+      last_ok         TEXT,
+      last_failed     TEXT,
+      updated_at      TEXT NOT NULL
+    );
+    """,
 ]
 
 
@@ -404,3 +416,30 @@ def wanted(con, series_id: int) -> list[float]:
 def sources(con, series_id: int):
     return con.execute("SELECT * FROM series_source WHERE series_id=? ORDER BY is_primary DESC, source_name",
                        (series_id,)).fetchall()
+
+
+# -- source reliability --------------------------------------------------------
+
+def record_source_result(con, source_name: str, result: str) -> None:
+    """result: ok | failed | corrupt."""
+    col = {"ok": "ok", "failed": "failed", "corrupt": "corrupt"}[result]
+    stamp = "last_ok" if result == "ok" else "last_failed"
+    con.execute(
+        f"INSERT INTO source_stats (source_name, {col}, {stamp}, updated_at) VALUES (?, 1, ?, ?)"
+        f" ON CONFLICT(source_name) DO UPDATE SET {col}={col}+1, {stamp}=excluded.{stamp},"
+        f" updated_at=excluded.updated_at",
+        (source_name, now(), now()))
+
+
+def source_stats(con) -> dict[str, dict]:
+    return {r["source_name"]: dict(r) for r in con.execute("SELECT * FROM source_stats")}
+
+
+def reliability(con) -> dict[str, float]:
+    """{source name: 0..1} - the share of attempted chapters that arrived
+    intact, smoothed so a source with two outcomes is not judged yet."""
+    out = {}
+    for name, r in source_stats(con).items():
+        bad = r["failed"] + r["corrupt"]
+        out[name] = (r["ok"] + 2) / (r["ok"] + bad + 4)
+    return out

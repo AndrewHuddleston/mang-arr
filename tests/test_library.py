@@ -121,5 +121,28 @@ class LinkTest(unittest.TestCase):
         self.assertEqual(parse_number("Vol.3 Ch.21.cbz"), 21.0)
 
 
+
+class VerifyTest(unittest.TestCase):
+    def test_verify_and_quarantine(self):
+        import zipfile
+
+        from mangarr.library import quarantine, verify_archive
+        with tempfile.TemporaryDirectory() as tmp:
+            good = os.path.join(tmp, "good.cbz")
+            with zipfile.ZipFile(good, "w") as z:
+                z.writestr("001.jpg", b"\xff\xd8" + b"x" * 2000)
+            self.assertEqual(verify_archive(good), (True, "1 pages"))
+            empty = os.path.join(tmp, "empty.cbz")
+            with open(empty, "wb") as f:
+                f.write(b"")
+            self.assertFalse(verify_archive(empty)[0])
+            noimg = os.path.join(tmp, "noimg.cbz")
+            with zipfile.ZipFile(noimg, "w") as z:
+                z.writestr("readme.txt", b"x" * 2000)
+            self.assertEqual(verify_archive(noimg), (False, "no images inside"))
+            moved = quarantine(noimg)
+            self.assertTrue(moved.endswith(".corrupt") and os.path.exists(moved) and not os.path.exists(noimg))
+
+
 if __name__ == "__main__":
     unittest.main()

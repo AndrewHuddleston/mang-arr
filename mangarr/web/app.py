@@ -828,8 +828,10 @@ def settings_page(request: Request, komga_test: str = "", komga_ok: str = ""):
     except SuwayomiError as e:
         sources = []
         log.error("settings page: suwayomi unreachable: %s", e)
+    with db.connect() as con:
+        stats = db.source_stats(con)
     return page(request, "settings.html", v=settings.masked(settings.all_values()), sources=sources,
-                komga_test=komga_test, komga_ok=(komga_ok == "1"))
+                komga_test=komga_test, komga_ok=(komga_ok == "1"), stats=stats)
 
 
 @app.post("/settings")

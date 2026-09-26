@@ -82,5 +82,22 @@ class RetryScheduleTest(unittest.TestCase):
             self.assertEqual(next(c for c in db.chapters(con, sid) if c["number"] == 1.0)["tries"], 0)
 
 
+
+class ReliabilityTest(unittest.TestCase):
+    def test_reliability_smoothing(self):
+        with tempfile.TemporaryDirectory() as tmp, db.connect(os.path.join(tmp, "s.db")) as con:
+            self.assertEqual(db.reliability(con), {})
+            for _ in range(8):
+                db.record_source_result(con, "Good", "ok")
+            db.record_source_result(con, "Good", "failed")
+            for _ in range(5):
+                db.record_source_result(con, "Bad", "failed")
+            db.record_source_result(con, "Bad", "corrupt")
+            r = db.reliability(con)
+            self.assertGreater(r["Good"], 0.75)
+            self.assertLess(r["Bad"], 0.25)
+            self.assertEqual(db.source_stats(con)["Bad"]["corrupt"], 1)
+
+
 if __name__ == "__main__":
     unittest.main()

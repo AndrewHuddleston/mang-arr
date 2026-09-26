@@ -209,3 +209,36 @@ def scan_library_dir(folder: str, root: str | None = None) -> dict[float, str]:
         return {}
     found, _ = scan_series_dir(d)
     return found
+
+
+_IMAGE_EXT = (".jpg", ".jpeg", ".png", ".webp", ".gif", ".avif", ".jxl")
+
+
+def verify_archive(path: str) -> tuple[bool, str]:
+    """Is this a readable comic archive with at least one image? Returns
+    (ok, detail). A truncated or empty file from a flaky source must not
+    reach the library."""
+    import zipfile
+    try:
+        if os.path.getsize(path) < 1024:
+            return False, "file is empty"
+        if not zipfile.is_zipfile(path):
+            return False, "not a zip archive"
+        with zipfile.ZipFile(path) as z:
+            bad = z.testzip()
+            if bad:
+                return False, f"corrupt entry {bad}"
+            images = [n for n in z.namelist() if n.lower().endswith(_IMAGE_EXT)]
+        if not images:
+            return False, "no images inside"
+        return True, f"{len(images)} pages"
+    except (OSError, zipfile.BadZipFile) as e:
+        return False, f"{type(e).__name__}: {e}"
+
+
+def quarantine(path: str) -> str:
+    """Move a bad staged file aside (same folder, .corrupt suffix) so Suwayomi
+    sees the chapter as not downloaded and it can be fetched again."""
+    dst = path + ".corrupt"
+    os.replace(path, dst)
+    return dst

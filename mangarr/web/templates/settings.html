@@ -24,14 +24,15 @@
   <legend class="legend">Sources</legend>
   <div class="help-text">From Suwayomi. <b>Disabled</b> sources are still searched (so a series that exists only there is reported) but never downloaded from. <b>Throttled</b> sources get one chapter at a time and lose close calls.</div>
   <div class="table-container"><table class="table">
-  <thead><tr><th>Source</th><th>Language</th><th class="col-check">Disabled</th><th class="col-check">Throttled</th></tr></thead>
+  <thead><tr><th>Source</th><th>Language</th><th>Reliability</th><th class="col-check">Disabled</th><th class="col-check">Throttled</th></tr></thead>
   <tbody>
   {% for s in sources %}
   <tr><td>{{ s.name }}</td><td class="muted">{{ s.lang }}</td>
+  {% set st = stats.get(s.name) %}<td class="muted small">{% if st %}{% set tot = st.ok + st.failed + st.corrupt %}{{ ((st.ok / tot) * 100)|round|int if tot else 0 }}% of {{ tot }} chapter{{ 's' if tot != 1 }}{% if st.corrupt %} ({{ st.corrupt }} corrupt){% endif %}{% else %}no downloads yet{% endif %}</td>
   <td class="col-check">{{ m.check('unusable_sources', (s.name|lower in v.unusable_sources), s.name|lower, none, 'danger', 'aria-label="Disable ' ~ s.name ~ '"') }}</td>
   <td class="col-check">{{ m.check('throttled_sources', (s.name|lower in v.throttled_sources), s.name|lower, none, 'warning', 'aria-label="Throttle ' ~ s.name ~ '"') }}</td></tr>
   {% endfor %}
-  {% if not sources %}<tr><td colspan="4" class="text-danger">Suwayomi unreachable - source list unavailable</td></tr>{% endif %}
+  {% if not sources %}<tr><td colspan="5" class="text-danger">Suwayomi unreachable - source list unavailable</td></tr>{% endif %}
   </tbody></table></div>
 </fieldset>
 

@@ -31,6 +31,7 @@ class SourceMatch:
     chapters: list[Chapter] = field(default_factory=list)
     query: str = ""               # which title found it
     note: str = ""                # why it is not used, if it is not
+    reliability: float = 0.5      # share of past downloads from this source that arrived intact (learned)
 
     @property
     def numbers(self) -> set[float]:
@@ -45,8 +46,10 @@ class SourceMatch:
         return not self.note
 
     def rank(self) -> tuple:
-        """Lower is better. Health first, then trust, then coverage."""
-        return (self.source.throttled, self.author_ok, self.match, -len(self.chapters))
+        """Lower is better: health, then trust in the match, then how reliably
+        the source has delivered before (in steps of 10 %, so a few outcomes do
+        not reorder sources), then coverage."""
+        return (self.source.throttled, self.author_ok, self.match, -round(self.reliability, 1), -len(self.chapters))
 
 
 @dataclass
@@ -95,8 +98,10 @@ class Plan:
         return [n for n in range(1, top + 1) if n not in listed]
 
 
-def resolve(client: Client, series: Series, sources: list[Source] | None = None) -> Plan:
+def resolve(client: Client, series: Series, sources: list[Source] | None = None,
+            reliability: dict[str, float] | None = None) -> Plan:
     sources = sources if sources is not None else client.sources()
+    reliability = reliability or {}
     log.info("resolving %s [%s] across %d sources, titles: %s", series.title, series.ref,
              len(sources), " | ".join(series.search_titles[:5]))
     matches: list[SourceMatch] = []
@@ -113,6 +118,7 @@ def resolve(client: Client, series: Series, sources: list[Source] | None = None)
         if found is None:
             log.info("%-26s no match", src.name)
             continue
+        found.reliability = reliability.get(src.name, 0.5)
         matches.append(found)
 
     _trust(series, matches)
