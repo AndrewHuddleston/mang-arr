@@ -243,7 +243,8 @@ def primary(plan: Plan) -> SourceMatch | None:
 
 
 def ranges(nums) -> str:
-    """[1,2,3,5,6.5] -> '1-3, 5, 6.5'"""
+    """[1,2,3,5,6.5] -> '1-3, 5, 6.5'; season numbers show as S1E0-S1E12."""
+    from .library import fmt_number
     nums = sorted(nums)
     if not nums:
         return "-"
@@ -252,7 +253,7 @@ def ranges(nums) -> str:
         if n == prev + 1 and n == int(n):
             prev = n
             continue
-        out.append(f"{start:g}" if start == prev else f"{start:g}-{prev:g}")
+        out.append(fmt_number(start) if start == prev else f"{fmt_number(start)}-{fmt_number(prev)}")
         start = prev = n
-    out.append(f"{start:g}" if start == prev else f"{start:g}-{prev:g}")
+    out.append(fmt_number(start) if start == prev else f"{fmt_number(start)}-{fmt_number(prev)}")
     return ", ".join(out)

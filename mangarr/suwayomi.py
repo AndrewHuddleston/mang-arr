@@ -178,14 +178,17 @@ def dedupe(raw: list[dict]) -> list[Chapter]:
     for c in raw:
         cov.setdefault(c.get("scanlator") or "", set()).add(c["chapterNumber"])
     rank = {s: i for i, s in enumerate(sorted(cov, key=lambda s: (-len(cov[s]), s)))}
+    from .library import parse_season, season_number
     best: dict[float, dict] = {}
     for c in raw:
         n = float(c["chapterNumber"])
+        se = parse_season(c.get("name") or "")
+        if se:                                      # "S2 - Episode 5": sources number these
+            n = season_number(*se)                  # inconsistently, the name is the truth
         if n < 0:                                   # Suwayomi uses -1 for "unknown"
             continue
         s = c.get("scanlator") or ""
         if n not in best or rank[s] < rank[best[n].get("scanlator") or ""]:
             best[n] = c
-    return sorted((Chapter(c["id"], float(c["chapterNumber"]), c.get("name"),
-                           c.get("scanlator"), bool(c.get("isDownloaded")))
-                   for c in best.values()), key=lambda c: c.number)
+    return sorted((Chapter(c["id"], n, c.get("name"), c.get("scanlator"), bool(c.get("isDownloaded")))
+                   for n, c in best.items()), key=lambda c: c.number)

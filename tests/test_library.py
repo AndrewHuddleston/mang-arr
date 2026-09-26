@@ -4,12 +4,14 @@ import unittest
 
 from mangarr.library import (
     chapter_filename,
+    fmt_number,
     link_into_library,
     parse_number,
     parse_season,
     safe_title,
     scan_series_dir,
 )
+from mangarr.resolver import ranges
 
 
 class ParseTest(unittest.TestCase):
@@ -40,9 +42,14 @@ class ParseTest(unittest.TestCase):
             with self.subTest(name=name):
                 self.assertEqual(parse_number(name), want)
 
-    def test_season_based_is_separate(self):
-        self.assertIsNone(parse_number("Official_S2 - Episode 5.0.cbz"))
+    def test_season_based(self):
+        self.assertEqual(parse_number("Official_S2 - Episode 5.0.cbz"), 200005.0)
         self.assertEqual(parse_season("Official_S2 - Episode 5.0.cbz"), (2, 5.0))
+        self.assertEqual(chapter_filename(200005.0), "S02 - Episode 005.0.cbz")
+        self.assertEqual(parse_number(chapter_filename(200005.0)), 200005.0)
+        self.assertEqual(fmt_number(200005.0), "S2E5")
+        self.assertEqual(ranges([100000.0, 100001.0, 100002.0, 200000.0]), "S1E0-S1E2, S2E0")
+        self.assertLess(chapter_filename(100012.0), chapter_filename(200001.0))
 
     def test_no_number(self):
         self.assertIsNone(parse_number("Official_Prologue.cbz"))

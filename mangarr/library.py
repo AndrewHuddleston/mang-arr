@@ -30,12 +30,40 @@ _VOLUME_ONLY = re.compile(r"(?<![A-Za-z])vol(?:ume)?\.?\s*\d+", re.I)
 _LASTNUM = re.compile(r"(\d+(?:\.\d+)?)(?!.*\d)")
 
 
+# Season-numbered webtoons ("S2 - Episode 5") get one number per episode that
+# sorts by season then episode and can never collide with a real chapter
+# number: SEASON_BASE * season + episode.
+SEASON_BASE = 100000
+
+
+def season_number(season: int, episode: float) -> float:
+    return SEASON_BASE * season + episode
+
+
+def split_season(number: float) -> tuple[int, float] | None:
+    """(season, episode) for a season number, else None."""
+    if number < SEASON_BASE:
+        return None
+    season = int(number // SEASON_BASE)
+    return season, round(number - SEASON_BASE * season, 2)
+
+
+def fmt_number(number: float) -> str:
+    """'12', '12.5', or 'S2E5' for display."""
+    se = split_season(number)
+    if se:
+        return f"S{se[0]}E{se[1]:g}"
+    return f"{number:g}"
+
+
 def parse_number(filename: str) -> float | None:
     """Chapter number in a file name, or None when there is no chapter number
-    (season-numbered files and volume-only files are not chapters)."""
+    (volume-only files are not chapters). Season-numbered files yield a
+    season number (see season_number)."""
     stem = os.path.splitext(os.path.basename(filename))[0]
-    if _SEASON.search(stem):
-        return None
+    ms = _SEASON.search(stem)
+    if ms:
+        return season_number(int(ms.group(1)), float(ms.group(2)))
     m = _KEYWORD.search(stem)
     if m:
         return float(m.group(1))
@@ -111,7 +139,11 @@ def unique_folder(title: str, taken: set[str], suffix: str) -> str:
 def chapter_filename(number: float) -> str:
     """'Chapter 012.0.cbz' - fixed width so Komga sorts 12 before 12.5 and
     before 100, and .5 chapters sort after their integer. Two decimals only
-    when the number needs them (5.25)."""
+    when the number needs them (5.25). Season numbers become
+    'S02 - Episode 005.0.cbz'."""
+    se = split_season(number)
+    if se:
+        return f"S{se[0]:02d} - Episode {se[1]:05.1f}.cbz"
     if round(number, 1) != round(number, 2):
         return f"Chapter {number:06.2f}.cbz"
     return f"Chapter {number:05.1f}.cbz"
