@@ -34,6 +34,7 @@ tr.dim{opacity:.55}
 form.col{display:flex;flex-direction:column;gap:8px;max-width:520px;margin-top:8px}
 form.settings label{display:flex;gap:10px;align-items:center;margin:6px 0;flex-wrap:wrap}form.settings label input{min-width:320px}
 form.settings table input[type=checkbox]{transform:scale(1.2)}
+select{background:var(--panel);border:1px solid var(--line);color:var(--fg);padding:5px 8px;border-radius:6px;max-width:420px}
 details summary{cursor:pointer;color:var(--muted);margin:14px 0 6px}
 pre.log{background:#0d0f12;border:1px solid var(--line);border-radius:8px;padding:10px;font-size:11.5px;max-height:480px;overflow:auto;white-space:pre-wrap}
 tr.job-failed td{color:var(--bad)}tr.job-running td{color:var(--accent)}

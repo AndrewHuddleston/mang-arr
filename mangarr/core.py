@@ -180,6 +180,7 @@ class AdoptItem:
     series: Series | None = None
     candidates: list[Series] = field(default_factory=list)
     manga_id: int | None = None
+    tracked: bool = False
 
 
 def suwayomi_downloaded_entries(client: Client) -> dict[tuple[str, str], int]:

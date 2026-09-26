@@ -4,7 +4,7 @@ import logging
 import signal
 import time
 
-from . import config, core, db, notify
+from . import config, core, db, notify, settings
 from .suwayomi import Client, SuwayomiError
 
 log = logging.getLogger(__name__)
@@ -68,6 +68,10 @@ def run(interval_hours: float = config.REFRESH_HOURS, once: bool = False) -> Non
             log.exception("cycle crashed")
         if once:
             break
+        try:
+            interval_hours = float(settings.get("refresh_hours")) or interval_hours
+        except Exception as e:
+            log.debug("could not read refresh_hours: %s", e)
         sleep_for = max(60.0, interval_hours * 3600 - (time.monotonic() - started))
         log.info("next cycle in %.0f min", sleep_for / 60)
         for _ in range(int(sleep_for)):

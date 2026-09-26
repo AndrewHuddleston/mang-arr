@@ -227,6 +227,86 @@ def add_submit(ref: str = Form(...), download: str = Form("1"), title: str = For
     return RedirectResponse(f"/activity?m=add+queued+as+job+{job.id}", 303)
 
 
+_adopt_scan: dict = {"items": None, "job": None}
+
+
+def _job_adopt_scan(job: jobs.Job):
+    items = core.plan_adopt(client)
+    with db.connect() as con:
+        tracked = {r["ref"] for r in con.execute("SELECT ref FROM series")}
+    for it in items:
+        it.tracked = bool(it.series and it.series.ref in tracked)
+    _adopt_scan["items"] = items
+    n_ok = sum(1 for i in items if i.series and not i.tracked)
+    return f"{len(items)} folders, {n_ok} identified, {sum(1 for i in items if not i.series)} need a choice"
+
+
+@app.get("/import")
+def import_page(request: Request):
+    items = _adopt_scan["items"]
+    job = _adopt_scan["job"]
+    scanning = bool(job and job.status in ("queued", "running"))
+    ctx = dict(items=items, scanning=scanning, staging=config.STAGING_ROOT)
+    if items is not None:
+        ctx.update(n_ok=sum(1 for i in items if i.series and not i.tracked),
+                   n_review=sum(1 for i in items if not i.series),
+                   n_tracked=sum(1 for i in items if i.tracked))
+    return page(request, "import.html", **ctx)
+
+
+@app.post("/import/scan")
+def import_scan():
+    job = _adopt_scan["job"]
+    if not (job and job.status in ("queued", "running")):
+        _adopt_scan["job"] = runner.submit("adopt-scan", "staging folders", _job_adopt_scan)
+    return RedirectResponse("/import", 303)
+
+
+@app.post("/import/apply")
+async def import_apply(request: Request):
+    items = _adopt_scan["items"]
+    if items is None:
+        return RedirectResponse("/import?m=scan+first", 303)
+    form = await request.form()
+    chosen = []
+    for i, it in enumerate(items):
+        if it.tracked:
+            continue
+        if it.series:
+            if form.get(f"adopt_{i}") == "1":
+                chosen.append(it)
+            continue
+        choice = form.get(f"choice_{i}", "skip")
+        if choice == "skip":
+            continue
+        if choice == "manual":
+            it.series = model.manual(it.folder_name)
+        else:
+            try:
+                it.series = metadata.by_ref(choice)
+            except Exception as e:
+                log.error("import: could not load %s for %s: %s", choice, it.folder_name, e)
+                continue
+        if it.series:
+            chosen.append(it)
+    if not chosen:
+        return RedirectResponse("/import?m=nothing+selected", 303)
+
+    def run(job: jobs.Job):
+        with db.connect() as con:
+            n_series, n_ch = core.apply_adopt(con, chosen)
+            ids = [r["id"] for r in con.execute("SELECT id FROM series ORDER BY id DESC LIMIT ?", (n_series,))]
+        linked = 0
+        for sid in ids:
+            with db.connect() as con:
+                linked += core.import_series(con, sid)
+        _adopt_scan["items"] = None
+        return f"adopted {n_series} series ({n_ch} chapters), linked {linked} files"
+
+    runner.submit("adopt", f"{len(chosen)} folder(s)", run)
+    return RedirectResponse("/activity?m=adopt+queued", 303)
+
+
 @app.get("/wanted")
 def wanted_page(request: Request):
     with db.connect() as con:

@@ -1,0 +1,45 @@
+{% extends "base.html" %}
+{% block title %}Import - mang-arr{% endblock %}
+{% block body %}
+<div class="bar"><h1>Import existing library</h1>
+  <form method="post" action="/import/scan"><button {% if scanning %}disabled{% endif %}>{{ 'Scanning…' if scanning else 'Scan staging folders' }}</button></form>
+</div>
+<p class="muted">Registers what Suwayomi has already downloaded under <code>{{ staging }}</code>. Each folder is looked up on AniList/MangaDex; exact matches are adopted as-is, the rest need a choice. Files are never moved: the library gets hard links.</p>
+
+{% if items is none %}
+  <p class="muted">No scan yet.{% if scanning %} One is running - this page refreshes.{% endif %}</p>
+{% else %}
+<form method="post" action="/import/apply">
+<p class="muted">{{ items|length }} folders: {{ n_ok }} identified, {{ n_review }} need a choice, {{ n_tracked }} already tracked.</p>
+<table class="list small">
+<thead><tr><th>Source</th><th>Folder</th><th class="num">Chapters</th><th>Identified as</th><th>Action</th></tr></thead>
+<tbody>
+{% for it in items %}
+<tr>
+  <td>{{ it.source }}</td>
+  <td>{{ it.folder_name }}{% if it.unparsed %} <span class="muted">(+{{ it.unparsed|length }} unnumbered{% if it.seasons %}, season-numbered{% endif %})</span>{% endif %}</td>
+  <td class="num">{{ it.numbers|length }}</td>
+  <td>
+    {% if it.series %}<b>{{ it.series.title }}</b> <span class="muted">{{ it.series.ref }}</span>
+    {% else %}<span class="err">no exact match</span>{% endif %}
+  </td>
+  <td>
+    {% if it.tracked %}<span class="tag">tracked</span>
+    {% elif it.series %}
+      <label><input type="checkbox" name="adopt_{{ loop.index0 }}" value="1" checked> adopt</label>
+    {% else %}
+      <select name="choice_{{ loop.index0 }}">
+        <option value="skip">skip</option>
+        {% for c in it.candidates[:6] %}<option value="{{ c.ref }}">{{ c.title }} ({{ c.format or '?' }} {{ c.country or '?' }}, {{ c.chapters or '?' }} ch)</option>{% endfor %}
+        <option value="manual">as-is: "{{ it.folder_name }}" (no metadata)</option>
+      </select>
+    {% endif %}
+  </td>
+</tr>
+{% endfor %}
+</tbody></table>
+<div class="actions"><button>Adopt selected</button> <span class="muted small">then chapters are linked into the library and a refresh finds what is missing</span></div>
+</form>
+{% endif %}
+{% endblock %}
+{% block script %}{% if scanning %}<script>setTimeout(()=>location.reload(), 8000);</script>{% endif %}{% endblock %}
