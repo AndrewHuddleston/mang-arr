@@ -13,12 +13,20 @@ _PAREN_SUFFIX = re.compile(r"\s*[\(\[][^\)\]]*[\)\]]\s*$")
 
 
 def norm(text: str | None) -> str:
-    """Lower-case, fold accents, straighten quotes, drop punctuation."""
-    t = (text or "").translate(_QUOTES)
+    """Lower-case, fold accents, straighten quotes, drop punctuation.
+    '_' counts as punctuation too: Suwayomi writes folder names with ':' and
+    '?' replaced by '_'. '&' reads as 'and'."""
+    t = (text or "").translate(_QUOTES).replace("&", " and ")
     t = unicodedata.normalize("NFKD", t)
     t = "".join(c for c in t if not unicodedata.combining(c)).lower()
-    t = re.sub(r"[^\w\s]", " ", t)
+    t = re.sub(r"[^\w\s]|_", " ", t)
     return re.sub(r"\s+", " ", t).strip()
+
+
+def disambiguator(title: str) -> str | None:
+    """The trailing '(...)' of a title, if any: 'Wind Breaker (NII Satoru)' -> 'NII Satoru'."""
+    m = re.search(r"[\(\[]([^\)\]]+)[\)\]]\s*$", title or "")
+    return m.group(1).strip() if m else None
 
 
 def strip_disambiguator(title: str) -> str:
