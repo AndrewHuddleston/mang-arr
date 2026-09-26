@@ -194,6 +194,27 @@ def _job_refresh_all(job: jobs.Job):
     return msg
 
 
+def _job_refresh_metadata(job: jobs.Job):
+    """Metadata only, every series: fast, no source searching."""
+    with db.connect() as con:
+        rows = db.series_rows(con)
+    ok = errors = 0
+    for i, r in enumerate(rows, 1):
+        if job.cancel:
+            break
+        job.progress = f"{i}/{len(rows)}: {r['title']}"
+        try:
+            with db.connect() as con:
+                core.refresh_metadata(con, r["id"])
+            ok += 1
+        except core.Gone:
+            continue
+        except Exception as e:
+            errors += 1
+            log.warning("metadata refresh: %s: %s: %s", r["title"], type(e).__name__, e)
+    return f"{ok} series refreshed, {errors} failed"
+
+
 def _job_search_wanted(job: jobs.Job):
     """Download-only pass over every series with wanted chapters."""
     with db.connect() as con:
@@ -652,6 +673,8 @@ def system_page(request: Request):
          "next": scheduler.next_at if scheduler else None, "action": "/activity/refresh-all"},
         {"name": "Update check", "every": "24 h", "action": "/system/update-check",
          "next": (updates.status()["checkedAt"] or time.time()) + updates.INTERVAL},
+        {"name": "Refresh metadata (AniList/MangaDex, no source search)", "every": "with each refresh",
+         "action": "/system/metadata-refresh", "next": None},
         {"name": "Database backup", "every": f"{backup.INTERVAL_HOURS:g} h (keep {backup.KEEP})",
          "action": "/system/backups/create",
          "next": (backups[0]["mtime"] + backup.INTERVAL_HOURS * 3600) if backups else None},
@@ -666,6 +689,12 @@ def system_page(request: Request):
 @app.get("/system/logs")
 def system_logs_page(request: Request, lines: int = 500):
     return page(request, "logs.html", log_lines=_tail_log(max(1, min(lines, 5000))), log_file=config.LOG_FILE)
+
+
+@app.post("/system/metadata-refresh")
+def system_metadata_refresh():
+    runner.submit("metadata", "every series", _job_refresh_metadata)
+    return _flash("/activity", "metadata refresh queued")
 
 
 @app.post("/system/update-check")
@@ -918,7 +947,9 @@ def api_command(body: dict):
         return scheduler.trigger().as_dict()
     if name == "SearchWanted":
         return runner.submit("search-wanted", "every series with wanted chapters", _job_search_wanted).as_dict()
-    raise HTTPException(400, f"unknown command {name!r}; known: RefreshAll, SearchWanted")
+    if name == "RefreshMetadata":
+        return runner.submit("metadata", "every series", _job_refresh_metadata).as_dict()
+    raise HTTPException(400, f"unknown command {name!r}; known: RefreshAll, SearchWanted, RefreshMetadata")
 
 
 @app.get("/api/v1/log")

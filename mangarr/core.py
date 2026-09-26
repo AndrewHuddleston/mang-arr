@@ -93,6 +93,25 @@ def refresh_series(con, client: Client, series_id: int, download: bool = True,
                       progress=progress)
 
 
+def refresh_metadata(con, series_id: int) -> str:
+    """Re-fetch the series record (titles, status, chapter count, description,
+    genres, year ...) from its provider without touching the sources."""
+    row = db.get_series(con, series_id)
+    if not row:
+        raise Gone(f"series #{series_id} does not exist")
+    series = db.series_to_model(row)
+    if series.manual:
+        return "manual series: no metadata provider"
+    fresh = metadata.by_ref(row["ref"])
+    if not fresh:
+        raise metadata.LookupError_(f"{row['ref']} not found any more")
+    db.upsert_series(con, fresh)
+    con.commit()
+    log.info("%s: metadata refreshed (%s, %s ch, %d genre(s), %s)", fresh.title, fresh.status, fresh.chapters,
+             len(fresh.genres), fresh.year)
+    return f"{fresh.title}: {fresh.status or '?'}, {len(fresh.genres)} genre(s), year {fresh.year or '?'}"
+
+
 def _resolve_summary(plan: Plan) -> str:
     used = sorted({m.source.name for m in plan.assignment.values()})
     s = f"{len(plan.chapters)} chapters listed from {', '.join(used) or 'no source'}; {len(plan.wanted())} wanted"
