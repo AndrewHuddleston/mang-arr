@@ -2,6 +2,9 @@
 import re
 from dataclasses import dataclass, field
 
+REF_RE = re.compile(r"^(anilist:\d{1,9}|mangadex:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
+                    r"|manual:.{1,300})$")
+
 
 @dataclass
 class Series:
@@ -24,12 +27,12 @@ class Series:
 
     @property
     def ref(self) -> str:
-        """Stable identity string: anilist:123, mangadex:uuid, manual:title."""
+        """Stable identity string: anilist:123, mangadex:uuid, manual:Title."""
         if self.anilist_id is not None:
             return f"anilist:{self.anilist_id}"
         if self.mangadex_id:
             return f"mangadex:{self.mangadex_id}"
-        return f"manual:{self.title.lower()}"
+        return f"manual:{self.title}"
 
     @property
     def manual(self) -> bool:
@@ -67,3 +70,7 @@ def manual(title: str, *aliases: str) -> Series:
     """A series no database has (some Western webtoons). Its identity is the
     typed title; strict matching still applies to source hits."""
     return Series(english=title.strip(), synonyms=[a.strip() for a in aliases if a.strip()])
+
+
+def valid_ref(ref: str | None) -> bool:
+    return bool(ref) and bool(REF_RE.match(ref))

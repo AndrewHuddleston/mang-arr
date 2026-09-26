@@ -25,16 +25,17 @@ class FakeClient:
         self.queued: list[int] = []
         self.calls: list[str] = []
 
-    def clear(self): self.queued = []
-    def enqueue(self, ids): self.queued.extend(ids)
+    def enqueue(self, ids): self.queued = list(ids)
+    def dequeue(self, ids): self.queued = [c for c in self.queued if c not in ids]
     def start(self):
         self.calls.append(f"start {sorted(self.queued)}")
         for cid in self.queued:
             if cid not in self.broken:
                 self.have.add(cid)
+        self.queued = [c for c in self.queued if c in self.broken]     # finished ones leave the queue
     def stop(self): pass
     def queue(self):
-        return [{"state": "ERROR", "tries": 3} for cid in self.queued if cid in self.broken]
+        return [{"id": cid, "state": "ERROR", "tries": 3, "progress": 0.0} for cid in self.queued]
     def downloaded_ids(self, manga_id):
         return {cid for cid in self.have if cid // 1000 == manga_id}
 

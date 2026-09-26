@@ -15,9 +15,10 @@ LOG_LEVEL = os.environ.get("MANGARR_LOG_LEVEL", "INFO")
 
 # Where Suwayomi writes chapters: <STAGING_ROOT>/<Source>/<Series>/*.cbz.
 # Never renamed - Suwayomi treats it as its record of what is downloaded.
-STAGING_ROOT = os.environ.get("MANGARR_STAGING", "/mnt/movie_silo/books/manga")
-# The clean per-series tree Komga reads: <LIBRARY_ROOT>/<Series>/Chapter 012.0.cbz
-LIBRARY_ROOT = os.environ.get("MANGARR_LIBRARY", "/mnt/movie_silo/books/library")
+STAGING_ROOT = os.environ.get("MANGARR_STAGING", os.path.join(DATA_DIR, "staging"))
+# The clean per-series tree Komga reads: <LIBRARY_ROOT>/<Series>/Chapter 012.0.cbz.
+# Must be on the same filesystem AND mount as STAGING_ROOT for hard links.
+LIBRARY_ROOT = os.environ.get("MANGARR_LIBRARY", os.path.join(DATA_DIR, "library"))
 
 # The worker re-checks every monitored series this often, starting this many
 # minutes after launch.

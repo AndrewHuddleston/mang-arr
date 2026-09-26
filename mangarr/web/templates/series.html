@@ -14,11 +14,12 @@
       <form method="post" action="/series/{{ s.id }}/refresh"><input type="hidden" name="download" value="1"><button {% if busy %}disabled{% endif %}>Search &amp; download missing</button></form>
       <form method="post" action="/series/{{ s.id }}/refresh"><input type="hidden" name="download" value="0"><button class="alt" {% if busy %}disabled{% endif %}>Re-check sources only</button></form>
       <form method="post" action="/series/{{ s.id }}/monitor"><input type="hidden" name="monitored" value="{{ 0 if s.monitored else 1 }}"><button class="alt">{{ 'Unmonitor' if s.monitored else 'Monitor' }}</button></form>
-      <form method="post" action="/series/{{ s.id }}/delete" onsubmit="return confirm('Remove {{ s.title|e }} from mang-arr?')">
+      <form method="post" action="/series/{{ s.id }}/delete" data-title="{{ s.title }}" onsubmit="return confirm('Remove ' + this.dataset.title + ' from mang-arr?')">
         <label><input type="checkbox" name="files" value="1"> also delete library folder</label>
-        <button class="danger">Delete</button></form>
+        <button class="danger" {% if busy %}disabled title="a job for this series is running"{% endif %}>Delete</button></form>
     </div>
     {% if busy %}<p class="muted">a job for this series is queued or running</p>{% endif %}
+    <p class="muted small">library folder: <code>{{ s.folder }}</code></p>
   </div>
 </div>
 
@@ -40,10 +41,12 @@
 
 <details><summary>Chapter list ({{ chapters|length }})</summary>
 <table class="list small">
-<thead><tr><th class="num">#</th><th>Status</th><th>Source</th><th>Library file</th></tr></thead>
+<thead><tr><th class="num">#</th><th>Status</th><th>Source</th><th>Library file</th><th></th></tr></thead>
 <tbody>
 {% for c in chapters %}
-<tr class="{{ c.status }}"><td class="num">{{ '%g'|format(c.number) }}</td><td>{{ c.status }}</td><td class="muted">{{ c.source_name or '' }}</td><td class="muted">{{ c.library_path or '' }}</td></tr>
+<tr class="{{ c.status }}"><td class="num">{{ '%g'|format(c.number) }}</td><td>{{ c.status }}</td><td class="muted">{{ c.source_name or '' }}</td><td class="muted">{{ c.library_path or '' }}</td>
+<td>{% if c.status in ['wanted','failed','unavailable'] %}<form method="post" action="/series/{{ s.id }}/chapter/{{ c.number }}/ignore"><button class="alt small">ignore</button></form>
+{% elif c.status == 'ignored' %}<form method="post" action="/series/{{ s.id }}/chapter/{{ c.number }}/unignore"><button class="alt small">want</button></form>{% endif %}</td></tr>
 {% endfor %}
 </tbody></table>
 </details>

@@ -12,12 +12,20 @@ Fallbacks, in order, all still requiring an exact title match at the end:
   * very long titles are searched by their first words (the databases'
     fuzzy search gives up on 15-word titles)
 """
+import logging
+
 from . import anilist, mangadex, model
 from .matching import disambiguator, name_tokens, query_score, strip_disambiguator
 from .model import Series
 
+log = logging.getLogger(__name__)
+
 _NOVEL = {"NOVEL", "LIGHT_NOVEL"}
 _LONG = 8          # words; beyond this, search with a prefix
+
+
+class LookupError_(RuntimeError):
+    """A metadata provider could not be used (network, bad id)."""
 
 
 def _exact(cands: list[Series], query: str) -> list[Series]:
@@ -43,14 +51,14 @@ def _pick(cands: list[Series], query: str, author_hint: str | None) -> Series | 
 
 
 def _safe(fn, query):
+    """A provider failure is logged and treated as 'no candidates from it';
+    the other provider still gets a chance."""
     try:
         return fn(query)
-    except RuntimeError:
+    except Exception as e:
+        log.warning("%s lookup for %r failed: %s: %s", fn.__module__.split(".")[-1], query,
+                    type(e).__name__, e)
         return []
-
-
-def _search_all(query: str) -> tuple[list[Series], list[Series]]:
-    return _safe(anilist.search, query), _safe(mangadex.search, query)
 
 
 def lookup(query: str) -> tuple[Series | None, list[Series]]:
@@ -88,12 +96,16 @@ def lookup(query: str) -> tuple[Series | None, list[Series]]:
 
 
 def by_ref(ref: str) -> Series | None:
-    """anilist:123 | mangadex:uuid | manual:Title"""
+    """anilist:123 | mangadex:uuid | manual:Title. Raises ValueError for a
+    malformed ref and LookupError_ when the provider cannot be reached."""
+    if not model.valid_ref(ref):
+        raise ValueError(f"not a series reference: {ref!r}")
     kind, _, value = ref.partition(":")
-    if kind == "anilist":
-        return anilist.by_id(int(value))
-    if kind == "mangadex":
-        return mangadex.by_id(value)
-    if kind == "manual":
-        return model.manual(value)
-    raise ValueError(f"unknown series reference {ref!r}")
+    try:
+        if kind == "anilist":
+            return anilist.by_id(int(value))
+        if kind == "mangadex":
+            return mangadex.by_id(value)
+    except Exception as e:
+        raise LookupError_(f"{kind} lookup for {value} failed: {type(e).__name__}: {e}") from e
+    return model.manual(value)

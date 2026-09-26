@@ -1,8 +1,10 @@
 {% extends "base.html" %}
 {% block title %}Wanted - mang-arr{% endblock %}
 {% block body %}
-<h1>Wanted</h1>
-<p class="muted">{{ rows|length }} series with missing chapters. The worker fetches them each cycle; a chapter stays here while no reachable source has it.</p>
+<div class="bar"><h1>Wanted</h1>
+  <form method="post" action="/wanted/search"><button {% if not rows %}disabled{% endif %}>Search all wanted now</button></form>
+</div>
+<p class="muted">{{ rows|length }} series with missing chapters. The worker fetches them each cycle; a chapter stays here while no reachable source has it. Chapters you do not want can be ignored from the series page.</p>
 <table class="list">
 <thead><tr><th>Series</th><th class="num">Wanted</th><th>Chapters</th><th class="num">Failed</th><th>Checked</th></tr></thead>
 <tbody>

@@ -24,18 +24,19 @@
 
 <h2>Komga</h2>
 <label>URL <input name="komga_url" value="{{ v.komga_url }}" placeholder="http://komga:25600"></label>
-<label>API key <input name="komga_api_key" type="password" value="{{ v.komga_api_key }}" placeholder="Komga: account menu → API keys"></label>
+<label>API key <input name="komga_api_key" type="password" value="" placeholder="{{ 'set - leave blank to keep' if v.komga_api_key else 'Komga: account menu → API keys' }}"></label>
 <label>Library id <input name="komga_library_id" value="{{ v.komga_library_id }}" placeholder="optional: scan only this library"></label>
 {% if komga_test %}<p class="{{ 'muted' if komga_ok else 'err' }}">Komga: {{ komga_test }}</p>{% endif %}
 
 <h2>Notifications</h2>
-<label>Pushover app token <input name="pushover_token" type="password" value="{{ v.pushover_token }}"></label>
-<label>Pushover user key <input name="pushover_user" type="password" value="{{ v.pushover_user }}"></label>
+<label>Pushover app token <input name="pushover_token" type="password" value="" placeholder="{{ 'set - leave blank to keep' if v.pushover_token else '' }}"></label>
+<label>Pushover user key <input name="pushover_user" type="password" value="" placeholder="{{ 'set - leave blank to keep' if v.pushover_user else '' }}"></label>
 <label>Webhook URL <input name="webhook_url" value="{{ v.webhook_url }}" placeholder="POST {title, message, kind} as JSON"></label>
 
 <h2>Security</h2>
 <label>Web username <input name="auth_user" value="{{ v.auth_user }}" placeholder="empty = no login"></label>
-<label>Web password <input name="auth_password" type="password" value="{{ v.auth_password }}"></label>
+<label>Web password <input name="auth_password" type="password" value="" placeholder="{{ 'set - leave blank to keep' if v.auth_password else '' }}"></label>
+<p class="muted small">Secrets are never shown again once saved. To clear one, enter a single space.</p>
 
 <div class="actions">
   <button>Save</button>

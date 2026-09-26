@@ -6,6 +6,7 @@
   <input type="search" name="term" value="{{ term }}" placeholder="title (English, romaji, or original)" autofocus>
   <button>Search</button>
 </form>
+{% if error %}<p class="err">{{ error }}</p>{% endif %}
 {% if term %}
   {% if pick %}<p class="muted">exact match: <b>{{ pick.title }}</b> ({{ pick.ref }})</p>
   {% elif cands %}<p class="muted">no single exact match - pick the right one:</p>

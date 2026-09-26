@@ -45,7 +45,9 @@ def setup(level: str | None = None, file: str | None = None, console: bool = Tru
     if json_lines is None:
         json_lines = os.environ.get("MANGARR_LOG_JSON", "").lower() in ("1", "true", "yes")
     root = logging.getLogger()
-    root.setLevel(getattr(logging, level_name, logging.INFO))
+    if not hasattr(logging, level_name) or not isinstance(getattr(logging, level_name), int):
+        raise ValueError(f"unknown log level {level_name!r} (use DEBUG, INFO, WARNING or ERROR)")
+    root.setLevel(getattr(logging, level_name))
     for h in list(root.handlers):
         root.removeHandler(h)
     fmt = JsonFormatter() if json_lines else logging.Formatter(FORMAT, DATEFMT)

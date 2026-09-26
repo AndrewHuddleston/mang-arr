@@ -17,8 +17,8 @@ class SuwayomiError(RuntimeError):
 
 
 _OPNAME = re.compile(r"\b(fetchSourceManga|fetchMangaAndChapters|fetchChapterPages|downloadStatus|"
-                     r"enqueueChapterDownload|startDownloader|stopDownloader|clearDownloader|"
-                     r"updateManga|sources|mangas|manga)\b")
+                     r"enqueueChapterDownloads|dequeueChapterDownloads|startDownloader|stopDownloader|"
+                     r"clearDownloader|updateManga|sources|mangas|manga)\b")
 
 
 @dataclass(frozen=True)
@@ -26,20 +26,12 @@ class Source:
     id: str
     name: str
     lang: str
+    unusable: bool = False      # searched, never downloaded from (Settings)
+    throttled: bool = False     # single-chapter batches, loses close calls (Settings)
 
     @property
     def key(self) -> str:
         return self.name.lower().strip()
-
-    @property
-    def unusable(self) -> bool:
-        from . import settings
-        return settings.source_flags(self.name)[0]
-
-    @property
-    def throttled(self) -> bool:
-        from . import settings
-        return settings.source_flags(self.name)[1]
 
 
 @dataclass
@@ -84,16 +76,26 @@ class Client:
                 last = e
                 log.debug("suwayomi %s attempt %d/%d failed after %.1fs: %s", op, attempt, retries,
                           time.monotonic() - t0, e)
-                time.sleep(5)
-        raise SuwayomiError(f"API unreachable: {last}")
+                if attempt < retries:
+                    time.sleep(5)
+        raise SuwayomiError(f"Suwayomi at {self.api} unreachable: {last}")
 
     # -- sources / search -------------------------------------------------
 
     def sources(self, langs=("en", "all")) -> list[Source]:
+        """Installed sources, with the disabled/throttled flags from Settings
+        stamped once so a run is consistent even if settings change."""
+        from . import settings
+        v = settings.all_values()
+        unusable, throttled = set(v["unusable_sources"]), set(v["throttled_sources"])
         d = self.gq("{ sources { nodes { id displayName lang } } }")
-        return [Source(s["id"], s["displayName"], s["lang"])
-                for s in d["sources"]["nodes"]
-                if s["lang"] in langs and s["displayName"] != "Local source"]
+        out = []
+        for s in d["sources"]["nodes"]:
+            if s["lang"] not in langs or s["displayName"] == "Local source":
+                continue
+            key = s["displayName"].lower().strip()
+            out.append(Source(s["id"], s["displayName"], s["lang"], key in unusable, key in throttled))
+        return out
 
     def search(self, source: Source, query: str) -> list[dict]:
         """Raw hits: [{id, title, author, status}]. Raises SuwayomiError when
@@ -137,30 +139,35 @@ class Client:
         except SuwayomiError:
             return None
 
-    def set_in_library(self, manga_id: int, in_library: bool) -> None:
+    def set_in_library(self, manga_id: int, in_library: bool, retries: int = 3, timeout: int = 60) -> None:
         self.gq('mutation($id: Int!, $v: Boolean!) {'
                 ' updateManga(input: {id: $id, patch: {inLibrary: $v}}) { manga { id } } }',
-                {"id": manga_id, "v": in_library})
+                {"id": manga_id, "v": in_library}, timeout=timeout, retries=retries)
 
     # -- downloader -------------------------------------------------------
+    # Only our own chapter ids are ever touched: Suwayomi's queue is shared
+    # with its own library updates and whatever the user queued in its UI.
 
     def enqueue(self, chapter_ids: list[int]) -> None:
-        for cid in chapter_ids:
-            self.gq('mutation($id: Int!) { enqueueChapterDownload(input: {id: $id}) { clientMutationId } }',
-                    {"id": cid})
+        self.gq('mutation($ids: [Int!]!) { enqueueChapterDownloads(input: {ids: $ids}) { clientMutationId } }',
+                {"ids": chapter_ids})
+
+    def dequeue(self, chapter_ids: list[int]) -> None:
+        if chapter_ids:
+            self.gq('mutation($ids: [Int!]!) { dequeueChapterDownloads(input: {ids: $ids}) { clientMutationId } }',
+                    {"ids": chapter_ids}, retries=1)
 
     def start(self) -> None:
         self.gq("mutation { startDownloader(input: {}) { clientMutationId } }")
 
     def stop(self) -> None:
-        self.gq("mutation { stopDownloader(input: {}) { clientMutationId } }")
-
-    def clear(self) -> None:
-        self.gq("mutation { clearDownloader(input: {}) { clientMutationId } }")
+        self.gq("mutation { stopDownloader(input: {}) { clientMutationId } }", retries=1)
 
     def queue(self) -> list[dict]:
+        """[{id, state, tries, progress}] for every item in Suwayomi's queue."""
         d = self.gq("{ downloadStatus { queue { chapter { id } state tries progress } } }")
-        return d["downloadStatus"]["queue"]
+        return [{"id": x["chapter"]["id"], "state": x["state"], "tries": x["tries"],
+                 "progress": x.get("progress") or 0.0} for x in d["downloadStatus"]["queue"]]
 
 
 def dedupe(raw: list[dict]) -> list[Chapter]:

@@ -65,7 +65,8 @@ class Plan:
     unreachable: list[tuple[Source, str]]
     assignment: dict[float, SourceMatch]     # chapter number -> source that will provide it
     junk: dict[float, tuple[SourceMatch, int]] = field(default_factory=dict)  # dropped: too few pages
-    candidates: dict[float, list[SourceMatch]] = field(default_factory=dict)  # every usable source per chapter, best first
+    # every usable source per chapter, best first (the first is used, the rest are fallbacks)
+    candidates: dict[float, list[SourceMatch]] = field(default_factory=dict)
 
     @property
     def usable(self) -> list[SourceMatch]:
@@ -76,8 +77,10 @@ class Plan:
         return sorted(self.assignment)
 
     def have(self) -> set[float]:
-        """Chapter numbers Suwayomi reports downloaded on any accepted source."""
-        return {c.number for m in self.matches for c in m.chapters if c.downloaded}
+        """Chapter numbers Suwayomi reports downloaded on a trusted source.
+        A download sitting on an entry that turned out to be another series
+        does not count."""
+        return {c.number for m in self.usable for c in m.chapters if c.downloaded}
 
     def wanted(self) -> list[float]:
         have = self.have()

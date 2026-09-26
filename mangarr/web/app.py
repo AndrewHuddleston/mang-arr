@@ -1,7 +1,7 @@
 """The web UI and JSON API (FastAPI). Long operations go through the job
 runner; requests only read the database and submit jobs.
 
-Pages:   /  /series/{id}  /add  /wanted  /activity  /system
+Pages:   /  /series/{id}  /add  /import  /wanted  /activity  /settings  /system
 API:     /api/v1/...  (mirrors the pages; used by the pages' live updates)
 """
 import base64
@@ -9,30 +9,48 @@ import logging
 import os
 import secrets
 import time
+import urllib.parse
 from collections import deque
+from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Form, HTTPException, Request
 from fastapi.responses import JSONResponse, RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
+from pydantic import BaseModel, Field
 
-from .. import __version__, config, core, db, jobs, komga, metadata, metrics, model, notify, settings
+from .. import __version__, config, core, db, jobs, komga, library, metadata, metrics, model, notify, settings
 from ..resolver import ranges
 from ..suwayomi import Client, SuwayomiError
 
 log = logging.getLogger(__name__)
 HERE = os.path.dirname(os.path.abspath(__file__))
 
-app = FastAPI(title="mang-arr", version=__version__, docs_url="/api/docs", redoc_url=None)
-app.mount("/static", StaticFiles(directory=os.path.join(HERE, "static")), name="static")
-templates = Jinja2Templates(directory=os.path.join(HERE, "templates"))
-templates.env.filters["ranges"] = ranges
-templates.env.filters["ago"] = lambda ts: _ago(ts)
-
 runner = jobs.Runner()
 scheduler: jobs.Scheduler | None = None
 client = Client()
 STARTED = time.time()
+OPEN_PATHS = ("/api/v1/health", "/api/v1/system/status", "/metrics")   # no login: monitoring + nav poller
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global scheduler
+    if not runner._thread.is_alive():
+        runner.start()
+        scheduler = jobs.Scheduler(runner, _job_refresh_all)
+        scheduler.start()
+    log.info("mang-arr %s web started (staging %s, library %s)", __version__, config.STAGING_ROOT,
+             config.LIBRARY_ROOT)
+    yield
+    log.info("web shutting down")
+
+
+app = FastAPI(title="mang-arr", version=__version__, docs_url="/api/docs", redoc_url=None, lifespan=lifespan)
+app.mount("/static", StaticFiles(directory=os.path.join(HERE, "static")), name="static")
+templates = Jinja2Templates(directory=os.path.join(HERE, "templates"))
+templates.env.filters["ranges"] = ranges
+templates.env.filters["ago"] = lambda ts: _ago(ts)
 
 
 def _ago(ts) -> str:
@@ -44,18 +62,37 @@ def _ago(ts) -> str:
         except ValueError:
             return ts
     d = int(time.time() - ts)
+    future = d < 0
+    d = abs(d)
     for unit, size in (("d", 86400), ("h", 3600), ("m", 60)):
         if d >= size:
-            return f"{d // size}{unit} ago"
-    return f"{d}s ago"
+            return f"in {d // size}{unit}" if future else f"{d // size}{unit} ago"
+    return f"in {d}s" if future else f"{d}s ago"
+
+
+def _flash(path: str, msg: str) -> RedirectResponse:
+    return RedirectResponse(f"{path}?m={urllib.parse.quote(msg)}", 303)
 
 
 # -- jobs ---------------------------------------------------------------------
 
+def _record_error(series_id: int, e: Exception) -> None:
+    with db.connect() as con:
+        con.execute("UPDATE series SET last_error=? WHERE id=?", (f"{type(e).__name__}: {e}"[:300], series_id))
+        db.event(con, "failed", f"{type(e).__name__}: {e}"[:300], series_id)
+
+
 def _job_refresh(series_id: int, download: bool):
     def run(job: jobs.Job):
-        with db.connect() as con:
-            o = core.refresh_series(con, client, series_id, download=download)
+        try:
+            with db.connect() as con:
+                o = core.refresh_series(con, client, series_id, download=download,
+                                        should_cancel=lambda: job.cancel)
+        except core.Gone as e:
+            return str(e)
+        except Exception as e:
+            _record_error(series_id, e)
+            raise
         return (f"{len(o.plan.chapters)} listed, {o.downloaded} downloaded, {o.failed} failed,"
                 f" {o.imported} imported")
     return run
@@ -64,7 +101,7 @@ def _job_refresh(series_id: int, download: bool):
 def _job_add(series: model.Series, download: bool):
     def run(job: jobs.Job):
         with db.connect() as con:
-            o = core.add_series(con, client, series, download=download)
+            o = core.add_series(con, client, series, download=download, should_cancel=lambda: job.cancel)
         job.series_id = o.series_id
         return f"{len(o.plan.chapters)} listed, {o.downloaded} downloaded, {o.imported} imported"
     return run
@@ -81,15 +118,15 @@ def _job_refresh_all(job: jobs.Job):
         job.progress = f"{i}/{len(rows)}: {r['title']}"
         try:
             with db.connect() as con:
-                o = core.refresh_series(con, client, r["id"], download=True)
+                o = core.refresh_series(con, client, r["id"], download=True, should_cancel=lambda: job.cancel)
             downloaded += o.downloaded
             imported += o.imported
+        except core.Gone:
+            continue
         except Exception as e:
             errors += 1
             log.error("refresh-all: %s: %s: %s", r["title"], type(e).__name__, e)
-            with db.connect() as con:
-                con.execute("UPDATE series SET last_error=? WHERE id=?",
-                            (f"{type(e).__name__}: {e}"[:300], r["id"]))
+            _record_error(r["id"], e)
         done += 1
     msg = f"{done} series, {downloaded} downloaded, {imported} imported, {errors} errors"
     if imported:
@@ -97,27 +134,35 @@ def _job_refresh_all(job: jobs.Job):
     return msg
 
 
-def start_background() -> None:
-    global scheduler
-    runner.start()
-    scheduler = jobs.Scheduler(runner, _job_refresh_all)
-    scheduler.start()
+def _job_search_wanted(job: jobs.Job):
+    """Download-only pass over every series with wanted chapters."""
+    with db.connect() as con:
+        rows = db.wanted_all(con)
+    got = 0
+    for i, r in enumerate(rows, 1):
+        if job.cancel:
+            break
+        job.progress = f"{i}/{len(rows)}: {r['title']}"
+        try:
+            with db.connect() as con:
+                o = core.refresh_series(con, client, r["id"], download=True, should_cancel=lambda: job.cancel)
+            got += o.downloaded
+        except core.Gone:
+            continue
+        except Exception as e:
+            log.error("search wanted: %s: %s: %s", r["title"], type(e).__name__, e)
+            _record_error(r["id"], e)
+    return f"{len(rows)} series searched, {got} chapters downloaded"
 
 
-@app.on_event("startup")
-def _startup():
-    if not runner._thread.is_alive():
-        start_background()
-    log.info("mang-arr %s web started", __version__)
-
+# -- middleware / errors -------------------------------------------------------
 
 @app.middleware("http")
 async def basic_auth(request: Request, call_next):
-    """Optional HTTP basic auth (Settings -> Security). /api/v1/health and
-    /metrics stay open so monitoring works."""
+    """Optional HTTP basic auth (Settings -> Security)."""
     v = settings.all_values()
     user, password = v["auth_user"], v["auth_password"]
-    if user and request.url.path not in ("/api/v1/health", "/metrics"):
+    if user and request.url.path not in OPEN_PATHS:
         header = request.headers.get("authorization", "")
         ok = False
         if header.startswith("Basic "):
@@ -183,14 +228,34 @@ def series_refresh(series_id: int, download: str = Form("1")):
         r = db.get_series(con, series_id)
     if not r:
         raise HTTPException(404)
+    if runner.pending_for(series_id):
+        return _flash(f"/series/{series_id}", "a job for this series is already queued")
     runner.submit("refresh", r["title"], _job_refresh(series_id, download == "1"), series_id)
-    return RedirectResponse(f"/series/{series_id}?m=refresh+queued", 303)
+    return _flash(f"/series/{series_id}", "refresh queued")
 
 
 @app.post("/series/{series_id}/monitor")
 def series_monitor(series_id: int, monitored: str = Form("1")):
     with db.connect() as con:
+        if not db.get_series(con, series_id):
+            raise HTTPException(404)
         db.set_monitored(con, series_id, monitored == "1")
+    return RedirectResponse(f"/series/{series_id}", 303)
+
+
+@app.post("/series/{series_id}/chapter/{number}/ignore")
+def chapter_ignore(series_id: int, number: float):
+    with db.connect() as con:
+        db.set_status(con, series_id, number, "ignored")
+        db.event(con, "ignore", f"chapter {number:g} ignored", series_id)
+    return RedirectResponse(f"/series/{series_id}", 303)
+
+
+@app.post("/series/{series_id}/chapter/{number}/unignore")
+def chapter_unignore(series_id: int, number: float):
+    with db.connect() as con:
+        db.set_status(con, series_id, number, "wanted")
+        db.event(con, "ignore", f"chapter {number:g} wanted again", series_id)
     return RedirectResponse(f"/series/{series_id}", 303)
 
 
@@ -200,35 +265,65 @@ def series_delete(series_id: int, files: str = Form("0")):
         r = db.get_series(con, series_id)
         if not r:
             raise HTTPException(404)
+        if runner.pending_for(series_id):
+            return _flash(f"/series/{series_id}", "cannot delete while a job for this series is running")
         core.delete_series(con, client, series_id, delete_library=(files == "1"))
-    return RedirectResponse(f"/?m=deleted+{r['title']}", 303)
+    return _flash("/", f"deleted {r['title']}")
 
 
 @app.get("/add")
 def add_page(request: Request, term: str = ""):
-    pick, cands = (None, [])
+    pick, cands, error = None, [], None
     if term:
-        pick, cands = metadata.lookup(term)
+        try:
+            pick, cands = metadata.lookup(term)
+        except Exception as e:                        # both providers down
+            error = f"lookup failed: {type(e).__name__}: {e}"
+            log.error("add page: %s", error)
         if pick and pick.ref not in [c.ref for c in cands]:
             cands.insert(0, pick)
-    tracked = set()
     with db.connect() as con:
         tracked = {r["ref"] for r in con.execute("SELECT ref FROM series")}
-    return page(request, "add.html", term=term, pick=pick, cands=cands, tracked=tracked)
+    return page(request, "add.html", term=term, pick=pick, cands=cands, tracked=tracked, error=error)
+
+
+def _series_from_ref(ref: str, title: str = "", aliases: list[str] | None = None) -> model.Series:
+    """Build the Series to add; raises ValueError with a user-facing message."""
+    if ref == "manual":
+        if not title.strip():
+            raise ValueError("a title is required")
+        return model.manual(title, *(aliases or []))
+    if not model.valid_ref(ref):
+        raise ValueError(f"not a series reference: {ref!r}")
+    try:
+        s = metadata.by_ref(ref)
+    except metadata.LookupError_ as e:
+        raise ValueError(str(e)) from e
+    if not s or s.title == "?":
+        raise ValueError(f"nothing found for {ref}")
+    return s
+
+
+def _queue_add(series: model.Series, download: bool) -> jobs.Job | str:
+    with db.connect() as con:
+        if db.get_series_by_ref(con, series.ref):
+            return "already tracked"
+    for j in runner.jobs():
+        if j.kind == "add" and j.title == series.title and j.status in ("queued", "running"):
+            return f"already queued as job #{j.id}"
+    return runner.submit("add", series.title, _job_add(series, download))
 
 
 @app.post("/add")
 def add_submit(ref: str = Form(...), download: str = Form("1"), title: str = Form(""), alias: str = Form("")):
-    if ref == "manual":
-        if not title.strip():
-            return RedirectResponse("/add?m=title+required", 303)
-        series = model.manual(title, *[a for a in alias.split("|") if a.strip()])
-    else:
-        series = metadata.by_ref(ref)
-        if not series:
-            return RedirectResponse(f"/add?m=unknown+{ref}", 303)
-    job = runner.submit("add", series.title, _job_add(series, download == "1"))
-    return RedirectResponse(f"/activity?m=add+queued+as+job+{job.id}", 303)
+    try:
+        series = _series_from_ref(ref, title, [a for a in alias.split("|") if a.strip()])
+    except ValueError as e:
+        return _flash("/add", str(e))
+    job = _queue_add(series, download == "1")
+    if isinstance(job, str):
+        return _flash("/add", f"{series.title}: {job}")
+    return _flash("/activity", f"{series.title} queued as job #{job.id}")
 
 
 _adopt_scan: dict = {"items": None, "job": None}
@@ -270,7 +365,7 @@ def import_scan():
 async def import_apply(request: Request):
     items = _adopt_scan["items"]
     if items is None:
-        return RedirectResponse("/import?m=scan+first", 303)
+        return _flash("/import", "scan first")
     form = await request.form()
     chosen = []
     for i, it in enumerate(items):
@@ -280,35 +375,30 @@ async def import_apply(request: Request):
             if form.get(f"adopt_{i}") == "1":
                 chosen.append(it)
             continue
-        choice = form.get(f"choice_{i}", "skip")
+        choice = str(form.get(f"choice_{i}", "skip"))
         if choice == "skip":
             continue
-        if choice == "manual":
-            it.series = model.manual(it.folder_name)
-        else:
-            try:
-                it.series = metadata.by_ref(choice)
-            except Exception as e:
-                log.error("import: could not load %s for %s: %s", choice, it.folder_name, e)
-                continue
-        if it.series:
-            chosen.append(it)
+        try:
+            it.series = _series_from_ref("manual" if choice == "manual" else choice, it.folder_name)
+        except ValueError as e:
+            log.error("import: %s for %s: %s", choice, it.folder_name, e)
+            continue
+        chosen.append(it)
     if not chosen:
-        return RedirectResponse("/import?m=nothing+selected", 303)
+        return _flash("/import", "nothing selected")
 
     def run(job: jobs.Job):
         with db.connect() as con:
-            n_series, n_ch = core.apply_adopt(con, chosen)
-            ids = [r["id"] for r in con.execute("SELECT id FROM series ORDER BY id DESC LIMIT ?", (n_series,))]
+            ids, n_ch = core.apply_adopt(con, chosen)
         linked = 0
         for sid in ids:
             with db.connect() as con:
                 linked += core.import_series(con, sid)
         _adopt_scan["items"] = None
-        return f"adopted {n_series} series ({n_ch} chapters), linked {linked} files"
+        return f"adopted {len(ids)} series ({n_ch} chapters), linked {linked} files"
 
     runner.submit("adopt", f"{len(chosen)} folder(s)", run)
-    return RedirectResponse("/activity?m=adopt+queued", 303)
+    return _flash("/activity", "adopt queued")
 
 
 @app.get("/wanted")
@@ -316,6 +406,15 @@ def wanted_page(request: Request):
     with db.connect() as con:
         rows = db.wanted_all(con)
     return page(request, "wanted.html", rows=rows)
+
+
+@app.post("/wanted/search")
+def wanted_search():
+    for j in runner.jobs():
+        if j.kind in ("search-wanted", "refresh-all") and j.status in ("queued", "running"):
+            return _flash("/activity", f"a {j.kind} job is already {j.status}")
+    runner.submit("search-wanted", "every series with wanted chapters", _job_search_wanted)
+    return _flash("/activity", "search queued")
 
 
 @app.get("/activity")
@@ -327,8 +426,10 @@ def activity_page(request: Request):
 
 @app.post("/activity/refresh-all")
 def activity_refresh_all():
+    if scheduler is None:
+        return _flash("/activity", "scheduler not started yet")
     scheduler.trigger()
-    return RedirectResponse("/activity?m=refresh-all+queued", 303)
+    return _flash("/activity", "refresh-all queued")
 
 
 @app.post("/activity/cancel/{job_id}")
@@ -347,14 +448,14 @@ def system_page(request: Request):
         log.error("system page: suwayomi unreachable: %s", e)
     return page(request, "system.html", sources=sources, suwayomi_ok=suwayomi_ok, cfg=_config_view(),
                 log_lines=_tail_log(200), uptime=_ago(STARTED), notify_ok=notify.configured(),
-                komga_ok=komga.configured(), metrics_ok=metrics.AVAILABLE,
+                komga_ok=komga.configured(), metrics_ok=metrics.AVAILABLE, copied=library.COPIED,
                 next_refresh=(scheduler.next_at if scheduler else None))
 
 
 @app.post("/system/notify-test")
 def system_notify_test():
     ok = notify.send("mang-arr", "test notification", "test")
-    return RedirectResponse("/system?m=" + ("notification+sent" if ok else "notification+failed+(see+log)"), 303)
+    return _flash("/system", "notification sent" if ok else "notification failed (see log)")
 
 
 @app.get("/settings")
@@ -381,26 +482,21 @@ async def settings_save(request: Request):
         with db.connect() as con:
             settings.set_many(con, values)
     except (ValueError, KeyError) as e:
-        return RedirectResponse(f"/settings?m=invalid+value:+{e}", 303)
+        return _flash("/settings", f"invalid value: {e}")
     action = form.get("action", "")
     if action == "test-komga":
         ok, msg = komga.test()
-        return RedirectResponse(f"/settings?komga_test={msg}&komga_ok={int(ok)}", 303)
+        return RedirectResponse(f"/settings?komga_test={urllib.parse.quote(msg)}&komga_ok={int(ok)}", 303)
     if action == "test-notify":
         ok = notify.send("mang-arr", "test notification", "test")
-        return RedirectResponse("/settings?m=" + ("notification+sent" if ok else "notification+failed+(see+log)"), 303)
-    return RedirectResponse("/settings?m=saved", 303)
+        return _flash("/settings", "notification sent" if ok else "notification failed (see log)")
+    return _flash("/settings", "saved")
 
 
 @app.get("/metrics")
 def metrics_endpoint():
-    try:
-        client.gq("{ sources { totalCount } }", timeout=5, retries=1)
-        up = True
-    except SuwayomiError:
-        up = False
     with db.connect() as con:
-        body, ctype = metrics.render(con, up)
+        body, ctype = metrics.render(con, _suwayomi_up())
     return Response(body, media_type=ctype)
 
 
@@ -414,7 +510,7 @@ def api_health():
     for name, path in (("staging", config.STAGING_ROOT), ("library", config.LIBRARY_ROOT)):
         if not os.path.isdir(path):
             problems.append(f"{name} path missing: {path}")
-    if not os.access(config.LIBRARY_ROOT, os.W_OK):
+    if os.path.isdir(config.LIBRARY_ROOT) and not os.access(config.LIBRARY_ROOT, os.W_OK):
         problems.append(f"library not writable: {config.LIBRARY_ROOT}")
     status = 200 if not problems else 503
     return JSONResponse({"ok": not problems, "problems": problems, "version": __version__}, status_code=status)
@@ -422,10 +518,18 @@ def api_health():
 
 # -- api ----------------------------------------------------------------------
 
+class AddBody(BaseModel):
+    ref: str = Field(description="anilist:ID, mangadex:UUID, manual:Title, or 'manual' with title")
+    title: str = ""
+    aliases: list[str] = []
+    download: bool = True
+
+
 @app.get("/api/v1/system/status")
 def api_status():
-    return {"version": __version__, "uptime": int(time.time() - STARTED), "job": runner.current.as_dict()
-            if runner.current else None, "nextRefresh": scheduler.next_at if scheduler else None}
+    return {"version": __version__, "uptime": int(time.time() - STARTED),
+            "job": runner.current.as_dict() if runner.current else None,
+            "nextRefresh": scheduler.next_at if scheduler else None}
 
 
 @app.get("/api/v1/series")
@@ -445,15 +549,15 @@ def api_series_one(series_id: int):
 
 
 @app.post("/api/v1/series")
-def api_series_add(body: dict):
-    ref, download = body.get("ref"), body.get("download", True)
-    if ref == "manual":
-        series = model.manual(body.get("title", ""), *body.get("aliases", []))
-    else:
-        series = metadata.by_ref(ref)
-    if not series or not series.title.strip() or series.title == "?":
-        raise HTTPException(400, "unknown ref or empty title")
-    return runner.submit("add", series.title, _job_add(series, bool(download))).as_dict()
+def api_series_add(body: AddBody):
+    try:
+        series = _series_from_ref(body.ref, body.title, body.aliases)
+    except ValueError as e:
+        raise HTTPException(400, str(e)) from e
+    job = _queue_add(series, body.download)
+    if isinstance(job, str):
+        raise HTTPException(409, f"{series.title}: {job}")
+    return job.as_dict()
 
 
 @app.post("/api/v1/series/{series_id}/refresh")
@@ -462,6 +566,8 @@ def api_series_refresh(series_id: int, download: bool = True):
         r = db.get_series(con, series_id)
     if not r:
         raise HTTPException(404)
+    if runner.pending_for(series_id):
+        raise HTTPException(409, "a job for this series is already queued")
     return runner.submit("refresh", r["title"], _job_refresh(series_id, download), series_id).as_dict()
 
 
@@ -470,13 +576,18 @@ def api_series_delete(series_id: int, files: bool = False):
     with db.connect() as con:
         if not db.get_series(con, series_id):
             raise HTTPException(404)
+        if runner.pending_for(series_id):
+            raise HTTPException(409, "a job for this series is running")
         core.delete_series(con, client, series_id, delete_library=files)
     return {"ok": True}
 
 
 @app.get("/api/v1/lookup")
 def api_lookup(term: str):
-    pick, cands = metadata.lookup(term)
+    try:
+        pick, cands = metadata.lookup(term)
+    except Exception as e:
+        raise HTTPException(502, f"lookup failed: {type(e).__name__}: {e}") from e
     return {"pick": pick.ref if pick else None,
             "candidates": [{"ref": c.ref, "title": c.title, "titles": c.titles, "format": c.format,
                             "country": c.country, "status": c.status, "chapters": c.chapters,
@@ -498,16 +609,28 @@ def api_queue():
 def api_command(body: dict):
     name = body.get("name")
     if name == "RefreshAll":
+        if scheduler is None:
+            raise HTTPException(503, "scheduler not started")
         return scheduler.trigger().as_dict()
-    raise HTTPException(400, f"unknown command {name!r}")
+    if name == "SearchWanted":
+        return runner.submit("search-wanted", "every series with wanted chapters", _job_search_wanted).as_dict()
+    raise HTTPException(400, f"unknown command {name!r}; known: RefreshAll, SearchWanted")
 
 
 @app.get("/api/v1/log")
 def api_log(lines: int = 200):
-    return JSONResponse({"lines": _tail_log(lines)})
+    return JSONResponse({"lines": _tail_log(max(1, min(lines, 5000)))})
 
 
 # -- helpers ------------------------------------------------------------------
+
+def _suwayomi_up() -> bool:
+    try:
+        client.gq("{ sources { totalCount } }", timeout=5, retries=1)
+        return True
+    except SuwayomiError:
+        return False
+
 
 def _suwayomi_queue() -> dict:
     try:
@@ -524,7 +647,7 @@ def _suwayomi_queue() -> dict:
 
 def _config_view() -> list[tuple[str, str]]:
     keep = ("SUWAYOMI_URL", "DATA_DIR", "DB_PATH", "STAGING_ROOT", "LIBRARY_ROOT", "REFRESH_HOURS",
-            "UNUSABLE_SOURCES", "THROTTLED_SOURCES", "MIN_PAGES", "DISAGREE", "LOG_LEVEL", "LOG_FILE")
+            "LOG_LEVEL", "LOG_FILE")
     return [(k, str(getattr(config, k))) for k in keep]
 
 

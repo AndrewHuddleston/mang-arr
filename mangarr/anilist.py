@@ -56,6 +56,7 @@ def _post(query: str, variables: dict, retries: int = 3) -> dict:
             if e.code == 429:            # 30 requests/minute
                 wait = int(e.headers.get("Retry-After", "10"))
                 log.debug("anilist rate limited, waiting %ds", wait)
+                last = e
                 time.sleep(wait)
                 continue
             if e.code == 404:            # unknown id

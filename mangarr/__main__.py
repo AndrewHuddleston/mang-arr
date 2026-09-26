@@ -8,7 +8,7 @@ import sys
 from . import config, core, daemon, db, logsetup, metadata, model
 from .model import Series
 from .resolver import Plan, primary, ranges, resolve
-from .suwayomi import Client
+from .suwayomi import Client, SuwayomiError
 
 log = logging.getLogger("mangarr.cli")
 
@@ -154,17 +154,30 @@ def _find(con, text):
 def cmd_refresh(a):
     client = Client()
     with db.connect() as con:
-        rows = [_find(con, a.series)] if a.series else db.series_rows(con)
+        if a.series:
+            rows = [_find(con, a.series)]
+        else:
+            rows = [r for r in db.series_rows(con) if r["monitored"] or a.all]
         rows = [r for r in rows if r]
         if not rows:
             return 1
+        failures = 0
         for r in rows:
             out(f"\n=== {r['title']}")
-            o = core.refresh_series(con, client, r["id"], download=not a.no_download)
+            try:
+                o = core.refresh_series(con, client, r["id"], download=not a.no_download)
+            except core.Gone as e:
+                out(f"  skipped: {e}")
+                continue
+            except SuwayomiError as e:
+                failures += 1
+                log.error("%s: %s", r["title"], e)
+                out(f"  error: {e}")
+                continue
             show_plan(o.plan)
             if o.results:
                 out(f"  downloaded {o.downloaded}, failed {o.failed}, imported {o.imported}")
-    return 0
+    return 1 if failures else 0
 
 
 def cmd_import(a):
@@ -191,8 +204,8 @@ def cmd_adopt(a):
     if a.dry_run:
         return 0
     with db.connect() as con:
-        n_series, n_ch = core.apply_adopt(con, ok)
-    out(f"\nadopted {n_series} series, {n_ch} chapters. Next: mangarr import (library links),"
+        ids, n_ch = core.apply_adopt(con, ok)
+    out(f"\nadopted {len(ids)} series, {n_ch} chapters. Next: mangarr import (library links),"
         " mangarr refresh (find missing chapters).")
     return 0
 
@@ -279,8 +292,9 @@ def main(argv=None):
         s.set_defaults(fn=fn)
 
     s = sub.add_parser("refresh", help="re-resolve tracked series and fetch new chapters")
-    s.add_argument("series", nargs="?", help="title fragment or id (default: all)")
+    s.add_argument("series", nargs="?", help="title fragment or id (default: every monitored series)")
     s.add_argument("--no-download", action="store_true")
+    s.add_argument("--all", action="store_true", help="include unmonitored series")
     s.set_defaults(fn=cmd_refresh)
 
     s = sub.add_parser("import", help="link downloaded chapters into the library")
@@ -313,10 +327,21 @@ def main(argv=None):
     if a.cmd == "serve" and not log_file:          # the System page tails this
         log_file = os.path.join(config.DATA_DIR, "mangarr.log")
         config.LOG_FILE = log_file
-    logsetup.setup("DEBUG" if a.debug else a.log_level, log_file, console=not a.quiet)
+    try:
+        logsetup.setup("DEBUG" if a.debug else a.log_level, log_file, console=not a.quiet)
+    except ValueError as e:
+        p.error(str(e))
     if a.cmd in ("resolve", "add") and not a.query and not a.anilist and not a.mangadex:
         p.error("give a title, --anilist ID or --mangadex UUID")
-    return a.fn(a) or 0
+    try:
+        return a.fn(a) or 0
+    except KeyboardInterrupt:
+        out("\ninterrupted")
+        return 130
+    except (SuwayomiError, metadata.LookupError_, RuntimeError, OSError, ValueError) as e:
+        log.error("%s: %s", type(e).__name__, e)
+        out(f"error: {e}")
+        return 2
 
 
 if __name__ == "__main__":

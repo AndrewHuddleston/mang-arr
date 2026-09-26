@@ -70,11 +70,26 @@ class LinkTest(unittest.TestCase):
             self.assertEqual(sorted(found), [1.0, 2.5])
             self.assertEqual(len(unparsed), 1)
             lib = os.path.join(tmp, "lib")
-            dst = link_into_library(found[2.5], "A: Title", 2.5, root=lib)
+            folder = safe_title("A: Title")
+            dst = link_into_library(found[2.5], folder, 2.5, root=lib)
             self.assertEqual(dst, os.path.join(lib, "A_ Title", "Chapter 002.5.cbz"))
             self.assertEqual(os.stat(dst).st_nlink, 2)
             # idempotent
-            self.assertEqual(link_into_library(found[2.5], "A: Title", 2.5, root=lib), dst)
+            self.assertEqual(link_into_library(found[2.5], folder, 2.5, root=lib), dst)
+            # never overwrites a file it did not make
+            with open(dst, "wb") as f:
+                f.write(b"other")
+            self.assertIsNone(link_into_library(found[1.0], folder, 2.5, root=lib))
+            self.assertEqual(link_into_library(found[1.0], folder, 2.5, root=lib, replace=True), dst)
+
+    def test_two_decimal_chapter_names(self):
+        self.assertEqual(chapter_filename(5.25), "Chapter 005.25.cbz")
+        self.assertEqual(chapter_filename(12.0), "Chapter 012.0.cbz")
+        self.assertEqual(parse_number("Chapter 005.25.cbz"), 5.25)
+
+    def test_volume_only_file_is_not_a_chapter(self):
+        self.assertIsNone(parse_number("Official_Vol.3.cbz"))
+        self.assertEqual(parse_number("Vol.3 Ch.21.cbz"), 21.0)
 
 
 if __name__ == "__main__":

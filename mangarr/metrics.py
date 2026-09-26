@@ -12,7 +12,7 @@ import logging
 log = logging.getLogger(__name__)
 
 try:
-    from prometheus_client import (CONTENT_TYPE_LATEST, Counter, Gauge, generate_latest)
+    from prometheus_client import CONTENT_TYPE_LATEST, Counter, Gauge, generate_latest
     AVAILABLE = True
 except ImportError:                       # metrics are optional
     AVAILABLE = False

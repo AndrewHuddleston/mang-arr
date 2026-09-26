@@ -10,7 +10,7 @@ import sqlite3
 import time
 from contextlib import contextmanager
 
-from . import config
+from . import config, library
 from .model import Series
 
 MIGRATIONS = [
@@ -52,7 +52,7 @@ MIGRATIONS = [
     CREATE TABLE chapter (
       series_id       INTEGER NOT NULL REFERENCES series(id) ON DELETE CASCADE,
       number          REAL NOT NULL,
-      status          TEXT NOT NULL,          -- wanted | have | failed | junk | unavailable
+      status          TEXT NOT NULL,          -- wanted | have | failed | junk | unavailable | ignored
       manga_id        INTEGER,                -- source entry chosen for it
       source_name     TEXT,
       staging_path    TEXT,                   -- Suwayomi's file
@@ -76,6 +76,11 @@ MIGRATIONS = [
       value           TEXT NOT NULL           -- JSON
     );
     """,
+    # 3: the library folder belongs to the series, not to its title, so two
+    #    same-titled series never share one
+    """
+    ALTER TABLE series ADD COLUMN folder TEXT;
+    """,
 ]
 
 
@@ -88,11 +93,22 @@ def migrate(con: sqlite3.Connection) -> None:
     for i, sql in enumerate(MIGRATIONS[version:], start=version + 1):
         con.executescript(sql)
         con.execute(f"PRAGMA user_version = {i}")
+        if i == 3:
+            _backfill_folders(con)
     con.commit()
 
 
+def _backfill_folders(con) -> None:
+    taken: set[str] = set()
+    for r in con.execute("SELECT id, ref, title FROM series ORDER BY id").fetchall():
+        folder = library.unique_folder(r["title"], taken, r["ref"])
+        taken.add(folder)
+        con.execute("UPDATE series SET folder=? WHERE id=?", (folder, r["id"]))
+
+
 @contextmanager
-def connect(path: str = config.DB_PATH):
+def connect(path: str | None = None):
+    path = path or config.DB_PATH
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
     con = sqlite3.connect(path, timeout=30)
     con.row_factory = sqlite3.Row
@@ -118,18 +134,25 @@ def event(con, kind: str, message: str, series_id: int | None = None) -> None:
 # -- series -----------------------------------------------------------------
 
 def upsert_series(con, s: Series) -> int:
-    """Insert or refresh a series; returns its internal id."""
+    """Insert or refresh a series; returns its internal id. A new series gets
+    a library folder that no other series uses."""
     fields = dict(
         anilist_id=s.anilist_id, mangadex_id=s.mangadex_id,
         title=s.title, romaji=s.romaji, english=s.english, native=s.native,
         synonyms=json.dumps(s.synonyms), country=s.country, status=s.status,
         format=s.format, expected=s.chapters, authors=json.dumps(s.authors),
         cover=s.cover)
-    row = con.execute("SELECT id FROM series WHERE ref=?", (s.ref,)).fetchone()
+    row = con.execute("SELECT id, folder FROM series WHERE ref=?", (s.ref,)).fetchone()
     if row:
         sets = ", ".join(f"{k}=?" for k in fields)
         con.execute(f"UPDATE series SET {sets} WHERE id=?", (*fields.values(), row["id"]))
+        if not row["folder"]:
+            taken = {r["folder"] for r in con.execute("SELECT folder FROM series WHERE folder IS NOT NULL")}
+            con.execute("UPDATE series SET folder=? WHERE id=?",
+                        (library.unique_folder(s.title, taken, s.ref), row["id"]))
         return row["id"]
+    taken = {r["folder"] for r in con.execute("SELECT folder FROM series WHERE folder IS NOT NULL")}
+    fields["folder"] = library.unique_folder(s.title, taken, s.ref)
     cols = ", ".join(["ref", *fields, "added_at"])
     marks = ", ".join("?" for _ in range(len(fields) + 2))
     cur = con.execute(f"INSERT INTO series ({cols}) VALUES ({marks})",
@@ -150,6 +173,10 @@ def get_series(con, series_id: int):
     return con.execute("SELECT * FROM series WHERE id=?", (series_id,)).fetchone()
 
 
+def get_series_by_ref(con, ref: str):
+    return con.execute("SELECT * FROM series WHERE ref=?", (ref,)).fetchone()
+
+
 def find_series(con, text: str):
     """Rows whose title contains the text (case-insensitive), or the id."""
     if text.isdigit():
@@ -162,12 +189,10 @@ def find_series(con, text: str):
 def series_rows(con):
     return con.execute(
         "SELECT s.*, "
-        " (SELECT COUNT(*) FROM chapter c WHERE c.series_id=s.id AND c.status!='junk') AS listed,"
+        " (SELECT COUNT(*) FROM chapter c WHERE c.series_id=s.id AND c.status NOT IN ('junk','ignored')) AS listed,"
         " (SELECT COUNT(*) FROM chapter c WHERE c.series_id=s.id AND c.status='have') AS have,"
-        " (SELECT COUNT(*) FROM chapter c WHERE c.series_id=s.id AND c.status IN ('wanted','failed'))"
-        "   AS wanted,"
-        " (SELECT source_name FROM series_source ss WHERE ss.series_id=s.id AND ss.is_primary=1)"
-        "   AS primary_source"
+        " (SELECT COUNT(*) FROM chapter c WHERE c.series_id=s.id AND c.status IN ('wanted','failed')) AS wanted,"
+        " (SELECT source_name FROM series_source ss WHERE ss.series_id=s.id AND ss.is_primary=1) AS primary_source"
         " FROM series s ORDER BY s.title COLLATE NOCASE").fetchall()
 
 
@@ -215,12 +240,13 @@ def save_plan(con, series_id: int, plan, primary_manga_id: int | None) -> None:
             " VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
             (series_id, m.manga_id, m.source.name, m.title, m.author, m.match, m.author_ok,
              len(m.chapters), m.max, m.note or None, int(m.manga_id == primary_manga_id), now()))
-    have_rows = {r["number"]: r for r in con.execute(
+    rows = {r["number"]: r for r in con.execute(
         "SELECT number, status, library_path FROM chapter WHERE series_id=?", (series_id,))}
+    keep = {"have", "ignored"}
     for n, m in plan.assignment.items():
-        prev = have_rows.get(n)
-        if prev and prev["status"] == "have":
-            continue                         # on disk already; keep its paths
+        prev = rows.get(n)
+        if prev and prev["status"] in keep:
+            continue                         # on disk already, or told to ignore; keep as is
         con.execute(
             "INSERT INTO chapter (series_id, number, status, manga_id, source_name, updated_at)"
             " VALUES (?,?,?,?,?,?)"
@@ -232,8 +258,15 @@ def save_plan(con, series_id: int, plan, primary_manga_id: int | None) -> None:
             "INSERT INTO chapter (series_id, number, status, manga_id, source_name, pages, updated_at)"
             " VALUES (?,?,?,?,?,?,?)"
             " ON CONFLICT(series_id, number) DO UPDATE SET status='junk', pages=excluded.pages,"
-            " updated_at=excluded.updated_at WHERE chapter.status!='have'",
+            " updated_at=excluded.updated_at WHERE chapter.status NOT IN ('have','ignored')",
             (series_id, n, "junk", m.manga_id, m.source.name, pages, now()))
+    # a chapter that was wanted but that no trusted source lists any more is
+    # not wanted, it is unavailable - it comes back if a source lists it again
+    still = set(plan.assignment) | set(plan.junk)
+    for n, prev in rows.items():
+        if prev["status"] in ("wanted", "failed") and n not in still:
+            con.execute("UPDATE chapter SET status='unavailable', updated_at=? WHERE series_id=? AND number=?",
+                        (now(), series_id, n))
     con.execute("UPDATE series SET last_resolved=?, last_error=NULL WHERE id=?", (now(), series_id))
 
 
