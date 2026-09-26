@@ -49,7 +49,7 @@ name shapes seen in the wild.
 .venv/bin/ruff check mangarr tests
 ```
 
-Configuration is in `pyproject.toml` (`[tool.ruff]`): line length 110,
+Configuration is in `pyproject.toml` (`[tool.ruff]`): line length 120,
 target Python 3.10, rule sets E, F, W, I, B and UP. `ruff check --fix` is
 fine for import order and unused imports. There is no formatter step; match
 the surrounding style rather than reformatting whole files.
@@ -74,7 +74,10 @@ a wheel build, and a Docker build on every push and pull request. Pushes to
 ```
 mangarr/
   config.py      every MANGARR_* setting and its default
-  settings.py    runtime settings stored in the database (Settings page)
+  settings.py    runtime settings stored in the database: DEFAULTS is the
+                 list of keys (sources, scheduling, Komga, notifications,
+                 login method / user / password, API key); secrets are
+                 never echoed back
   model.py       Series: the one dataclass every module agrees on
   anilist.py     AniList lookup (primary identity database)
   mangadex.py    MangaDex lookup (fallback database)
@@ -82,18 +85,38 @@ mangarr/
   matching.py    title normalisation and the strict match rules
   suwayomi.py    Suwayomi GraphQL client (the only module that talks to it)
   resolver.py    search every source, accept matches, build the per-chapter plan
-  downloader.py  paced per-source download through Suwayomi
-  library.py     staging tree parsing and the hard-link library
-  db.py          SQLite schema and queries (numbered migrations)
-  core.py        add / refresh / import / adopt, independent of the caller
+  downloader.py  paced per-source download through Suwayomi, with the
+                 per-chapter failure reasons
+  library.py     staging tree parsing, the hard-link library, chapter file
+                 names (chapter_filename / chapter_label) and the
+                 season-episode matching through Suwayomi's chapter list
+  db.py          SQLite schema and queries (numbered migrations; chapter
+                 statuses and the reason column live here)
+  core.py        add / refresh / import / adopt / delete and the per-chapter
+                 search (chapter_releases, download_chapter), independent
+                 of the caller
+  lists.py       import lists: one fetcher per kind (AniList user list,
+                 AniList chart, text URL), param validation, storage, sync
   jobs.py        in-process job runner and scheduler for the web UI
   daemon.py      the standalone background worker
-  komga.py       Komga scan trigger after imports
+  health.py      health checks: live tests of Suwayomi, Komga, AniList,
+                 MangaDex, paths, disk, configuration; cached a minute
+  backup.py      database backups: scheduled, on demand, listing, pruning,
+                 verify and restore through SQLite's online-backup API
+  updates.py     daily GitHub release check (banner, /api/v1/system/status)
+  komga.py       Komga scan trigger after imports and the connection test
   notify.py      Pushover and webhook notifications
-  metrics.py     Prometheus metrics for /metrics
+  metrics.py     Prometheus metrics for /metrics (optional prometheus-client)
   logsetup.py    console + rotating file logging (text or JSON lines)
   __main__.py    the CLI
-  web/           FastAPI app, Jinja templates, one stylesheet (optional extra)
+  web/
+    app.py         FastAPI app: pages, JSON API, login middleware, jobs
+    lists_routes.py  the /lists page, its API and the list sync thread
+    views.py       pure template helpers: NAV (the sidebar), chapter
+                   grouping (group_chapters), status labels, description
+                   cleanup; unit-testable without the app
+    templates/     Jinja templates, one per page
+    static/        one stylesheet and one script
 tests/           unittest suites; no network
 ```
 

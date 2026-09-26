@@ -37,6 +37,8 @@ services:
       MANGARR_REFRESH_HOURS: "6"                 # default refresh interval; the Settings page overrides it
       MANGARR_LOG_LEVEL: INFO                    # DEBUG logs every request and match decision
       # MANGARR_LOG_JSON: "1"                    # one JSON object per log line (Loki/Promtail)
+      # MANGARR_BACKUP_HOURS: "24"              # database backup interval; kept under /config/backups
+      # MANGARR_BACKUPS_KEEP: "7"               # how many backups to keep
       # Defaults for the Settings page (Pushover, webhook). Anything saved there wins.
       # MANGARR_PUSHOVER_TOKEN: your-app-token
       # MANGARR_PUSHOVER_USER: your-user-key
