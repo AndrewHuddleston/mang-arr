@@ -5,12 +5,13 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="color-scheme" content="dark">
 <title>Sign in - mang-arr</title>
+<link rel="icon" type="image/svg+xml" href="/static/mark.svg">
 <link rel="stylesheet" href="/static/style.css">
 </head>
 <body class="login">
 {% include "icons.html" %}
 <main class="login-box">
-  <div class="brand"><span class="brand-mark"><svg class="ic"><use href="#i-logo"/></svg></span><span class="brand-name">mang-arr</span></div>
+  <div class="brand"><img class="brand-mark" src="/static/mark.svg" alt="" width="32" height="32"><span class="brand-name">mang<em>-arr</em></span></div>
   {% if error %}<div class="alert danger">{{ error }}</div>{% endif %}
   <form method="post" action="/login" class="form login-form">
     <input type="hidden" name="next" value="{{ next }}">

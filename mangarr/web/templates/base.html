@@ -5,6 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="color-scheme" content="dark">
 <title>{% block title %}mang-arr{% endblock %}</title>
+<link rel="icon" type="image/svg+xml" href="/static/mark.svg">
 <link rel="stylesheet" href="/static/style.css">
 </head>
 {% set path = request.url.path %}
@@ -16,7 +17,7 @@
 
 <header class="page-header">
   <div class="logo-container">
-    <a class="brand" href="/" title="mang-arr"><span class="brand-mark"><svg class="ic"><use href="#i-logo"/></svg></span><span class="brand-name">mang-arr</span></a>
+    <a class="brand" href="/" title="mang-arr"><img class="brand-mark" src="/static/mark.svg" alt="" width="32" height="32"><span class="brand-name">mang<em>-arr</em></span></a>
   </div>
   <div class="sidebar-toggle">
     <button type="button" class="iconbtn" id="navtoggle" aria-label="Toggle navigation" aria-controls="sidebar" aria-expanded="false"><svg class="ic"><use href="#i-menu"/></svg></button>

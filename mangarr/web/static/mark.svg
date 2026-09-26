@@ -1,0 +1,28 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64" role="img" aria-label="mang-arr">
+  <defs>
+    <linearGradient id="g" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#ff4fa3"/>
+      <stop offset="1" stop-color="#7a43ff"/>
+    </linearGradient>
+  </defs>
+  <!-- rounded badge -->
+  <rect x="2" y="2" width="60" height="60" rx="14" fill="url(#g)"/>
+  <!-- manga impact / speed lines, top-right -->
+  <g stroke="#fff" stroke-width="2.4" stroke-linecap="round" opacity=".95">
+    <line x1="46" y1="9" x2="52" y2="4"/>
+    <line x1="52" y1="16" x2="59" y2="13"/>
+    <line x1="40" y1="7" x2="42" y2="3"/>
+  </g>
+  <!-- speech bubble with a tail (manga panel dialogue) -->
+  <path d="M15 14h34a5 5 0 0 1 5 5v22a5 5 0 0 1-5 5H30l-9 9v-9h-6a5 5 0 0 1-5-5V19a5 5 0 0 1 5-5z" fill="#fff"/>
+  <!-- the open book "M": two pages meeting at the spine -->
+  <path d="M19 38V22c4-2 8-2 12 0v16c-4-2-8-2-12 0zM33 22c4-2 8-2 12 0v16c-4-2-8-2-12 0z" fill="url(#g)"/>
+  <path d="M31 22v16" stroke="#fff" stroke-width="2.2" stroke-linecap="round"/>
+  <!-- page lines -->
+  <g stroke="#fff" stroke-width="1.6" stroke-linecap="round" opacity=".85">
+    <line x1="22" y1="27" x2="28" y2="26"/>
+    <line x1="22" y1="31" x2="28" y2="30"/>
+    <line x1="36" y1="26" x2="42" y2="27"/>
+    <line x1="36" y1="30" x2="42" y2="31"/>
+  </g>
+</svg>
