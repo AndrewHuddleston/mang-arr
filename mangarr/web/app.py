@@ -4,17 +4,19 @@ runner; requests only read the database and submit jobs.
 Pages:   /  /series/{id}  /add  /wanted  /activity  /system
 API:     /api/v1/...  (mirrors the pages; used by the pages' live updates)
 """
+import base64
 import logging
 import os
+import secrets
 import time
 from collections import deque
 
 from fastapi import FastAPI, Form, HTTPException, Request
-from fastapi.responses import JSONResponse, RedirectResponse
+from fastapi.responses import JSONResponse, RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
-from .. import __version__, config, core, db, jobs, metadata, model, notify
+from .. import __version__, config, core, db, jobs, komga, metadata, metrics, model, notify, settings
 from ..resolver import ranges
 from ..suwayomi import Client, SuwayomiError
 
@@ -105,6 +107,38 @@ def _startup():
     if not runner._thread.is_alive():
         start_background()
     log.info("mang-arr %s web started", __version__)
+
+
+@app.middleware("http")
+async def basic_auth(request: Request, call_next):
+    """Optional HTTP basic auth (Settings -> Security). /api/v1/health and
+    /metrics stay open so monitoring works."""
+    v = settings.all_values()
+    user, password = v["auth_user"], v["auth_password"]
+    if user and request.url.path not in ("/api/v1/health", "/metrics"):
+        header = request.headers.get("authorization", "")
+        ok = False
+        if header.startswith("Basic "):
+            try:
+                given = base64.b64decode(header[6:]).decode("utf-8", "replace")
+                u, _, p = given.partition(":")
+                ok = secrets.compare_digest(u, user) and secrets.compare_digest(p, password)
+            except Exception:
+                ok = False
+        if not ok:
+            log.warning("unauthorised request to %s from %s", request.url.path,
+                        request.client.host if request.client else "?")
+            return Response("authentication required", 401, headers={"WWW-Authenticate": 'Basic realm="mang-arr"'})
+    return await call_next(request)
+
+
+@app.exception_handler(Exception)
+async def _unhandled(request: Request, exc: Exception):
+    log.exception("unhandled error on %s %s", request.method, request.url.path)
+    if request.url.path.startswith("/api/"):
+        return JSONResponse({"error": f"{type(exc).__name__}: {exc}"}, status_code=500)
+    return Response(f"mang-arr: {type(exc).__name__}: {exc}\n(see the log on the System page)",
+                    500, media_type="text/plain")
 
 
 # -- pages --------------------------------------------------------------------
@@ -229,13 +263,77 @@ def system_page(request: Request):
         log.error("system page: suwayomi unreachable: %s", e)
     return page(request, "system.html", sources=sources, suwayomi_ok=suwayomi_ok, cfg=_config_view(),
                 log_lines=_tail_log(200), uptime=_ago(STARTED), notify_ok=notify.configured(),
+                komga_ok=komga.configured(), metrics_ok=metrics.AVAILABLE,
                 next_refresh=(scheduler.next_at if scheduler else None))
 
 
 @app.post("/system/notify-test")
 def system_notify_test():
-    notify.send("mang-arr", "test notification", "test")
-    return RedirectResponse("/system?m=notification+sent", 303)
+    ok = notify.send("mang-arr", "test notification", "test")
+    return RedirectResponse("/system?m=" + ("notification+sent" if ok else "notification+failed+(see+log)"), 303)
+
+
+@app.get("/settings")
+def settings_page(request: Request, komga_test: str = "", komga_ok: str = ""):
+    try:
+        sources = client.sources()
+    except SuwayomiError as e:
+        sources = []
+        log.error("settings page: suwayomi unreachable: %s", e)
+    return page(request, "settings.html", v=settings.all_values(), sources=sources,
+                komga_test=komga_test, komga_ok=(komga_ok == "1"))
+
+
+@app.post("/settings")
+async def settings_save(request: Request):
+    form = await request.form()
+    values = {}
+    for key in settings.DEFAULTS:
+        if isinstance(settings.DEFAULTS[key], list):
+            values[key] = form.getlist(key)
+        elif key in form:
+            values[key] = form[key]
+    try:
+        with db.connect() as con:
+            settings.set_many(con, values)
+    except (ValueError, KeyError) as e:
+        return RedirectResponse(f"/settings?m=invalid+value:+{e}", 303)
+    action = form.get("action", "")
+    if action == "test-komga":
+        ok, msg = komga.test()
+        return RedirectResponse(f"/settings?komga_test={msg}&komga_ok={int(ok)}", 303)
+    if action == "test-notify":
+        ok = notify.send("mang-arr", "test notification", "test")
+        return RedirectResponse("/settings?m=" + ("notification+sent" if ok else "notification+failed+(see+log)"), 303)
+    return RedirectResponse("/settings?m=saved", 303)
+
+
+@app.get("/metrics")
+def metrics_endpoint():
+    try:
+        client.gq("{ sources { totalCount } }", timeout=5, retries=1)
+        up = True
+    except SuwayomiError:
+        up = False
+    with db.connect() as con:
+        body, ctype = metrics.render(con, up)
+    return Response(body, media_type=ctype)
+
+
+@app.get("/api/v1/health")
+def api_health():
+    problems = []
+    try:
+        client.gq("{ sources { totalCount } }", timeout=5, retries=1)
+    except SuwayomiError as e:
+        problems.append(f"suwayomi: {e}")
+    for name, path in (("staging", config.STAGING_ROOT), ("library", config.LIBRARY_ROOT)):
+        if not os.path.isdir(path):
+            problems.append(f"{name} path missing: {path}")
+    if not os.access(config.LIBRARY_ROOT, os.W_OK):
+        problems.append(f"library not writable: {config.LIBRARY_ROOT}")
+    status = 200 if not problems else 503
+    return JSONResponse({"ok": not problems, "problems": problems, "version": __version__}, status_code=status)
 
 
 # -- api ----------------------------------------------------------------------

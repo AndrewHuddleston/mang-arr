@@ -1,0 +1,46 @@
+{% extends "base.html" %}
+{% block title %}Settings - mang-arr{% endblock %}
+{% block body %}
+<h1>Settings</h1>
+<p class="muted">Stored in the database; environment variables are the defaults. Changes apply to the next job.</p>
+<form method="post" action="/settings" class="settings">
+
+<h2>Sources</h2>
+<p class="muted small">From Suwayomi. <b>Disabled</b> sources are still searched (so a series that exists only there is reported) but never downloaded from. <b>Throttled</b> sources get one chapter at a time and lose close calls.</p>
+<table class="list small">
+<thead><tr><th>Source</th><th>Language</th><th>Disabled</th><th>Throttled</th></tr></thead>
+<tbody>
+{% for s in sources %}
+<tr><td>{{ s.name }}</td><td class="muted">{{ s.lang }}</td>
+<td><input type="checkbox" name="unusable_sources" value="{{ s.name|lower }}" {% if s.name|lower in v.unusable_sources %}checked{% endif %}></td>
+<td><input type="checkbox" name="throttled_sources" value="{{ s.name|lower }}" {% if s.name|lower in v.throttled_sources %}checked{% endif %}></td></tr>
+{% endfor %}
+{% if not sources %}<tr><td colspan="4" class="err">Suwayomi unreachable - source list unavailable</td></tr>{% endif %}
+</tbody></table>
+
+<h2>Scheduling &amp; matching</h2>
+<label>Refresh every (hours) <input name="refresh_hours" value="{{ v.refresh_hours }}" size="6"></label>
+<label>Minimum pages for a fractional chapter <input name="min_pages" value="{{ v.min_pages }}" size="6"> <span class="muted small">below this a "Chapter 12.5" is treated as a notice image and skipped</span></label>
+
+<h2>Komga</h2>
+<label>URL <input name="komga_url" value="{{ v.komga_url }}" placeholder="http://komga:25600"></label>
+<label>API key <input name="komga_api_key" type="password" value="{{ v.komga_api_key }}" placeholder="Komga: account menu → API keys"></label>
+<label>Library id <input name="komga_library_id" value="{{ v.komga_library_id }}" placeholder="optional: scan only this library"></label>
+{% if komga_test %}<p class="{{ 'muted' if komga_ok else 'err' }}">Komga: {{ komga_test }}</p>{% endif %}
+
+<h2>Notifications</h2>
+<label>Pushover app token <input name="pushover_token" type="password" value="{{ v.pushover_token }}"></label>
+<label>Pushover user key <input name="pushover_user" type="password" value="{{ v.pushover_user }}"></label>
+<label>Webhook URL <input name="webhook_url" value="{{ v.webhook_url }}" placeholder="POST {title, message, kind} as JSON"></label>
+
+<h2>Security</h2>
+<label>Web username <input name="auth_user" value="{{ v.auth_user }}" placeholder="empty = no login"></label>
+<label>Web password <input name="auth_password" type="password" value="{{ v.auth_password }}"></label>
+
+<div class="actions">
+  <button>Save</button>
+  <button name="action" value="test-komga" class="alt">Save &amp; test Komga</button>
+  <button name="action" value="test-notify" class="alt">Save &amp; send test notification</button>
+</div>
+</form>
+{% endblock %}

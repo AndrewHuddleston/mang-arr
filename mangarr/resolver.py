@@ -209,10 +209,12 @@ def _prune_junk(client: Client, plan: Plan) -> None:
     notices and ads, not chapters. Every fractional chapter is probed, not
     just single-source ones - aggregators (Bato, Manganato) scrape the same
     upstream and list the same junk, so agreement between them proves nothing."""
+    from . import settings
+    min_pages = int(settings.get("min_pages"))
     suspects = [n for n in plan.assignment if n != int(n)]
     if not suspects:
         return
-    log.info("probing %d fractional chapter(s) for junk", len(suspects))
+    log.info("probing %d fractional chapter(s) for junk (< %d pages)", len(suspects), min_pages)
     for n in sorted(suspects):
         m = plan.assignment[n]
         ch = next((c for c in m.chapters if c.number == n), None)
@@ -220,7 +222,7 @@ def _prune_junk(client: Client, plan: Plan) -> None:
             continue
         pages = client.page_count(ch.id)
         log.debug("%s ch %g: %s pages", m.source.name, n, pages)
-        if pages is not None and pages < config.MIN_PAGES:
+        if pages is not None and pages < min_pages:
             plan.junk[n] = (m, pages)
             del plan.assignment[n]
             plan.candidates.pop(n, None)

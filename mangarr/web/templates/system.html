@@ -9,7 +9,10 @@
   <div class="stat"><b>{{ next_refresh|ago if next_refresh else '-' }}</b> next scheduled refresh</div>
   <div class="stat {{ 'have' if notify_ok else '' }}"><b>{{ 'on' if notify_ok else 'off' }}</b> notifications
     {% if notify_ok %}<form method="post" action="/system/notify-test"><button class="alt small">send test</button></form>{% endif %}</div>
+  <div class="stat {{ 'have' if komga_ok else '' }}"><b>{{ 'on' if komga_ok else 'off' }}</b> Komga scan</div>
+  <div class="stat {{ 'have' if metrics_ok else '' }}"><b>{{ '/metrics' if metrics_ok else 'off' }}</b> Prometheus</div>
 </div>
+<p class="muted small">Health: <a href="/api/v1/health">/api/v1/health</a> · API docs: <a href="/api/docs">/api/docs</a> · <a href="/settings">Settings</a></p>
 
 <h2>Sources (from Suwayomi)</h2>
 <table class="list small">

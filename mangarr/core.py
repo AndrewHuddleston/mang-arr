@@ -9,7 +9,7 @@ import logging
 import os
 from dataclasses import dataclass, field
 
-from . import db, downloader, library, metadata
+from . import db, downloader, komga, library, metadata, metrics
 from .model import Series
 from .resolver import Plan, primary, resolve
 from .suwayomi import Client, SuwayomiError
@@ -84,6 +84,8 @@ def download_wanted(con, client: Client, series_id: int, plan: Plan) -> dict:
         return {}
     results = downloader.download(client, plan, only=set(wanted))
     for n, r in results.items():
+        m = plan.assignment.get(n)
+        metrics.record_download(m.source.name if m else "?", r)
         if r != "ok":
             db.set_status(con, series_id, n, "failed")
     ok = sum(1 for r in results.values() if r == "ok")
@@ -160,6 +162,7 @@ def import_series(con, series_id: int) -> int:
     if linked:
         db.event(con, "imported", f"{linked} chapter(s) linked into the library", series_id)
         log.info("%s: imported %d chapter(s) into %s", title, linked, library.library_dir(title))
+        komga.scan()
     con.commit()
     return linked
 

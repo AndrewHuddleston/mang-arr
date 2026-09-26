@@ -14,7 +14,7 @@ import time
 import traceback
 from dataclasses import dataclass, field
 
-from . import config
+from . import config, metrics, settings
 
 log = logging.getLogger(__name__)
 
@@ -108,6 +108,9 @@ class Runner:
             finally:
                 job.finished_at = time.time()
                 self.current = None
+                metrics.record_job(job.kind, job.status)
+                if job.kind == "refresh-all" and job.status == "done":
+                    metrics.record_refresh_done(job.finished_at)
 
 
 class Scheduler:
@@ -133,6 +136,14 @@ class Scheduler:
     def _loop(self) -> None:
         while True:
             time.sleep(5)
+            try:                                   # the Settings page can change the interval
+                new = float(settings.get("refresh_hours")) * 3600
+                if new != self.interval and new > 0:
+                    log.info("refresh interval now %.1fh", new / 3600)
+                    self.next_at += new - self.interval
+                    self.interval = new
+            except Exception as e:
+                log.debug("scheduler could not read settings: %s", e)
             if time.time() >= self.next_at:
                 if any(j.kind == "refresh-all" and j.status in ("queued", "running") for j in self.runner.jobs()):
                     log.info("scheduled refresh skipped: one is already queued or running")

@@ -51,11 +51,14 @@ class FallbackTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.lock = self.tmp.name + "/lock"
-        self.sleep = mock.patch("mangarr.downloader.time.sleep", lambda s: None)
-        self.sleep.start()
+        self.patches = [mock.patch("mangarr.downloader.time.sleep", lambda s: None),
+                        mock.patch("mangarr.config.DB_PATH", self.tmp.name + "/test.db")]
+        for p in self.patches:
+            p.start()
 
     def tearDown(self):
-        self.sleep.stop()
+        for p in self.patches:
+            p.stop()
         self.tmp.cleanup()
 
     def run_download(self, client, plan, only):

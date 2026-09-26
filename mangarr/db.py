@@ -69,6 +69,13 @@ MIGRATIONS = [
       message         TEXT NOT NULL
     );
     """,
+    # 2: runtime settings (see settings.py)
+    """
+    CREATE TABLE setting (
+      key             TEXT PRIMARY KEY,
+      value           TEXT NOT NULL           -- JSON
+    );
+    """,
 ]
 
 

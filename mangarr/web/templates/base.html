@@ -13,6 +13,7 @@
   <a href="/add" {% if request.url.path.startswith('/add') %}class="on"{% endif %}>Add</a>
   <a href="/wanted" {% if request.url.path.startswith('/wanted') %}class="on"{% endif %}>Wanted</a>
   <a href="/activity" {% if request.url.path.startswith('/activity') %}class="on"{% endif %}>Activity</a>
+  <a href="/settings" {% if request.url.path.startswith('/settings') %}class="on"{% endif %}>Settings</a>
   <a href="/system" {% if request.url.path.startswith('/system') %}class="on"{% endif %}>System</a>
   <span class="spacer"></span>
   <span id="status" class="muted">{% if current %}running: {{ current.kind }} {{ current.title }}{% endif %}</span>

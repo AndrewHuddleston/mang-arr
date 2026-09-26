@@ -33,11 +33,13 @@ class Source:
 
     @property
     def unusable(self) -> bool:
-        return self.key in config.UNUSABLE_SOURCES
+        from . import settings
+        return settings.source_flags(self.name)[0]
 
     @property
     def throttled(self) -> bool:
-        return self.key in config.THROTTLED_SOURCES
+        from . import settings
+        return settings.source_flags(self.name)[1]
 
 
 @dataclass

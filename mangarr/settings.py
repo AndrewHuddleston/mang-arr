@@ -1,0 +1,134 @@
+"""Runtime settings: stored in the database, editable in the UI, with the
+environment/config defaults as fallback. Modules read values at use time
+through get(), so a change on the Settings page applies to the next job.
+
+    key                  type   default (from config)
+    refresh_hours        float  REFRESH_HOURS
+    min_pages            int    MIN_PAGES
+    unusable_sources     list   UNUSABLE_SOURCES   (lower-cased source names)
+    throttled_sources    list   THROTTLED_SOURCES
+    pushover_token       str    PUSHOVER_TOKEN
+    pushover_user        str    PUSHOVER_USER
+    webhook_url          str    WEBHOOK_URL
+    komga_url            str    ""     e.g. http://komga:25600
+    komga_api_key        str    ""     triggers a library scan after imports
+    komga_library_id     str    ""     optional: scan only this library
+    auth_user            str    ""     basic auth for the web UI (empty = off)
+    auth_password        str    ""
+"""
+import json
+import logging
+import sqlite3
+import threading
+import time
+
+from . import config
+
+log = logging.getLogger(__name__)
+
+DEFAULTS: dict[str, object] = {
+    "refresh_hours": config.REFRESH_HOURS,
+    "min_pages": config.MIN_PAGES,
+    "unusable_sources": sorted(config.UNUSABLE_SOURCES),
+    "throttled_sources": sorted(config.THROTTLED_SOURCES),
+    "pushover_token": config.PUSHOVER_TOKEN or "",
+    "pushover_user": config.PUSHOVER_USER or "",
+    "webhook_url": config.WEBHOOK_URL or "",
+    "komga_url": "",
+    "komga_api_key": "",
+    "komga_library_id": "",
+    "auth_user": "",
+    "auth_password": "",
+}
+SECRET_KEYS = {"pushover_token", "pushover_user", "komga_api_key", "auth_password"}
+
+_cache: dict[str, object] = {}
+_loaded_at = 0.0
+_lock = threading.Lock()
+TTL = 5.0        # seconds between re-reads; the UI and jobs share one file
+
+
+def _load(con: sqlite3.Connection) -> dict[str, object]:
+    out = dict(DEFAULTS)
+    try:
+        for r in con.execute("SELECT key, value FROM setting"):
+            if r["key"] in DEFAULTS:
+                try:
+                    out[r["key"]] = json.loads(r["value"])
+                except json.JSONDecodeError:
+                    log.warning("setting %s has unreadable value; using default", r["key"])
+    except sqlite3.OperationalError:          # table not there yet (first migrate)
+        pass
+    return out
+
+
+def refresh(con: sqlite3.Connection) -> None:
+    global _cache, _loaded_at
+    with _lock:
+        _cache = _load(con)
+        _loaded_at = time.monotonic()
+
+
+def all_values(con: sqlite3.Connection | None = None) -> dict[str, object]:
+    global _cache, _loaded_at
+    with _lock:
+        stale = time.monotonic() - _loaded_at > TTL or not _cache
+    if stale:
+        try:
+            if con is None:
+                from . import db
+                with db.connect() as c:
+                    refresh(c)
+            else:
+                refresh(con)
+        except Exception as e:                # unreadable DB: run on defaults, say so once
+            global _warned
+            if not _warned:
+                log.warning("settings unavailable (%s: %s); using defaults", type(e).__name__, e)
+                _warned = True
+            with _lock:
+                _cache = dict(DEFAULTS)
+                _loaded_at = time.monotonic()
+    with _lock:
+        return dict(_cache)
+
+
+_warned = False
+
+
+def get(key: str):
+    return all_values().get(key, DEFAULTS[key])
+
+
+def set_many(con: sqlite3.Connection, values: dict[str, object]) -> None:
+    for k, v in values.items():
+        if k not in DEFAULTS:
+            raise KeyError(k)
+        v = _coerce(k, v)
+        con.execute("INSERT INTO setting (key, value) VALUES (?, ?)"
+                    " ON CONFLICT(key) DO UPDATE SET value=excluded.value", (k, json.dumps(v)))
+        log.info("setting %s = %s", k, "***" if k in SECRET_KEYS and v else v)
+    con.commit()
+    refresh(con)
+
+
+def _coerce(key: str, v):
+    d = DEFAULTS[key]
+    if isinstance(d, bool):
+        return str(v).lower() in ("1", "true", "on", "yes")
+    if isinstance(d, float):
+        return float(v)
+    if isinstance(d, int):
+        return int(v)
+    if isinstance(d, list):
+        if isinstance(v, str):
+            v = [s for s in v.replace("\n", ",").split(",")]
+        return sorted({str(s).strip().lower() for s in v if str(s).strip()})
+    return str(v).strip()
+
+
+def source_flags(name: str) -> tuple[bool, bool]:
+    """(unusable, throttled) for a Suwayomi source display name."""
+    k = name.lower().strip()
+    vals = all_values()
+    return k in vals["unusable_sources"], k in vals["throttled_sources"]
