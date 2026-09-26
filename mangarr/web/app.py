@@ -21,6 +21,7 @@ from pydantic import BaseModel, Field
 
 from .. import (
     __version__,
+    backup,
     config,
     core,
     db,
