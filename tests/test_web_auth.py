@@ -44,7 +44,7 @@ class AuthTest(unittest.TestCase):
         self.assertTrue(r.headers["location"].startswith("/login"))
         self.assertEqual(c.get("/api/v1/series").status_code, 401)
         self.assertEqual(c.get("/api/v1/series", headers={"X-Api-Key": self.key}).status_code, 200)
-        self.assertEqual(c.get("/api/v1/health").status_code, 200)          # open for monitoring
+        self.assertIn(c.get("/api/v1/health").status_code, (200, 503))      # open for monitoring (503 = problems)
         with mock.patch("mangarr.web.app.time.sleep", lambda s: None):
             self.assertEqual(c.post("/login", data={"username": "andy", "password": "bad"}).status_code, 401)
         r = c.post("/login", data={"username": "andy", "password": "pw", "next": "/wanted"}, follow_redirects=False)
