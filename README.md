@@ -540,8 +540,10 @@ reverse proxy in that case.
 ## Roadmap
 
 - Interactive per-chapter search: pick the source for one chapter by hand.
-- Season-numbered webtoons (`S2 - Episode 5`): adopt and track them as one
-  series with a running chapter number.
+- Languages other than English: today only Suwayomi's English (`en`/`all`)
+  sources are searched and every chapter is the English release. Planned: a
+  per-series language setting, searching that language's sources, and a
+  library layout that can hold more than one language of the same series.
 - Sync read direction (webtoon vs. manga) to Komga.
 
 ## License

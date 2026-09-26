@@ -355,6 +355,55 @@ def series_monitor(series_id: int, monitored: str = Form("1")):
     return RedirectResponse(f"/series/{series_id}", 303)
 
 
+def _job_chapter(series_id: int, number: float, manga_id: int | None):
+    def run(job: jobs.Job):
+        with db.connect() as con:
+            return core.download_chapter(con, client, series_id, number, manga_id)
+    return run
+
+
+@app.post("/series/{series_id}/chapter/{number}/search")
+def chapter_search(series_id: int, number: float):
+    with db.connect() as con:
+        r = db.get_series(con, series_id)
+    if not r:
+        raise HTTPException(404)
+    runner.submit("chapter", f"{r['title']} ch {number:g}", _job_chapter(series_id, number, None), series_id)
+    return _flash(f"/series/{series_id}", f"search for chapter {number:g} queued")
+
+
+@app.post("/series/{series_id}/chapter/{number}/download")
+def chapter_download(series_id: int, number: float, manga_id: int = Form(...)):
+    with db.connect() as con:
+        r = db.get_series(con, series_id)
+        src = next((x for x in db.sources(con, series_id) if x["manga_id"] == manga_id), None)
+    if not r:
+        raise HTTPException(404)
+    if not src:
+        return _flash(f"/series/{series_id}", "that source entry does not belong to this series")
+    runner.submit("chapter", f"{r['title']} ch {number:g} from {src['source_name']}",
+                  _job_chapter(series_id, number, manga_id), series_id)
+    return _flash(f"/series/{series_id}", f"download of chapter {number:g} from {src['source_name']} queued")
+
+
+@app.get("/api/v1/series/{series_id}/chapter/{number}/releases")
+def api_chapter_releases(series_id: int, number: float):
+    with db.connect() as con:
+        if not db.get_series(con, series_id):
+            raise HTTPException(404)
+        return core.chapter_releases(con, client, series_id, number)
+
+
+@app.post("/api/v1/series/{series_id}/chapter/{number}/search")
+def api_chapter_search(series_id: int, number: float, manga_id: int | None = None):
+    with db.connect() as con:
+        r = db.get_series(con, series_id)
+    if not r:
+        raise HTTPException(404)
+    return runner.submit("chapter", f"{r['title']} ch {number:g}", _job_chapter(series_id, number, manga_id),
+                         series_id).as_dict()
+
+
 @app.post("/series/{series_id}/chapter/{number}/ignore")
 def chapter_ignore(series_id: int, number: float):
     with db.connect() as con:

@@ -81,7 +81,11 @@ def _to_series(m: dict) -> Series:
             chapters = int(float(a["lastChapter"]))
         except ValueError:
             pass
+    genres = [((t.get("attributes") or {}).get("name") or {}).get("en") for t in (a.get("tags") or [])
+              if (t.get("attributes") or {}).get("group") == "genre"]
     return Series(
+        genres=[g for g in genres if g], year=a.get("year"),
+        demographic=a.get("publicationDemographic"),
         mangadex_id=m["id"], romaji=romaji, english=english, native=native, synonyms=synonyms,
         format="MANGA", country=_COUNTRY.get(a.get("originalLanguage") or "", None),
         status=status, chapters=chapters,

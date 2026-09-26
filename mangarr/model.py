@@ -24,6 +24,9 @@ class Series:
     cover: str | None = None
     description: str | None = None
     authors: list[str] = field(default_factory=list)
+    genres: list[str] = field(default_factory=list)
+    year: int | None = None
+    demographic: str | None = None      # shounen, shoujo, seinen, josei (when known)
 
     @property
     def ref(self) -> str:
@@ -59,6 +62,19 @@ class Series:
         latin = [t for t in self.titles if re.search(r"[A-Za-z]", t)]
         other = [t for t in self.titles if t not in latin]
         return latin + other
+
+    @property
+    def language(self) -> str | None:
+        """Original language, from the country of origin."""
+        return {"JP": "Japanese", "KR": "Korean", "CN": "Chinese", "TW": "Chinese", "US": "English",
+                "GB": "English", "FR": "French", "ES": "Spanish"}.get(self.country or "")
+
+    @property
+    def kind(self) -> str:
+        """What people call it: manga, manhwa, manhua, webtoon, comic."""
+        if self.format == "ONE_SHOT":
+            return "one-shot"
+        return {"JP": "manga", "KR": "manhwa", "CN": "manhua", "TW": "manhua"}.get(self.country or "", "comic")
 
     @property
     def right_to_left(self) -> bool:

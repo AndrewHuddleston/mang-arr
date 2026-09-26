@@ -28,6 +28,9 @@ _FIELDS = """
   volumes
   isAdult
   popularity
+  genres
+  startDate { year }
+  tags { name category }
   coverImage { large }
   description(asHtml: false)
   staff(perPage: 4, sort: RELEVANCE) { edges { role node { name { full native } } } }
@@ -91,6 +94,10 @@ def _to_series(m: dict) -> Series:
         cover=(m.get("coverImage") or {}).get("large"),
         description=m.get("description"),
         authors=authors,
+        genres=[g for g in (m.get("genres") or []) if g],
+        year=(m.get("startDate") or {}).get("year"),
+        demographic=next((t["name"].lower() for t in (m.get("tags") or [])
+                          if t.get("category") == "Demographic" and t.get("name")), None),
     )
 
 

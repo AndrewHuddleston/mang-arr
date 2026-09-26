@@ -126,6 +126,15 @@ def download(client: Client, plan: Plan, only: set[float] | None = None,
     return results
 
 
+def download_one(client: Client, manga_id: int, chapter, label: str, source_name: str) -> tuple[bool, list, dict]:
+    """One chapter from one source entry, under the download lock. Returns
+    (ok, failed numbers, {number: why})."""
+    with download_lock():
+        ok, failed, why = _download_source(client, manga_id, [chapter], 1, label, source_name, False,
+                                           lambda: False)
+    return bool(ok), failed, why
+
+
 def _download_source(client, manga_id, todo, batch, label, source_name, patient, cancel):
     """Returns (ok numbers, failed numbers, {number: why it failed})."""
     ok, failed, why = [], [], {}
