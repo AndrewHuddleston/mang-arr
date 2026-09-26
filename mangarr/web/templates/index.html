@@ -1,0 +1,27 @@
+{% extends "base.html" %}
+{% block title %}Series - mang-arr{% endblock %}
+{% block body %}
+<div class="bar">
+  <form method="get" action="/"><input type="search" name="q" value="{{ q }}" placeholder="filter titles"></form>
+  <span class="muted">{{ rows|length }} series</span>
+  <a class="btn" href="/add">+ Add series</a>
+</div>
+<table class="list">
+<thead><tr><th></th><th>Title</th><th>Status</th><th class="num">Have</th><th class="num">Listed</th><th class="num">Wanted</th><th>Primary source</th><th>Checked</th></tr></thead>
+<tbody>
+{% for r in rows %}
+<tr class="{% if not r.monitored %}dim{% endif %}">
+  <td class="cover">{% if r.cover %}<img src="{{ r.cover }}" alt="" loading="lazy">{% endif %}</td>
+  <td><a href="/series/{{ r.id }}">{{ r.title }}</a>{% if r.last_error %} <span class="err" title="{{ r.last_error }}">!</span>{% endif %}</td>
+  <td><span class="tag {{ (r.status or '')|lower }}">{{ r.status or '?' }}</span></td>
+  <td class="num">{{ r.have }}</td>
+  <td class="num">{{ r.listed }}</td>
+  <td class="num {% if r.wanted %}want{% endif %}">{{ r.wanted }}</td>
+  <td class="muted">{{ r.primary_source or '-' }}</td>
+  <td class="muted">{{ r.last_resolved|ago }}</td>
+</tr>
+{% endfor %}
+</tbody>
+</table>
+{% if not rows %}<p class="muted">Nothing tracked yet. <a href="/add">Add a series</a>, or run <code>mangarr adopt</code> to register what Suwayomi already downloaded.</p>{% endif %}
+{% endblock %}

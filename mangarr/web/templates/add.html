@@ -1,0 +1,44 @@
+{% extends "base.html" %}
+{% block title %}Add - mang-arr{% endblock %}
+{% block body %}
+<h1>Add a series</h1>
+<form method="get" action="/add" class="bar">
+  <input type="search" name="term" value="{{ term }}" placeholder="title (English, romaji, or original)" autofocus>
+  <button>Search</button>
+</form>
+{% if term %}
+  {% if pick %}<p class="muted">exact match: <b>{{ pick.title }}</b> ({{ pick.ref }})</p>
+  {% elif cands %}<p class="muted">no single exact match - pick the right one:</p>
+  {% else %}<p class="muted">nothing on AniList or MangaDex. Western webtoons are often missing: add it by exact title below.</p>{% endif %}
+  <div class="cards">
+  {% for c in cands %}
+    <div class="card {% if pick and c.ref == pick.ref %}pick{% endif %}">
+      {% if c.cover %}<img src="{{ c.cover }}" alt="">{% endif %}
+      <div>
+        <b>{{ c.title }}</b>
+        <div class="small muted">{{ c.ref }}<br>{{ c.format or '?' }} · {{ c.country or '?' }} · {{ c.status or '?' }} · {{ c.chapters or '?' }} ch</div>
+        <div class="small muted">{{ c.titles[:4]|join(' | ') }}</div>
+        {% if c.ref in tracked %}<span class="tag">already tracked</span>
+        {% else %}
+        <form method="post" action="/add">
+          <input type="hidden" name="ref" value="{{ c.ref }}">
+          <label><input type="checkbox" name="download" value="1" checked> download missing chapters now</label>
+          <button>Add</button>
+        </form>
+        {% endif %}
+      </div>
+    </div>
+  {% endfor %}
+  </div>
+{% endif %}
+<details {% if term and not cands %}open{% endif %}>
+<summary>Add by exact title (no metadata)</summary>
+<form method="post" action="/add" class="col">
+  <input type="hidden" name="ref" value="manual">
+  <input name="title" value="{{ term }}" placeholder="exact title as the sources spell it">
+  <input name="alias" placeholder="other exact titles, separated by |">
+  <label><input type="checkbox" name="download" value="1" checked> download missing chapters now</label>
+  <button>Add</button>
+</form>
+</details>
+{% endblock %}

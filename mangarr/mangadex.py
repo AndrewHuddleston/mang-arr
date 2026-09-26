@@ -5,6 +5,7 @@ WEBTOON originals) and indexes alternate titles in many languages. It is
 consulted when AniList has no exact match.
 """
 import json
+import logging
 import time
 import urllib.error
 import urllib.parse
@@ -13,6 +14,8 @@ import urllib.request
 from . import config
 from .matching import query_score
 from .model import Series
+
+log = logging.getLogger(__name__)
 
 _STATUS = {"ongoing": "RELEASING", "completed": "FINISHED", "hiatus": "HIATUS", "cancelled": "CANCELLED"}
 _COUNTRY = {"ja": "JP", "ko": "KR", "zh": "CN", "zh-hk": "CN", "en": "US", "fr": "FR", "es": "ES"}
@@ -24,12 +27,17 @@ def _get(path: str, params: list[tuple[str, str]], retries: int = 3) -> dict:
     last: Exception | None = None
     for _ in range(retries):
         req = urllib.request.Request(url, headers={"User-Agent": config.USER_AGENT})
+        t0 = time.monotonic()
         try:
             with urllib.request.urlopen(req, timeout=30) as r:
-                return json.load(r)
+                d = json.load(r)
+            log.debug("mangadex %s -> ok in %.1fs", path, time.monotonic() - t0)
+            return d
         except urllib.error.HTTPError as e:
             if e.code == 429:
-                time.sleep(int(e.headers.get("Retry-After", "5")))
+                wait = int(e.headers.get("Retry-After", "5"))
+                log.debug("mangadex rate limited, waiting %ds", wait)
+                time.sleep(wait)
                 continue
             if e.code == 404:
                 return {}

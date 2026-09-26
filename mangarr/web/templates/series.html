@@ -1,0 +1,55 @@
+{% extends "base.html" %}
+{% block title %}{{ s.title }} - mang-arr{% endblock %}
+{% block body %}
+<div class="head">
+  {% if s.cover %}<img class="bigcover" src="{{ s.cover }}" alt="">{% endif %}
+  <div>
+    <h1>{{ s.title }}</h1>
+    <p class="muted">{{ s.ref }} · {{ s.format or '?' }} · {{ s.country or '?' }} · <span class="tag {{ (s.status or '')|lower }}">{{ s.status or '?' }}</span>
+      {% if s.expected %}· {{ s.expected }} chapters{% endif %}
+      {% if series.authors %}· by {{ series.authors[:2]|join(', ') }}{% endif %}</p>
+    <p class="muted small">titles: {{ series.titles[:6]|join(' | ') }}</p>
+    {% if s.last_error %}<p class="err">last error: {{ s.last_error }}</p>{% endif %}
+    <div class="actions">
+      <form method="post" action="/series/{{ s.id }}/refresh"><input type="hidden" name="download" value="1"><button {% if busy %}disabled{% endif %}>Search &amp; download missing</button></form>
+      <form method="post" action="/series/{{ s.id }}/refresh"><input type="hidden" name="download" value="0"><button class="alt" {% if busy %}disabled{% endif %}>Re-check sources only</button></form>
+      <form method="post" action="/series/{{ s.id }}/monitor"><input type="hidden" name="monitored" value="{{ 0 if s.monitored else 1 }}"><button class="alt">{{ 'Unmonitor' if s.monitored else 'Monitor' }}</button></form>
+      <form method="post" action="/series/{{ s.id }}/delete" onsubmit="return confirm('Remove {{ s.title|e }} from mang-arr?')">
+        <label><input type="checkbox" name="files" value="1"> also delete library folder</label>
+        <button class="danger">Delete</button></form>
+    </div>
+    {% if busy %}<p class="muted">a job for this series is queued or running</p>{% endif %}
+  </div>
+</div>
+
+<h2>Chapters</h2>
+<div class="stats">
+  {% for st in ['have','wanted','failed','junk','unavailable'] %}{% if by.get(st) %}
+  <div class="stat {{ st }}"><b>{{ by[st]|length }}</b> {{ st }}<div class="small muted">{{ by[st]|ranges }}</div></div>
+  {% endif %}{% endfor %}
+</div>
+
+<h2>Sources</h2>
+<table class="list">
+<thead><tr><th></th><th>Source</th><th>Entry title</th><th class="num">Chapters</th><th class="num">Max</th><th>Note</th></tr></thead>
+<tbody>
+{% for x in sources %}
+<tr><td>{{ '★' if x.is_primary else '' }}</td><td>{{ x.source_name }}</td><td>{{ x.title }}</td><td class="num">{{ x.chapter_count }}</td><td class="num">{{ '%g'|format(x.max_chapter) }}</td><td class="muted">{{ x.note or '' }}</td></tr>
+{% endfor %}
+</tbody></table>
+
+<details><summary>Chapter list ({{ chapters|length }})</summary>
+<table class="list small">
+<thead><tr><th class="num">#</th><th>Status</th><th>Source</th><th>Library file</th></tr></thead>
+<tbody>
+{% for c in chapters %}
+<tr class="{{ c.status }}"><td class="num">{{ '%g'|format(c.number) }}</td><td>{{ c.status }}</td><td class="muted">{{ c.source_name or '' }}</td><td class="muted">{{ c.library_path or '' }}</td></tr>
+{% endfor %}
+</tbody></table>
+</details>
+
+<h2>History</h2>
+<table class="list small">
+{% for e in events %}<tr><td class="muted">{{ e.at }}</td><td>{{ e.kind }}</td><td>{{ e.message }}</td></tr>{% endfor %}
+</table>
+{% endblock %}

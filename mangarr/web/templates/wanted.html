@@ -1,0 +1,14 @@
+{% extends "base.html" %}
+{% block title %}Wanted - mang-arr{% endblock %}
+{% block body %}
+<h1>Wanted</h1>
+<p class="muted">{{ rows|length }} series with missing chapters. The worker fetches them each cycle; a chapter stays here while no reachable source has it.</p>
+<table class="list">
+<thead><tr><th>Series</th><th class="num">Wanted</th><th>Chapters</th><th class="num">Failed</th><th>Checked</th></tr></thead>
+<tbody>
+{% for r in rows %}
+<tr><td><a href="/series/{{ r.id }}">{{ r.title }}</a></td><td class="num want">{{ r.wanted }}</td>
+<td class="small muted">{{ r.numbers }}</td><td class="num">{{ r.failed }}</td><td class="muted">{{ r.last_resolved|ago }}</td></tr>
+{% endfor %}
+</tbody></table>
+{% endblock %}

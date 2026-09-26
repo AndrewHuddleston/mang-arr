@@ -1,0 +1,26 @@
+{% extends "base.html" %}
+{% block title %}System - mang-arr{% endblock %}
+{% block body %}
+<h1>System</h1>
+<div class="stats">
+  <div class="stat"><b>{{ version }}</b> version</div>
+  <div class="stat"><b>{{ uptime }}</b> started</div>
+  <div class="stat {{ 'have' if suwayomi_ok else 'failed' }}"><b>{{ 'ok' if suwayomi_ok else 'unreachable' }}</b> Suwayomi</div>
+  <div class="stat"><b>{{ next_refresh|ago if next_refresh else '-' }}</b> next scheduled refresh</div>
+  <div class="stat {{ 'have' if notify_ok else '' }}"><b>{{ 'on' if notify_ok else 'off' }}</b> notifications
+    {% if notify_ok %}<form method="post" action="/system/notify-test"><button class="alt small">send test</button></form>{% endif %}</div>
+</div>
+
+<h2>Sources (from Suwayomi)</h2>
+<table class="list small">
+{% for s in sources %}<tr><td>{{ s.name }}</td><td class="muted">{{ s.lang }}</td>
+<td>{% if s.unusable %}<span class="tag failed">unusable</span>{% elif s.throttled %}<span class="tag wanted">throttled</span>{% else %}<span class="tag have">ok</span>{% endif %}</td></tr>{% endfor %}
+</table>
+
+<h2>Configuration</h2>
+<table class="list small">{% for k, v in cfg %}<tr><td class="muted">MANGARR_{{ k }}</td><td>{{ v }}</td></tr>{% endfor %}</table>
+
+<h2>Log <span class="muted small">(last {{ log_lines|length }} lines)</span></h2>
+{% if log_lines %}<pre class="log">{% for l in log_lines %}{{ l }}{% endfor %}</pre>
+{% else %}<p class="muted">no log file configured (MANGARR_LOG_FILE)</p>{% endif %}
+{% endblock %}

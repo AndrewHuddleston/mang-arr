@@ -87,9 +87,14 @@ def migrate(con: sqlite3.Connection) -> None:
 @contextmanager
 def connect(path: str = config.DB_PATH):
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-    con = sqlite3.connect(path)
+    con = sqlite3.connect(path, timeout=30)
     con.row_factory = sqlite3.Row
     con.execute("PRAGMA foreign_keys = ON")
+    try:
+        con.execute("PRAGMA journal_mode = WAL")   # web requests read while a job writes
+        con.execute("PRAGMA synchronous = NORMAL")
+    except sqlite3.OperationalError:               # another process holds it; next open will switch
+        pass
     migrate(con)
     try:
         yield con
@@ -159,6 +164,35 @@ def series_rows(con):
 
 def delete_series(con, series_id: int) -> None:
     con.execute("DELETE FROM series WHERE id=?", (series_id,))
+
+
+def set_monitored(con, series_id: int, monitored: bool) -> None:
+    con.execute("UPDATE series SET monitored=? WHERE id=?", (int(monitored), series_id))
+    event(con, "monitor", "monitored" if monitored else "unmonitored", series_id)
+
+
+def wanted_all(con):
+    """One row per series with wanted/failed chapters, numbers as a range string."""
+    from .resolver import ranges
+    rows = con.execute(
+        "SELECT s.id, s.title, s.last_resolved,"
+        " SUM(c.status='wanted') AS wanted, SUM(c.status='failed') AS failed,"
+        " GROUP_CONCAT(c.number) AS nums"
+        " FROM series s JOIN chapter c ON c.series_id=s.id AND c.status IN ('wanted','failed')"
+        " GROUP BY s.id ORDER BY s.title COLLATE NOCASE").fetchall()
+    out = []
+    for r in rows:
+        d = dict(r)
+        d["wanted"] = (d["wanted"] or 0) + (d["failed"] or 0)
+        d["numbers"] = ranges(float(x) for x in (d.pop("nums") or "").split(",") if x)
+        out.append(d)
+    return out
+
+
+def events(con, limit: int = 50):
+    return con.execute(
+        "SELECT e.*, s.title FROM event e LEFT JOIN series s ON s.id=e.series_id"
+        " ORDER BY e.id DESC LIMIT ?", (limit,)).fetchall()
 
 
 # -- plan / chapters ---------------------------------------------------------

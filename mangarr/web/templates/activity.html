@@ -1,0 +1,32 @@
+{% extends "base.html" %}
+{% block title %}Activity - mang-arr{% endblock %}
+{% block body %}
+<div class="bar"><h1>Activity</h1>
+  <form method="post" action="/activity/refresh-all"><button>Refresh all now</button></form>
+</div>
+
+<h2>Jobs</h2>
+<table class="list" id="jobs">
+<thead><tr><th>#</th><th>Kind</th><th>What</th><th>Status</th><th>Progress / result</th><th>When</th><th></th></tr></thead>
+<tbody>
+{% for j in jobs %}
+<tr class="job-{{ j.status }}"><td>{{ j.id }}</td><td>{{ j.kind }}</td>
+<td>{% if j.series_id %}<a href="/series/{{ j.series_id }}">{{ j.title }}</a>{% else %}{{ j.title }}{% endif %}</td>
+<td>{{ j.status }}</td><td class="small">{{ j.message or j.progress }}</td>
+<td class="muted">{{ (j.finished_at or j.started_at or j.queued_at)|ago }}</td>
+<td>{% if j.status in ['queued','running'] %}<form method="post" action="/activity/cancel/{{ j.id }}"><button class="alt small">cancel</button></form>{% endif %}</td></tr>
+{% endfor %}
+</tbody></table>
+
+<h2>Suwayomi download queue <span class="muted small">({{ squeue.state }}, {{ squeue.count }})</span></h2>
+{% if squeue.error %}<p class="err">{{ squeue.error }}</p>{% endif %}
+<table class="list small" id="squeue">
+{% for x in squeue["items"] %}<tr><td>{{ x.manga }}</td><td>{{ x.chapter }}</td><td>{{ x.state }}</td><td>{{ x.progress }}%</td><td class="muted">tries {{ x.tries }}</td></tr>{% endfor %}
+</table>
+
+<h2>History</h2>
+<table class="list small">
+{% for e in events %}<tr><td class="muted">{{ e.at }}</td><td>{{ e.kind }}</td><td>{% if e.series_id %}<a href="/series/{{ e.series_id }}">{{ e.title }}</a>{% endif %}</td><td>{{ e.message }}</td></tr>{% endfor %}
+</table>
+{% endblock %}
+{% block script %}<script>setTimeout(()=>location.reload(), 10000);</script>{% endblock %}

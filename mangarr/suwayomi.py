@@ -1,15 +1,24 @@
 """Suwayomi GraphQL client. Suwayomi is the download engine; this is the only
 module that talks to it."""
 import json
+import logging
+import re
 import time
 import urllib.request
 from dataclasses import dataclass
 
 from . import config
 
+log = logging.getLogger(__name__)
+
 
 class SuwayomiError(RuntimeError):
     pass
+
+
+_OPNAME = re.compile(r"\b(fetchSourceManga|fetchMangaAndChapters|fetchChapterPages|downloadStatus|"
+                     r"enqueueChapterDownload|startDownloader|stopDownloader|clearDownloader|"
+                     r"updateManga|sources|mangas|manga)\b")
 
 
 @dataclass(frozen=True)
@@ -51,19 +60,27 @@ class Client:
         if variables:
             body["variables"] = variables
         last = None
-        for _ in range(retries):
+        m = _OPNAME.search(query)
+        op = m.group(1) if m else "query"
+        for attempt in range(1, retries + 1):
+            t0 = time.monotonic()
             try:
                 req = urllib.request.Request(self.api, json.dumps(body).encode(),
                                              {"Content-Type": "application/json"})
                 with urllib.request.urlopen(req, timeout=timeout) as r:
                     d = json.load(r)
                 if "errors" in d:
-                    raise SuwayomiError(d["errors"][0]["message"].split("\n")[0][:200])
+                    msg = d["errors"][0]["message"].split("\n")[0][:200]
+                    log.debug("suwayomi %s %s -> error in %.1fs: %s", op, variables or "", time.monotonic() - t0, msg)
+                    raise SuwayomiError(msg)
+                log.debug("suwayomi %s %s -> ok in %.1fs", op, variables or "", time.monotonic() - t0)
                 return d["data"]
             except SuwayomiError:
                 raise
             except Exception as e:
                 last = e
+                log.debug("suwayomi %s attempt %d/%d failed after %.1fs: %s", op, attempt, retries,
+                          time.monotonic() - t0, e)
                 time.sleep(5)
         raise SuwayomiError(f"API unreachable: {last}")
 

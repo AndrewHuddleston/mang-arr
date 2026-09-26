@@ -6,6 +6,7 @@ finished series - the real chapter count. It covers Japanese, Korean and
 Chinese comics well and Western webtoons poorly; see mangadex.py for those.
 """
 import json
+import logging
 import time
 import urllib.error
 import urllib.request
@@ -13,6 +14,8 @@ import urllib.request
 from . import config
 from .matching import query_score
 from .model import Series
+
+log = logging.getLogger(__name__)
 
 _FIELDS = """
   id
@@ -42,12 +45,17 @@ def _post(query: str, variables: dict, retries: int = 3) -> dict:
             config.ANILIST_URL, body,
             {"Content-Type": "application/json", "Accept": "application/json",
              "User-Agent": config.USER_AGENT})
+        t0 = time.monotonic()
         try:
             with urllib.request.urlopen(req, timeout=30) as r:
-                return json.load(r)
+                d = json.load(r)
+            log.debug("anilist %s -> ok in %.1fs", variables, time.monotonic() - t0)
+            return d
         except urllib.error.HTTPError as e:
             if e.code == 429:            # 30 requests/minute
-                time.sleep(int(e.headers.get("Retry-After", "10")))
+                wait = int(e.headers.get("Retry-After", "10"))
+                log.debug("anilist rate limited, waiting %ds", wait)
+                time.sleep(wait)
                 continue
             if e.code == 404:            # unknown id
                 return {}

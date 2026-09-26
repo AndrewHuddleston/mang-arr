@@ -1,18 +1,22 @@
-"""Turn an AniList series into a per-chapter download plan.
+"""Turn a series into a per-chapter download plan.
 
-    series (AniList) -> search every source with every title
-                     -> accept only exact title matches
-                     -> distrust sources whose length is off
-                     -> union the chapter numbers
-                     -> pick a source for each chapter
+    series (AniList/MangaDex/manual) -> search every source with every title
+                                     -> accept only exact title matches
+                                     -> distrust sources whose length is off
+                                     -> union the chapter numbers
+                                     -> drop fractional "chapters" with no pages
+                                     -> pick a source for each chapter
 """
+import logging
 import statistics
 from dataclasses import dataclass, field
 
 from . import config
+from .matching import (ACCEPTED, AUTHOR_DIFFER, author_level, match_level)
 from .model import Series
-from .matching import (ACCEPTED, AUTHOR_AGREE, AUTHOR_DIFFER, NONE, author_level, match_level)
 from .suwayomi import Chapter, Client, Source, SuwayomiError
+
+log = logging.getLogger(__name__)
 
 
 @dataclass
@@ -21,7 +25,7 @@ class SourceMatch:
     manga_id: int
     title: str
     author: str | None
-    match: int                    # matching.EXACT / EXACT_BASE / NONE
+    match: int                    # matching.EXACT / EXACT_BASE
     matched_title: str | None
     author_ok: int                # matching.AUTHOR_*
     chapters: list[Chapter] = field(default_factory=list)
@@ -71,7 +75,7 @@ class Plan:
         return sorted(self.assignment)
 
     def have(self) -> set[float]:
-        """Chapter numbers already downloaded on any accepted source."""
+        """Chapter numbers Suwayomi reports downloaded on any accepted source."""
         return {c.number for m in self.matches for c in m.chapters if c.downloaded}
 
     def wanted(self) -> list[float]:
@@ -87,55 +91,37 @@ class Plan:
         return [n for n in range(1, top + 1) if n not in listed]
 
 
-def resolve(client: Client, series: Series, sources: list[Source] | None = None,
-            log=lambda m: None) -> Plan:
+def resolve(client: Client, series: Series, sources: list[Source] | None = None) -> Plan:
     sources = sources if sources is not None else client.sources()
+    log.info("resolving %s [%s] across %d sources, titles: %s", series.title, series.ref,
+             len(sources), " | ".join(series.search_titles[:5]))
     matches: list[SourceMatch] = []
     rejected: list[Rejected] = []
     unreachable: list[tuple[Source, str]] = []
     titles = series.search_titles
 
     for src in sources:
-        found = _search_source(client, src, series, titles, rejected, log)
+        found = _search_source(client, src, series, titles, rejected)
         if isinstance(found, str):
             unreachable.append((src, found))
-            log(f"  {src.name:<26} unreachable: {found}")
+            log.warning("%s unreachable: %s", src.name, found)
             continue
         if found is None:
-            log(f"  {src.name:<26} no match")
+            log.info("%-26s no match", src.name)
             continue
         matches.append(found)
 
-    _trust(series, matches, log)
+    _trust(series, matches)
     assignment = _assign(matches)
     plan = Plan(series, matches, rejected, unreachable, assignment)
-    _prune_junk(client, plan, log)
+    _prune_junk(client, plan)
+    log.info("%s: %d chapters listed from %d source(s), %d on disk per Suwayomi, %d wanted, %d junk",
+             series.title, len(plan.chapters), len({m.manga_id for m in assignment.values()}),
+             len(plan.have()), len(plan.wanted()), len(plan.junk))
     return plan
 
 
-def _prune_junk(client: Client, plan: Plan, log) -> None:
-    """Drop fractional chapters that turn out to be a handful of pages:
-    notices and ads, not chapters. Every fractional chapter is probed, not
-    just single-source ones - aggregators (Bato, Manganato) scrape the same
-    upstream and list the same junk, so agreement between them proves nothing."""
-    suspects = [n for n in plan.assignment if n != int(n)]
-    if not suspects:
-        return
-    log(f"  checking {len(suspects)} fractional chapter(s) for junk ...")
-    for n in sorted(suspects):
-        m = plan.assignment[n]
-        ch = next((c for c in m.chapters if c.number == n), None)
-        if ch is None or ch.downloaded:
-            continue
-        pages = client.page_count(ch.id)
-        if pages is not None and pages < config.MIN_PAGES:
-            plan.junk[n] = (m, pages)
-            del plan.assignment[n]
-    if plan.junk:
-        log(f"  dropped {len(plan.junk)} as junk (<{config.MIN_PAGES} pages)")
-
-
-def _search_source(client, src, series, titles, rejected, log):
+def _search_source(client, src, series, titles, rejected):
     """Best accepted hit on one source, trying each title until one lands.
     Returns SourceMatch, None (no acceptable hit) or str (unreachable)."""
     seen_ids: set[int] = set()
@@ -144,9 +130,10 @@ def _search_source(client, src, series, titles, rejected, log):
             hits = client.search(src, q)
         except SuwayomiError as e:
             msg = str(e)
-            if "unreachable" in msg.lower() or "resolve" in msg.lower():
+            if "unreachable" in msg.lower() or "resolve" in msg.lower() or "hostname" in msg.lower():
                 return "DNS/network"
             return msg[:60]
+        log.debug("%s search %r -> %d hit(s)", src.name, q, len(hits))
         scored = []
         for h in hits:
             if h["id"] in seen_ids:
@@ -155,8 +142,10 @@ def _search_source(client, src, series, titles, rejected, log):
             lvl, matched = match_level(h.get("title"), series.titles)
             if lvl in ACCEPTED:
                 scored.append((lvl, h, matched))
+                log.debug("%s   accept %r == %r", src.name, h.get("title"), matched)
             else:
                 rejected.append(Rejected(src, h.get("title") or "?", q, "title differs"))
+                log.debug("%s   reject %r", src.name, h.get("title"))
         if not scored:
             continue
         scored.sort(key=lambda x: x[0])
@@ -164,7 +153,10 @@ def _search_source(client, src, series, titles, rejected, log):
         try:
             manga, chapters = client.manga(hit["id"])
         except SuwayomiError as e:
-            return str(e)[:60]
+            if "no chapters" in str(e).lower():       # matched, but the entry is empty
+                manga, chapters = hit, []
+            else:
+                return str(e)[:60]
         author = manga.get("author") or manga.get("artist") or hit.get("author")
         a_lvl = author_level(author, series.authors)
         m = SourceMatch(src, hit["id"], manga.get("title") or hit["title"], author,
@@ -175,13 +167,13 @@ def _search_source(client, src, series, titles, rejected, log):
             m.note = "source cannot deliver images from here"
         elif not chapters:
             m.note = "lists no chapters"
-        log(f"  {src.name:<26} {m.title[:34]:<34} {len(chapters):>4} ch, max {m.max:<6g}"
-            f" id={hit['id']:<6} {'[' + m.note + ']' if m.note else ''}")
+        log.info("%-26s %-34s %4d ch, max %-6g id=%-6d %s", src.name, m.title[:34], len(chapters),
+                 m.max, hit["id"], f"[{m.note}]" if m.note else "")
         return m
     return None
 
 
-def _trust(series: Series, matches: list[SourceMatch], log) -> None:
+def _trust(series: Series, matches: list[SourceMatch]) -> None:
     """Flag sources whose length says they merged in another series."""
     good = [m for m in matches if m.usable and m.max]
     if not good:
@@ -196,7 +188,7 @@ def _trust(series: Series, matches: list[SourceMatch], log) -> None:
     for m in good:
         if m.max > expected * config.DISAGREE:
             m.note = f"too long: max {m.max:g} vs expected ~{expected:g}"
-            log(f"  ! {m.source.name}: {m.note} - not trusted")
+            log.warning("%s: %s - not trusted", m.source.name, m.note)
 
 
 def _assign(matches: list[SourceMatch]) -> dict[float, SourceMatch]:
@@ -207,6 +199,29 @@ def _assign(matches: list[SourceMatch]) -> dict[float, SourceMatch]:
         for n in m.numbers:
             out.setdefault(n, m)
     return out
+
+
+def _prune_junk(client: Client, plan: Plan) -> None:
+    """Drop fractional chapters that turn out to be a handful of pages:
+    notices and ads, not chapters. Every fractional chapter is probed, not
+    just single-source ones - aggregators (Bato, Manganato) scrape the same
+    upstream and list the same junk, so agreement between them proves nothing."""
+    suspects = [n for n in plan.assignment if n != int(n)]
+    if not suspects:
+        return
+    log.info("probing %d fractional chapter(s) for junk", len(suspects))
+    for n in sorted(suspects):
+        m = plan.assignment[n]
+        ch = next((c for c in m.chapters if c.number == n), None)
+        if ch is None or ch.downloaded:
+            continue
+        pages = client.page_count(ch.id)
+        log.debug("%s ch %g: %s pages", m.source.name, n, pages)
+        if pages is not None and pages < config.MIN_PAGES:
+            plan.junk[n] = (m, pages)
+            del plan.assignment[n]
+    if plan.junk:
+        log.info("dropped %d junk chapter(s): %s", len(plan.junk), ranges(sorted(plan.junk)))
 
 
 def primary(plan: Plan) -> SourceMatch | None:

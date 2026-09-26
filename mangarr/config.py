@@ -6,13 +6,28 @@ USER_AGENT = "mang-arr/0.1 (+https://github.com/AndrewHuddleston/mang-arr)"
 SUWAYOMI_URL = os.environ.get("MANGARR_SUWAYOMI_URL", "http://localhost:4567")
 ANILIST_URL = "https://graphql.anilist.co"
 MANGADEX_URL = "https://api.mangadex.org"
-DB_PATH = os.environ.get("MANGARR_DB", "/var/lib/mangarr/mangarr.db")
+
+DATA_DIR = os.environ.get("MANGARR_DATA", "/var/lib/mangarr")
+DB_PATH = os.environ.get("MANGARR_DB", os.path.join(DATA_DIR, "mangarr.db"))
+LOCK_PATH = os.environ.get("MANGARR_LOCK", os.path.join(DATA_DIR, "download.lock"))
+LOG_FILE = os.environ.get("MANGARR_LOG_FILE")          # e.g. /var/lib/mangarr/mangarr.log
+LOG_LEVEL = os.environ.get("MANGARR_LOG_LEVEL", "INFO")
 
 # Where Suwayomi writes chapters: <STAGING_ROOT>/<Source>/<Series>/*.cbz.
 # Never renamed - Suwayomi treats it as its record of what is downloaded.
 STAGING_ROOT = os.environ.get("MANGARR_STAGING", "/mnt/movie_silo/books/manga")
 # The clean per-series tree Komga reads: <LIBRARY_ROOT>/<Series>/Chapter 012.0.cbz
 LIBRARY_ROOT = os.environ.get("MANGARR_LIBRARY", "/mnt/movie_silo/books/library")
+
+# The worker re-checks every monitored series this often, starting this many
+# minutes after launch.
+REFRESH_HOURS = float(os.environ.get("MANGARR_REFRESH_HOURS", "6"))
+FIRST_REFRESH_MIN = float(os.environ.get("MANGARR_FIRST_REFRESH_MIN", "5"))
+
+# Notifications: Pushover, and/or a generic JSON webhook.
+PUSHOVER_TOKEN = os.environ.get("MANGARR_PUSHOVER_TOKEN")
+PUSHOVER_USER = os.environ.get("MANGARR_PUSHOVER_USER")
+WEBHOOK_URL = os.environ.get("MANGARR_WEBHOOK_URL")
 
 # Sources that list chapters but cannot deliver images from this network, or
 # that rate-limit so hard under bulk load that they are worthless for a

@@ -5,67 +5,84 @@
     import   link what is on disk into the library
     adopt    register everything Suwayomi already downloaded
 """
+import logging
 import os
 from dataclasses import dataclass, field
 
 from . import db, downloader, library, metadata
-from .matching import query_score
 from .model import Series
 from .resolver import Plan, primary, resolve
 from .suwayomi import Client, SuwayomiError
 
+log = logging.getLogger(__name__)
 
-def _quiet(msg: str = "") -> None:
-    pass
+
+@dataclass
+class Outcome:
+    series_id: int
+    plan: Plan
+    results: dict = field(default_factory=dict)   # chapter -> ok | failed
+    imported: int = 0                             # chapters newly linked into the library
+
+    @property
+    def downloaded(self) -> int:
+        return sum(1 for r in self.results.values() if r == "ok")
+
+    @property
+    def failed(self) -> int:
+        return len(self.results) - self.downloaded
 
 
 # -- add / refresh ------------------------------------------------------------
 
-def add_series(con, client: Client, series: Series, log=_quiet, download: bool = True,
-               do_import: bool = True) -> tuple[int, Plan, dict]:
+def add_series(con, client: Client, series: Series, download: bool = True,
+               do_import: bool = True) -> Outcome:
     """Track a series: resolve it, remember the plan, fetch what is missing,
-    link the results into the library. Returns (series id, plan, results)."""
-    plan = resolve(client, series, log=log)
+    link the results into the library."""
+    plan = resolve(client, series)
     series_id = db.upsert_series(con, series)
     p = primary(plan)
     db.save_plan(con, series_id, plan, p.manga_id if p else None)
-    db.event(con, "added", f"tracking {series.title} ({len(plan.chapters)} chapters listed)", series_id)
+    db.event(con, "resolved", f"{len(plan.chapters)} chapters listed, {len(plan.wanted())} wanted"
+             + (f", {len(plan.junk)} junk skipped" if plan.junk else ""), series_id)
     con.commit()
+    out = Outcome(series_id, plan)
     if p:
         _set_library_entries(client, plan, p.manga_id)
+    else:
+        log.warning("%s: no usable source", series.title)
     if do_import:
-        import_series(con, series_id, log=log)
-    results: dict = {}
+        out.imported += import_series(con, series_id)
     if download and p:
-        results = download_wanted(con, client, series_id, plan, log=log)
+        out.results = download_wanted(con, client, series_id, plan)
         if do_import:
-            import_series(con, series_id, log=log)
-    return series_id, plan, results
+            out.imported += import_series(con, series_id)
+    return out
 
 
-def refresh_series(con, client: Client, series_id: int, log=_quiet, download: bool = True) -> tuple[Plan, dict]:
+def refresh_series(con, client: Client, series_id: int, download: bool = True) -> Outcome:
     row = db.get_series(con, series_id)
     series = db.series_to_model(row)
-    return add_series(con, client, series, log=log, download=download)[1:]
+    return add_series(con, client, series, download=download)
 
 
 def _set_library_entries(client: Client, plan: Plan, primary_manga_id: int) -> None:
-    """Only the primary entry stays in Suwayomi's library, so its 12h update
+    """Only the primary entry stays in Suwayomi's library, so its own update
     fetches new chapters from one source, not five copies."""
     for m in plan.matches:
         try:
             client.set_in_library(m.manga_id, m.manga_id == primary_manga_id)
-        except SuwayomiError:
-            pass
+        except SuwayomiError as e:
+            log.debug("could not set library flag on %d: %s", m.manga_id, e)
 
 
-def download_wanted(con, client: Client, series_id: int, plan: Plan, log=_quiet) -> dict:
+def download_wanted(con, client: Client, series_id: int, plan: Plan) -> dict:
     have_on_disk = {r["number"] for r in db.chapters(con, series_id) if r["status"] == "have"}
     wanted = [n for n in plan.wanted() if n not in have_on_disk]
     if not wanted:
+        log.info("%s: nothing to download", plan.series.title)
         return {}
-    log(f"downloading {len(wanted)} chapter(s):")
-    results = downloader.download(client, plan, log=log, only=set(wanted))
+    results = downloader.download(client, plan, only=set(wanted))
     for n, r in results.items():
         if r != "ok":
             db.set_status(con, series_id, n, "failed")
@@ -73,6 +90,37 @@ def download_wanted(con, client: Client, series_id: int, plan: Plan, log=_quiet)
     db.event(con, "downloaded", f"{ok} chapter(s) downloaded, {len(results) - ok} failed", series_id)
     con.commit()
     return results
+
+
+def delete_series(con, client: Client, series_id: int, delete_library: bool = False) -> None:
+    """Stop tracking. Optionally remove the library folder (hard links only;
+    Suwayomi's staging files are never touched). The Suwayomi entries are
+    taken out of its library so it stops auto-updating them."""
+    row = db.get_series(con, series_id)
+    title = row["title"]
+    for s in db.sources(con, series_id):
+        try:
+            client.set_in_library(s["manga_id"], False)
+        except SuwayomiError as e:
+            log.warning("%s: could not unset library flag on %s entry: %s", title, s["source_name"], e)
+    if delete_library:
+        d = library.library_dir(title)
+        removed = 0
+        if os.path.isdir(d):
+            for name in os.listdir(d):
+                p = os.path.join(d, name)
+                if os.path.isfile(p):
+                    os.remove(p)
+                    removed += 1
+            try:
+                os.rmdir(d)
+            except OSError as e:
+                log.warning("%s: library folder %s not removed: %s", title, d, e)
+        log.info("%s: removed %d file(s) from %s", title, removed, d)
+    db.delete_series(con, series_id)
+    db.event(con, "deleted", f"{title} removed" + (" with library files" if delete_library else ""))
+    con.commit()
+    log.info("%s: no longer tracked", title)
 
 
 # -- import ------------------------------------------------------------------
@@ -88,15 +136,17 @@ def series_staging_dirs(con, series_id: int) -> list[tuple[str, str]]:
     return out
 
 
-def import_series(con, series_id: int, log=_quiet) -> int:
+def import_series(con, series_id: int) -> int:
     """Link every staged chapter into <library>/<title>/. Returns how many
-    chapters are now in the library."""
+    chapters were newly linked."""
     row = db.get_series(con, series_id)
     title = row["title"]
     known = {r["number"]: r for r in db.chapters(con, series_id)}
     linked = 0
     for source_name, folder in series_staging_dirs(con, series_id):
-        found, _ = library.scan_series_dir(folder)
+        found, unparsed = library.scan_series_dir(folder)
+        if unparsed:
+            log.debug("%s: %d file(s) in %s without a chapter number", title, len(unparsed), folder)
         for n, path in found.items():
             prev = known.get(n)
             if prev and prev["status"] == "junk":
@@ -105,12 +155,13 @@ def import_series(con, series_id: int, log=_quiet) -> int:
                 continue
             dst = library.link_into_library(path, title, n)
             db.set_have(con, series_id, n, path, dst, source_name)
+            log.debug("%s: linked ch %g <- %s", title, n, path)
             linked += 1
     if linked:
         db.event(con, "imported", f"{linked} chapter(s) linked into the library", series_id)
-        log(f"  imported {linked} chapter(s) into {library.library_dir(title)}")
+        log.info("%s: imported %d chapter(s) into %s", title, linked, library.library_dir(title))
     con.commit()
-    return sum(1 for r in db.chapters(con, series_id) if r["status"] == "have")
+    return linked
 
 
 # -- adopt -------------------------------------------------------------------
@@ -142,7 +193,7 @@ def suwayomi_downloaded_entries(client: Client) -> dict[tuple[str, str], int]:
     return out
 
 
-def plan_adopt(client: Client, log=_quiet, only: str | None = None) -> list[AdoptItem]:
+def plan_adopt(client: Client, only: str | None = None) -> list[AdoptItem]:
     """Inspect every staged series folder and work out what it is."""
     entries = suwayomi_downloaded_entries(client)
     items: list[AdoptItem] = []
@@ -158,12 +209,12 @@ def plan_adopt(client: Client, log=_quiet, only: str | None = None) -> list[Adop
         it.series, it.candidates = cache[name]
         items.append(it)
         tag = it.series.ref if it.series else f"REVIEW ({len(it.candidates)} candidates)"
-        log(f"  {src[:14]:<14} {name[:42]:<42} {len(numbers):>4} ch"
-            f"{'  +' + str(len(unparsed)) + ' unparsed' if unparsed else ''}  -> {tag}")
+        log.info("%-14s %-42s %4d ch%s -> %s", src[:14], name[:42], len(numbers),
+                 f" +{len(unparsed)} unparsed" if unparsed else "", tag)
     return items
 
 
-def apply_adopt(con, items: list[AdoptItem], log=_quiet) -> tuple[int, int]:
+def apply_adopt(con, items: list[AdoptItem]) -> tuple[int, int]:
     """Register the identified folders. Folders of the same series (one per
     source) merge into one tracked series. Returns (series, chapters)."""
     by_ref: dict[str, list[AdoptItem]] = {}
@@ -187,6 +238,7 @@ def apply_adopt(con, items: list[AdoptItem], log=_quiet) -> tuple[int, int]:
                 db.set_have(con, series_id, n, path, None, it.source)
                 n_chapters += 1
         db.event(con, "added", f"adopted from {', '.join(it.source for it in group)}", series_id)
-        log(f"  adopted {series.title} <- {', '.join(f'{it.source} ({len(it.numbers)})' for it in group)}")
+        log.info("adopted %s <- %s", series.title,
+                 ", ".join(f"{it.source} ({len(it.numbers)})" for it in group))
     con.commit()
     return len(by_ref), n_chapters
