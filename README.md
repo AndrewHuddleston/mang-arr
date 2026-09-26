@@ -205,9 +205,8 @@ applies to the next job.
 | API key | Generated on first start and shown in the clear (it is not a secret field). When a login is set, a request carrying it as an `X-Api-Key` header or `?apikey=` query parameter is accepted without a session or basic auth. Edit it to rotate it; rotating it, or changing the password, also signs every browser out. |
 
 Secrets (the Komga API key, Pushover values, password) are never shown again once
-saved: the field is blank with a "set - leave blank to keep" placeholder.
-Submitting it blank keeps the current value; submitting a single space
-clears it.
+saved: the field shows `********`. Leave that as it is to keep the value,
+type a new one to replace it, or clear the field to remove it.
 
 The remaining knobs are constants in `config.py`: `DISAGREE` (a source
 whose highest chapter is more than 1.5× what the series should have is

@@ -773,7 +773,7 @@ def settings_page(request: Request, komga_test: str = "", komga_ok: str = ""):
     except SuwayomiError as e:
         sources = []
         log.error("settings page: suwayomi unreachable: %s", e)
-    return page(request, "settings.html", v=settings.all_values(), sources=sources,
+    return page(request, "settings.html", v=settings.masked(settings.all_values()), sources=sources,
                 komga_test=komga_test, komga_ok=(komga_ok == "1"))
 
 

@@ -27,12 +27,15 @@ class SettingsTest(unittest.TestCase):
         self.assertEqual(v["refresh_hours"], 3.5)
         self.assertEqual(v["throttled_sources"], ["bbato (en)", "manganato (en)"])
 
-    def test_blank_secret_keeps_space_clears(self):
+    def test_masked_secret_keeps_blank_clears(self):
         with db.connect(self.path) as con:
             settings.set_many(con, {"komga_api_key": "abc"})
-            settings.set_many(con, {"komga_api_key": ""})
+            self.assertEqual(settings.masked(settings.all_values(con))["komga_api_key"], settings.MASK)
+            settings.set_many(con, {"komga_api_key": settings.MASK})      # form submitted untouched
             self.assertEqual(settings.all_values(con)["komga_api_key"], "abc")
-            settings.set_many(con, {"komga_api_key": " "})
+            settings.set_many(con, {"komga_api_key": "new"})
+            self.assertEqual(settings.all_values(con)["komga_api_key"], "new")
+            settings.set_many(con, {"komga_api_key": ""})                 # cleared
             self.assertEqual(settings.all_values(con)["komga_api_key"], "")
 
     def test_api_key_generated_once(self):

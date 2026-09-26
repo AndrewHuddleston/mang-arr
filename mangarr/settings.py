@@ -45,6 +45,16 @@ DEFAULTS: dict[str, object] = {
     "api_key": "",           # X-Api-Key for the JSON API when a web login is set; generated on first start
 }
 SECRET_KEYS = {"pushover_token", "pushover_user", "komga_api_key", "auth_password"}
+MASK = "********"        # what the UI shows for a stored secret; submitting it unchanged keeps the value
+
+
+def masked(values: dict) -> dict:
+    """The values for a form: secrets replaced by MASK when set."""
+    out = dict(values)
+    for k in SECRET_KEYS:
+        if out.get(k):
+            out[k] = MASK
+    return out
 
 
 def ensure_api_key(con: sqlite3.Connection) -> str:
@@ -115,19 +125,17 @@ def get(key: str):
 
 
 def set_many(con: sqlite3.Connection, values: dict[str, object]) -> None:
-    """Store values. A secret submitted blank keeps its current value (the UI
-    never echoes secrets); a single space clears it."""
+    """Store values. A secret submitted as MASK (the form's placeholder for a
+    stored secret) keeps its current value; anything else, including an
+    empty field, is stored as given."""
     current = all_values(con)
     for k, v in values.items():
         if k not in DEFAULTS:
             raise KeyError(k)
         if k in SECRET_KEYS and isinstance(v, str):
-            if v == "":
+            if v.strip() == MASK or (v == current.get(k)):
                 continue
-            if v.strip() == "" and v:
-                v = ""
-            if v == current.get(k):
-                continue
+            v = v.strip()
         v = _coerce(k, v)
         con.execute("INSERT INTO setting (key, value) VALUES (?, ?)"
                     " ON CONFLICT(key) DO UPDATE SET value=excluded.value", (k, json.dumps(v)))
