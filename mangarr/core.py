@@ -222,13 +222,16 @@ def import_series(con, series_id: int, client: Client | None = None) -> int:
                 names = {}
                 log.warning("%s: cannot list chapters of %s entry to match %d unnamed file(s): %s",
                             title, source_name, len(unparsed), e)
+            matched = 0
             for path in unparsed:
-                stem = os.path.splitext(os.path.basename(path))[0].lower()
-                n = names.get(stem)
+                n = library.match_unparsed(path, names)
                 if n is not None and n not in found:
                     found[n] = path
+                    matched += 1
                 else:
                     log.debug("%s: no chapter matches file %s", title, os.path.basename(path))
+            log.info("%s: %d of %d unnumbered file(s) in %s matched through Suwayomi's chapter list",
+                     title, matched, len(unparsed), staging)
         elif unparsed:
             log.debug("%s: %d file(s) in %s without a chapter number", title, len(unparsed), staging)
         for n, path in found.items():

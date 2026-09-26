@@ -6,6 +6,7 @@ from mangarr.library import (
     chapter_filename,
     chapter_label,
     link_into_library,
+    match_unparsed,
     parse_number,
     parse_season,
     safe_title,
@@ -66,6 +67,9 @@ class ParseTest(unittest.TestCase):
                                Chapter(2, 1.0, "Chapter 1", None, False)])
         self.assertEqual(m["official_s2 - episode 5"], 131.0)
         self.assertEqual(m["chapter 1"], 1.0)
+        self.assertEqual(match_unparsed("/x/Official_S2 - Episode 5.cbz", m), 131.0)
+        self.assertEqual(match_unparsed("/x/S2 - Episode 005.0.cbz", m), 131.0)   # renamed/padded file
+        self.assertIsNone(match_unparsed("/x/S3 - Episode 1.cbz", m))
 
     def test_no_number(self):
         self.assertIsNone(parse_number("Official_Prologue.cbz"))

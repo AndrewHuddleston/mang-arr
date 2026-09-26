@@ -137,14 +137,30 @@ def chapter_label(number: float, name: str | None) -> str | None:
     return safe_title(n)[:80]
 
 
-def suwayomi_name_map(chapters) -> dict[str, float]:
-    """{file stem as Suwayomi writes it: chapter number} so files whose name
-    carries no global number (season episodes) can still be matched."""
-    out = {}
+def suwayomi_name_map(chapters) -> dict:
+    """Lookup tables so files whose name carries no global chapter number
+    (season episodes) can still be matched to a chapter: by the file stem as
+    Suwayomi writes it ('Official_S1 - Episode 0') and by (season, episode),
+    which survives renames such as 'S1 - Episode 000.0'."""
+    out: dict = {}
     for c in chapters:
         stem = f"{c.scanlator}_{c.name}" if c.scanlator else (c.name or "")
         out[safe_title(stem).lower()] = c.number
+        se = parse_season(c.name or "")
+        if se:
+            out[se] = c.number
     return out
+
+
+def match_unparsed(path: str, names: dict) -> float | None:
+    """Chapter number for a file with no global number, via the name map."""
+    stem = os.path.splitext(os.path.basename(path))[0]
+    n = names.get(stem.lower())
+    if n is None:
+        se = parse_season(stem)
+        if se:
+            n = names.get(se)
+    return n
 
 
 def library_dir(folder: str, root: str | None = None) -> str:
