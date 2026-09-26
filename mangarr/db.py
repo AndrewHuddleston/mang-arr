@@ -85,6 +85,28 @@ MIGRATIONS = [
     """
     ALTER TABLE chapter ADD COLUMN reason TEXT;
     """,
+    # 5: import lists (see lists.py) and the refs they must never add back
+    """
+    CREATE TABLE import_list (
+      id              INTEGER PRIMARY KEY AUTOINCREMENT,
+      name            TEXT NOT NULL,
+      kind            TEXT NOT NULL,          -- anilist_user | anilist_top | url_text
+      params          TEXT NOT NULL DEFAULT '{}',   -- JSON, per kind
+      enabled         INTEGER NOT NULL DEFAULT 1,
+      download        INTEGER NOT NULL DEFAULT 1,   -- download chapters when adding
+      monitored       INTEGER NOT NULL DEFAULT 1,
+      sync_hours      REAL NOT NULL DEFAULT 24,
+      last_sync       TEXT,
+      last_result     TEXT,
+      created_at      TEXT NOT NULL
+    );
+    CREATE TABLE import_list_exclusion (
+      ref             TEXT PRIMARY KEY,
+      title           TEXT,
+      reason          TEXT,
+      created_at      TEXT NOT NULL
+    );
+    """,
 ]
 
 
