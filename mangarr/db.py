@@ -81,6 +81,10 @@ MIGRATIONS = [
     """
     ALTER TABLE series ADD COLUMN folder TEXT;
     """,
+    # 4: why a chapter is failed / junk / unavailable, for the UI
+    """
+    ALTER TABLE chapter ADD COLUMN reason TEXT;
+    """,
 ]
 
 
@@ -211,7 +215,9 @@ def wanted_all(con):
     rows = con.execute(
         "SELECT s.id, s.title, s.last_resolved,"
         " SUM(c.status='wanted') AS wanted, SUM(c.status='failed') AS failed,"
-        " GROUP_CONCAT(c.number) AS nums"
+        " GROUP_CONCAT(c.number) AS nums,"
+        " (SELECT reason FROM chapter f WHERE f.series_id=s.id AND f.status='failed'"
+        "  ORDER BY f.updated_at DESC LIMIT 1) AS last_reason"
         " FROM series s JOIN chapter c ON c.series_id=s.id AND c.status IN ('wanted','failed')"
         " GROUP BY s.id ORDER BY s.title COLLATE NOCASE").fetchall()
     out = []
@@ -248,25 +254,27 @@ def save_plan(con, series_id: int, plan, primary_manga_id: int | None) -> None:
         if prev and prev["status"] in keep:
             continue                         # on disk already, or told to ignore; keep as is
         con.execute(
-            "INSERT INTO chapter (series_id, number, status, manga_id, source_name, updated_at)"
-            " VALUES (?,?,?,?,?,?)"
-            " ON CONFLICT(series_id, number) DO UPDATE SET status=excluded.status,"
+            "INSERT INTO chapter (series_id, number, status, manga_id, source_name, reason, updated_at)"
+            " VALUES (?,?,?,?,?,NULL,?)"
+            " ON CONFLICT(series_id, number) DO UPDATE SET status=excluded.status, reason=NULL,"
             " manga_id=excluded.manga_id, source_name=excluded.source_name, updated_at=excluded.updated_at",
             (series_id, n, "wanted", m.manga_id, m.source.name, now()))
     for n, (m, pages) in plan.junk.items():
+        reason = f"{pages} page(s) on {m.source.name}: a notice image, not a chapter"
         con.execute(
-            "INSERT INTO chapter (series_id, number, status, manga_id, source_name, pages, updated_at)"
-            " VALUES (?,?,?,?,?,?,?)"
+            "INSERT INTO chapter (series_id, number, status, manga_id, source_name, pages, reason, updated_at)"
+            " VALUES (?,?,?,?,?,?,?,?)"
             " ON CONFLICT(series_id, number) DO UPDATE SET status='junk', pages=excluded.pages,"
-            " updated_at=excluded.updated_at WHERE chapter.status NOT IN ('have','ignored')",
-            (series_id, n, "junk", m.manga_id, m.source.name, pages, now()))
+            " reason=excluded.reason, updated_at=excluded.updated_at WHERE chapter.status NOT IN ('have','ignored')",
+            (series_id, n, "junk", m.manga_id, m.source.name, pages, reason, now()))
     # a chapter that was wanted but that no trusted source lists any more is
     # not wanted, it is unavailable - it comes back if a source lists it again
     still = set(plan.assignment) | set(plan.junk)
     for n, prev in rows.items():
         if prev["status"] in ("wanted", "failed") and n not in still:
-            con.execute("UPDATE chapter SET status='unavailable', updated_at=? WHERE series_id=? AND number=?",
-                        (now(), series_id, n))
+            con.execute("UPDATE chapter SET status='unavailable', reason=?, updated_at=?"
+                        " WHERE series_id=? AND number=?",
+                        ("no trusted source lists this chapter any more", now(), series_id, n))
     con.execute("UPDATE series SET last_resolved=?, last_error=NULL WHERE id=?", (now(), series_id))
 
 
@@ -282,9 +290,13 @@ def set_have(con, series_id: int, number: float, staging_path: str | None,
         (series_id, number, source_name, staging_path, library_path, now()))
 
 
-def set_status(con, series_id: int, number: float, status: str) -> None:
-    con.execute("UPDATE chapter SET status=?, updated_at=? WHERE series_id=? AND number=?",
-                (status, now(), series_id, number))
+def set_status(con, series_id: int, number: float, status: str, reason: str | None = None) -> None:
+    """Change a chapter's status; the reason is kept for failed / junk /
+    unavailable / ignored and cleared for have / wanted."""
+    if status in ("have", "wanted"):
+        reason = None
+    con.execute("UPDATE chapter SET status=?, reason=?, updated_at=? WHERE series_id=? AND number=?",
+                (status, (reason or None) and reason[:300], now(), series_id, number))
 
 
 def chapters(con, series_id: int):

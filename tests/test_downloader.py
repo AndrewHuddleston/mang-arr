@@ -83,8 +83,21 @@ class FallbackTest(unittest.TestCase):
     def test_fails_when_every_source_fails(self):
         a, b = match("A", 1, [5]), match("B", 2, [5])
         client = FakeClient(broken={1050, 2050})
-        res = self.run_download(client, plan_for([a, b]), {5.0})
+        reasons = {}
+        with mock.patch.object(downloader.config, "LOCK_PATH", self.lock):
+            res = downloader.download(client, plan_for([a, b]), only={5.0}, reasons=reasons)
         self.assertEqual(res, {5.0: "failed"})
+        self.assertIn("A:", reasons[5.0])
+        self.assertIn("B:", reasons[5.0])
+
+    def test_single_source_failure_says_so(self):
+        a = match("A", 1, [7])
+        client = FakeClient(broken={1070})
+        reasons = {}
+        with mock.patch.object(downloader.config, "LOCK_PATH", self.lock):
+            res = downloader.download(client, plan_for([a]), only={7.0}, reasons=reasons)
+        self.assertEqual(res, {7.0: "failed"})
+        self.assertIn("no other source has this chapter", reasons[7.0])
 
     def test_dead_source_not_retried(self):
         a, b = match("A", 1, [1, 2]), match("B", 2, [1, 2, 3])

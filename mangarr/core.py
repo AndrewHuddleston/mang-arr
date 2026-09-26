@@ -135,14 +135,21 @@ def download_wanted(con, client: Client, series_id: int, plan: Plan,
     if not wanted:
         log.info("%s: nothing to download", plan.series.title)
         return {}
-    results = downloader.download(client, plan, only=set(wanted), should_cancel=should_cancel)
+    reasons: dict = {}
+    results = downloader.download(client, plan, only=set(wanted), should_cancel=should_cancel, reasons=reasons)
     for n, r in results.items():
         m = plan.assignment.get(n)
         metrics.record_download(m.source.name if m else "?", r)
         if r != "ok":
-            db.set_status(con, series_id, n, "failed")
+            db.set_status(con, series_id, n, "failed", reasons.get(n, "download failed"))
     ok = sum(1 for r in results.values() if r == "ok")
-    db.event(con, "downloaded", f"{ok} chapter(s) downloaded, {len(results) - ok} failed", series_id)
+    failed = sorted(n for n, r in results.items() if r != "ok")
+    msg = f"{ok} chapter(s) downloaded, {len(failed)} failed"
+    if failed:
+        msg += ": " + "; ".join(f"ch {n:g}: {reasons.get(n, '?')}" for n in failed[:5])
+        if len(failed) > 5:
+            msg += f"; ... {len(failed) - 5} more"
+    db.event(con, "downloaded", msg[:900], series_id)
     con.commit()
     return results
 

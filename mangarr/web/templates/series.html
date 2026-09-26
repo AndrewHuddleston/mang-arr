@@ -25,10 +25,17 @@
 
 <h2>Chapters</h2>
 <div class="stats">
-  {% for st in ['have','wanted','failed','junk','unavailable'] %}{% if by.get(st) %}
+  {% for st in ['have','wanted','failed','junk','unavailable','ignored'] %}{% if by.get(st) %}
   <div class="stat {{ st }}"><b>{{ by[st]|length }}</b> {{ st }}<div class="small muted">{{ by[st]|ranges }}</div></div>
   {% endif %}{% endfor %}
 </div>
+{% if by.get('failed') %}
+<h2>Why chapters failed</h2>
+<table class="list small">
+{% for c in chapters if c.status == 'failed' %}<tr><td class="num">{{ '%g'|format(c.number) }}</td><td class="err">{{ c.reason or 'download failed' }}</td><td class="muted">{{ c.updated_at|ago }}</td></tr>{% endfor %}
+</table>
+<p class="muted small">Failed chapters are retried on every refresh. Ignore a chapter (chapter list below) to stop trying.</p>
+{% endif %}
 
 <h2>Sources</h2>
 <table class="list">
@@ -41,10 +48,10 @@
 
 <details><summary>Chapter list ({{ chapters|length }})</summary>
 <table class="list small">
-<thead><tr><th class="num">#</th><th>Status</th><th>Source</th><th>Library file</th><th></th></tr></thead>
+<thead><tr><th class="num">#</th><th>Status</th><th>Source</th><th>Library file / reason</th><th></th></tr></thead>
 <tbody>
 {% for c in chapters %}
-<tr class="{{ c.status }}"><td class="num">{{ '%g'|format(c.number) }}</td><td>{{ c.status }}</td><td class="muted">{{ c.source_name or '' }}</td><td class="muted">{{ c.library_path or '' }}</td>
+<tr class="{{ c.status }}"><td class="num">{{ '%g'|format(c.number) }}</td><td>{{ c.status }}</td><td class="muted">{{ c.source_name or '' }}</td><td class="muted">{% if c.status == 'have' %}{{ c.library_path or '' }}{% elif c.reason %}<span class="{{ 'err' if c.status == 'failed' else '' }}">{{ c.reason }}</span>{% endif %}</td>
 <td>{% if c.status in ['wanted','failed','unavailable'] %}<form method="post" action="/series/{{ s.id }}/chapter/{{ c.number }}/ignore"><button class="alt small">ignore</button></form>
 {% elif c.status == 'ignored' %}<form method="post" action="/series/{{ s.id }}/chapter/{{ c.number }}/unignore"><button class="alt small">want</button></form>{% endif %}</td></tr>
 {% endfor %}

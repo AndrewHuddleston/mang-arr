@@ -55,15 +55,19 @@ def download_lock(path: str | None = None):
 
 
 def download(client: Client, plan: Plan, only: set[float] | None = None,
-             should_cancel: Callable[[], bool] | None = None) -> dict:
+             should_cancel: Callable[[], bool] | None = None, reasons: dict | None = None) -> dict:
     """Returns {chapter_number: 'ok' | 'failed'} for every chapter attempted.
-    Chapters not reached before a cancel are simply absent."""
+    Chapters not reached before a cancel are simply absent. When `reasons`
+    is given it is filled with a human-readable reason per failed chapter."""
+    reasons = reasons if reasons is not None else {}
+    tried: dict[float, list[str]] = {}          # what happened on each source, per chapter
     wanted = set(plan.wanted()) if only is None else set(only)
     label = plan.series.title
     results: dict[float, str] = {}
     pending = {n for n in wanted if plan.candidates.get(n)}
     for n in wanted - pending:
         results[n] = "failed"
+        reasons[n] = "no enabled source lists this chapter"
         log.warning("%s: ch %g has no usable source", label, n)
     attempt: dict[float, int] = dict.fromkeys(pending, 0)   # index into plan.candidates[n]
     dead: set[int] = set()                                     # manga ids that failed everything
@@ -78,8 +82,9 @@ def download(client: Client, plan: Plan, only: set[float] | None = None,
                         attempt[n] += 1
                     if attempt[n] >= len(cands):
                         results[n] = "failed"
-                        log.warning("%s: ch %g failed on every source (%s)", label, n,
-                                    ", ".join(c.source.name for c in cands))
+                        reasons[n] = "failed on every source: " + "; ".join(tried.get(n) or
+                                                                              [c.source.name for c in cands])
+                        log.warning("%s: ch %g %s", label, n, reasons[n])
                         continue
                     by_source.setdefault(cands[attempt[n]].manga_id, []).append(n)
                 pending = set()
@@ -94,8 +99,8 @@ def download(client: Client, plan: Plan, only: set[float] | None = None,
                     log.info("%s: downloading %d chapter(s) of %r from %s [%s]%s", label, len(todo),
                              m.title, m.source.name, ranges([c.number for c in todo]),
                              "" if patient else " (fallbacks available)")
-                    ok, failed = _download_source(client, manga_id, todo, batch, label, m.source.name,
-                                                  patient, cancel)
+                    ok, failed, why = _download_source(client, manga_id, todo, batch, label, m.source.name,
+                                                       patient, cancel)
                     for n in ok:
                         results[n] = "ok"
                     if failed:
@@ -105,20 +110,25 @@ def download(client: Client, plan: Plan, only: set[float] | None = None,
                                         m.source.name)
                         for n in failed:
                             attempt[n] += 1
+                            tried.setdefault(n, []).append(f"{m.source.name}: {why.get(n, 'failed')}")
                             if attempt[n] < len(plan.candidates[n]):
                                 nxt = plan.candidates[n][attempt[n]].source.name
                                 log.info("%s: ch %g failed on %s, will try %s", label, n, m.source.name, nxt)
                                 pending.add(n)
                             else:
                                 results[n] = "failed"
-                                log.warning("%s: ch %g failed on every source", label, n)
+                                only_one = len(plan.candidates[n]) == 1
+                                reasons[n] = ("; ".join(tried[n]) +
+                                              (" (no other source has this chapter)" if only_one else ""))
+                                log.warning("%s: ch %g failed: %s", label, n, reasons[n])
     except Cancelled:
         log.warning("%s: download cancelled; %d done", label, sum(1 for r in results.values() if r == "ok"))
     return results
 
 
 def _download_source(client, manga_id, todo, batch, label, source_name, patient, cancel):
-    ok, failed = [], []
+    """Returns (ok numbers, failed numbers, {number: why it failed})."""
+    ok, failed, why = [], [], {}
     i, size, backoff = 0, batch, 0
     max_backoff = config.BACKOFF_MAX if patient else config.BACKOFF_MAX_WITH_FALLBACK
     while i < len(todo):
@@ -149,11 +159,17 @@ def _download_source(client, manga_id, todo, batch, label, source_name, patient,
                 log.error("%s: giving up on %s at ch %g (%d done, %d left)", label, source_name,
                           chunk[0].number, len(ok), len(rest))
                 failed.extend(c.number for c in rest)
+                what = ("Suwayomi reported an error on every try" if outcome == "stalled"
+                        else "download made no progress")
+                for c in rest:
+                    why[c.number] = f"{what}, gave up after {backoff}s of backoff"
                 break
             continue
         ok.extend(c.number for c in got)
         missed = [c.number for c in chunk if c.id not in have]
         failed.extend(missed)
+        for n in missed:
+            why[n] = "Suwayomi finished the batch without this chapter (download error)"
         if missed:
             log.warning("%s: %s failed ch %s", label, source_name, ranges(missed))
         backoff = 0
@@ -163,7 +179,7 @@ def _download_source(client, manga_id, todo, batch, label, source_name, patient,
         log.info("%s: %s %d/%d done%s", label, source_name, len(ok), len(todo),
                  f", {len(failed)} failed" if failed else "")
         time.sleep(2)
-    return ok, failed
+    return ok, failed, why
 
 
 def _wait(client, ids: list[int], cancel, every: int = 5) -> str:
