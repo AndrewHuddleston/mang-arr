@@ -53,12 +53,29 @@
 <tbody>
 {% for c in chapters %}
 <tr class="{{ c.status }}"><td class="num">{{ '%g'|format(c.number) }}</td><td>{{ c.status }}</td><td class="muted">{{ c.source_name or '' }}</td><td class="muted">{% if c.status == 'have' %}{{ c.library_path or '' }}{% elif c.reason %}<span class="{{ 'err' if c.status == 'failed' else '' }}">{{ c.reason }}</span>{% endif %}</td>
-<td>{% if c.status in ['wanted','failed','unavailable'] %}<form method="post" action="/series/{{ s.id }}/chapter/{{ c.number }}/ignore"><button class="alt small">ignore</button></form>
+<td class="actions">{% if c.status in ['wanted','failed','unavailable','ignored'] %}<form method="post" action="/series/{{ s.id }}/chapter/{{ c.number }}/search"><button class="alt small" title="fetch this chapter now from the best trusted source">search</button></form>
+<button class="alt small" type="button" onclick="manualSearch({{ s.id }}, {{ c.number }}, this)" title="see what every source has for this chapter">manual</button>{% endif %}
+{% if c.status in ['wanted','failed','unavailable'] %}<form method="post" action="/series/{{ s.id }}/chapter/{{ c.number }}/ignore"><button class="alt small">ignore</button></form>
 {% elif c.status == 'ignored' %}<form method="post" action="/series/{{ s.id }}/chapter/{{ c.number }}/unignore"><button class="alt small">want</button></form>{% endif %}</td></tr>
+<tr class="manual" id="manual-{{ c.number }}" hidden><td colspan="5"></td></tr>
 {% endfor %}
 </tbody></table>
 </details>
 
+<script>
+async function manualSearch(sid, n, btn){
+  const row = document.getElementById('manual-' + n); const cell = row.firstElementChild;
+  row.hidden = false; cell.textContent = 'asking every source...';
+  try {
+    const r = await fetch(`/api/v1/series/${sid}/chapter/${n}/releases`); const rel = await r.json();
+    let h = '<table class="list small"><tr><th>Source</th><th>Entry</th><th>Chapter</th><th>Scanlator</th><th>Uploaded</th><th></th></tr>';
+    for (const x of rel) {
+      h += `<tr><td>${x.source}</td><td class="muted">${x.title||''}</td><td>${x.listed ? (x.name||'') : '<span class="muted">not listed</span>'}${x.error?' <span class="err">'+x.error+'</span>':''}</td><td class="muted">${x.scanlator||''}</td><td class="muted">${x.uploaded||''}</td><td>${x.note?'<span class="muted small">'+x.note+'</span> ':''}${x.listed?`<form method="post" action="/series/${sid}/chapter/${n}/download" class="inline"><input type="hidden" name="manga_id" value="${x.mangaId}"><button class="alt small">download</button></form>`:''}</td></tr>`;
+    }
+    cell.innerHTML = h + '</table>';
+  } catch (e) { cell.textContent = 'manual search failed: ' + e; }
+}
+</script>
 <h2>History</h2>
 <table class="list small">
 {% for e in events %}<tr><td class="muted">{{ e.at }}</td><td>{{ e.kind }}</td><td>{{ e.message }}</td></tr>{% endfor %}

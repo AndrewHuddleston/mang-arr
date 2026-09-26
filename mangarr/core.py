@@ -150,8 +150,73 @@ def download_wanted(con, client: Client, series_id: int, plan: Plan,
         if len(failed) > 5:
             msg += f"; ... {len(failed) - 5} more"
     db.event(con, "downloaded", msg[:900], series_id)
+    for n in wanted:
+        if n not in results:                      # the pass ended (cancelled/interrupted) before this one
+            db.set_status(con, series_id, n, "wanted",
+                          "not attempted: the download pass was cancelled or interrupted before this chapter")
     con.commit()
     return results
+
+
+def chapter_releases(con, client: Client, series_id: int, number: float) -> list[dict]:
+    """Manual search: what every source entry of this series has for one
+    chapter number, trusted or not, with why an entry is not used."""
+    out = []
+    for s in db.sources(con, series_id):
+        try:
+            chapters = client.chapters(s["manga_id"])
+        except SuwayomiError as e:
+            out.append({"source": s["source_name"], "mangaId": s["manga_id"], "title": s["title"],
+                        "error": str(e), "note": s["note"]})
+            continue
+        ch = next((c for c in chapters if c.number == number), None)
+        out.append({"source": s["source_name"], "mangaId": s["manga_id"], "title": s["title"], "note": s["note"],
+                    "listed": ch is not None, "chapterId": ch.id if ch else None, "name": ch.name if ch else None,
+                    "scanlator": ch.scanlator if ch else None, "uploaded": ch.uploaded if ch else None,
+                    "downloaded": ch.downloaded if ch else False, "usable": not s["note"] and ch is not None})
+    return out
+
+
+def download_chapter(con, client: Client, series_id: int, number: float, manga_id: int | None = None) -> str:
+    """Fetch one chapter now: from the given source entry (manual search) or
+    from the best trusted entry that lists it (automatic search). Returns a
+    message; the chapter row is updated with the outcome."""
+    row = db.get_series(con, series_id)
+    if not row:
+        raise Gone(f"series #{series_id} does not exist")
+    title = row["title"]
+    entries = [s for s in db.sources(con, series_id) if (manga_id is None and not s["note"]) or s["manga_id"] == manga_id]
+    if not entries:
+        raise ValueError("no such source entry for this series")
+    tried = []
+    for s in entries:
+        chapters = client.chapters(s["manga_id"])
+        ch = next((c for c in chapters if c.number == number), None)
+        if ch is None:
+            tried.append(f"{s['source_name']}: does not list it")
+            continue
+        if s["note"] and manga_id is None:
+            continue
+        ok, failed, why = downloader.download_one(client, s["manga_id"], ch, title, s["source_name"])
+        metrics.record_download(s["source_name"], "ok" if ok else "failed")
+        if ok:
+            db.set_status(con, series_id, number, "wanted", None)     # import_series flips it to have
+            con.execute("UPDATE chapter SET manga_id=?, source_name=?, name=COALESCE(?, name), uploaded=COALESCE(?, uploaded)"
+                        " WHERE series_id=? AND number=?", (s["manga_id"], s["source_name"], ch.name, ch.uploaded,
+                                                            series_id, number))
+            con.commit()
+            linked = import_series(con, series_id, client)
+            msg = f"chapter {number:g} downloaded from {s['source_name']}" + (" and linked" if linked else "")
+            db.event(con, "downloaded", msg, series_id)
+            log.info("%s: %s", title, msg)
+            return msg
+        tried.append(f"{s['source_name']}: {why.get(number, 'failed')}")
+    reason = "; ".join(tried) or "no source lists this chapter"
+    db.set_status(con, series_id, number, "failed", reason)
+    db.event(con, "failed", f"chapter {number:g}: {reason}", series_id)
+    con.commit()
+    log.warning("%s: chapter %g: %s", title, number, reason)
+    return f"chapter {number:g} failed: {reason}"
 
 
 def delete_series(con, client: Client, series_id: int, delete_library: bool = False) -> None:

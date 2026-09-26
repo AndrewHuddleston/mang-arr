@@ -116,3 +116,17 @@ class FallbackTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class DownloadOneTest(unittest.TestCase):
+    def test_download_one(self):
+        with tempfile.TemporaryDirectory() as tmp, \
+             mock.patch("mangarr.downloader.time.sleep", lambda s: None), \
+             mock.patch("mangarr.config.LOCK_PATH", tmp + "/lock"):
+            a = match("A", 1, [3, 4])
+            ok, failed, why = downloader.download_one(FakeClient(), 1, a.chapters[0], "T", "A")
+            self.assertTrue(ok)
+            ok, failed, why = downloader.download_one(FakeClient(broken={1040}), 1, a.chapters[1], "T", "A")
+            self.assertFalse(ok)
+            self.assertEqual(failed, [4.0])
+            self.assertIn(4.0, why)

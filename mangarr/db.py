@@ -311,12 +311,15 @@ def save_plan(con, series_id: int, plan, primary_manga_id: int | None) -> None:
         prev = rows.get(n)
         if prev and prev["status"] in keep:
             continue                         # on disk already, or told to ignore; keep as is
+        others = [c.source.name for c in plan.candidates.get(n, []) if c.manga_id != m.manga_id]
+        reason = f"available on {m.source.name}" + (f" (also {', '.join(others[:3])})" if others else "") + \
+            "; not downloaded yet - waiting for a download pass"
         con.execute(
             "INSERT INTO chapter (series_id, number, status, manga_id, source_name, reason, updated_at)"
-            " VALUES (?,?,?,?,?,NULL,?)"
-            " ON CONFLICT(series_id, number) DO UPDATE SET status=excluded.status, reason=NULL,"
+            " VALUES (?,?,?,?,?,?,?)"
+            " ON CONFLICT(series_id, number) DO UPDATE SET status=excluded.status, reason=excluded.reason,"
             " manga_id=excluded.manga_id, source_name=excluded.source_name, updated_at=excluded.updated_at",
-            (series_id, n, "wanted", m.manga_id, m.source.name, now()))
+            (series_id, n, "wanted", m.manga_id, m.source.name, reason, now()))
     for n, (m, pages) in plan.junk.items():
         reason = f"{pages} page(s) on {m.source.name}: a notice image, not a chapter"
         con.execute(
@@ -355,9 +358,8 @@ def set_have(con, series_id: int, number: float, staging_path: str | None,
 
 
 def set_status(con, series_id: int, number: float, status: str, reason: str | None = None) -> None:
-    """Change a chapter's status; the reason is kept for failed / junk /
-    unavailable / ignored and cleared for have / wanted."""
-    if status in ("have", "wanted"):
+    """Change a chapter's status with a reason (cleared for have)."""
+    if status == "have":
         reason = None
     con.execute("UPDATE chapter SET status=?, reason=?, updated_at=? WHERE series_id=? AND number=?",
                 (status, (reason or None) and reason[:300], now(), series_id, number))
