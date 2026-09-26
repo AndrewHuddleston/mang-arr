@@ -1,16 +1,18 @@
 {% extends "base.html" %}
 {% block title %}Wanted - mang-arr{% endblock %}
+{% block page_title %}Wanted: Missing{% endblock %}
 {% block body %}
-<div class="bar"><h1>Wanted</h1>
-  <form method="post" action="/wanted/search"><button {% if not rows %}disabled{% endif %}>Search all wanted now</button></form>
+<div class="toolbar">
+  <p class="muted" style="margin:0;flex:1">{{ rows|length }} series with missing chapters. The worker fetches them each cycle; a chapter stays here while no reachable source has it. Chapters you do not want can be ignored from the series page.</p>
+  <form method="post" action="/wanted/search"><button {% if not rows %}disabled{% endif %}><svg class="ic sm"><use href="#i-search"/></svg>Search all wanted now</button></form>
 </div>
-<p class="muted">{{ rows|length }} series with missing chapters. The worker fetches them each cycle; a chapter stays here while no reachable source has it. Chapters you do not want can be ignored from the series page.</p>
-<table class="list">
+<div class="tablewrap"><table class="list">
 <thead><tr><th>Series</th><th class="num">Wanted</th><th>Chapters</th><th class="num">Failed</th><th>Last failure</th><th>Checked</th></tr></thead>
 <tbody>
 {% for r in rows %}
 <tr><td><a href="/series/{{ r.id }}">{{ r.title }}</a></td><td class="num want">{{ r.wanted }}</td>
-<td class="small muted">{{ r.numbers }}</td><td class="num">{{ r.failed }}</td><td class="small err">{{ r.last_reason or '' }}</td><td class="muted">{{ r.last_resolved|ago }}</td></tr>
+<td class="small muted">{{ r.numbers }}</td><td class="num {% if r.failed %}err{% endif %}">{{ r.failed }}</td><td class="small err">{{ r.last_reason or '' }}</td><td class="muted nowrap">{{ r.last_resolved|ago }}</td></tr>
 {% endfor %}
-</tbody></table>
+{% if not rows %}<tr><td colspan="6" class="muted">Nothing missing. Every listed chapter is on disk.</td></tr>{% endif %}
+</tbody></table></div>
 {% endblock %}

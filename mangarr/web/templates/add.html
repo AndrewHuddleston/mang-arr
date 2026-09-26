@@ -1,26 +1,35 @@
 {% extends "base.html" %}
-{% block title %}Add - mang-arr{% endblock %}
+{% block title %}Add New - mang-arr{% endblock %}
+{% block page_title %}Add New{% endblock %}
 {% block body %}
-<h1>Add a series</h1>
-<form method="get" action="/add" class="bar">
-  <input type="search" name="term" value="{{ term }}" placeholder="title (English, romaji, or original)" autofocus>
+<form method="get" action="/add" class="toolbar" role="search">
+  <span class="searchbox" style="flex:1;max-width:640px"><svg class="ic" aria-hidden="true"><use href="#i-search"/></svg>
+    <input type="search" name="term" value="{{ term }}" placeholder="Search by title (English, romaji, or original)" aria-label="Search title" style="width:100%" autofocus></span>
   <button>Search</button>
 </form>
 {% if error %}<p class="err">{{ error }}</p>{% endif %}
 {% if term %}
-  {% if pick %}<p class="muted">exact match: <b>{{ pick.title }}</b> ({{ pick.ref }})</p>
-  {% elif cands %}<p class="muted">no single exact match - pick the right one:</p>
-  {% else %}<p class="muted">nothing on AniList or MangaDex. Western webtoons are often missing: add it by exact title below.</p>{% endif %}
-  <div class="cards">
+  {% if pick %}<p class="muted">Exact match: <b>{{ pick.title }}</b> <span class="small">({{ pick.ref }})</span></p>
+  {% elif cands %}<p class="muted">No single exact match - pick the right one:</p>
+  {% else %}<p class="muted">Nothing on AniList or MangaDex. Western webtoons are often missing: add it by exact title below.</p>{% endif %}
+  <div class="results">
   {% for c in cands %}
-    <div class="card {% if pick and c.ref == pick.ref %}pick{% endif %}">
-      {% if c.cover %}<img src="{{ c.cover }}" alt="">{% endif %}
-      <div>
-        <b>{{ c.title }}</b>
-        <div class="small muted">{{ c.ref }}<br>{{ c.format or '?' }} · {{ c.country or '?' }} · {{ c.status or '?' }} · {{ c.chapters or '?' }} ch</div>
-        <div class="small muted">{{ c.titles[:4]|join(' | ') }}</div>
-        {% if c.ref in tracked %}<span class="tag">already tracked</span>
-        {% else %}
+    <article class="result {% if pick and c.ref == pick.ref %}pick{% endif %}">
+      {% if pick and c.ref == pick.ref %}<span class="exact">exact match</span>{% endif %}
+      <div class="art">{% if c.cover %}<img src="{{ c.cover }}" alt="">{% else %}<svg class="ic"><use href="#i-image"/></svg>{% endif %}</div>
+      <div class="body">
+        <div class="ttl">{{ c.title }}</div>
+        <div class="ref">{{ c.ref }}</div>
+        {% set alts = c.titles|reject('equalto', c.title)|list %}
+        {% if alts %}<div class="alt">{{ alts[:4]|join(' · ') }}</div>{% endif %}
+        <div class="badges">
+          <span class="tag {{ c.status|status_class }}">{{ c.status|status_label }}</span>
+          {% if c.format %}<span class="tag">{{ c.format|replace('_', ' ')|lower }}</span>{% endif %}
+          {% if c.country %}<span class="tag">{{ c.country }}</span>{% endif %}
+          <span class="tag">{{ c.chapters or '?' }} ch</span>
+          {% if c.ref in tracked %}<span class="tag info">already tracked</span>{% endif %}
+        </div>
+        {% if c.ref not in tracked %}
         <form method="post" action="/add">
           <input type="hidden" name="ref" value="{{ c.ref }}">
           <label><input type="checkbox" name="download" value="1" checked> download missing chapters now</label>
@@ -28,18 +37,22 @@
         </form>
         {% endif %}
       </div>
-    </div>
+    </article>
   {% endfor %}
   </div>
+{% else %}
+<p class="muted">Type a title to search AniList and MangaDex. Pick a result to track it; chapters are then searched on every Suwayomi source.</p>
 {% endif %}
-<details {% if term and not cands %}open{% endif %}>
-<summary>Add by exact title (no metadata)</summary>
-<form method="post" action="/add" class="col">
-  <input type="hidden" name="ref" value="manual">
-  <input name="title" value="{{ term }}" placeholder="exact title as the sources spell it">
-  <input name="alias" placeholder="other exact titles, separated by |">
-  <label><input type="checkbox" name="download" value="1" checked> download missing chapters now</label>
-  <button>Add</button>
-</form>
-</details>
+
+<section class="card" style="margin-top:18px">
+  <h2>Add by exact title (no metadata)</h2>
+  <p class="muted small">For series no database has. The typed title is the series; sources must spell it exactly (or one of the aliases).</p>
+  <form method="post" action="/add" class="col">
+    <input type="hidden" name="ref" value="manual">
+    <input name="title" value="{{ term }}" placeholder="exact title as the sources spell it" aria-label="Title">
+    <input name="alias" placeholder="other exact titles, separated by |" aria-label="Aliases">
+    <label><input type="checkbox" name="download" value="1" checked> download missing chapters now</label>
+    <div><button>Add</button></div>
+  </form>
+</section>
 {% endblock %}

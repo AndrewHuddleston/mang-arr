@@ -1,32 +1,38 @@
 {% extends "base.html" %}
-{% block title %}Activity - mang-arr{% endblock %}
+{% block title %}Queue - mang-arr{% endblock %}
+{% block page_title %}Activity: Queue{% endblock %}
 {% block body %}
-<div class="bar"><h1>Activity</h1>
-  <form method="post" action="/activity/refresh-all"><button>Refresh all now</button></form>
+{% set active = jobs|selectattr('status', 'in', ['queued', 'running'])|list|length %}
+<div class="toolbar">
+  <span class="muted">{{ active }} active job{{ 's' if active != 1 }} · this page refreshes every 10 s</span>
+  <span class="grow"></span>
+  <a class="btn ghost small" href="/activity/history">History</a>
+  <form method="post" action="/activity/refresh-all"><button><svg class="ic sm"><use href="#i-refresh"/></svg>Refresh all now</button></form>
 </div>
 
 <h2>Jobs</h2>
-<table class="list" id="jobs">
+<div class="tablewrap"><table class="list" id="jobs">
 <thead><tr><th>#</th><th>Kind</th><th>What</th><th>Status</th><th>Progress / result</th><th>When</th><th></th></tr></thead>
 <tbody>
 {% for j in jobs %}
-<tr class="job-{{ j.status }}"><td>{{ j.id }}</td><td>{{ j.kind }}</td>
+<tr class="job-{{ j.status }}"><td class="muted">{{ j.id }}</td><td>{{ j.kind }}</td>
 <td>{% if j.series_id %}<a href="/series/{{ j.series_id }}">{{ j.title }}</a>{% else %}{{ j.title }}{% endif %}</td>
-<td>{{ j.status }}</td><td class="small">{{ j.message or j.progress }}</td>
-<td class="muted">{{ (j.finished_at or j.started_at or j.queued_at)|ago }}</td>
-<td>{% if j.status in ['queued','running'] %}<form method="post" action="/activity/cancel/{{ j.id }}"><button class="alt small">cancel</button></form>{% endif %}</td></tr>
+<td><span class="tag {{ j.status }}">{{ j.status }}</span></td><td class="small">{{ j.message or j.progress }}</td>
+<td class="muted nowrap">{{ (j.finished_at or j.started_at or j.queued_at)|ago }}</td>
+<td class="act">{% if j.status in ['queued','running'] %}<form method="post" action="/activity/cancel/{{ j.id }}"><button class="ghost small">cancel</button></form>{% endif %}</td></tr>
 {% endfor %}
-</tbody></table>
+{% if not jobs %}<tr><td colspan="7" class="muted">no jobs since start</td></tr>{% endif %}
+</tbody></table></div>
 
-<h2>Suwayomi download queue <span class="muted small">({{ squeue.state }}, {{ squeue.count }})</span></h2>
+<h2>Suwayomi download queue <span class="muted small" style="text-transform:none;letter-spacing:0">({{ squeue.state|lower }}, {{ squeue.count }} item{{ 's' if squeue.count != 1 }})</span></h2>
 {% if squeue.error %}<p class="err">{{ squeue.error }}</p>{% endif %}
-<table class="list small" id="squeue">
-{% for x in squeue["items"] %}<tr><td>{{ x.manga }}</td><td>{{ x.chapter }}</td><td>{{ x.state }}</td><td>{{ x.progress }}%</td><td class="muted">tries {{ x.tries }}</td></tr>{% endfor %}
-</table>
-
-<h2>History</h2>
-<table class="list small">
-{% for e in events %}<tr><td class="muted">{{ e.at }}</td><td>{{ e.kind }}</td><td>{% if e.series_id %}<a href="/series/{{ e.series_id }}">{{ e.title }}</a>{% endif %}</td><td>{{ e.message }}</td></tr>{% endfor %}
-</table>
+<div class="tablewrap"><table class="list small" id="squeue">
+<thead><tr><th>Series</th><th>Chapter</th><th>State</th><th style="width:260px">Progress</th><th>Tries</th></tr></thead>
+<tbody>
+{% for x in squeue["items"] %}<tr><td>{{ x.manga }}</td><td>{{ x.chapter }}</td><td><span class="tag {{ 'running' if x.state == 'DOWNLOADING' else 'failed' if x.state == 'ERROR' else 'queued' }}">{{ x.state|lower }}</span></td>
+<td><div class="qprog"><div class="progress info" role="progressbar" aria-valuenow="{{ x.progress }}" aria-valuemin="0" aria-valuemax="100"><span class="fill" style="width:{{ x.progress }}%"></span><span class="txt">{{ x.progress }}%</span></div></div></td>
+<td class="muted">{{ x.tries }}</td></tr>{% endfor %}
+{% if not squeue["items"] %}<tr><td colspan="5" class="muted">{{ 'Suwayomi is not downloading anything' if not squeue.error else 'unavailable' }}</td></tr>{% endif %}
+</tbody></table></div>
 {% endblock %}
-{% block script %}<script>setTimeout(()=>location.reload(), 10000);</script>{% endblock %}
+{% block main_attrs %}data-reload="10000"{% endblock %}

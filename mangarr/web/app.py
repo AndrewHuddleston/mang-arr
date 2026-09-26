@@ -1,7 +1,8 @@
 """The web UI and JSON API (FastAPI). Long operations go through the job
 runner; requests only read the database and submit jobs.
 
-Pages:   /  /series/{id}  /add  /import  /wanted  /activity  /settings  /system
+Pages:   /  /series/{id}  /add  /import  /lists  /wanted  /activity  /activity/history
+         /settings  /system  /system/logs
 API:     /api/v1/...  (mirrors the pages; used by the pages' live updates)
 """
 import base64
@@ -40,7 +41,7 @@ from .. import (
 )
 from ..resolver import ranges
 from ..suwayomi import Client, SuwayomiError
-from . import lists_routes
+from . import lists_routes, views
 
 log = logging.getLogger(__name__)
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -78,6 +79,7 @@ app.mount("/static", StaticFiles(directory=os.path.join(HERE, "static")), name="
 templates = Jinja2Templates(directory=os.path.join(HERE, "templates"))
 templates.env.filters["ranges"] = ranges
 templates.env.filters["ago"] = lambda ts: _ago(ts)
+views.install(templates.env)
 app.include_router(lists_routes.router)
 
 
@@ -319,11 +321,17 @@ def series_page(request: Request, series_id: int):
         chs = db.chapters(con, series_id)
         events = con.execute("SELECT * FROM event WHERE series_id=? ORDER BY id DESC LIMIT 15",
                              (series_id,)).fetchall()
+        size_fn = getattr(db, "series_size", None)          # lands on main; (bytes, files)
+        size_bytes, size_files = size_fn(con, series_id) if size_fn else (0, 0)
     by: dict[str, list] = {}
     for c in chs:
         by.setdefault(c["status"], []).append(c["number"])
     return page(request, "series.html", s=r, series=db.series_to_model(r), sources=srcs, chapters=chs,
-                by=by, events=events, busy=runner.pending_for(series_id))
+                by=by, events=events, busy=runner.pending_for(series_id),
+                groups=views.group_chapters(chs, r), counts=views.counts(chs),
+                description=views.plain_description(r["description"]),
+                library_path=library.library_dir(r["folder"] or ""), size_bytes=size_bytes, size_files=size_files,
+                size_human=views.human_size(size_bytes), ref_url=views.ref_url(r))
 
 
 @app.post("/series/{series_id}/refresh")
@@ -525,9 +533,14 @@ def wanted_search():
 
 @app.get("/activity")
 def activity_page(request: Request):
+    return page(request, "activity.html", jobs=runner.jobs()[:50], squeue=_suwayomi_queue())
+
+
+@app.get("/activity/history")
+def history_page(request: Request):
     with db.connect() as con:
-        events = db.events(con, 40)
-    return page(request, "activity.html", jobs=runner.jobs()[:50], events=events, squeue=_suwayomi_queue())
+        events = db.events(con, 200)
+    return page(request, "history.html", events=events)
 
 
 @app.post("/activity/refresh-all")
@@ -563,10 +576,15 @@ def system_page(request: Request):
          "next": (backups[0]["mtime"] + backup.INTERVAL_HOURS * 3600) if backups else None},
     ]
     return page(request, "system.html", sources=sources, suwayomi_ok=suwayomi_ok, cfg=_config_view(),
-                log_lines=_tail_log(200), uptime=_ago(STARTED), notify_ok=notify.configured(),
+                uptime=_ago(STARTED), notify_ok=notify.configured(),
                 komga_ok=komga.configured(), metrics_ok=metrics.AVAILABLE, copied=library.COPIED,
                 next_refresh=(scheduler.next_at if scheduler else None),
                 checks=health.run(client, force=True), tasks=tasks, backups=backups)
+
+
+@app.get("/system/logs")
+def system_logs_page(request: Request, lines: int = 500):
+    return page(request, "logs.html", log_lines=_tail_log(max(1, min(lines, 5000))), log_file=config.LOG_FILE)
 
 
 @app.post("/system/update-check")

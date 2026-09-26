@@ -1,66 +1,142 @@
 {% extends "base.html" %}
 {% block title %}{{ s.title }} - mang-arr{% endblock %}
+{% block page_title %}{{ s.title }}{% endblock %}
 {% block body %}
-<div class="head">
-  {% if s.cover %}<img class="bigcover" src="{{ s.cover }}" alt="">{% endif %}
-  <div>
+{% set kind = series.kind|default('') %}
+{% set language = series.language|default(none) %}
+{% set genres = series.genres|default([]) %}
+{% set year = series.year|default(none) %}
+{% set demographic = series.demographic|default(none) %}
+{% set alt_titles = series.titles|reject('equalto', s.title)|list %}
+{% set primary = (sources|selectattr('is_primary')|list|first) if sources else none %}
+{% set listed = counts.have + counts.wanted + counts.failed + counts.unavailable %}
+
+<section class="hero">
+  {% if s.cover %}<img class="bigcover" src="{{ s.cover }}" alt="">{% else %}<div class="bigcover none"><svg class="ic"><use href="#i-image"/></svg></div>{% endif %}
+  <div class="body">
     <h1>{{ s.title }}</h1>
-    <p class="muted">{{ s.ref }} · {{ s.format or '?' }} · {{ s.country or '?' }} · <span class="tag {{ (s.status or '')|lower }}">{{ s.status or '?' }}</span>
-      {% if s.expected %}· {{ s.expected }} chapters{% endif %}
-      {% if series.authors %}· by {{ series.authors[:2]|join(', ') }}{% endif %}</p>
-    <p class="muted small">titles: {{ series.titles[:6]|join(' | ') }}</p>
-    {% if s.last_error %}<p class="err">last error: {{ s.last_error }}</p>{% endif %}
+    {% if alt_titles %}<div class="alt">{{ alt_titles[:6]|join(' · ') }}</div>{% endif %}
+    <div class="badges">
+      <span class="tag {{ s.status|status_class }}">{{ s.status|status_label }}</span>
+      {% if not s.monitored %}<span class="tag ignored">Unmonitored</span>{% endif %}
+      {% if s.country %}<span class="tag">{{ s.country }}</span>{% endif %}
+      {% if s.format %}<span class="tag">{{ s.format|replace('_', ' ')|lower }}</span>{% endif %}
+      {% if kind and kind|lower != (s.format or '')|lower %}<span class="tag">{{ kind }}</span>{% endif %}
+      {% if s.expected %}<span class="tag">{{ s.expected }} chapters expected</span>{% endif %}
+      {% if series.volumes %}<span class="tag">{{ series.volumes }} volumes</span>{% endif %}
+    </div>
+    {% if series.authors %}<div class="kv">by {{ series.authors|join(', ') }}</div>{% endif %}
+    {% if description %}
+    <p class="desc" id="desc" data-clamp="desc-more">{{ description }}</p>
+    <button type="button" class="linkbtn small" id="desc-more" aria-controls="desc" aria-expanded="false">more</button>
+    {% endif %}
+    {% if s.last_error %}<p class="err small">last error: {{ s.last_error }}</p>{% endif %}
     <div class="actions">
-      <form method="post" action="/series/{{ s.id }}/refresh"><input type="hidden" name="download" value="1"><button {% if busy %}disabled{% endif %}>Search &amp; download missing</button></form>
-      <form method="post" action="/series/{{ s.id }}/refresh"><input type="hidden" name="download" value="0"><button class="alt" {% if busy %}disabled{% endif %}>Re-check sources only</button></form>
-      <form method="post" action="/series/{{ s.id }}/monitor"><input type="hidden" name="monitored" value="{{ 0 if s.monitored else 1 }}"><button class="alt">{{ 'Unmonitor' if s.monitored else 'Monitor' }}</button></form>
+      <form method="post" action="/series/{{ s.id }}/refresh"><input type="hidden" name="download" value="1"><button {% if busy %}disabled{% endif %}><svg class="ic sm"><use href="#i-search"/></svg>Search missing</button></form>
+      <form method="post" action="/series/{{ s.id }}/refresh"><input type="hidden" name="download" value="0"><button class="alt" {% if busy %}disabled{% endif %}><svg class="ic sm"><use href="#i-refresh"/></svg>Re-check sources only</button></form>
+      <form method="post" action="/series/{{ s.id }}/monitor"><input type="hidden" name="monitored" value="{{ 0 if s.monitored else 1 }}"><button class="alt"><svg class="ic sm"><use href="{{ '#i-bookmark-off' if s.monitored else '#i-bookmark' }}"/></svg>{{ 'Unmonitor' if s.monitored else 'Monitor' }}</button></form>
       <form method="post" action="/series/{{ s.id }}/delete" data-title="{{ s.title }}" onsubmit="return confirm('Remove ' + this.dataset.title + ' from mang-arr?')">
         <label><input type="checkbox" name="files" value="1"> also delete library folder</label>
         <label><input type="checkbox" name="exclude" value="1"> exclude from import lists</label>
         <button class="danger" {% if busy %}disabled title="a job for this series is running"{% endif %}>Delete</button></form>
     </div>
-    {% if busy %}<p class="muted">a job for this series is queued or running</p>{% endif %}
-    <p class="muted small">library folder: <code>{{ s.folder }}</code></p>
+    {% if busy %}<p class="muted small" style="margin-top:8px">a job for this series is queued or running</p>{% endif %}
   </div>
+</section>
+
+<section class="card details">
+  <dl class="dl">
+    <div><dt>Path</dt><dd><code>{{ library_path }}</code></dd></div>
+    <div><dt>Status</dt><dd><span class="tag {{ s.status|status_class }}">{{ s.status|status_label }}</span></dd></div>
+    <div><dt>Size on disk</dt><dd>{{ size_human }}, {{ size_files }} file{{ 's' if size_files != 1 }}</dd></div>
+    <div><dt>Type</dt><dd>{{ kind or (s.format|replace('_', ' ')|lower if s.format else '-') }}{% if kind and s.format and kind|lower != s.format|lower %} <span class="muted">({{ s.format|replace('_', ' ')|lower }})</span>{% endif %}</dd></div>
+    <div><dt>Original language</dt><dd>{{ language or (s.country or '-') }}</dd></div>
+    <div><dt>Author</dt><dd>{% if series.authors %}{{ series.authors[0] }}{% else %}-{% endif %}</dd></div>
+    {% if series.authors|length > 1 %}<div><dt>Artist / others</dt><dd>{{ series.authors[1:]|join(', ') }}</dd></div>{% endif %}
+    <div><dt>Genres</dt><dd>{% if genres %}{{ genres|join(', ') }}{% else %}-{% endif %}</dd></div>
+    <div><dt>Year</dt><dd>{{ year or '-' }}</dd></div>
+    <div><dt>Demographic</dt><dd>{{ demographic or '-' }}</dd></div>
+    <div><dt>Chapters</dt><dd>{{ counts.have }} / {{ listed }}{% if s.expected %} <span class="muted">({{ s.expected }} expected)</span>{% endif %}</dd></div>
+    {% if series.volumes %}<div><dt>Volumes</dt><dd>{{ series.volumes }}</dd></div>{% endif %}
+    <div><dt>Reading direction</dt><dd>{{ 'right to left' if series.right_to_left else 'left to right' }}</dd></div>
+    <div><dt>Primary source</dt><dd>{% if primary %}{{ primary.source_name }} <span class="muted">({{ primary.title }})</span>{% else %}-{% endif %}</dd></div>
+    <div><dt>Metadata</dt><dd>{% if ref_url %}<a href="{{ ref_url }}" rel="noopener">{{ s.ref }}</a>{% else %}<code>{{ s.ref }}</code>{% endif %}</dd></div>
+    <div><dt>Added</dt><dd>{{ s.added_at|ago }}</dd></div>
+    <div><dt>Last checked</dt><dd>{{ s.last_resolved|ago }}</dd></div>
+  </dl>
+</section>
+
+<div class="summary" aria-label="Chapter counts">
+  {% for st in ['have','wanted','failed','junk','unavailable','ignored'] %}
+  <span class="pill {{ st }}"><b>{{ counts[st] }}</b>{{ st }}{% if by.get(st) %}<span class="rng" title="{{ by[st]|ranges }}">{{ by[st]|ranges }}</span>{% endif %}</span>
+  {% endfor %}
 </div>
 
-<h2>Chapters</h2>
-<div class="stats">
-  {% for st in ['have','wanted','failed','junk','unavailable','ignored'] %}{% if by.get(st) %}
-  <div class="stat {{ st }}"><b>{{ by[st]|length }}</b> {{ st }}<div class="small muted">{{ by[st]|ranges }}</div></div>
-  {% endif %}{% endfor %}
-</div>
 {% if by.get('failed') %}
-<h2>Why chapters failed</h2>
-<table class="list small">
-{% for c in chapters if c.status == 'failed' %}<tr><td class="num">{{ '%g'|format(c.number) }}</td><td class="err">{{ c.reason or 'download failed' }}</td><td class="muted">{{ c.updated_at|ago }}</td></tr>{% endfor %}
-</table>
-<p class="muted small">Failed chapters are retried on every refresh. Ignore a chapter (chapter list below) to stop trying.</p>
+<section class="card">
+  <h2>Why chapters failed</h2>
+  <div class="tablewrap"><table class="list small">
+  {% for c in chapters if c.status == 'failed' %}<tr><td class="num">{{ '%g'|format(c.number) }}</td><td class="err">{{ c.reason or 'download failed' }}</td><td class="muted nowrap">{{ c.updated_at|ago }}</td></tr>{% endfor %}
+  </table></div>
+  <p class="muted small" style="margin:8px 0 0">Failed chapters are retried on every refresh. Ignore a chapter below to stop trying.</p>
+</section>
 {% endif %}
 
+<div class="toolbar">
+  <h2 style="margin:0">Chapters <span class="count">({{ chapters|length }})</span></h2>
+  <span class="grow"></span>
+  <button type="button" class="ghost small" data-expand-all="1">Expand all</button>
+  <button type="button" class="ghost small" data-expand-all="0">Collapse all</button>
+</div>
+{% for g in groups %}
+<section class="group">
+  <button type="button" class="grouphead" aria-expanded="{{ 'true' if g.open else 'false' }}" aria-controls="group-{{ g.key }}">
+    <svg class="ic"><use href="#i-chevron"/></svg>
+    <span class="gname">{{ g.name }}</span>
+    <span class="progress {% if g.wanted %}warn{% endif %}" role="progressbar" aria-valuenow="{{ g.pct }}" aria-valuemin="0" aria-valuemax="100"><span class="fill" style="width:{{ g.pct }}%"></span><span class="txt">{{ g.have }}/{{ g.total }}</span></span>
+    <span class="gcount">{{ g.chapters|length }} chapter{{ 's' if g.chapters|length != 1 }}</span>
+    {% if g.wanted %}<span class="gwant">{{ g.wanted }} wanted</span>{% endif %}
+  </button>
+  <div id="group-{{ g.key }}" {% if not g.open %}hidden{% endif %}>
+  <div class="tablewrap" style="border:0;border-radius:0"><table class="list small">
+    <thead><tr><th class="num">#</th><th>Title</th><th>Released</th><th>Status</th><th>Source</th><th>Reason / file</th><th></th></tr></thead>
+    <tbody>
+    {% for c in g.chapters %}
+    <tr class="{{ c.status }}">
+      <td class="num">{{ '%g'|format(c.number) }}</td>
+      <td>{{ c.name or '' }}</td>
+      <td class="muted nowrap">{{ (c.uploaded or '')[:10] }}</td>
+      <td><span class="tag {{ c.status }}">{{ c.status }}</span></td>
+      <td class="muted">{{ c.source_name or '' }}</td>
+      {% if c.status == 'have' %}<td class="path" title="{{ c.library_path or '' }}">{{ (c.library_path or '')|replace(library_path ~ '/', '') }}</td>
+      {% else %}<td class="reason {{ 'err' if c.status == 'failed' }}">{{ c.reason or ('waiting for a download pass' if c.status == 'wanted' else '') }}</td>{% endif %}
+      <td class="act">{% if c.status in ['wanted','failed','unavailable','ignored'] %}
+        <form method="post" action="/series/{{ s.id }}/chapter/{{ c.number }}/search"><button class="alt small" title="search the trusted sources for this chapter and download it" {% if busy %}disabled{% endif %}>Search</button></form>
+        <button type="button" class="ghost small" data-manual="/api/v1/series/{{ s.id }}/chapter/{{ c.number }}/releases" data-download="/series/{{ s.id }}/chapter/{{ c.number }}/download" aria-expanded="false" title="see what every source has for this chapter and pick one">Manual</button>
+        {% endif %}
+        {% if c.status in ['wanted','failed','unavailable'] %}<form method="post" action="/series/{{ s.id }}/chapter/{{ c.number }}/ignore"><button class="ghost small">ignore</button></form>
+        {% elif c.status == 'ignored' %}<form method="post" action="/series/{{ s.id }}/chapter/{{ c.number }}/unignore"><button class="ghost small">want</button></form>{% endif %}</td>
+    </tr>
+    {% endfor %}
+    </tbody></table></div>
+  </div>
+</section>
+{% endfor %}
+{% if not groups %}<p class="empty">No chapters listed yet. Run <em>Search &amp; download missing</em> to resolve the sources.</p>{% endif %}
+
 <h2>Sources</h2>
-<table class="list">
+<div class="tablewrap"><table class="list">
 <thead><tr><th></th><th>Source</th><th>Entry title</th><th class="num">Chapters</th><th class="num">Max</th><th>Note</th></tr></thead>
 <tbody>
 {% for x in sources %}
-<tr><td>{{ '★' if x.is_primary else '' }}</td><td>{{ x.source_name }}</td><td>{{ x.title }}</td><td class="num">{{ x.chapter_count }}</td><td class="num">{{ '%g'|format(x.max_chapter) }}</td><td class="muted">{{ x.note or '' }}</td></tr>
+<tr><td title="{{ 'primary source' if x.is_primary }}">{{ '★' if x.is_primary else '' }}</td><td>{{ x.source_name }}</td><td>{{ x.title }}</td><td class="num">{{ x.chapter_count }}</td><td class="num">{{ '%g'|format(x.max_chapter) }}</td><td class="muted">{{ x.note or '' }}</td></tr>
 {% endfor %}
-</tbody></table>
-
-<details><summary>Chapter list ({{ chapters|length }})</summary>
-<table class="list small">
-<thead><tr><th class="num">#</th><th>Status</th><th>Source</th><th>Library file / reason</th><th></th></tr></thead>
-<tbody>
-{% for c in chapters %}
-<tr class="{{ c.status }}"><td class="num">{{ '%g'|format(c.number) }}</td><td>{{ c.status }}</td><td class="muted">{{ c.source_name or '' }}</td><td class="muted">{% if c.status == 'have' %}{{ c.library_path or '' }}{% elif c.reason %}<span class="{{ 'err' if c.status == 'failed' else '' }}">{{ c.reason }}</span>{% endif %}</td>
-<td>{% if c.status in ['wanted','failed','unavailable'] %}<form method="post" action="/series/{{ s.id }}/chapter/{{ c.number }}/ignore"><button class="alt small">ignore</button></form>
-{% elif c.status == 'ignored' %}<form method="post" action="/series/{{ s.id }}/chapter/{{ c.number }}/unignore"><button class="alt small">want</button></form>{% endif %}</td></tr>
-{% endfor %}
-</tbody></table>
-</details>
+{% if not sources %}<tr><td colspan="6" class="muted">no source has matched this series yet</td></tr>{% endif %}
+</tbody></table></div>
 
 <h2>History</h2>
-<table class="list small">
-{% for e in events %}<tr><td class="muted">{{ e.at }}</td><td>{{ e.kind }}</td><td>{{ e.message }}</td></tr>{% endfor %}
-</table>
+<div class="tablewrap"><table class="list small">
+{% for e in events %}<tr><td class="muted nowrap">{{ e.at }}</td><td><span class="tag {{ e.kind }}">{{ e.kind }}</span></td><td>{{ e.message }}</td></tr>{% endfor %}
+{% if not events %}<tr><td class="muted">nothing yet</td></tr>{% endif %}
+</table></div>
 {% endblock %}

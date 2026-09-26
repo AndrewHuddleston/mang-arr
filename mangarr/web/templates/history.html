@@ -1,0 +1,16 @@
+{% extends "base.html" %}
+{% block title %}History - mang-arr{% endblock %}
+{% block page_title %}Activity: History{% endblock %}
+{% block body %}
+<div class="toolbar">
+  <span class="muted">Last {{ events|length }} events: series added, sources resolved, chapters downloaded and imported, failures, monitor and ignore changes.</span>
+  <span class="grow"></span>
+  <a class="btn ghost small" href="/activity">Queue</a>
+</div>
+<div class="tablewrap"><table class="list small">
+<thead><tr><th>When</th><th>Event</th><th>Series</th><th>Message</th></tr></thead>
+<tbody>
+{% for e in events %}<tr><td class="muted nowrap">{{ e.at }}</td><td><span class="tag {{ e.kind }}">{{ e.kind }}</span></td><td>{% if e.series_id %}<a href="/series/{{ e.series_id }}">{{ e.title or ('#' ~ e.series_id) }}</a>{% endif %}</td><td>{{ e.message }}</td></tr>{% endfor %}
+{% if not events %}<tr><td colspan="4" class="muted">nothing yet</td></tr>{% endif %}
+</tbody></table></div>
+{% endblock %}

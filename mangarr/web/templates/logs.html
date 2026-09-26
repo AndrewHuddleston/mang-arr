@@ -1,0 +1,21 @@
+{% extends "base.html" %}
+{% block title %}Logs - mang-arr{% endblock %}
+{% block page_title %}System: Logs{% endblock %}
+{% block body %}
+{% if not log_file %}
+<p class="empty">No log file configured. Set <code>MANGARR_LOG_FILE</code> (or <code>--log-file</code>) to keep a log on disk.</p>
+{% else %}
+<div class="logtools">
+  <label class="small muted">Level <select id="log-level" aria-label="Minimum level">
+    <option value="DEBUG">All</option><option value="INFO">Info and up</option><option value="WARNING">Warnings and up</option><option value="ERROR">Errors only</option>
+  </select></label>
+  <label class="check small muted"><input type="checkbox" id="log-auto" checked> auto-refresh (5 s)</label>
+  <label class="check small muted"><input type="checkbox" id="log-follow" checked> follow</label>
+  <button type="button" class="ghost small" data-log-refresh><svg class="ic sm"><use href="#i-refresh"/></svg>Refresh</button>
+  <span class="grow"></span>
+  <span class="count" id="log-count">{{ log_lines|length }} lines</span>
+  <span class="muted small"><code>{{ log_file }}</code></span>
+</div>
+<pre class="log" id="log" data-lines="{{ log_lines|length if log_lines|length > 500 else 500 }}">{% for l in log_lines %}{% set parts = l.split(' ', 3) %}{% set lvl = parts[2] if parts|length > 2 and parts[2] in ['DEBUG','INFO','WARNING','ERROR','CRITICAL'] else '' %}<span class="ln {{ lvl }}">{{ l.rstrip('\n') }}</span>{% endfor %}{% if not log_lines %}<span class="ln muted">the log file is empty</span>{% endif %}</pre>
+{% endif %}
+{% endblock %}

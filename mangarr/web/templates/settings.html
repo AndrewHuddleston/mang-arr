@@ -1,49 +1,58 @@
 {% extends "base.html" %}
 {% block title %}Settings - mang-arr{% endblock %}
+{% block page_title %}Settings{% endblock %}
 {% block body %}
-<h1>Settings</h1>
 <p class="muted">Stored in the database; environment variables are the defaults. Changes apply to the next job.</p>
-<form method="post" action="/settings" class="settings">
+<form method="post" action="/settings" class="settings-form">
 
-<h2>Sources</h2>
-<p class="muted small">From Suwayomi. <b>Disabled</b> sources are still searched (so a series that exists only there is reported) but never downloaded from. <b>Throttled</b> sources get one chapter at a time and lose close calls.</p>
-<table class="list small">
-<thead><tr><th>Source</th><th>Language</th><th>Disabled</th><th>Throttled</th></tr></thead>
-<tbody>
-{% for s in sources %}
-<tr><td>{{ s.name }}</td><td class="muted">{{ s.lang }}</td>
-<td><input type="checkbox" name="unusable_sources" value="{{ s.name|lower }}" {% if s.name|lower in v.unusable_sources %}checked{% endif %}></td>
-<td><input type="checkbox" name="throttled_sources" value="{{ s.name|lower }}" {% if s.name|lower in v.throttled_sources %}checked{% endif %}></td></tr>
-{% endfor %}
-{% if not sources %}<tr><td colspan="4" class="err">Suwayomi unreachable - source list unavailable</td></tr>{% endif %}
-</tbody></table>
+<section class="card" id="sources">
+  <h2>Sources</h2>
+  <p class="muted small">From Suwayomi. <b>Disabled</b> sources are still searched (so a series that exists only there is reported) but never downloaded from. <b>Throttled</b> sources get one chapter at a time and lose close calls.</p>
+  <div class="tablewrap"><table class="list small">
+  <thead><tr><th>Source</th><th>Language</th><th>Disabled</th><th>Throttled</th></tr></thead>
+  <tbody>
+  {% for s in sources %}
+  <tr><td>{{ s.name }}</td><td class="muted">{{ s.lang }}</td>
+  <td><input type="checkbox" name="unusable_sources" value="{{ s.name|lower }}" aria-label="Disable {{ s.name }}" {% if s.name|lower in v.unusable_sources %}checked{% endif %}></td>
+  <td><input type="checkbox" name="throttled_sources" value="{{ s.name|lower }}" aria-label="Throttle {{ s.name }}" {% if s.name|lower in v.throttled_sources %}checked{% endif %}></td></tr>
+  {% endfor %}
+  {% if not sources %}<tr><td colspan="4" class="err">Suwayomi unreachable - source list unavailable</td></tr>{% endif %}
+  </tbody></table></div>
+</section>
 
-<h2>Scheduling &amp; matching</h2>
-<label>Refresh every (hours) <input name="refresh_hours" value="{{ v.refresh_hours }}" size="6"></label>
-<label>Minimum pages for a fractional chapter <input name="min_pages" value="{{ v.min_pages }}" size="6"> <span class="muted small">below this a "Chapter 12.5" is treated as a notice image and skipped</span></label>
+<section class="card" id="scheduling">
+  <h2>Scheduling &amp; matching</h2>
+  <div class="field"><span class="lbl">Refresh every (hours)</span><input name="refresh_hours" value="{{ v.refresh_hours }}" size="6"></div>
+  <div class="field"><span class="lbl">Minimum pages for a fractional chapter</span><input name="min_pages" value="{{ v.min_pages }}" size="6"><span class="help">below this a "Chapter 12.5" is treated as a notice image and skipped</span></div>
+</section>
 
-<h2>Komga</h2>
-<label>URL <input name="komga_url" value="{{ v.komga_url }}" placeholder="http://komga:25600"></label>
-<label>API key <input name="komga_api_key" type="password" value="" placeholder="{{ 'set - leave blank to keep' if v.komga_api_key else 'Komga: account menu → API keys' }}"></label>
-<label>Library id <input name="komga_library_id" value="{{ v.komga_library_id }}" placeholder="optional: scan only this library"></label>
-{% if komga_test %}<p class="{{ 'muted' if komga_ok else 'err' }}">Komga: {{ komga_test }}</p>{% endif %}
+<section class="card" id="komga">
+  <h2>Komga</h2>
+  <div class="field"><span class="lbl">URL</span><input name="komga_url" value="{{ v.komga_url }}" placeholder="http://komga:25600"></div>
+  <div class="field"><span class="lbl">API key</span><input name="komga_api_key" type="password" value="" placeholder="{{ 'set - leave blank to keep' if v.komga_api_key else 'Komga: account menu → API keys' }}"></div>
+  <div class="field"><span class="lbl">Library id</span><input name="komga_library_id" value="{{ v.komga_library_id }}" placeholder="optional: scan only this library"></div>
+  {% if komga_test %}<p class="{{ 'muted' if komga_ok else 'err' }}" style="margin-top:8px">Komga: {{ komga_test }}</p>{% endif %}
+</section>
 
-<h2>Notifications</h2>
-<label>Pushover app token <input name="pushover_token" type="password" value="" placeholder="{{ 'set - leave blank to keep' if v.pushover_token else '' }}"></label>
-<label>Pushover user key <input name="pushover_user" type="password" value="" placeholder="{{ 'set - leave blank to keep' if v.pushover_user else '' }}"></label>
-<label>Webhook URL <input name="webhook_url" value="{{ v.webhook_url }}" placeholder="POST {title, message, kind} as JSON"></label>
+<section class="card" id="notifications">
+  <h2>Notifications</h2>
+  <div class="field"><span class="lbl">Pushover app token</span><input name="pushover_token" type="password" value="" placeholder="{{ 'set - leave blank to keep' if v.pushover_token else '' }}"></div>
+  <div class="field"><span class="lbl">Pushover user key</span><input name="pushover_user" type="password" value="" placeholder="{{ 'set - leave blank to keep' if v.pushover_user else '' }}"></div>
+  <div class="field"><span class="lbl">Webhook URL</span><input name="webhook_url" value="{{ v.webhook_url }}" placeholder="POST {title, message, kind} as JSON"></div>
+</section>
 
-<h2>Security</h2>
-<label>Login method
-  <label><input type="radio" name="auth_method" value="forms" {% if v.auth_method != 'basic' %}checked{% endif %}> login page</label>
-  <label><input type="radio" name="auth_method" value="basic" {% if v.auth_method == 'basic' %}checked{% endif %}> browser prompt (basic auth)</label>
-</label>
-<label>Web username <input name="auth_user" value="{{ v.auth_user }}" placeholder="empty = no login"></label>
-<label>Web password <input name="auth_password" type="password" value="" placeholder="{{ 'set - leave blank to keep' if v.auth_password else '' }}"></label>
-<p class="muted small">Secrets are never shown again once saved. To clear one, enter a single space.</p>
-<label>API key <input name="api_key" value="{{ v.api_key }}"> <span class="muted small">send as <code>X-Api-Key</code> header (or <code>?apikey=</code>) to use the JSON API when a login is set</span></label>
+<section class="card" id="security">
+  <h2>Security</h2>
+  <div class="field"><span class="lbl">Login method</span><div class="radios">
+    <label><input type="radio" name="auth_method" value="forms" {% if v.auth_method != 'basic' %}checked{% endif %}> login page</label>
+    <label><input type="radio" name="auth_method" value="basic" {% if v.auth_method == 'basic' %}checked{% endif %}> browser prompt (basic auth)</label>
+  </div></div>
+  <div class="field"><span class="lbl">Web username</span><input name="auth_user" value="{{ v.auth_user }}" placeholder="empty = no login"></div>
+  <div class="field"><span class="lbl">Web password</span><input name="auth_password" type="password" value="" placeholder="{{ 'set - leave blank to keep' if v.auth_password else '' }}"><span class="help">Secrets are never shown again once saved. To clear one, enter a single space.</span></div>
+  <div class="field"><span class="lbl">API key</span><input name="api_key" value="{{ v.api_key }}"><span class="help">send as <code>X-Api-Key</code> header (or <code>?apikey=</code>) to use the JSON API when a login is set</span></div>
+</section>
 
-<div class="actions">
+<div class="savebar">
   <button>Save</button>
   <button name="action" value="test-komga" class="alt">Save &amp; test Komga</button>
   <button name="action" value="test-notify" class="alt">Save &amp; send test notification</button>

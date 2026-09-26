@@ -1,27 +1,94 @@
 {% extends "base.html" %}
 {% block title %}Series - mang-arr{% endblock %}
+{% block page_title %}Series{% endblock %}
 {% block body %}
-<div class="bar">
-  <form method="get" action="/"><input type="search" name="q" value="{{ q }}" placeholder="filter titles"></form>
-  <span class="muted">{{ rows|length }} series</span>
-  <a class="btn" href="/add">+ Add series</a>
+<div class="toolbar">
+  <form method="get" action="/" role="search">
+    <span class="searchbox"><svg class="ic" aria-hidden="true"><use href="#i-search"/></svg>
+      <input type="search" id="series-search" name="q" value="{{ q }}" placeholder="Search series" aria-label="Search series" autocomplete="off"></span>
+  </form>
+  <label class="small muted">Sort <select id="series-sort" aria-label="Sort by">
+    <option value="title">Title</option><option value="status">Status</option><option value="progress">Progress</option>
+    <option value="wanted">Wanted</option><option value="checked">Last checked</option><option value="added">Added</option>
+  </select></label>
+  <button type="button" id="series-dir" class="ghost small" data-dir="asc" aria-label="Toggle sort direction" title="Sort direction">&#9652;</button>
+  <label class="small muted">Filter <select id="series-filter" aria-label="Filter">
+    <option value="all">All</option><option value="monitored">Monitored</option><option value="unmonitored">Unmonitored</option>
+    <option value="wanted">Wanted</option><option value="continuing">Continuing</option><option value="ended">Ended</option>
+  </select></label>
+  <span class="grow"></span>
+  <span class="count" id="series-count" data-total="{{ rows|length }}">{{ rows|length }} series</span>
+  <div class="seg" role="group" aria-label="View">
+    <button type="button" data-setview="posters" aria-pressed="true" title="Posters"><svg class="ic sm"><use href="#i-grid"/></svg></button>
+    <button type="button" data-setview="table" aria-pressed="false" title="Table"><svg class="ic sm"><use href="#i-list"/></svg></button>
+  </div>
+  <a class="btn" href="/add">+ Add New</a>
 </div>
-<table class="list">
-<thead><tr><th></th><th>Title</th><th>Status</th><th class="num">Have</th><th class="num">Listed</th><th class="num">Wanted</th><th>Primary source</th><th>Checked</th></tr></thead>
-<tbody>
-{% for r in rows %}
-<tr class="{% if not r.monitored %}dim{% endif %}">
-  <td class="cover">{% if r.cover %}<img src="{{ r.cover }}" alt="" loading="lazy">{% endif %}</td>
-  <td><a href="/series/{{ r.id }}">{{ r.title }}</a>{% if r.last_error %} <span class="err" title="{{ r.last_error }}">!</span>{% endif %}</td>
-  <td><span class="tag {{ (r.status or '')|lower }}">{{ r.status or '?' }}</span></td>
-  <td class="num">{{ r.have }}</td>
-  <td class="num">{{ r.listed }}</td>
-  <td class="num {% if r.wanted %}want{% endif %}">{{ r.wanted }}</td>
-  <td class="muted">{{ r.primary_source or '-' }}</td>
-  <td class="muted">{{ r.last_resolved|ago }}</td>
-</tr>
-{% endfor %}
-</tbody>
-</table>
-{% if not rows %}<p class="muted">Nothing tracked yet. <a href="/add">Add a series</a>, or run <code>mangarr adopt</code> to register what Suwayomi already downloaded.</p>{% endif %}
+
+{% macro attrs(r) -%}
+data-id="{{ r.id }}" data-title="{{ r.title }}" data-alt="{{ r.romaji or '' }} {{ r.native or '' }}" data-status="{{ r.status|status_class }}"
+data-progress="{{ progress(r.have, r.listed) }}" data-wanted="{{ r.wanted }}" data-monitored="{{ 1 if r.monitored else 0 }}"
+data-checked="{{ r.last_resolved or '' }}" data-added="{{ r.added_at or '' }}"
+{%- endmacro %}
+{% macro bar(r) -%}
+{% set pct = progress(r.have, r.listed) %}
+<div class="progress {% if r.wanted %}warn{% elif not r.listed %}info{% endif %}" role="progressbar" aria-valuenow="{{ pct }}" aria-valuemin="0" aria-valuemax="100" title="{{ r.have }} of {{ r.listed }} chapters"><span class="fill" style="width:{{ pct }}%"></span><span class="txt">{{ r.have }}/{{ r.listed }}</span></div>
+{%- endmacro %}
+{% macro monform(r) -%}
+<form method="post" action="/series/{{ r.id }}/monitor" class="iconform" data-async="monitor" data-id="{{ r.id }}">
+  <input type="hidden" name="monitored" value="{{ 0 if r.monitored else 1 }}">
+  <button type="submit" class="{{ 'monitored' if r.monitored }}" title="{{ 'Monitored: click to unmonitor' if r.monitored else 'Unmonitored: click to monitor' }}" aria-label="{{ 'Monitored: click to unmonitor' if r.monitored else 'Unmonitored: click to monitor' }}"><svg class="ic mon"><use href="{{ '#i-bookmark' if r.monitored else '#i-bookmark-off' }}"/></svg></button>
+</form>
+{%- endmacro %}
+
+<div class="views" data-view="posters">
+  <div class="view-posters">
+    <div class="grid" data-items>
+    {% for r in rows %}
+      <a class="poster {% if not r.monitored %}dim{% endif %}" href="/series/{{ r.id }}" {{ attrs(r) }}>
+        <div class="art">
+          {% if r.cover %}<img src="{{ r.cover }}" alt="" loading="lazy">{% else %}<div class="noart"><svg class="ic"><use href="#i-image"/></svg>no cover</div>{% endif %}
+          <span class="ribbon {{ r.status|status_class }}">{{ r.status|status_label }}</span>
+          {% if not r.monitored %}<svg class="ic unmon" aria-label="unmonitored"><use href="#i-bookmark-off"/></svg>{% endif %}
+        </div>
+        <div class="meta">
+          <span class="ttl" title="{{ r.title }}">{{ r.title }}</span>
+          <div class="sub"><span>{{ r.primary_source or 'no source' }}</span>{% if r.wanted %}<span class="want">{{ r.wanted }} wanted</span>{% endif %}</div>
+          {{ bar(r) }}
+        </div>
+      </a>
+    {% endfor %}
+    </div>
+  </div>
+
+  <div class="view-table tablewrap">
+    <table class="list">
+      <thead><tr>
+        <th></th>
+        <th class="sortable" data-sort="title">Title</th>
+        <th title="Monitored"></th>
+        <th class="sortable" data-sort="status">Status</th>
+        <th class="sortable" data-sort="progress" style="width:170px">Chapters</th>
+        <th class="num sortable" data-sort="wanted">Wanted</th>
+        <th>Primary source</th>
+        <th class="sortable" data-sort="checked">Last checked</th>
+      </tr></thead>
+      <tbody data-items>
+      {% for r in rows %}
+        <tr class="{% if not r.monitored %}dim{% endif %}" {{ attrs(r) }}>
+          <td class="cover">{% if r.cover %}<img class="thumb" src="{{ r.cover }}" alt="" loading="lazy">{% else %}<span class="thumb none"><svg class="ic sm"><use href="#i-image"/></svg></span>{% endif %}</td>
+          <td><a href="/series/{{ r.id }}">{{ r.title }}</a>{% if r.last_error %} <span class="err" title="{{ r.last_error }}">!</span>{% endif %}</td>
+          <td>{{ monform(r) }}</td>
+          <td><span class="tag {{ r.status|status_class }}">{{ r.status|status_label }}</span></td>
+          <td>{{ bar(r) }}</td>
+          <td class="num {% if r.wanted %}want{% endif %}">{{ r.wanted }}</td>
+          <td class="muted">{{ r.primary_source or '-' }}</td>
+          <td class="muted nowrap">{{ r.last_resolved|ago }}</td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</div>
+{% if not rows %}<p class="empty">Nothing tracked yet. <a href="/add">Add a series</a>, <a href="/import">import what Suwayomi already downloaded</a>, or set up an <a href="/lists">import list</a>.</p>{% endif %}
 {% endblock %}
