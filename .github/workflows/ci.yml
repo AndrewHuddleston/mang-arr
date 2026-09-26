@@ -56,7 +56,7 @@ jobs:
           python -m zipfile -l dist/*.whl | grep -E 'mangarr/web/static/style.css'
       - name: the web extra installs and imports
         run: |
-          pip install dist/*.whl[web]
+          pip install "$(ls dist/*.whl)[web]"
           python -c "import mangarr.web.app; print('ok')"
           mangarr --help
 

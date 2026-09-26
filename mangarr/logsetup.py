@@ -55,13 +55,24 @@ def setup(level: str | None = None, file: str | None = None, console: bool = Tru
         ch = logging.StreamHandler(sys.stderr)
         ch.setFormatter(fmt)
         root.addHandler(ch)
+    file_error = None
     if file:
-        os.makedirs(os.path.dirname(file) or ".", exist_ok=True)
-        fh = logging.handlers.RotatingFileHandler(file, maxBytes=10_000_000, backupCount=5, encoding="utf-8")
-        fh.setFormatter(fmt)
-        root.addHandler(fh)
+        try:
+            os.makedirs(os.path.dirname(file) or ".", exist_ok=True)
+            fh = logging.handlers.RotatingFileHandler(file, maxBytes=10_000_000, backupCount=5, encoding="utf-8")
+            fh.setFormatter(fmt)
+            root.addHandler(fh)
+        except OSError as e:                  # unwritable volume: keep running, say so on the console
+            file_error = f"{type(e).__name__}: {e}"
+            if not console:
+                ch = logging.StreamHandler(sys.stderr)
+                ch.setFormatter(fmt)
+                root.addHandler(ch)
     # third-party noise stays quiet unless we are debugging
     if level_name != "DEBUG":
         for name in ("urllib3", "asyncio", "uvicorn.access"):
             logging.getLogger(name).setLevel(logging.WARNING)
     logging.getLogger(__name__).debug("logging ready: level=%s file=%s json=%s", level_name, file, json_lines)
+    if file_error:
+        logging.getLogger(__name__).warning("cannot write the log file %s (%s); logging to the console only",
+                                            file, file_error)
