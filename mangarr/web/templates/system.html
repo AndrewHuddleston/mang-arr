@@ -1,66 +1,98 @@
 {% extends "base.html" %}
-{% block title %}System - mang-arr{% endblock %}
-{% block page_title %}System Status{% endblock %}
-{% block body %}
-<div class="stats" id="status">
-  <div class="stat"><b>{{ version }}</b><span class="lbl">version</span></div>
-  <div class="stat"><b>{{ uptime }}</b><span class="lbl">started</span></div>
-  <div class="stat {{ 'have' if suwayomi_ok else 'failed' }}"><b>{{ 'ok' if suwayomi_ok else 'unreachable' }}</b><span class="lbl">Suwayomi</span></div>
-  <div class="stat"><b>{{ next_refresh|ago if next_refresh else '-' }}</b><span class="lbl">next refresh</span></div>
-  <div class="stat {{ 'have' if notify_ok else '' }}"><b>{{ 'on' if notify_ok else 'off' }}</b><span class="lbl">notifications</span>
-    {% if notify_ok %}<form method="post" action="/system/notify-test"><button class="ghost small">send test</button></form>{% endif %}</div>
-  <div class="stat {{ 'have' if komga_ok else '' }}"><b>{{ 'on' if komga_ok else 'off' }}</b><span class="lbl">Komga scan</span></div>
-  <div class="stat {{ 'have' if metrics_ok else '' }}"><b>{{ '/metrics' if metrics_ok else 'off' }}</b><span class="lbl">Prometheus</span></div>
-  {% if copied %}<div class="stat failed"><b>{{ copied }}</b><span class="lbl">chapters copied, not linked</span><div class="small muted">staging and library are on different mounts</div></div>{% endif %}
-</div>
-<p class="muted small">Health: <a href="/api/v1/health">/api/v1/health</a> · API docs: <a href="/api/docs">/api/docs</a> · <a href="/system/logs">Logs</a> · <a href="/system/backup">Download database backup</a></p>
+{% import "macros.html" as m %}
+{% block title %}System Status - mang-arr{% endblock %}
 
-<section class="card" id="health-table">
-  <h2>Health</h2>
-  <div class="tablewrap"><table class="list small">
-  {% for c in checks %}<tr><td style="width:90px"><span class="tag {{ c.level }}">{{ c.level }}</span></td><td>{{ c.name }}</td><td class="muted">{{ c.detail }}</td></tr>{% endfor %}
-  </table></div>
-</section>
-
-<section class="card" id="tasks">
-  <h2>Tasks</h2>
-  <div class="tablewrap"><table class="list small">
-  <thead><tr><th>Task</th><th>Interval</th><th>Next run</th><th></th></tr></thead>
-  {% for t in tasks %}<tr><td>{{ t.name }}</td><td class="muted">{{ t.every }}</td><td class="muted">{{ t.next|ago if t.next else '-' }}</td>
-  <td class="act"><form method="post" action="{{ t.action }}"><button class="alt small">run now</button></form></td></tr>{% endfor %}
-  </table></div>
-  <p class="muted small" style="margin:8px 0 0">Version {{ version }}{% if update.latest %} · latest release {{ update.latest }}{% endif %}{% if update.error %} · update check: {{ update.error }}{% endif %}</p>
-</section>
-
-<section class="card" id="backups">
-  <div class="cardhead"><h2>Backups <span class="muted small" style="text-transform:none;letter-spacing:0">(daily, {{ backups|length }} kept in the data folder)</span></h2>
-    <form method="post" action="/system/backups/create"><button class="alt small">Back up now</button></form>
+{% block toolbar %}
+<div class="page-toolbar">
+  <div class="toolbar-section left">
+    {{ m.toolbar_button('Refresh', 'refresh', href='/system') }}
+    {{ m.toolbar_separator() }}
+    {{ m.toolbar_button('Backup Now', 'backup', form='/system/backups/create') }}
+    {{ m.toolbar_button('Check Update', 'download', form='/system/update-check') }}
+    {{ m.toolbar_button('Logs', 'logs', href='/system/logs') }}
   </div>
-  <div class="tablewrap"><table class="list small">
-  <thead><tr><th>Backup</th><th class="num">Size</th><th>Taken</th><th></th></tr></thead>
-  {% for b in backups %}<tr><td><a href="/system/backups/{{ b.name }}">{{ b.name }}</a></td><td class="num">{{ (b.size / 1048576)|round(1) }} MB</td><td class="muted">{{ b.mtime|ago }}</td>
-  <td class="act">
-    <form method="post" action="/system/backups/{{ b.name }}/restore" onsubmit="return confirm('Restore {{ b.name }}? The current database is saved first.')"><button class="alt small">restore</button></form>
-    <form method="post" action="/system/backups/{{ b.name }}/delete" onsubmit="return confirm('Delete {{ b.name }}?')"><button class="danger small">delete</button></form>
+  <div class="toolbar-section right">
+    <nav class="settings-nav" aria-label="System sections"><a href="#health-table">Status</a><a href="#tasks">Tasks</a><a href="#backups">Backups</a><a href="/system/logs">Logs</a></nav>
+  </div>
+</div>
+{% endblock %}
+
+{% block body %}
+<fieldset class="fieldset" id="health-table">
+  <legend class="legend">Health</legend>
+  {% set problems = checks|rejectattr('level', 'equalto', 'ok')|list %}
+  {% if not problems %}<div class="health-ok">No issues with your configuration</div>{% endif %}
+  <div class="table-container"><table class="table">
+  <thead><tr><th class="col-icon"></th><th>Check</th><th>Message</th></tr></thead>
+  <tbody>
+  {% for c in checks %}<tr><td class="col-icon event-icon {{ 'danger' if c.level == 'error' else 'warning' if c.level == 'warning' else 'success' }}" title="{{ c.level }}">{{ m.icon('warning' if c.level != 'ok' else 'check-circle', 'sm') }}</td><td>{{ c.name }}</td><td class="muted">{{ c.detail }}</td></tr>{% endfor %}
+  </tbody></table></div>
+</fieldset>
+
+<fieldset class="fieldset" id="system-status">
+  <legend class="legend">About</legend>
+  <dl class="description-list">
+    <dt>Version</dt><dd>{{ version }}{% if update.latest %} <span class="muted">(latest release {{ update.latest }})</span>{% endif %}{% if update.error %} <span class="text-danger">update check: {{ update.error }}</span>{% endif %}</dd>
+    <dt>Started</dt><dd>{{ uptime }}</dd>
+    <dt>Suwayomi</dt><dd>{{ m.label('reachable' if suwayomi_ok else 'unreachable', 'success' if suwayomi_ok else 'danger') }}</dd>
+    <dt>Next refresh</dt><dd>{{ next_refresh|ago if next_refresh else '-' }}</dd>
+    <dt>Notifications</dt><dd>{{ m.label('on' if notify_ok else 'off', 'success' if notify_ok else 'default') }} {% if notify_ok %}<form method="post" action="/system/notify-test" class="inline"><button class="button small">Send test</button></form>{% endif %}</dd>
+    <dt>Komga scan</dt><dd>{{ m.label('on' if komga_ok else 'off', 'success' if komga_ok else 'default') }}</dd>
+    <dt>Prometheus</dt><dd>{% if metrics_ok %}<a href="/metrics">/metrics</a>{% else %}off{% endif %}</dd>
+    {% if copied %}<dt>Copied chapters</dt><dd class="text-danger">{{ copied }} chapters copied, not linked: staging and library are on different mounts</dd>{% endif %}
+  </dl>
+</fieldset>
+
+<fieldset class="fieldset" id="more-info">
+  <legend class="legend">More Info</legend>
+  <dl class="description-list">
+    <dt>Health API</dt><dd><a href="/api/v1/health">/api/v1/health</a></dd>
+    <dt>API docs</dt><dd><a href="/api/docs">/api/docs</a></dd>
+    <dt>Backup</dt><dd><a href="/system/backup">Download database backup</a></dd>
+  </dl>
+</fieldset>
+
+<fieldset class="fieldset" id="tasks">
+  <legend class="legend">Scheduled</legend>
+  <div class="table-container"><table class="table tasks">
+  <thead><tr><th>Name</th><th class="col-interval">Interval</th><th class="col-date">Next Execution</th><th class="col-actions"></th></tr></thead>
+  <tbody>
+  {% for t in tasks %}<tr><td>{{ t.name }}</td><td class="col-interval muted">{{ t.every }}</td><td class="col-date muted">{{ t.next|ago if t.next else '-' }}</td>
+  <td class="col-actions"><form method="post" action="{{ t.action }}" class="iconform"><button class="iconbtn" title="Run now">{{ m.icon('refresh') }}</button></form></td></tr>{% endfor %}
+  </tbody></table></div>
+</fieldset>
+
+<fieldset class="fieldset" id="backups">
+  <legend class="legend">Backups <span class="legend-note">(daily, {{ backups|length }} kept in the data folder)</span></legend>
+  <div class="table-container"><table class="table backups">
+  <thead><tr><th>Name</th><th class="num">Size</th><th class="col-date">Time</th><th class="col-actions"></th></tr></thead>
+  <tbody>
+  {% for b in backups %}<tr><td>{{ m.icon('backup', 'sm') }} <a href="/system/backups/{{ b.name }}">{{ b.name }}</a></td><td class="num">{{ (b.size / 1048576)|round(1) }} MB</td><td class="col-date muted">{{ b.mtime|ago }}</td>
+  <td class="col-actions">
+    <form method="post" action="/system/backups/{{ b.name }}/restore" class="iconform" onsubmit="return confirm('Restore {{ b.name }}? The current database is saved first.')"><button class="iconbtn" title="Restore">{{ m.icon('history') }}</button></form>
+    <form method="post" action="/system/backups/{{ b.name }}/delete" class="iconform" onsubmit="return confirm('Delete {{ b.name }}?')"><button class="iconbtn" title="Delete">{{ m.icon('delete') }}</button></form>
   </td></tr>{% endfor %}
   {% if not backups %}<tr><td colspan="4" class="muted">no backups yet</td></tr>{% endif %}
-  </table></div>
-  <form method="post" action="/system/backups/upload" enctype="multipart/form-data" class="toolbar" style="margin:12px 0 0" onsubmit="return confirm('Replace the live database with this file? The current one is saved first.')">
-    <input type="file" name="file" accept=".db" required aria-label="Backup file"> <button class="alt small">Restore from file</button>
+  </tbody></table></div>
+  <form method="post" action="/system/backups/create" class="inline"><button class="button">Backup Now</button></form>
+  <form method="post" action="/system/backups/upload" enctype="multipart/form-data" class="restore-form" onsubmit="return confirm('Replace the live database with this file? The current one is saved first.')">
+    <input type="file" name="file" accept=".db" required aria-label="Backup file" class="input file"> <button class="button">Restore from file</button>
   </form>
-</section>
+</fieldset>
 
-<section class="card" id="sources">
-  <h2>Sources (from Suwayomi)</h2>
-  <div class="tablewrap"><table class="list small">
+<fieldset class="fieldset" id="sources">
+  <legend class="legend">Sources (from Suwayomi)</legend>
+  <div class="table-container"><table class="table">
+  <thead><tr><th>Source</th><th>Language</th><th>State</th></tr></thead>
+  <tbody>
   {% for s in sources %}<tr><td>{{ s.name }}</td><td class="muted">{{ s.lang }}</td>
-  <td>{% if s.unusable %}<span class="tag failed">unusable</span>{% elif s.throttled %}<span class="tag wanted">throttled</span>{% else %}<span class="tag have">ok</span>{% endif %}</td></tr>{% endfor %}
-  {% if not sources %}<tr><td class="muted">Suwayomi unreachable - source list unavailable</td></tr>{% endif %}
-  </table></div>
-</section>
+  <td>{% if s.unusable %}{{ m.label('disabled', 'danger') }}{% elif s.throttled %}{{ m.label('throttled', 'warning') }}{% else %}{{ m.label('ok', 'success') }}{% endif %}</td></tr>{% endfor %}
+  {% if not sources %}<tr><td colspan="3" class="muted">Suwayomi unreachable - source list unavailable</td></tr>{% endif %}
+  </tbody></table></div>
+</fieldset>
 
-<section class="card" id="configuration">
-  <h2>Configuration</h2>
-  <div class="tablewrap"><table class="list small">{% for k, v in cfg %}<tr><td class="muted">MANGARR_{{ k }}</td><td><code>{{ v }}</code></td></tr>{% endfor %}</table></div>
-</section>
+<fieldset class="fieldset" id="configuration">
+  <legend class="legend">Configuration</legend>
+  <dl class="description-list wide">{% for k, val in cfg %}<dt>MANGARR_{{ k }}</dt><dd><code>{{ val }}</code></dd>{% endfor %}</dl>
+</fieldset>
 {% endblock %}

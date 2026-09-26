@@ -1,6 +1,7 @@
 """Every page renders (200) against a seeded temporary database, with no
 Suwayomi and no network; plus the chapter grouping the series page uses."""
 import os
+import re
 import tempfile
 import unittest
 from unittest import mock
@@ -86,6 +87,47 @@ class HelpersTest(unittest.TestCase):
         self.assertEqual(views.ref_url({"anilist_id": 5, "mangadex_id": None}), "https://anilist.co/manga/5")
         self.assertEqual(views.ref_url({"anilist_id": None, "mangadex_id": "u-u"}), "https://mangadex.org/title/u-u")
         self.assertIsNone(views.ref_url({"anilist_id": None, "mangadex_id": None}))
+
+    def test_sonarr_style_helpers(self):
+        self.assertEqual(views.progress_kind("RELEASING", True, 100), "primary")
+        self.assertEqual(views.progress_kind("FINISHED", True, 100), "success")
+        self.assertEqual(views.progress_kind("RELEASING", True, 40), "danger")
+        self.assertEqual(views.progress_kind("RELEASING", False, 40), "warning")
+        self.assertEqual(views.progress_kind("RELEASING", True, 40, downloading=True), "purple")
+        self.assertEqual(views.chapter_status("have"), {"kind": "success", "text": "Downloaded", "icon": "downloaded"})
+        self.assertEqual(views.chapter_status("wanted")["text"], "Missing")
+        self.assertEqual(views.chapter_status("weird")["text"], "weird")
+        self.assertEqual(views.event_icon("failed")["kind"], "danger")
+        self.assertEqual(views.event_icon("nope")["icon"], "unknown")
+        s = model.Series(anilist_id=1, english="X", country="KR", format="MANGA")
+        self.assertEqual(views.network_line(s), "AniList · manhwa · Korean")
+        self.assertEqual(views.network_line(model.manual("Y")), "Manual · comic")
+        self.assertEqual(views.provider({"anilist_id": None, "mangadex_id": "u"}), "MangaDex")
+        self.assertEqual(views.row_kind({"country": "JP", "format": "MANGA"}), "manga")
+        self.assertEqual(views.row_language({"country": "JP", "format": "MANGA"}), "Japanese")
+        self.assertEqual(views.snippet("Hello <b>there</b><br>friend", 8), "Hello…")
+        self.assertEqual(views.snippet("short", 80), "short")
+        st = views.index_stats([{"status": "FINISHED", "monitored": 1, "listed": 5, "have": 5, "wanted": 0},
+                                {"status": "RELEASING", "monitored": 0, "listed": 4, "have": 1, "wanted": 3}])
+        self.assertEqual(st, {"series": 2, "ended": 1, "continuing": 1, "monitored": 1, "unmonitored": 1,
+                              "chapters": 9, "files": 6, "wanted": 3})
+
+    def test_queue_rows_merge_jobs_and_suwayomi(self):
+        from mangarr import jobs
+        j_done = jobs.Job(1, "add", "A", None, "done", 1.0, 2.0, 3.0, "", "added")
+        j_run = jobs.Job(2, "refresh", "B", 7, "running", 4.0, 5.0, None, "3/10", "")
+        sq = {"state": "STARTED", "count": 1, "items": [
+            {"manga": "T", "chapter": "Ch 3", "state": "DOWNLOADING", "progress": 40, "tries": 1},
+            {"manga": "T", "chapter": "Ch 4", "state": "ERROR", "progress": 0, "tries": 3}]}
+        rows = views.queue_rows([j_done, j_run], sq)
+        self.assertEqual([r["status"] for r in rows], ["running", "running", "done", "failed"])
+        self.assertEqual(rows[0]["cancel"], "/activity/cancel/2")
+        self.assertEqual(rows[0]["message"], "3/10")
+        self.assertEqual(rows[0]["series_id"], 7)
+        self.assertEqual((rows[1]["client"], rows[1]["chapter"], rows[1]["progress"]), ("Suwayomi", "Ch 3", 40))
+        self.assertEqual(rows[2]["at"], 3.0)
+        self.assertIsNone(rows[3]["cancel"])
+        self.assertEqual(views.queue_rows([], None), [])
 
     def test_nav(self):
         self.assertEqual(views.nav_section("/series/3"), "Series")
@@ -181,21 +223,51 @@ class PagesTest(unittest.TestCase):
             self.assertIn(n, r.text, f"{path}: missing {n!r}")
         return r.text
 
-    def test_index_both_views(self):
-        html = self._ok("/", "Alpha Manga", "Season Webtoon", 'data-view="posters"', "view-table", "Continuing", "Ended")
+    def test_index_three_views(self):
+        html = self._ok("/", "Alpha Manga", "Season Webtoon", 'data-view="posters"', "view-posters", "view-overview",
+                        "view-table", "Continuing", "Ended", 'id="view-menu"', 'id="sort-menu"', 'id="filter-menu"',
+                        'id="series-count"', "Update All", 'class="page-toolbar"')
         self.assertIn(f'action="/series/{self.sid}/monitor"', html)
-        self.assertIn("2/6", html)                                   # have/listed like Sonarr's 16/16
+        self.assertIn("2 / 6", html)                                 # have / listed like Sonarr's 16 / 16
+        self.assertIn('class="progress-bar danger"', html)           # monitored + missing = red (Sonarr rule)
+        self.assertIn('class="poster-status ended"', html)           # Sonarr's red corner on ended series
+        self.assertIn('class="poster-controls label"', html)         # hover controls: refresh / search / edit
+        self.assertIn(f'data-edit="{self.sid}"', html)
+        self.assertIn('id="edit-modal"', html)                       # Edit + Delete modals shared by every row
+        self.assertIn('id="delete-modal"', html)
+        self.assertIn('name="exclude"', html)
+        self.assertIn('name="files"', html)
+        self.assertIn("Line one.", html)                             # overview snippet in the Overview view
+        self.assertIn('class="index-footer"', html)                  # legend + statistics like SeriesIndexFooter
         self._ok("/?q=alpha", "Alpha Manga")
         self.assertNotIn("Season Webtoon", self.client.get("/?q=alpha").text)
 
     def test_series_page(self):
         html = self._ok(f"/series/{self.sid}", "Alpha Manga", "Chapters 21-40", "Chapters 1-20", "Continuing",
-                        "Line one.", "Line two.", "Why chapters failed", "download failed: 404",
+                        "Line one.", "Line two.", "download failed: 404",
                         f'action="/series/{self.sid}/chapter/3.0/ignore"', f'action="/series/{self.sid}/chapter/6.0/unignore"',
                         'data-title="Alpha Manga"', 'name="files"', 'name="exclude"', "Weeb Central",
                         "https://anilist.co/manga/1", "right to left", "Someone", "Size on disk")
         self.assertIn('id="group-block-21"', html)
-        self.assertIn("Search missing", html)
+        self.assertIn("Search Missing", html)
+        self.assertIn("Refresh &amp; Scan", html)
+        self.assertIn('class="series-header"', html)                                       # backdrop header
+        self.assertIn('class="backdrop"', html)
+        self.assertIn('class="details-labels"', html)                                      # path / size / status labels
+        self.assertIn('class="season"', html)                                              # SeriesDetailsSeason cards
+        self.assertIn('class="label danger large', html)                                   # 2 / 6 progress label
+        # modals: Edit, Delete (with delete-files + exclusion) and the chapter details modal with its three tabs
+        self.assertIn('id="edit-modal"', html)
+        self.assertIn(f'action="/series/{self.sid}/monitor" id="edit-form"', html)
+        self.assertIn('id="delete-modal"', html)
+        self.assertIn(f'action="/series/{self.sid}/delete" id="delete-form"', html)
+        self.assertIn('id="chapter-modal"', html)
+        for tab in ("summary", "history", "search"):
+            self.assertIn(f'data-tab="{tab}"', html)
+            self.assertIn(f'data-panel="{tab}"', html)
+        self.assertIn("data-start-interactive", html)
+        self.assertIn(f'data-chapter-url="/api/v1/series/{self.sid}/chapter/3.0"', html)
+        self.assertIn('class="episode-title-link"', html)
         self.assertIn(f'action="/series/{self.sid}/chapter/3.0/search"', html)             # per-chapter automatic search
         self.assertIn(f'data-manual="/api/v1/series/{self.sid}/chapter/3.0/releases"', html)
         self.assertIn(f'data-download="/series/{self.sid}/chapter/3.0/download"', html)
@@ -206,6 +278,8 @@ class PagesTest(unittest.TestCase):
         self.assertIn("waiting for a download pass", html)                                  # wanted without a reason yet
         self.assertIn('aria-controls="group-block-21"', html)
         self.assertNotIn("<i>two</i>", html)
+        self.assertIn("Downloaded", html)                                                   # Sonarr-style status labels
+        self.assertIn("Missing", html)
         self._ok(f"/series/{self.season_id}", "Season 1", "Season 2", "Ended", "left to right",
                  "https://mangadex.org/title/12345678-1234-1234-1234-123456789abc")
         self.assertEqual(self.client.get("/series/999").status_code, 404)
@@ -215,11 +289,18 @@ class PagesTest(unittest.TestCase):
         pick = model.Series(anilist_id=1, english="Alpha Manga", status="RELEASING", format="MANGA", country="JP")
         other = model.Series(anilist_id=2, english="Beta Manga", romaji="Beeta", status="FINISHED", chapters=12)
         with mock.patch("mangarr.web.app.metadata.lookup", lambda term: (pick, [pick, other])):
-            html = self._ok("/add?term=alpha", "already tracked", "Beta Manga", "exact match",
-                            'name="download" value="1"', "Beeta")
-            self.assertIn('value="anilist:2"', html)
+            html = self._ok("/add?term=alpha", "Already tracked", "Beta Manga", "Exact match",
+                            'name="download" value="1"', "Beeta", 'class="search-result pick"')
+            self.assertIn('data-ref="anilist:2"', html)
+            self.assertIn(f'href="/series/{self.sid}"', html)                       # tracked result links to the series
+            self.assertIn("AniList · manga · Japanese", html)                        # Sonarr's "network" line
+            self.assertIn('id="add-modal"', html)                                    # AddNewSeriesModalContent
+            self.assertIn('name="monitored"', html)
+            self.assertIn('data-field="rootfolder"', html)
+            self.assertIn("Start search for missing chapters", html)
+            self.assertIn('id="manual-modal"', html)
         with mock.patch("mangarr.web.app.metadata.lookup", lambda term: (None, [])):
-            self._ok("/add?term=zzz", "Nothing on AniList")
+            self._ok("/add?term=zzz", "Couldn't find any results")
 
         def boom(term):
             raise RuntimeError("down")
@@ -227,30 +308,60 @@ class PagesTest(unittest.TestCase):
             self._ok("/add?term=x", "lookup failed")
 
     def test_other_pages(self):
-        self._ok("/import", "Scan staging folders", "No scan yet")
+        self._ok("/import", "Scan Folders", "No scan yet")
         self._ok("/lists", "Add a list", 'id="addlist"', 'name="sync_hours"', "Exclusions")
-        self._ok("/wanted", "Alpha Manga", 'action="/wanted/search"')
-        self._ok("/activity", 'action="/activity/refresh-all"', "Ch 3", "40%", 'data-reload="10000"')
-        self._ok("/activity/history", "added by test", "boom")
+        html = self._ok("/wanted", "Alpha Manga", 'action="/wanted/search"', 'id="missing-table"', 'id="select-all"',
+                        f'data-select="{self.sid}"', 'data-label-selected="Search Selected"',
+                        f'action="/series/{self.sid}/refresh"')
+        self.assertIn("3-4, 25", html)                                              # chapter numbers as ranges
+        self._ok("/activity", 'action="/activity/refresh-all"', "Ch 3", "40%", 'data-reload="10000"',
+                 'id="queue-filter"', "Suwayomi", 'class="progress-bar purple"')
+        html = self._ok("/activity/history", "added by test", "boom", 'id="history-filter"', 'data-kind="failed"')
+        self.assertIn('class="col-icon event-icon danger"', html)                   # event type icon per row
         self._ok("/settings", 'id="sources"', 'id="scheduling"', 'id="komga"', 'id="notifications"', 'id="security"',
                  "Weeb Central", 'name="refresh_hours"', 'name="api_key"', 'value="test-komga"')
-        self._ok("/system", 'id="tasks"', 'id="backups"', "Suwayomi", "/system/logs", 'action="/system/backups/create"')
+        html = self._ok("/system", 'id="tasks"', 'id="backups"', "Suwayomi", "/system/logs",
+                        'action="/system/backups/create"', 'id="health-table"', 'class="description-list"')
+        self.assertEqual(html.count('id="status"'), 1)                               # the poller's element only
         html = self._ok("/system/logs", 'id="log"', "careful", 'class="ln WARNING"', 'id="log-level"', 'id="log-auto"')
         self.assertIn('class="ln INFO"', html)
         self._ok("/login?next=/")                              # no login configured: redirects home (followed)
 
     def test_shell(self):
         html = self._ok("/wanted", 'id="health"', 'id="status"', 'id="sidebar"', "/static/app.js",
-                        'href="/activity/history"', 'href="/settings#komga"', 'href="/system/logs"')
+                        'href="/activity/history"', 'href="/settings#komga"', 'href="/system/logs"',
+                        'class="page-header"', 'id="navtoggle"', 'id="series-search"')
         self.assertIn('class="navsec open current" data-section="wanted"', html)
         self.assertIn('href="/wanted" class="on"', html)
+        self.assertRegex(html, r'id="health" class="health label (success|warning|danger)"')
         html = self.client.get(f"/series/{self.sid}").text
         self.assertIn('data-section="series"', html)
-        self.assertIn('href="/" class="on"', html)
+        self.assertIn('class="navlink on" href="/"', html)
         self.assertIn('data-section="settings"', html)
         self.assertNotIn('class="navsec open current" data-section="settings"', html)
         self.assertEqual(self.client.get("/static/app.js").status_code, 200)
         self.assertEqual(self.client.get("/static/style.css").status_code, 200)
+
+    def test_external_links_open_in_a_new_tab(self):
+        html = self.client.get(f"/series/{self.sid}").text
+        m = re.search(r'<a[^>]*href="https://anilist.co/manga/1"[^>]*>', html)
+        self.assertIsNotNone(m, "metadata link missing")
+        for tag in re.findall(r'<a[^>]*href="https://anilist.co/manga/1"[^>]*>', html):
+            self.assertIn('target="_blank"', tag)
+            self.assertIn('rel="noopener noreferrer"', tag)
+        self.assertIn("#i-external", html)
+        # cover images are images, never links to the provider
+        self.assertNotRegex(html, r'<a[^>]*href="https://anilist\.co[^>]*>\s*<img')
+        # Add New results link to the provider the same way
+        pick = model.Series(anilist_id=2, english="Beta Manga", status="FINISHED")
+        with mock.patch("mangarr.web.app.metadata.lookup", lambda term: (pick, [pick])):
+            html = self.client.get("/add?term=beta").text
+        for tag in re.findall(r'<a[^>]*href="https://anilist.co/manga/2"[^>]*>', html):
+            self.assertIn('target="_blank"', tag)
+        # every absolute off-site link in every page carries the attributes
+        for path in ("/", f"/series/{self.sid}", "/system", "/settings"):
+            for tag in re.findall(r'<a[^>]*href="https?://[^"]*"[^>]*>', self.client.get(path).text):
+                self.assertIn('target="_blank"', tag, tag)
 
     def test_login_page_with_auth(self):
         from mangarr import db, settings

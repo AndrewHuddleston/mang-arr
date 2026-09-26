@@ -12,33 +12,21 @@
 {% set cur = nav_current(path) %}
 <body data-page="{{ section|lower }}">
 <a class="skip" href="#main">Skip to content</a>
-<svg xmlns="http://www.w3.org/2000/svg" style="display:none" aria-hidden="true">
-  <symbol id="i-menu" viewBox="0 0 24 24"><path d="M4 6h16M4 12h16M4 18h16"/></symbol>
-  <symbol id="i-chevron" viewBox="0 0 24 24"><path d="M9 6l6 6-6 6"/></symbol>
-  <symbol id="i-series" viewBox="0 0 24 24"><path d="M4 4h6a2 2 0 0 1 2 2v14a1 1 0 0 0-1-1H4zM20 4h-6a2 2 0 0 0-2 2v14a1 1 0 0 1 1-1h7z"/></symbol>
-  <symbol id="i-activity" viewBox="0 0 24 24"><path d="M3 12h4l3-8 4 16 3-8h4"/></symbol>
-  <symbol id="i-wanted" viewBox="0 0 24 24"><path d="M12 3l10 18H2zM12 10v5M12 18v.5"/></symbol>
-  <symbol id="i-settings" viewBox="0 0 24 24"><path d="M4 7h10M18 7h2M4 12h2M10 12h10M4 17h10M18 17h2"/><circle cx="16" cy="7" r="2"/><circle cx="8" cy="12" r="2"/><circle cx="16" cy="17" r="2"/></symbol>
-  <symbol id="i-system" viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="12" rx="2"/><path d="M8 20h8M12 16v4"/></symbol>
-  <symbol id="i-search" viewBox="0 0 24 24"><circle cx="11" cy="11" r="6"/><path d="M20 20l-4.5-4.5"/></symbol>
-  <symbol id="i-bookmark" viewBox="0 0 24 24"><path d="M6 3h12v18l-6-4-6 4z"/></symbol>
-  <symbol id="i-bookmark-off" viewBox="0 0 24 24"><path d="M6 3h12v18l-6-4-6 4z"/><path d="M4 4l16 16"/></symbol>
-  <symbol id="i-grid" viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/></symbol>
-  <symbol id="i-list" viewBox="0 0 24 24"><path d="M4 6h16M4 12h16M4 18h16"/></symbol>
-  <symbol id="i-x" viewBox="0 0 24 24"><path d="M6 6l12 12M18 6L6 18"/></symbol>
-  <symbol id="i-check" viewBox="0 0 24 24"><path d="M5 12l5 5 9-10"/></symbol>
-  <symbol id="i-refresh" viewBox="0 0 24 24"><path d="M20 12a8 8 0 1 1-2.3-5.7M20 4v5h-5"/></symbol>
-  <symbol id="i-image" viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="M3 16l5-5 4 4 3-3 6 6"/><circle cx="16" cy="9" r="1.5"/></symbol>
-</svg>
+{% include "icons.html" %}
 
-<header class="topbar">
-  <button type="button" class="iconbtn" id="navtoggle" aria-label="Toggle navigation" aria-controls="sidebar" aria-expanded="false"><svg class="ic"><use href="#i-menu"/></svg></button>
-  <a class="brand" href="/"><span class="brand-mark">M</span><span class="brand-name">mang-arr</span></a>
-  <h1 class="pagetitle">{% block page_title %}mang-arr{% endblock %}</h1>
-  <div class="topbar-right">
-    <span id="status" class="jobstatus" aria-live="polite">{% if current %}running: {{ current.kind }} {{ current.title }}{% endif %}</span>
-    <a id="health" href="/system" class="health {% if health_errors %}bad{% elif health_warnings %}warn{% else %}ok{% endif %}" title="backend health (System page)">{% if health_errors %}{{ health_errors }} problem{{ 's' if health_errors != 1 }}{% elif health_warnings %}{{ health_warnings }} warning{{ 's' if health_warnings != 1 }}{% else %}healthy{% endif %}</a>
-    {% if logged_in %}<form method="post" action="/logout" class="inline"><button class="btn ghost small">Sign out</button></form>{% endif %}
+<header class="page-header">
+  <div class="logo-container">
+    <a class="brand" href="/" title="mang-arr"><span class="brand-mark"><svg class="ic"><use href="#i-logo"/></svg></span><span class="brand-name">mang-arr</span></a>
+  </div>
+  <div class="sidebar-toggle">
+    <button type="button" class="iconbtn" id="navtoggle" aria-label="Toggle navigation" aria-controls="sidebar" aria-expanded="false"><svg class="ic"><use href="#i-menu"/></svg></button>
+  </div>
+  <form method="get" action="/" class="series-search" role="search">
+    <svg class="ic" aria-hidden="true"><use href="#i-search"/></svg>
+    <input type="search" id="series-search" name="q" value="{{ q|default('') }}" placeholder="Search" aria-label="Search series" autocomplete="off">
+  </form>
+  <div class="header-right">
+    {% if logged_in %}<form method="post" action="/logout" class="inline"><button class="iconbtn" title="Sign out" aria-label="Sign out"><svg class="ic"><use href="#i-signout"/></svg></button></form>{% endif %}
   </div>
 </header>
 
@@ -47,24 +35,29 @@
   {% for name, icon, links in NAV %}
     {% set is_open = (name == section) %}
     <li class="navsec {% if is_open %}open{% endif %} {% if is_open %}current{% endif %}" data-section="{{ name|lower }}">
-      <div class="navhead">
-        <a class="navlink {% if is_open %}on{% endif %}" href="{{ SECTION_HOME.get(name, links[0][1]) }}" title="{{ name }}"><svg class="ic"><use href="#i-{{ icon }}"/></svg><span class="navlabel">{{ name }}</span></a>
-        <button type="button" class="navexpand" aria-expanded="{{ 'true' if is_open else 'false' }}" aria-label="{{ 'Collapse' if is_open else 'Expand' }} {{ name }}"><svg class="ic"><use href="#i-chevron"/></svg></button>
-      </div>
+      <a class="navlink {% if is_open %}on{% endif %}" href="{{ SECTION_HOME.get(name, links[0][1]) }}"><span class="navicon"><svg class="ic"><use href="#i-{{ icon }}"/></svg></span><span class="navlabel">{{ name }}</span>
+        {% if name == 'System' %}<span class="navstatus"><span id="health" class="health label {% if health_errors %}danger{% elif health_warnings %}warning{% else %}success{% endif %}" title="backend health (System page)">{% if health_errors %}{{ health_errors }} problem{{ 's' if health_errors != 1 }}{% elif health_warnings %}{{ health_warnings }} warning{{ 's' if health_warnings != 1 }}{% else %}healthy{% endif %}</span></span>{% endif %}
+      </a>
       <ul class="navsub" {% if not is_open %}hidden{% endif %}>
         {% for label, href in links %}<li><a href="{{ href }}" class="{% if href == cur %}on{% endif %}">{{ label }}</a></li>{% endfor %}
       </ul>
     </li>
   {% endfor %}
   </ul>
+  <div class="sidebar-messages">
+    <div id="status" class="sidebar-message" aria-live="polite">{% if current %}running: {{ current.kind }} {{ current.title }}{% endif %}</div>
+  </div>
   <div class="navfoot">mang-arr {{ version }}</div>
 </nav>
 <div class="backdrop" id="backdrop" hidden></div>
 
 <main id="main" class="content" {% block main_attrs %}{% endblock %}>
-{% if update and update.updateAvailable %}<div class="banner update">mang-arr {{ update.latest }} is available (running {{ update.current }}). <a href="{{ update.url }}">Release notes</a></div>{% endif %}
-{% if flash %}<div class="banner flash" role="status">{{ flash }}</div>{% endif %}
+{% block toolbar %}{% endblock %}
+<div class="content-body {% block body_class %}{% endblock %}">
+{% if update and update.updateAvailable %}<div class="alert info">mang-arr {{ update.latest }} is available (running {{ update.current }}). <a href="{{ update.url }}" target="_blank" rel="noopener noreferrer" class="external">Release notes<svg class="ic sm ext-icon" aria-hidden="true"><use href="#i-external"/></svg></a></div>{% endif %}
+{% if flash %}<div class="alert success flash" role="status">{{ flash }}</div>{% endif %}
 {% block body %}{% endblock %}
+</div>
 </main>
 <script src="/static/app.js"></script>
 {% block script %}{% endblock %}
