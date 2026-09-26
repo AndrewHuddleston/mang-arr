@@ -16,6 +16,7 @@
       <form method="post" action="/series/{{ s.id }}/monitor"><input type="hidden" name="monitored" value="{{ 0 if s.monitored else 1 }}"><button class="alt">{{ 'Unmonitor' if s.monitored else 'Monitor' }}</button></form>
       <form method="post" action="/series/{{ s.id }}/delete" data-title="{{ s.title }}" onsubmit="return confirm('Remove ' + this.dataset.title + ' from mang-arr?')">
         <label><input type="checkbox" name="files" value="1"> also delete library folder</label>
+        <label><input type="checkbox" name="exclude" value="1"> exclude from import lists</label>
         <button class="danger" {% if busy %}disabled title="a job for this series is running"{% endif %}>Delete</button></form>
     </div>
     {% if busy %}<p class="muted">a job for this series is queued or running</p>{% endif %}

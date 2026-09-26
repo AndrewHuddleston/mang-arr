@@ -12,6 +12,7 @@
   <a href="/" {% if request.url.path == '/' %}class="on"{% endif %}>Series</a>
   <a href="/add" {% if request.url.path.startswith('/add') %}class="on"{% endif %}>Add</a>
   <a href="/import" {% if request.url.path.startswith('/import') %}class="on"{% endif %}>Import</a>
+  <a href="/lists" {% if request.url.path.startswith('/lists') %}class="on"{% endif %}>Lists</a>
   <a href="/wanted" {% if request.url.path.startswith('/wanted') %}class="on"{% endif %}>Wanted</a>
   <a href="/activity" {% if request.url.path.startswith('/activity') %}class="on"{% endif %}>Activity</a>
   <a href="/settings" {% if request.url.path.startswith('/settings') %}class="on"{% endif %}>Settings</a>

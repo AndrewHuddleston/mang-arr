@@ -40,6 +40,7 @@ from .. import (
 )
 from ..resolver import ranges
 from ..suwayomi import Client, SuwayomiError
+from . import lists_routes
 
 log = logging.getLogger(__name__)
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -65,6 +66,7 @@ async def lifespan(app: FastAPI):
         log.error("could not open the database at %s: %s", config.DB_PATH, e)
     updates.start_background()
     backup.start_background()
+    lists_routes.init()
     log.info("mang-arr %s web started (staging %s, library %s)", __version__, config.STAGING_ROOT,
              config.LIBRARY_ROOT)
     yield
@@ -76,6 +78,7 @@ app.mount("/static", StaticFiles(directory=os.path.join(HERE, "static")), name="
 templates = Jinja2Templates(directory=os.path.join(HERE, "templates"))
 templates.env.filters["ranges"] = ranges
 templates.env.filters["ago"] = lambda ts: _ago(ts)
+app.include_router(lists_routes.router)
 
 
 def _ago(ts) -> str:
@@ -361,13 +364,15 @@ def chapter_unignore(series_id: int, number: float):
 
 
 @app.post("/series/{series_id}/delete")
-def series_delete(series_id: int, files: str = Form("0")):
+def series_delete(series_id: int, files: str = Form("0"), exclude: str = Form("0")):
     with db.connect() as con:
         r = db.get_series(con, series_id)
         if not r:
             raise HTTPException(404)
         if runner.pending_for(series_id):
             return _flash(f"/series/{series_id}", "cannot delete while a job for this series is running")
+        if exclude == "1":
+            lists_routes.exclude_deleted(con, r)
         core.delete_series(con, client, series_id, delete_library=(files == "1"))
     return _flash("/", f"deleted {r['title']}")
 
