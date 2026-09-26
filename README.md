@@ -24,7 +24,8 @@ Every off-the-shelf "manga *arr" fails on a real library for the same reasons:
 - **Identity from AniList (MangaDex as fallback).** A series is a database
   record with every title it is known by, not a string you typed. Ambiguous
   titles are shown as candidates, never guessed; series no database has can
-  be added by exact title (`--manual`).
+  be added by exact title (`--manual`). Status, chapter count and synonyms
+  are re-read from the provider on every refresh.
 - **Strict matching on every source.** Every Suwayomi source is searched with
   every known title; a hit is accepted only when its title equals one of them
   after normalisation. Anthologies, promos and spin-offs are rejected and
@@ -33,20 +34,26 @@ Every off-the-shelf "manga *arr" fails on a real library for the same reasons:
   across every accepted source minus what is on disk. A series split across
   three sites is still complete. Sources whose chapter count is far off are
   distrusted; fractional "chapters" that are a two-page notice are dropped.
+  Chapters you do not want can be ignored one by one.
 - **Paced downloads through Suwayomi**, one source at a time, with batch
-  sizes that shrink and back off when a source throttles.
+  sizes that shrink and back off when a source throttles. A chapter that
+  fails on one source is retried on the next source that lists it.
 - **A clean library for Komga.** One folder per series, `Chapter 012.0.cbz`,
   built from hard links so Suwayomi's own download tree is never touched and
-  nothing is stored twice.
+  nothing is stored twice. Komga can be asked to rescan after every import.
 - **Adopt an existing library.** Everything Suwayomi already downloaded is
-  identified from its folder name, registered, linked, and then topped up.
+  identified from its folder name, registered, linked, and then topped up;
+  from the Import page or the CLI.
 - **Web UI and JSON API** with a background job runner and scheduler, a
-  wanted list, an activity page with Suwayomi's live download queue, and a
-  System page with configuration, source health and a log tail.
+  wanted list, an activity page with Suwayomi's live download queue, a
+  Settings page, and a System page with configuration, source health and a
+  log tail. Optional HTTP basic auth, with an API key for scripts.
 - **CLI** for everything the UI does, plus `resolve`, a dry run that shows
   where every chapter would come from before you commit.
 - **Notifications** via Pushover and/or a generic JSON webhook when new
   chapters land or a refresh fails.
+- **Monitoring**: Prometheus metrics at `/metrics`, a health endpoint that
+  says what is wrong, and optional JSON log lines.
 - **Stdlib-only core.** Python 3.10+, SQLite, `urllib`. The web UI is an
   optional extra.
 
@@ -60,27 +67,41 @@ Images are published to `ghcr.io/andrewhuddleston/mang-arr` (`latest` from
 1. Copy [`docker-compose.example.yml`](docker-compose.example.yml) to
    `docker-compose.yml`. It contains an optional `suwayomi` service; delete
    it if you already run Suwayomi and point `MANGARR_SUWAYOMI_URL` at yours.
-2. Edit the two host paths. mang-arr needs three mounts:
+2. Edit the host paths. mang-arr needs two mounts:
 
    | Container path | What | Access |
    |---|---|---|
    | `/config` | database, download lock and log | read/write |
-   | `/staging` | Suwayomi's download tree: the folder whose children are source folders (`.../downloads/mangas` in a default Suwayomi install), laid out `<Source>/<Series>/*.cbz` | read |
-   | `/library` | the per-series tree mang-arr builds for Komga | read/write |
+   | `/data` | one folder that holds **both** Suwayomi's download tree and the library mang-arr builds; `MANGARR_STAGING` and `MANGARR_LIBRARY` point inside it (defaults `/data/staging` and `/data/library`) | read/write (the staging tree is only read) |
 
-   **`/staging` and `/library` must be on the same filesystem** (the same
-   host disk or dataset). The library is made of hard links; on different
-   filesystems mang-arr silently falls back to copying every chapter.
+   **Staging and library must be under the same bind mount.** The library is
+   made of hard links, and `link(2)` fails across mount points even when
+   both sides are on the same disk. Do not mount the download tree and the
+   library as two separate volumes. When a link is impossible mang-arr
+   falls back to copying the chapter and the System page shows how many were
+   copied.
+
+   In the example the host folder `/data/manga` is mounted as `/data`;
+   Suwayomi writes to `/data/manga/downloads` (so its tree is
+   `/data/downloads/mangas` inside the mang-arr container, the folder whose
+   children are source folders, laid out `<Source>/<Series>/*.cbz`) and the
+   library goes to `/data/manga/library`. `MANGARR_STAGING` and
+   `MANGARR_LIBRARY` are set accordingly.
 3. Make sure Suwayomi saves chapters as CBZ (Settings → Downloads → *Save
    as CBZ*, or `DOWNLOAD_AS_CBZ=true` on the container). mang-arr only looks
    at `.cbz`, `.cbr` and `.zip` files.
 4. `docker compose up -d`, then open <http://localhost:6789>.
 
-The container runs as `1000:1000` in the example; `chown` the config and
-library folders to match, and make the download tree readable by that user.
+The image runs as user `1000:1000` by default (`USER` in the Dockerfile;
+override with `user: "PUID:PGID"` in compose). `chown` the config folder and
+the library folder to that user and make the download tree readable by it.
+The simplest arrangement is to run Suwayomi as the same user.
 
-The web UI has **no authentication**. Keep it on your LAN or behind a reverse
-proxy that adds some.
+Authentication is optional and off until you set a username and password on
+the Settings page (HTTP basic auth). Scripts can use the API key shown on
+the same page instead. `/api/v1/health`, `/api/v1/system/status` and
+`/metrics` stay open so health checks and scrapers work without
+credentials.
 
 ### Plain Python
 
@@ -95,21 +116,26 @@ python3 -m venv .venv
 
 export MANGARR_DATA=~/.local/share/mangarr
 export MANGARR_SUWAYOMI_URL=http://localhost:4567
-export MANGARR_STAGING=/path/to/suwayomi/downloads/mangas
-export MANGARR_LIBRARY=/path/to/manga-library
+export MANGARR_STAGING=/path/to/manga/downloads/mangas   # Suwayomi's tree
+export MANGARR_LIBRARY=/path/to/manga/library            # same mount as staging
 
 .venv/bin/mangarr serve              # web UI + API + scheduler on :6789
 .venv/bin/mangarr status             # or use the CLI directly
 ```
 
 `mangarr daemon` runs the scheduled refresh without the web UI, for a
-systemd service or a cron-style setup where the CLI is all you need.
+systemd service or a cron-style setup where the CLI is all you need. Run
+either `serve` or `daemon`, not both: each has its own scheduler and the two
+would refresh the same series.
 
 ## Configuration
 
-Everything is an environment variable read by `mangarr/config.py`. The
-Docker image presets the paths marked with an asterisk to the container
-mounts (`/config`, `/staging`, `/library`, `/config/mangarr.log`,
+There are two layers.
+
+**Environment variables** (read by `mangarr/config.py`) set paths, the
+Suwayomi URL, logging, and the defaults for everything else. The Docker
+image presets the ones marked with an asterisk to the container mounts
+(`/config`, `/data/staging`, `/data/library`, `/config/mangarr.log`,
 `http://suwayomi:4567`).
 
 | Variable | Default | Meaning |
@@ -117,25 +143,48 @@ mounts (`/config`, `/staging`, `/library`, `/config/mangarr.log`,
 | `MANGARR_SUWAYOMI_URL` * | `http://localhost:4567` | Base URL of the Suwayomi server. mang-arr talks to `<url>/api/graphql`. |
 | `MANGARR_DATA` * | `/var/lib/mangarr` | Data directory: the database, the download lock and (for `serve`) the log file live here. |
 | `MANGARR_DB` | `$MANGARR_DATA/mangarr.db` | SQLite database path. |
-| `MANGARR_LOCK` | `$MANGARR_DATA/download.lock` | Lock file so two download runs (worker + CLI) never clear each other's Suwayomi queue. |
-| `MANGARR_STAGING` * | `/mnt/movie_silo/books/manga` | Suwayomi's download tree, `<Source>/<Series>/*.cbz`. Read only; never renamed. |
-| `MANGARR_LIBRARY` * | `/mnt/movie_silo/books/library` | The per-series hard-link tree Komga reads, `<Series>/Chapter 012.0.cbz`. |
+| `MANGARR_LOCK` | `$MANGARR_DATA/download.lock` | Lock file; only one download run (web worker or CLI) exists at a time, the other waits. |
+| `MANGARR_STAGING` * | `$MANGARR_DATA/staging` | Suwayomi's download tree, `<Source>/<Series>/*.cbz`. Read only; never renamed. |
+| `MANGARR_LIBRARY` * | `$MANGARR_DATA/library` | The per-series hard-link tree Komga reads, `<Series>/Chapter 012.0.cbz`. Same mount as staging. |
 | `MANGARR_LOG_LEVEL` | `INFO` | `DEBUG`, `INFO`, `WARNING` or `ERROR`. |
 | `MANGARR_LOG_FILE` * | unset (`serve`: `$MANGARR_DATA/mangarr.log`) | Also log to this file, rotated at 10 MB, five kept. The System page tails it. |
-| `MANGARR_REFRESH_HOURS` | `6` | The scheduler re-checks every monitored series this often. |
+| `MANGARR_LOG_JSON` | unset | `1` writes one JSON object per log line (`ts`, `level`, `logger`, `msg`, `exc`, `thread`) instead of the human format, for Loki/Promtail/Vector. |
+| `MANGARR_REFRESH_HOURS` | `6` | Default for the refresh interval (see Settings). |
 | `MANGARR_FIRST_REFRESH_MIN` | `5` | Minutes after start-up before the first scheduled refresh. |
-| `MANGARR_PUSHOVER_TOKEN` | unset | Pushover application token. Notifications are sent only when both Pushover values are set. |
-| `MANGARR_PUSHOVER_USER` | unset | Pushover user key. |
-| `MANGARR_WEBHOOK_URL` | unset | A URL to POST `{"title", "message", "kind"}` JSON to on every notification. |
-| `MANGARR_UNUSABLE_SOURCES` | `comick (unoriginal) (en),mangakakalot (en),readcomiconline (en)` | Comma-separated Suwayomi source names (case-insensitive) that are searched but never assigned chapters: they list series but cannot deliver images, or rate-limit into uselessness. |
-| `MANGARR_THROTTLED_SOURCES` | `manganato (en)` | Sources that work but throttle: they lose every close call and get single-chapter batches, but chapters nobody else has are still taken from them. |
+| `MANGARR_PUSHOVER_TOKEN` | unset | Default Pushover application token. Notifications are sent only when both Pushover values are set. |
+| `MANGARR_PUSHOVER_USER` | unset | Default Pushover user key. |
+| `MANGARR_WEBHOOK_URL` | unset | Default URL to POST `{"title", "message", "kind"}` JSON to on every notification. |
+| `MANGARR_UNUSABLE_SOURCES` | `comick (unoriginal) (en),mangakakalot (en),readcomiconline (en)` | Default set of disabled sources: comma-separated Suwayomi source names (case-insensitive) that are searched but never assigned chapters, because they list series but cannot deliver images, or rate-limit into uselessness. |
+| `MANGARR_THROTTLED_SOURCES` | `manganato (en)` | Default set of throttled sources: they work but throttle, so they lose every close call and get single-chapter batches; chapters nobody else has are still taken from them. |
 
 Source names are Suwayomi's display names as shown on the System page, e.g.
 `Weeb Central (EN)`.
 
-The remaining knobs (`DISAGREE`, the length ratio above which a source is
-distrusted; `MIN_PAGES`, below which a fractional chapter counts as junk;
-`BATCH_DEFAULT` / `BATCH_THROTTLED`) are constants in `config.py`.
+**Runtime settings** live in the database and are edited on the Settings
+page (`/settings`). The environment variables above are only their initial
+values; a saved setting wins and applies to the next job.
+
+| Setting | Notes |
+|---|---|
+| Sources: disabled / throttled | One row per Suwayomi source, two checkboxes. Defaults from `MANGARR_UNUSABLE_SOURCES` and `MANGARR_THROTTLED_SOURCES`. |
+| Refresh every (hours) | The scheduler and the daemon pick a change up within seconds. |
+| Minimum pages for a fractional chapter | A `12.5` with fewer pages than this is treated as a notice image and marked junk. Default 8. |
+| Komga URL, API key, library id | When URL and key are set, every import that linked at least one chapter asks Komga to scan (the given library, or all of them). The key comes from Komga's account menu → API keys. *Save & test Komga* lists the libraries it can see. |
+| Pushover token / user, webhook URL | Notification channels; *Save & send test notification* checks them. |
+| Web username / password | HTTP basic auth for the UI and API. Empty username means no login. |
+| API key | Generated on first start and shown in the clear (it is not a secret field). When a login is set, a request carrying it as an `X-Api-Key` header or `?apikey=` query parameter is accepted without basic auth. Edit it to rotate it. |
+
+Secrets (the Komga API key, Pushover values, password) are never shown again once
+saved: the field is blank with a "set - leave blank to keep" placeholder.
+Submitting it blank keeps the current value; submitting a single space
+clears it.
+
+The remaining knobs are constants in `config.py`: `DISAGREE` (a source
+whose highest chapter is more than 1.5× what the series should have is
+distrusted), `BATCH_DEFAULT` / `BATCH_THROTTLED` (4 and 1 chapters queued
+at a time), and `BACKOFF_MAX` / `BACKOFF_MAX_WITH_FALLBACK` (how long a
+failing source is retried with doubling waits before it is dropped for the
+run: 300 s, or 60 s when another source can supply the same chapters).
 
 ## Usage
 
@@ -144,11 +193,13 @@ distrusted; `MIN_PAGES`, below which a fractional chapter counts as junk;
 | Page | What it does |
 |---|---|
 | **Series** (`/`) | Every tracked series with have / listed / wanted counts, status, primary source and when it was last checked. Filter box on top. |
-| **Series detail** (`/series/{id}`) | Sources that matched and why some are not used, chapter ranges by status (have, wanted, failed, junk), history. Buttons: *Search & download missing*, *Re-check sources only*, *Monitor / Unmonitor*, *Delete* (optionally with the library files; Suwayomi's files are never deleted). |
+| **Series detail** (`/series/{id}`) | Sources that matched and why some are not used, chapter ranges by status (have, wanted, failed, junk, unavailable), history. Buttons: *Search & download missing*, *Re-check sources only*, *Monitor / Unmonitor*, *Delete* (optionally with the library folder; Suwayomi's files are never deleted). Delete is refused while a job for the series is queued or running. The chapter list has an *ignore* button per wanted / failed / unavailable chapter and a *want* button to take an ignored one back. |
 | **Add** (`/add`) | Type a title; get AniList / MangaDex candidates with covers and chapter counts. Pick one, or add by exact title with aliases when no database has it. Adding is queued as a job. |
-| **Wanted** (`/wanted`) | Every series with missing or failed chapters and which numbers. |
-| **Activity** (`/activity`) | The job queue (add, refresh, refresh-all) with progress and results, a *Refresh all now* button, cancel, and Suwayomi's own download queue. |
-| **System** (`/system`) | Version, uptime, Suwayomi reachability, next scheduled refresh, notification test, every source with its unusable / throttled flag, the effective configuration and the last 200 log lines. |
+| **Import** (`/import`) | *Scan staging folders* walks Suwayomi's download tree in a background job. Folders with exactly one exact database match are listed as identified and adopted with one click; the rest get a drop-down of candidates, an as-is (no metadata) option, or skip. *Adopt selected* registers the series, links their chapters into the library and leaves the rest to the next refresh. |
+| **Wanted** (`/wanted`) | Every series with missing or failed chapters and which numbers. *Search all wanted now* queues a download-only pass over all of them. |
+| **Activity** (`/activity`) | The job list (add, refresh, refresh-all, search-wanted, adopt-scan, adopt) with progress and results and a *cancel* button per queued or running job, a *Refresh all now* button, Suwayomi's own download queue, and recent history. |
+| **Settings** (`/settings`) | Runtime settings; see Configuration. |
+| **System** (`/system`) | Version, uptime, Suwayomi reachability, next scheduled refresh, whether notifications / Komga scan / Prometheus are on, chapters copied instead of linked (if any), every source with its unusable / throttled flag, the effective configuration, the last 200 log lines, and a *Download database backup* link (`/system/backup`, a consistent SQLite online-backup copy). |
 
 The navigation bar shows the running job and updates every five seconds.
 
@@ -223,19 +274,32 @@ mangarr add --anilist 175717
 mangarr add --manual "Some Webtoon" --alias "Some Webtoon (Official)"
 ```
 
-#### `mangarr refresh [SERIES] [--no-download]`
+#### `mangarr refresh [SERIES] [--no-download] [--all]`
 
-Re-resolves one tracked series (title fragment or id) or all of them,
-downloads new chapters and links them. This is what the scheduler runs.
+```
+positional arguments:
+  series         title fragment or id (default: every monitored series)
+
+options:
+  --no-download
+  --all          include unmonitored series
+```
+
+Re-resolves one tracked series or every monitored one (`--all` includes
+unmonitored series too), refreshes its metadata, downloads new chapters
+and links them. This is what the scheduler runs. If the web worker is
+downloading at the same time, the CLI waits for the download lock.
 
 #### `mangarr import [SERIES]`
 
 Links whatever is in the staging tree for one or all tracked series into the
-library without touching the network. Idempotent.
+library without touching the network. Idempotent. Triggers a Komga scan
+when Komga is configured and something was linked.
 
 #### `mangarr adopt [--only FRAGMENT] [--dry-run]`
 
-Registers what Suwayomi already downloaded; see the next section.
+Registers what Suwayomi already downloaded; `--only` limits it to folders
+whose name contains the fragment. See the next section.
 
 #### `mangarr status`
 
@@ -250,9 +314,10 @@ ranges by status, and the last eight events.
 #### `mangarr daemon [--interval HOURS] [--once]`
 
 The background worker without the web UI: a refresh of every monitored
-series every `--interval` hours (default `MANGARR_REFRESH_HOURS`), with
-notifications. `--once` runs one cycle and exits (for cron or a systemd
-timer). Stops cleanly on SIGTERM after the current series.
+series every `--interval` hours (default: the *Refresh every* setting, or
+`MANGARR_REFRESH_HOURS`), with notifications. `--once` runs one cycle and
+exits (for cron or a systemd timer). Stops cleanly on SIGTERM after the
+current series. Do not run it next to `serve`, which has its own scheduler.
 
 #### `mangarr serve [--host HOST] [--port PORT]`
 
@@ -262,19 +327,21 @@ The web UI, JSON API, job runner and scheduler in one process. Defaults to
 ### Adopting an existing Suwayomi library
 
 If Suwayomi has been downloading for a while, do not re-add everything by
-hand:
+hand. Every `<Source>/<Series>` folder in the staging tree is looked up by
+its folder name (Suwayomi's sanitised title; `:` and `?` become `_`, which
+the matcher understands). Folders with exactly one exact database match are
+*identified*; the rest need a choice from their candidate list.
+
+**Web:** open **Import**, press *Scan staging folders*, wait for the job,
+then tick the identified rows you want, pick a candidate (or as-is, or
+skip) for each of the others, and press *Adopt selected*. The adopt job
+registers the series and links their chapters; run *Refresh all now* on the
+Activity page afterwards to fetch what is missing.
+
+**CLI:**
 
 ```sh
-mangarr adopt --dry-run          # look first
-```
-
-Every `<Source>/<Series>` folder in the staging tree is looked up by its
-folder name (Suwayomi's sanitised title; `:` and `?` become `_`, which the
-matcher understands). Folders with exactly one exact database match are
-listed as identified; the rest are printed as `REVIEW` with their
-candidates. Then:
-
-```sh
+mangarr adopt --dry-run          # look first: identified rows and REVIEW rows with candidates
 mangarr adopt                    # register the identified folders
 mangarr add --anilist 12345      # one command per REVIEW folder, using the
                                  # candidate list (or --mangadex / --manual)
@@ -294,15 +361,43 @@ rather than five copies. The downloaded files stay where they are.
 
 ### Komga
 
-Point a Komga library at the mang-arr library tree (`/library` in the
+Point a Komga library at the mang-arr library tree (`/data/library` in the
 container, `MANGARR_LIBRARY` otherwise). Komga sees one series per folder
 and one book per `Chapter NNN.N.cbz`; the zero-padded names sort 12 before
 12.5 before 100 without any Komga-side tweaking. Mount it read-only in
 Komga. Because the files are hard links, deleting a series with its library
 files in mang-arr removes only Komga's view; Suwayomi's copies are untouched.
 
-Komga's periodic scan picks new chapters up on its own; there is no
-mang-arr → Komga notification yet (see Roadmap).
+Komga's periodic scan picks new chapters up on its own. To get them sooner,
+put Komga's URL and an API key on the Settings page: mang-arr then asks
+Komga to scan (one library, or all) after every import that linked
+something.
+
+## Monitoring
+
+- **`GET /metrics`** is a Prometheus exposition (needs `prometheus-client`,
+  included in the `web` extra and the Docker image; otherwise the endpoint
+  says so in plain text). Gauges are refreshed from the database on each
+  scrape.
+
+  | Metric | Labels | Meaning |
+  |---|---|---|
+  | `mangarr_series_total` | | tracked series |
+  | `mangarr_chapters` | `status` (have, wanted, failed, junk, unavailable) | chapters by status |
+  | `mangarr_downloads_total` | `source`, `result` (ok, failed) | chapter download attempts |
+  | `mangarr_jobs_total` | `kind`, `status` | jobs by outcome |
+  | `mangarr_suwayomi_up` | | 1 when the Suwayomi API answered on this scrape |
+  | `mangarr_last_refresh_timestamp` | | unix time of the last completed refresh-all |
+
+- **`GET /api/v1/health`** returns `{"ok": true, "problems": [],
+  "version": "..."}` with 200, or 503 and a list of problems when Suwayomi
+  does not answer, the staging or library path is missing, or the library
+  is not writable. The Docker `HEALTHCHECK` uses it.
+- **`MANGARR_LOG_JSON=1`** switches both the console and the log file to one
+  JSON object per line, for Loki/Promtail, Vector and similar.
+
+`/metrics`, `/api/v1/health` and `/api/v1/system/status` are exempt from
+basic auth.
 
 ## How it works
 
@@ -325,14 +420,28 @@ mang-arr → Komga notification yet (see Roadmap).
    folder per series regardless of how many sources the chapters came from.
 
 State lives in one SQLite database (series, the source entries that matched
-them, every chapter's status and paths, an event log). Long operations run
-in a single worker thread because Suwayomi has one download queue; mang-arr
-clears and refills that queue while it downloads, so do not queue manual
-downloads in Suwayomi at the same time.
+them, every chapter's status and paths, an event log, settings). Long
+operations run in a single worker thread because Suwayomi has one download
+queue.
+
+The downloader works one source at a time. It queues a batch of its own
+chapter ids in Suwayomi, watches them, and dequeues them if it gives up;
+it never clears Suwayomi's queue, so your own manual downloads and
+Suwayomi's library updates are left alone. Waiting is progress-aware: a
+batch is abandoned only when none of its chapters has moved for ten
+minutes (or after three hours in total), so a slow 150-page webtoon chapter
+is not mistaken for a dead source. Within a source the batch size shrinks
+to one and backs off when it errors and grows back when downloads succeed.
+A chapter that fails on its first source is retried on the next source
+that lists it; a source that fails everything it was asked for is dropped
+for the rest of the run; only chapters no source could deliver end up
+`failed`. A file lock (`MANGARR_LOCK`) makes sure only one download run
+exists at a time across the web worker and the CLI; a second one waits.
 
 ```
 mangarr/
-  config.py      every MANGARR_* setting
+  config.py      every MANGARR_* setting and its default
+  settings.py    runtime settings stored in the database (Settings page)
   model.py       Series: the one dataclass every module agrees on
   anilist.py     AniList lookup (series identity)
   mangadex.py    MangaDex lookup (fallback identity)
@@ -340,14 +449,16 @@ mangarr/
   matching.py    title normalisation + strict match rules
   suwayomi.py    Suwayomi GraphQL client
   resolver.py    search every source, accept matches, build per-chapter plan
-  downloader.py  paced per-source download through Suwayomi
+  downloader.py  paced per-source download through Suwayomi, with fallback
   library.py     staging tree parsing, hard-link library
-  db.py          SQLite: series, sources, chapters, events
+  db.py          SQLite: series, sources, chapters, events, settings
   core.py        add / refresh / import / adopt
   jobs.py        job runner + scheduler (web)
   daemon.py      standalone background worker
+  komga.py       Komga scan trigger
   notify.py      Pushover / webhook
-  logsetup.py    logging
+  metrics.py     Prometheus metrics
+  logsetup.py    logging (text or JSON lines)
   __main__.py    CLI
   web/           FastAPI app, templates, stylesheet (optional extra)
 ```
@@ -360,8 +471,8 @@ a rotating file.
 | Level | What you see |
 |---|---|
 | `DEBUG` | Every API request with timing, every search hit and why it was accepted or rejected, every page-count probe. |
-| `INFO` | What the app decided and did: sources matched, chapters planned, downloads, imports, notifications, job start/finish. |
-| `WARNING` | Degraded but handled: a source unreachable, a source distrusted, a chapter that failed and stays wanted, throttling back-off. |
+| `INFO` | What the app decided and did: sources matched, chapters planned, downloads, imports, notifications, job start/finish, settings changes. |
+| `WARNING` | Degraded but handled: a source unreachable, a source distrusted, a chapter that failed and stays wanted, throttling back-off, an unauthorised request. |
 | `ERROR` | An operation did not complete. |
 
 - `--debug` on any command is shorthand for `--log-level DEBUG`; `--quiet`
@@ -373,6 +484,7 @@ a rotating file.
   `$MANGARR_DATA/mangarr.log`, because the System page and
   `GET /api/v1/log` tail it. The Docker image sets it to
   `/config/mangarr.log`.
+- `MANGARR_LOG_JSON=1` writes JSON lines instead of the text format.
 - The System page shows the last 200 lines; `docker compose logs mangarr`
   shows the same stream.
 
@@ -384,36 +496,47 @@ rejected.
 
 The web process exposes a JSON API under `/api/v1/`, used by the pages'
 live updates and usable from scripts. Interactive docs (Swagger UI) are at
-**`/api/docs`**.
+**`/api/docs`**. When a web login is set in Settings it applies to the API
+as well, except for the three endpoints listed under Monitoring; send the
+API key from the Settings page as an `X-Api-Key` header (or `?apikey=`)
+instead of basic auth:
+
+```sh
+curl -H "X-Api-Key: $KEY" http://localhost:6789/api/v1/wanted
+```
 
 | Method and path | Purpose |
 |---|---|
-| `GET /api/v1/system/status` | version, uptime, the running job, next scheduled refresh (also the Docker health check) |
+| `GET /api/v1/health` | 200 `{"ok": true, "problems": [], "version"}` or 503 with the problems (Suwayomi down, paths missing, library not writable); the Docker health check |
+| `GET /api/v1/system/status` | version, uptime, the running job, next scheduled refresh; polled by the navigation bar |
 | `GET /api/v1/series` | every tracked series with counts |
 | `GET /api/v1/series/{id}` | one series with its sources and chapters |
-| `POST /api/v1/series` | add: `{"ref": "anilist:123", "download": true}` or `{"ref": "manual", "title": "...", "aliases": [...]}`; returns the job |
-| `POST /api/v1/series/{id}/refresh?download=true` | queue a refresh; returns the job |
-| `DELETE /api/v1/series/{id}?files=false` | stop tracking, optionally delete library files |
+| `POST /api/v1/series` | add. Body: `{"ref": "anilist:123", "download": true}` or `{"ref": "mangadex:<uuid>"}` or `{"ref": "manual", "title": "...", "aliases": ["..."]}`; `download` defaults to true. Returns the job. 400 on a bad reference, 409 when the series is already tracked or already queued. |
+| `POST /api/v1/series/{id}/refresh?download=true` | queue a refresh; returns the job; 409 if one is already queued for the series |
+| `DELETE /api/v1/series/{id}?files=false` | stop tracking, optionally delete the library folder; 409 while a job for the series runs |
+| `POST /series/{id}/chapter/{number}/ignore` | mark a chapter ignored (form route used by the series page; redirects) |
+| `POST /series/{id}/chapter/{number}/unignore` | make an ignored chapter wanted again |
 | `GET /api/v1/lookup?term=...` | AniList / MangaDex candidates for a title |
 | `GET /api/v1/wanted` | series with missing chapters |
 | `GET /api/v1/queue` | mang-arr's jobs and Suwayomi's download queue |
-| `POST /api/v1/command` | `{"name": "RefreshAll"}` |
-| `GET /api/v1/log?lines=200` | tail of the log file |
+| `POST /api/v1/command` | `{"name": "RefreshAll"}` (refresh every monitored series; returns the existing job if one is already queued) or `{"name": "SearchWanted"}` (download-only pass over series with wanted chapters). 400 for any other name. |
+| `GET /api/v1/log?lines=200` | tail of the log file (`lines` capped at 5000) |
+| `GET /metrics` | Prometheus exposition; see Monitoring |
+| `GET /system/backup` | download a consistent copy of the SQLite database (`mangarr-backup-<timestamp>.db`) |
 
-There is no authentication or API key; see the note under Installation.
+Jobs are returned as `{"id", "kind", "title", "seriesId", "status",
+"queuedAt", "startedAt", "finishedAt", "progress", "message"}`; poll
+`/api/v1/queue` to follow one.
+
+Without a web login the API is open; keep it on your LAN or behind a
+reverse proxy in that case.
 
 ## Roadmap
 
-- Trigger a Komga library scan after an import instead of waiting for
-  Komga's schedule.
+- Interactive per-chapter search: pick the source for one chapter by hand.
 - Season-numbered webtoons (`S2 - Episode 5`): adopt and track them as one
   series with a running chapter number.
-- Per-series source overrides (pin or exclude a source for one series) from
-  the UI.
-- Refresh a tracked series' metadata (status, expected chapter count) from
-  AniList on refresh, not only on add.
-- Authentication for the web UI, or at least an API key.
-- Tests for the resolver and downloader against a recorded Suwayomi.
+- Sync read direction (webtoon vs. manga) to Komga.
 
 ## License
 

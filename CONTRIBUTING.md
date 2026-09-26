@@ -74,6 +74,7 @@ a wheel build, and a Docker build on every push and pull request. Pushes to
 ```
 mangarr/
   config.py      every MANGARR_* setting and its default
+  settings.py    runtime settings stored in the database (Settings page)
   model.py       Series: the one dataclass every module agrees on
   anilist.py     AniList lookup (primary identity database)
   mangadex.py    MangaDex lookup (fallback database)
@@ -87,8 +88,10 @@ mangarr/
   core.py        add / refresh / import / adopt, independent of the caller
   jobs.py        in-process job runner and scheduler for the web UI
   daemon.py      the standalone background worker
+  komga.py       Komga scan trigger after imports
   notify.py      Pushover and webhook notifications
-  logsetup.py    console + rotating file logging
+  metrics.py     Prometheus metrics for /metrics
+  logsetup.py    console + rotating file logging (text or JSON lines)
   __main__.py    the CLI
   web/           FastAPI app, Jinja templates, one stylesheet (optional extra)
 tests/           unittest suites; no network

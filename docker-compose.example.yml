@@ -1,50 +1,63 @@
 # mang-arr with (optionally) its own Suwayomi.
 #
-# Copy to docker-compose.yml and edit the two host paths below. Keep the
-# Suwayomi download tree and the mang-arr library on the SAME filesystem:
-# the library is built from hard links to Suwayomi's files, so nothing is
-# stored twice. On different filesystems mang-arr falls back to copying.
+# Copy to docker-compose.yml and edit the host paths below. mang-arr has two
+# mounts:
 #
-#   /data/manga/downloads   Suwayomi writes here; its "mangas" subfolder -> /staging (read)
-#   /data/manga/library     mang-arr links here    -> /library   (write) -> Komga reads it
+#   /config   database, download lock, log                (./config)
+#   /data     ONE folder that holds both Suwayomi's download tree and the
+#             library mang-arr builds for Komga            (/data/manga)
 #
-# mang-arr runs as uid:gid 1000:1000 here, so ./config and the library must
-# be writable by that user and the download tree readable by it. Make sure
-# it matches the user Suwayomi writes files as (chown -R 1000:1000 /data/manga).
+# The library is made of hard links to Suwayomi's files, and link(2) fails
+# across mount points even on the same disk, so the download tree and the
+# library must sit under the same bind mount. With the layout below:
+#
+#   /data/manga/downloads          Suwayomi's downloads folder
+#   /data/manga/downloads/mangas   <Source>/<Series>/*.cbz  -> /data/downloads/mangas (MANGARR_STAGING)
+#   /data/manga/library            one folder per series     -> /data/library         (MANGARR_LIBRARY)
+#                                                            -> mount read-only in Komga
+#
+# The image runs as uid:gid 1000:1000. ./config and /data/manga/library must
+# be writable by that user and the download tree readable by it; the easy
+# way is to run Suwayomi as the same user (chown -R 1000:1000 /data/manga).
 
 services:
   mangarr:
     image: ghcr.io/andrewhuddleston/mang-arr:latest
     container_name: mangarr
-    user: "1000:1000"
+    # user: "1000:1000"                          # the image default; set PUID:PGID here to change it
     ports:
       - "6789:6789"
     volumes:
-      - ./config:/config                             # database + log
-      - /data/manga/downloads/mangas:/staging        # Suwayomi's <Source>/<Series>/*.cbz tree
-      - /data/manga/library:/library                 # per-series hard-link tree for Komga
+      - ./config:/config                         # database, lock, log
+      - /data/manga:/data                        # Suwayomi downloads + mang-arr library, same mount
     environment:
-      MANGARR_SUWAYOMI_URL: http://suwayomi:4567     # or http://your-host:4567 if Suwayomi runs elsewhere
-      MANGARR_REFRESH_HOURS: "6"                     # re-check every monitored series this often
-      MANGARR_LOG_LEVEL: INFO                        # DEBUG logs every request and match decision
-      # Optional: push a notification when new chapters land or a refresh fails.
+      MANGARR_SUWAYOMI_URL: http://suwayomi:4567 # or http://your-host:4567 if Suwayomi runs elsewhere
+      MANGARR_STAGING: /data/downloads/mangas    # Suwayomi's <Source>/<Series>/*.cbz tree, inside /data
+      MANGARR_LIBRARY: /data/library             # per-series hard-link tree for Komga, inside /data
+      MANGARR_REFRESH_HOURS: "6"                 # default refresh interval; the Settings page overrides it
+      MANGARR_LOG_LEVEL: INFO                    # DEBUG logs every request and match decision
+      # MANGARR_LOG_JSON: "1"                    # one JSON object per log line (Loki/Promtail)
+      # Defaults for the Settings page (Pushover, webhook). Anything saved there wins.
       # MANGARR_PUSHOVER_TOKEN: your-app-token
       # MANGARR_PUSHOVER_USER: your-user-key
-      # MANGARR_WEBHOOK_URL: https://example.invalid/hook   # generic JSON POST instead of / as well as Pushover
+      # MANGARR_WEBHOOK_URL: https://example.invalid/hook
     depends_on:
       - suwayomi
     restart: unless-stopped
 
-  # Delete this service if you already run Suwayomi; point
-  # MANGARR_SUWAYOMI_URL at it and mount its download tree as /staging.
+  # Delete this service if you already run Suwayomi. Then point
+  # MANGARR_SUWAYOMI_URL at it and mount the folder that contains BOTH its
+  # download tree and your library folder as /data, adjusting MANGARR_STAGING
+  # and MANGARR_LIBRARY to match.
   suwayomi:
     image: ghcr.io/suwayomi/suwayomi-server:stable
     container_name: suwayomi
+    user: "1000:1000"                            # same user as mang-arr, so it can read what Suwayomi writes
     ports:
       - "4567:4567"
     volumes:
       - ./suwayomi:/home/suwayomi/.local/share/Tachidesk           # settings, extensions, database
-      - /data/manga/downloads:/home/suwayomi/.local/share/Tachidesk/downloads
+      - /data/manga/downloads:/home/suwayomi/.local/share/Tachidesk/downloads   # lands under /data/manga
     environment:
       TZ: Etc/UTC
       # mang-arr reads .cbz files; make sure "save chapters as CBZ" is on
