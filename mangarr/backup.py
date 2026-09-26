@@ -117,6 +117,12 @@ def restore(path: str) -> str:
 
 
 def start_background(interval_hours: float = INTERVAL_HOURS, first_delay: float = 300.0) -> None:
+    try:
+        d = backup_dir()
+    except OSError as e:
+        log.error("scheduled backups disabled: cannot create the backups folder: %s", e)
+        return
+
     def loop():
         time.sleep(first_delay)
         while True:
@@ -129,4 +135,4 @@ def start_background(interval_hours: float = INTERVAL_HOURS, first_delay: float 
                 log.exception("scheduled backup failed")
             time.sleep(600)
     threading.Thread(target=loop, name="mangarr-backups", daemon=True).start()
-    log.info("scheduled backups: every %.0fh, keeping %d, in %s", interval_hours, KEEP, backup_dir())
+    log.info("scheduled backups: every %.0fh, keeping %d, in %s", interval_hours, KEEP, d)
