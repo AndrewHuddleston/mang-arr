@@ -185,7 +185,8 @@ def download_chapter(con, client: Client, series_id: int, number: float, manga_i
     if not row:
         raise Gone(f"series #{series_id} does not exist")
     title = row["title"]
-    entries = [s for s in db.sources(con, series_id) if (manga_id is None and not s["note"]) or s["manga_id"] == manga_id]
+    entries = [s for s in db.sources(con, series_id)
+               if (manga_id is None and not s["note"]) or s["manga_id"] == manga_id]
     if not entries:
         raise ValueError("no such source entry for this series")
     tried = []
@@ -201,9 +202,9 @@ def download_chapter(con, client: Client, series_id: int, number: float, manga_i
         metrics.record_download(s["source_name"], "ok" if ok else "failed")
         if ok:
             db.set_status(con, series_id, number, "wanted", None)     # import_series flips it to have
-            con.execute("UPDATE chapter SET manga_id=?, source_name=?, name=COALESCE(?, name), uploaded=COALESCE(?, uploaded)"
-                        " WHERE series_id=? AND number=?", (s["manga_id"], s["source_name"], ch.name, ch.uploaded,
-                                                            series_id, number))
+            con.execute("UPDATE chapter SET manga_id=?, source_name=?, name=COALESCE(?, name),"
+                        " uploaded=COALESCE(?, uploaded) WHERE series_id=? AND number=?",
+                        (s["manga_id"], s["source_name"], ch.name, ch.uploaded, series_id, number))
             con.commit()
             linked = import_series(con, series_id, client)
             msg = f"chapter {number:g} downloaded from {s['source_name']}" + (" and linked" if linked else "")
