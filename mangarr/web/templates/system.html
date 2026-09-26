@@ -15,6 +15,19 @@
 </div>
 <p class="muted small">Health: <a href="/api/v1/health">/api/v1/health</a> · API docs: <a href="/api/docs">/api/docs</a> · <a href="/settings">Settings</a> · <a href="/system/backup">Download database backup</a></p>
 
+<h2>Health</h2>
+<table class="list small">
+{% for c in checks %}<tr><td><span class="tag {{ 'failed' if c.level == 'error' else 'wanted' if c.level == 'warning' else 'have' }}">{{ c.level }}</span></td><td>{{ c.name }}</td><td class="muted">{{ c.detail }}</td></tr>{% endfor %}
+</table>
+
+<h2>Tasks</h2>
+<table class="list small">
+<thead><tr><th>Task</th><th>Interval</th><th>Next run</th><th></th></tr></thead>
+{% for t in tasks %}<tr><td>{{ t.name }}</td><td class="muted">{{ t.every }}</td><td class="muted">{{ t.next|ago if t.next else '-' }}</td>
+<td><form method="post" action="{{ t.action }}"><button class="alt small">run now</button></form></td></tr>{% endfor %}
+</table>
+<p class="muted small">Version {{ version }}{% if update.latest %} · latest release {{ update.latest }}{% endif %}{% if update.error %} · update check: {{ update.error }}{% endif %}</p>
+
 <h2>Sources (from Suwayomi)</h2>
 <table class="list small">
 {% for s in sources %}<tr><td>{{ s.name }}</td><td class="muted">{{ s.lang }}</td>

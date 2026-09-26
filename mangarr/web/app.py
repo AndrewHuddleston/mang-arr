@@ -20,7 +20,22 @@ from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel, Field
 from starlette.background import BackgroundTask
 
-from .. import __version__, config, core, db, jobs, komga, library, metadata, metrics, model, notify, settings
+from .. import (
+    __version__,
+    config,
+    core,
+    db,
+    health,
+    jobs,
+    komga,
+    library,
+    metadata,
+    metrics,
+    model,
+    notify,
+    settings,
+    updates,
+)
 from ..resolver import ranges
 from ..suwayomi import Client, SuwayomiError
 
@@ -46,6 +61,7 @@ async def lifespan(app: FastAPI):
             settings.ensure_api_key(con)
     except Exception as e:
         log.error("could not open the database at %s: %s", config.DB_PATH, e)
+    updates.start_background()
     log.info("mang-arr %s web started (staging %s, library %s)", __version__, config.STAGING_ROOT,
              config.LIBRARY_ROOT)
     yield
@@ -201,7 +217,7 @@ async def _unhandled(request: Request, exc: Exception):
 
 def page(request: Request, name: str, **ctx):
     ctx.update(request=request, version=__version__, current=runner.current,
-               flash=request.query_params.get("m"))
+               flash=request.query_params.get("m"), update=updates.status())
     return templates.TemplateResponse(request, name, ctx)
 
 
@@ -455,10 +471,24 @@ def system_page(request: Request):
     except SuwayomiError as e:
         sources, suwayomi_ok = [], False
         log.error("system page: suwayomi unreachable: %s", e)
+    tasks = [
+        {"name": "Refresh all monitored series", "every": f"{settings.get('refresh_hours')} h",
+         "next": scheduler.next_at if scheduler else None, "action": "/activity/refresh-all"},
+        {"name": "Update check", "every": "24 h", "action": "/system/update-check",
+         "next": (updates.status()["checkedAt"] or time.time()) + updates.INTERVAL},
+    ]
     return page(request, "system.html", sources=sources, suwayomi_ok=suwayomi_ok, cfg=_config_view(),
                 log_lines=_tail_log(200), uptime=_ago(STARTED), notify_ok=notify.configured(),
                 komga_ok=komga.configured(), metrics_ok=metrics.AVAILABLE, copied=library.COPIED,
-                next_refresh=(scheduler.next_at if scheduler else None))
+                next_refresh=(scheduler.next_at if scheduler else None), checks=health.run(client), tasks=tasks)
+
+
+@app.post("/system/update-check")
+def system_update_check():
+    s = updates.check(force=True)
+    if s["error"]:
+        return _flash("/system", f"update check failed: {s['error']}")
+    return _flash("/system", f"latest release: {s['latest'] or 'none published'} (running {s['current']})")
 
 
 @app.get("/system/backup")
@@ -529,18 +559,12 @@ def metrics_endpoint():
 
 @app.get("/api/v1/health")
 def api_health():
-    problems = []
-    try:
-        client.gq("{ sources { totalCount } }", timeout=5, retries=1)
-    except SuwayomiError as e:
-        problems.append(f"suwayomi: {e}")
-    for name, path in (("staging", config.STAGING_ROOT), ("library", config.LIBRARY_ROOT)):
-        if not os.path.isdir(path):
-            problems.append(f"{name} path missing: {path}")
-    if os.path.isdir(config.LIBRARY_ROOT) and not os.access(config.LIBRARY_ROOT, os.W_OK):
-        problems.append(f"library not writable: {config.LIBRARY_ROOT}")
+    checks = health.run(client)
+    problems = [f"{c.name}: {c.detail}" for c in checks if c.level == "error"]
+    warnings = [f"{c.name}: {c.detail}" for c in checks if c.level == "warning"]
     status = 200 if not problems else 503
-    return JSONResponse({"ok": not problems, "problems": problems, "version": __version__}, status_code=status)
+    return JSONResponse({"ok": not problems, "problems": problems, "warnings": warnings,
+                         "version": __version__}, status_code=status)
 
 
 # -- api ----------------------------------------------------------------------
@@ -556,7 +580,7 @@ class AddBody(BaseModel):
 def api_status():
     return {"version": __version__, "uptime": int(time.time() - STARTED),
             "job": runner.current.as_dict() if runner.current else None,
-            "nextRefresh": scheduler.next_at if scheduler else None}
+            "nextRefresh": scheduler.next_at if scheduler else None, "update": updates.status()}
 
 
 @app.get("/api/v1/series")

@@ -20,6 +20,7 @@
   <span id="status" class="muted">{% if current %}running: {{ current.kind }} {{ current.title }}{% endif %}</span>
 </nav>
 <main>
+{% if update and update.updateAvailable %}<div class="flash">mang-arr {{ update.latest }} is available (running {{ update.current }}). <a href="{{ update.url }}">Release notes</a></div>{% endif %}
 {% if flash %}<div class="flash">{{ flash }}</div>{% endif %}
 {% block body %}{% endblock %}
 </main>
