@@ -28,8 +28,13 @@ ENTRY_ERRORS = (zipfile.BadZipFile, zlib.error, NotImplementedError, RuntimeErro
 
 
 def natural_key(name: str) -> list:
-    # re.split with one group alternates text and digits, so ints only meet ints
-    return [int(t) if t.isdigit() else t.lower() for t in re.split(r"(\d+)", name)]
+    # re.split with one group puts the runs of ASCII digits at the odd
+    # indexes, so numbers only meet numbers. A run is compared as (length,
+    # digits) without its leading zeros, which orders like int() but never
+    # fails: not on "²" (a digit to str.isdigit, not to int), nor on a run
+    # past int()'s 4300-digit limit.
+    parts = re.split(r"([0-9]+)", name)
+    return [(len(d := t.lstrip("0")), d) if i % 2 else t.lower() for i, t in enumerate(parts)]
 
 
 def page_names(z: zipfile.ZipFile) -> list[str]:

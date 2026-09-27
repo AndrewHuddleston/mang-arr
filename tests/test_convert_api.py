@@ -183,6 +183,11 @@ class SourceTests(unittest.TestCase):
         self.assertEqual(source.page_names(z), ["cover.avif", "p1.jpeg", "p2.JPG", "p10.jpg", "v1/c2/p1.webp",
                                                 "v1/c10/p1.png"])
 
+    def test_page_names_with_odd_digits(self):
+        long = "9" * 5000 + ".jpg"                              # past int()'s 4300-digit limit
+        z = cbz([(n, b"x") for n in ("1\u00b22.jpg", long, "\u0663.jpg", "10.jpg", "001.jpg", "2.jpg")])
+        self.assertEqual(source.page_names(z), ["001.jpg", "1\u00b22.jpg", "2.jpg", "10.jpg", long, "\u0663.jpg"])
+
     def test_entry_caps(self):
         z = cbz([("a.jpg", b"x" * 100)])
         self.assertEqual(source.read_entry(z, "a.jpg"), b"x" * 100)
