@@ -1182,8 +1182,10 @@ def settings_page(request: Request):
     with db.connect() as con:
         stats = db.source_stats(con)
     komga_ok, _, komga_test = (views.flash_from(request.query_params, "komga_test") or "").partition(":")
-    return page(request, "settings.html", v=settings.masked(settings.all_values()), sources=sources,
-                komga_test=komga_test, komga_ok=(komga_ok == "1"), stats=stats, auto_days=db.AUTO_THROTTLE_DAYS)
+    values = settings.all_values()
+    return page(request, "settings.html", v=settings.masked(values), bad_urls=settings.invalid_urls(values),
+                sources=sources, komga_test=komga_test, komga_ok=(komga_ok == "1"), stats=stats,
+                auto_days=db.AUTO_THROTTLE_DAYS)
 
 
 @app.post("/settings")

@@ -76,6 +76,11 @@
 </div>
 {%- endmacro %}
 
+{# Under a URL setting whose stored value is not an http(s) URL (settings.invalid_urls) #}
+{% macro url_warning(key, bad_urls) -%}
+{% if key in bad_urls %}<div class="help-text text-warning">The stored value is not a valid URL (it needs http:// or https:// and a host name), so nothing is sent to it. Correct it or clear it.</div>{% endif %}
+{%- endmacro %}
+
 {# Sonarr CheckInput look: the real checkbox stays for forms, the box is drawn by CSS #}
 {% macro check(name, checked=false, value='1', id=none, kind='primary', attrs=none) -%}
 <label class="check-input {{ kind }}"><input type="checkbox" {% if name %}name="{{ name }}"{% endif %} value="{{ value }}" {% if id %}id="{{ id }}"{% endif %} {% if checked %}checked{% endif %}{{ (attrs or {})|xmlattr }}><span class="check-box">{{ icon('check', 'sm') }}</span></label>

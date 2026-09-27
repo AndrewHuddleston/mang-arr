@@ -319,6 +319,10 @@ def set_many(con: sqlite3.Connection, values: dict[str, object], internal: bool 
                 continue
             if k != "auth_password":                    # passwords are taken exactly as typed
                 v = v.strip()
+        elif v == current.get(k) or (isinstance(v, str) and v.strip() == current.get(k)):
+            # sent back as stored: nothing to check or write. The form posts every field, so a value an
+            # older version stored unchecked (a Komga URL without http://) must not block every save.
+            continue
         v = _coerce(k, v)
         if k == "auth_password":
             if (not v and not current.get(k)) or (v and verify_password(str(current.get(k) or ""), str(v))):
@@ -408,6 +412,22 @@ def _validate(v: dict) -> None:
 # would also open file:, ftp: and data: URLs). outbound.fetch checks again at
 # use time, for values that arrive from the environment or a restored backup.
 URL_KEYS = {"komga_url", "webhook_url", "apprise_url", "discord_webhook", "slack_webhook", "ntfy_url", "gotify_url"}
+
+
+def invalid_urls(values: dict) -> set[str]:
+    """URL settings whose stored value is not an http(s) URL (an older
+    version stored it unchecked): requests to it fail until it is corrected,
+    so the Settings page points them out."""
+    from .outbound import check_url
+    bad = set()
+    for k in URL_KEYS:
+        v = str(values.get(k) or "").strip()
+        if v:
+            try:
+                check_url(v, k)
+            except ValueError:
+                bad.add(k)
+    return bad
 
 
 def _coerce(key: str, v):
