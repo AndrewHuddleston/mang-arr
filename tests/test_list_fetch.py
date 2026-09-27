@@ -1,9 +1,11 @@
 """A text import list is fetched from a URL anyone may control: the download
 is bounded in size and time, redirects stay on the same host, loopback and
-link-local addresses are refused, only lines that look like titles are
-looked up or quoted, other documents are refused without quoting them, the
-lines are capped, the sync can be cancelled, and the result quotes only a
-little."""
+link-local addresses are refused before anything is connected to, only
+lines that look like titles are looked up, other documents are refused
+without quoting them, a body is only taken for a title list once AniList or
+MangaDex know its lines (until then nothing of it is quoted and only a few
+lines are looked up), the lines are capped, the sync can be cancelled, and
+the result quotes only a little."""
 import http.server
 import os
 import socket
@@ -13,10 +15,12 @@ import time
 import unittest
 from unittest import mock
 
-from mangarr import db, lists
+from mangarr import db, lists, metadata
 from mangarr.model import Series
 
 SECRET_JSON = b'{"secret_db_password": "hunter2",\n"internal_token": "abc123"}\n'
+SECRET_CONFIG = b"database:\n  host: db.internal\n  password: hunter2\n  username: admin\n"
+SECRET_OCTETS = b"admin:hunter2\nbackup:S3cretPass!\n"
 
 
 class Handler(http.server.BaseHTTPRequestHandler):
@@ -98,6 +102,12 @@ def redirect_away_secret(h):
     h.end_headers()
 
 
+def redirect_config(h):
+    h.send_response(302)
+    h.send_header("Location", "/config")
+    h.end_headers()
+
+
 def serve(body: bytes, content_type: str | None = None, status: int = 200, reason: str | None = None):
     def handler(h):
         Handler.served.append(h.path)
@@ -136,6 +146,9 @@ class ServerTest(unittest.TestCase):
                                          b"<body>password: hunter2</body></html>\n", "text/plain"),
                           "/env": serve(b"DB_HOST=10.0.0.5\nDB_PASSWORD=hunter2\nAPI_TOKEN=abc123\nOK\n"),
                           "/mixed": serve(b"One Piece\n{\"token\": \"abc123\"}\nBerserk\n", "text/plain; charset=utf-8"),
+                          "/config": serve(SECRET_CONFIG, "text/plain"),
+                          "/octets": serve(SECRET_OCTETS, "application/octet-stream"),
+                          "/to-config": redirect_config,
                           "/oops": serve(b"", "text/plain", 500, "secret=hunter2")}
         cls.server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
         cls.server.daemon_threads = True
@@ -234,35 +247,95 @@ class FetchTest(ServerTest):
         self.assertEqual(str(cm.exception), "the URL did not return a title list (it sent JSON)")
         self.assertEqual(lists._get_text(self.base + "/mixed"), "One Piece\n{\"token\": \"abc123\"}\nBerserk\n")
 
+    def test_content_types_a_text_file_is_served_with(self):
+        # what NAS shares and file hosts send for a .txt / .md / .tsv file
+        for ctype in ("", "text/plain; charset=utf-8", "text/markdown", "text/x-markdown", "text/csv",
+                      "text/tab-separated-values", "text/yaml", "application/octet-stream", "binary/octet-stream",
+                      "application/x-download", "application/force-download", "application/unknown"):
+            self.assertIsNone(lists._not_text(ctype), ctype)
+        for ctype, what in (("application/json", "JSON"), ("application/problem+json", "JSON"), ("text/html", "a web page"),
+                            ("application/xhtml+xml", "a web page"), ("application/rss+xml", "XML"),
+                            ("image/png", "not plain text"), ("application/pdf", "not plain text"),
+                            ("application/zip", "not plain text"), ("text/css", "not plain text")):
+            self.assertEqual(lists._not_text(ctype), what, ctype)
+
+
+def addrinfo(*ips):
+    """A getaddrinfo() that resolves every name to these addresses."""
+    def resolve(host, port, *a, **kw):
+        return [(socket.AF_INET6, socket.SOCK_STREAM, 6, "", (ip, port, 0, 0)) if ":" in ip
+                else (socket.AF_INET, socket.SOCK_STREAM, 6, "", (ip, port)) for ip in ips]
+    return resolve
+
+
+class FakeSocket:
+    connected: list = []
+
+    def __init__(self, *a):
+        pass
+
+    def settimeout(self, t):
+        pass
+
+    def connect(self, sockaddr):
+        FakeSocket.connected.append(sockaddr[0])
+
+    def close(self):
+        pass
+
 
 class AddressTest(ServerTest):
     """Loopback, link-local, multicast and unspecified addresses are refused
-    when a list is added and again at connect; LAN addresses are allowed."""
+    when a list is added, and on every fetch before anything is connected
+    to; LAN addresses are allowed."""
     allow = False
 
-    def test_peer_check(self):
-        class Sock:
-            def __init__(self, ip):
-                self.ip = ip
-                self.closed = False
-
-            def getpeername(self):
-                return (self.ip, 80)
-
-            def close(self):
-                self.closed = True
-        for ip in ("169.254.169.254", "fe80::1", "::ffff:169.254.169.254", "0.0.0.0", "127.0.0.1", "127.0.0.11",
-                   "::1", "::ffff:127.0.0.1", "224.0.0.251", "ff02::1"):
-            s = Sock(ip)
-            with self.assertRaises(lists.ListFetchError, msg=ip), self.assertLogs("mangarr.lists", "WARNING"):
-                lists._check_peer(s)
-            self.assertTrue(s.closed)
+    def test_refused_addresses_are_never_connected_to(self):
+        def no_socket(*a, **kw):
+            raise AssertionError("a socket was opened for a refused address")
+        for ip in ("169.254.169.254", "fe80::1", "fe80::1%eth0", "::ffff:169.254.169.254", "0.0.0.0", "127.0.0.1",
+                   "127.0.0.11", "127.0.1.1", "::1", "::ffff:127.0.0.1", "224.0.0.251", "ff02::1"):
+            with mock.patch.object(lists.socket, "getaddrinfo", addrinfo(ip)), \
+                    mock.patch.object(lists.socket, "socket", no_socket), \
+                    self.assertRaises(lists.ListFetchError, msg=ip) as cm, self.assertLogs("mangarr.lists", "WARNING"):
+                lists._connect(("list.example", 80), 5)
+            self.assertIn("refusing to fetch a list from", str(cm.exception))
+        FakeSocket.connected = []
         for ip in ("192.168.1.10", "10.0.0.2", "172.17.0.1", "fd00::5", "93.184.216.34"):
-            lists._check_peer(Sock(ip))                       # a NAS on the LAN is the normal case
+            with mock.patch.object(lists.socket, "getaddrinfo", addrinfo(ip)), \
+                    mock.patch.object(lists.socket, "socket", FakeSocket):
+                lists._connect(("nas.lan", 80), 5)                    # a NAS on the LAN is the normal case
+        self.assertEqual(FakeSocket.connected, ["192.168.1.10", "10.0.0.2", "172.17.0.1", "fd00::5", "93.184.216.34"])
+        FakeSocket.connected = []
+        with mock.patch.object(lists.socket, "getaddrinfo", addrinfo("::1", "192.168.1.10")), \
+                mock.patch.object(lists.socket, "socket", FakeSocket):
+            lists._connect(("nas.lan", 80), 5)
+        self.assertEqual(FakeSocket.connected, ["192.168.1.10"])      # only the address that passed
+
+    def test_a_name_for_loopback_is_no_port_scanner(self):
+        # the review's note: through a name resolving to 127.x, an open port
+        # gave 'refusing ... loopback' (checked after connect) and a closed
+        # one 'the connection was refused'
+        closed = socket.socket()
+        closed.bind(("127.0.0.1", 0))
+        closed_port = closed.getsockname()[1]
+        closed.close()
+        real = socket.getaddrinfo
+
+        def resolve(host, *a, **kw):
+            return real("127.0.0.1" if host == "lists.internal" else host, *a, **kw)
+        msgs = []
+        with mock.patch.object(lists.socket, "getaddrinfo", resolve):
+            for port in (self.server.server_address[1], closed_port):
+                with self.assertRaises(lists.ListFetchError) as cm, self.assertLogs("mangarr.lists", "WARNING"):
+                    lists._get_text(f"http://lists.internal:{port}/secret")
+                msgs.append(str(cm.exception))
+        self.assertEqual(msgs, ["refusing to fetch a list from 127.0.0.1 (a loopback address)"] * 2)
+        self.assertEqual(Handler.served, [])
 
     def test_loopback_server_is_refused_at_connect(self):
         # a list stored before the check, or a host name that resolves to
-        # 127.0.0.1: refused after connect, before a request is sent
+        # 127.0.0.1: refused before connect, so before a request is sent
         with self.assertRaises(lists.ListFetchError) as cm, self.assertLogs("mangarr.lists", "WARNING"):
             lists._get_text(self.base + "/secret")
         self.assertIn("loopback", str(cm.exception))
@@ -287,20 +360,27 @@ class AddressTest(ServerTest):
 
 
 class ContentTest(ServerTest):
-    """What a list URL returns is shown on /lists and sent to AniList and
-    MangaDex only line by line and only when the line looks like a title."""
+    """What a list URL returns is sent to AniList and MangaDex only line by
+    line and only when the line looks like a title, and is shown on /lists
+    only once AniList or MangaDex know most of its lines."""
+    SECRETS = ("hunter2", "db.internal", "admin", "S3cret", "abc123", "Mystery")
 
-    def _sync(self, path):
+    def _sync(self, path, known=()):
+        """(last_result, lines looked up); lines in `known` are confident
+        picks. Nothing secret may reach last_result or any log line."""
         looked_up = []
 
         def lookup(t):
             looked_up.append(t)
-            return None, []
+            return (Series(anilist_id=len(looked_up), english=t) if t in known else None), []
         with tempfile.TemporaryDirectory() as tmp, db.connect(os.path.join(tmp, "l.db")) as con:
             lid = lists.add_list(con, "L", "url_text", {"url": self.base + path})
-            with mock.patch.object(lists.metadata, "lookup", lookup), self.assertLogs("mangarr.lists", "INFO"):
+            with mock.patch.object(lists.metadata, "lookup", lookup), self.assertLogs("mangarr", "DEBUG") as logs:
                 msg = lists.sync(con, lists.get_list(con, lid), lambda *a: None)
             self.assertEqual(lists.get_list(con, lid)["last_result"], msg)
+        logged = "\n".join(logs.output)
+        for secret in self.SECRETS:
+            self.assertNotIn(secret, logged)
         return msg, looked_up
 
     def test_json_reply_is_neither_quoted_nor_looked_up(self):
@@ -319,10 +399,38 @@ class ContentTest(ServerTest):
             self.assertEqual(looked_up, [])
 
     def test_junk_lines_in_a_real_list_are_skipped(self):
-        msg, looked_up = self._sync("/mixed")
+        msg, looked_up = self._sync("/mixed", known={"One Piece"})
         self.assertEqual(looked_up, ["One Piece", "Berserk"])
-        self.assertEqual(msg, "0 fetched, 0 added, 2 review, 1 line(s) skipped (not titles); "
-                              "needs review: One Piece | Berserk")
+        self.assertEqual(msg, "1 fetched, 1 added, 1 review, 1 line(s) skipped (not titles); needs review: Berserk")
+
+    def test_text_answers_that_look_like_titles_are_never_quoted(self):
+        # the verifier's repro, with loopback standing in for a LAN or
+        # container-network host: a config file as text/plain, key:value as
+        # octet-stream, and the config again behind a same-host redirect.
+        # Every line passes as a title, and none is a series anyone knows.
+        for path, n in (("/config", 3), ("/octets", 2), ("/to-config", 3)):
+            msg, looked_up = self._sync(path)
+            self.assertEqual(msg, f"error: the URL did not return a title list: none of the {n} line(s) looked up "
+                                  "is a series AniList or MangaDex knows", path)
+            self.assertEqual(len(looked_up), n)
+            for secret in self.SECRETS:
+                self.assertNotIn(secret, msg)
+
+    def test_an_unknown_text_answer_is_looked_up_only_a_little(self):
+        body = "".join(f"Status line {i} of the service\n" for i in range(40)).encode()
+        with mock.patch.dict(Handler.routes, {"/status": serve(body, "text/plain")}):
+            msg, looked_up = self._sync("/status")
+        self.assertEqual(len(looked_up), lists.PROBE_LINES)
+        self.assertTrue(msg.startswith("error: the URL did not return a title list: none of the 5 line(s)"), msg)
+
+    def test_a_list_mostly_unknown_is_reported_by_line_number(self):
+        body = b"One Piece\nMystery A\nBerserk\nMystery B\nMystery C\nMystery D\n"
+        with mock.patch.dict(Handler.routes, {"/weak": serve(body, "text/plain")}):
+            msg, looked_up = self._sync("/weak", known={"One Piece", "Berserk"})
+        self.assertEqual(len(looked_up), 6)
+        self.assertEqual(msg, "2 fetched, 2 added, 4 review; needs review: line 2 | line 4 | line 5 | line 6 "
+                              "(not quoted: fewer than half of the lines looked up are series AniList or MangaDex "
+                              "knows)")
 
 
 class LinesTest(unittest.TestCase):
@@ -331,13 +439,14 @@ class LinesTest(unittest.TestCase):
               "Yu-Gi-Oh!", "Is It Wrong to Try to Pick Up Girls in a Dungeon?", "100% Perfect Girl", "Tokyo Ghoul:re",
               "Hunter × Hunter", "葬送のフリーレン", "나 혼자만 레벨업", "<Infinite Dendrogram>", "Kaiju No. 8",
               "Zom 100: Bucket List of the Dead", "magi: the labyrinth of magic", "JoJo's Bizarre Adventure Part 7: Steel Ball Run",
-              "anilist:30013", "mangadex:12345678-1234-1234-1234-123456789abc", "Me & Roboco", "Haikyu!!", "B.A.D."]
+              "anilist:30013", "mangadex:12345678-1234-1234-1234-123456789abc", "Me & Roboco", "Haikyu!!", "B.A.D.",
+              "86", "Love=Game", "Sword Art Online: Progressive", "citrus", "Fate/Zero", "2001 Nights"]
     JUNK = ['{"secret_db_password": "hunter2",', '"internal_token": "abc123"}', "DB_PASSWORD=hunter2",
             "export TOKEN=abc", "<title>Admin</title>", '<div class="x">', "<!DOCTYPE html>", "<?xml version='1.0'?>",
             "database:", "db_password: hunter2", "postgres://user:pass@db/app", "see http://10.0.0.5:8200/v1/secret",
             "admin@corp.example", "host: 10.0.0.5", "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0",
             "3f9a7b2c4d5e6f708192a3b4c5d6e7f8a9b0c1d2", "12345", "---", "}", 'go_gc_duration_seconds{quantile="0"} 1e-05',
-            "C:\\Windows\\System32", "a\tb"]
+            "C:\\Windows\\System32", "password=hunter2", "root:x:0:0:root:/root:/bin/bash", "aa:bb:cc:dd:ee:ff"]
 
     def test_looks_like_title(self):
         for t in self.TITLES:
@@ -349,10 +458,15 @@ class LinesTest(unittest.TestCase):
         text = "\n".join(["# my list", *self.TITLES, *self.JUNK[:5]])
         with self.assertLogs("mangarr.lists", "WARNING"):
             titles, skipped = lists.list_titles(text)
-        self.assertEqual(titles, self.TITLES)
+        self.assertEqual([ln.text for ln in titles], self.TITLES)
+        self.assertEqual(titles[0].no, 2)                          # line numbers count every line, from 1
         self.assertEqual(skipped, 5)
-        self.assertEqual(lists.list_titles("[Oshi no Ko]\nBerserk\n"), (["[Oshi no Ko]", "Berserk"], 0))
+        self.assertEqual(lists.list_titles("[Oshi no Ko]\nBerserk\n"),
+                         ([lists.Line(1, "[Oshi no Ko]"), lists.Line(2, "Berserk")], 0))
         self.assertEqual(lists.list_titles(""), ([], 0))
+        # a title in angle brackets first is not a web page; a tab is a space
+        self.assertEqual(lists.list_titles("<Infinite Dendrogram>\nOne Piece\tReading\n"),
+                         ([lists.Line(1, "<Infinite Dendrogram>"), lists.Line(2, "One Piece Reading")], 0))
         for body, kind in (('["One Piece", "Berserk"]', "JSON"), ('{"a": 1}', "JSON"), ("\ufeff  {\n", "JSON"),
                            ("<?xml version='1.0'?><titles/>", "a web page or XML"), ("PK\x03\x04\x00\x00", "binary data"),
                            ("\n".join(self.JUNK[2:]), "most of its lines are not titles")):
@@ -374,7 +488,7 @@ class LinesTest(unittest.TestCase):
 
         def lookup(t):
             calls.append(t)
-            return None, []
+            return Series(anilist_id=len(calls), english=t), []
         with mock.patch.object(lists, "_get_text", lambda url, **kw: text), \
                 mock.patch.object(lists.metadata, "lookup", lookup), self.assertLogs("mangarr.lists", "WARNING"):
             lists.fetch_url_text({"url": "http://x"})
@@ -384,6 +498,44 @@ class LinesTest(unittest.TestCase):
                 mock.patch.object(lists.metadata, "lookup", lookup), self.assertLogs("mangarr.lists", "INFO"):
             lists.fetch("url_text", {"url": "http://x"}, should_cancel=lambda: len(calls) >= 3)
         self.assertEqual(len(calls), 3)
+
+    def test_an_exact_title_counts_as_known(self):
+        # several series of exactly that title: no confident pick, but a title
+        text = "Berserk\nMystery\n"
+        twins = [Series(anilist_id=1, english="Berserk"), Series(anilist_id=2, english="Berserk")]
+        lookup = {"Berserk": (None, twins), "Mystery": (None, [Series(anilist_id=3, english="Mystery Man")])}
+        with mock.patch.object(lists, "_get_text", lambda url, **kw: text), \
+                mock.patch.object(lists.metadata, "lookup", lookup.get):
+            fetched = lists.fetch_url_text({"url": "http://x"})
+        self.assertEqual((fetched.review, fetched.quoted), (["Berserk", "Mystery"], True))
+
+    def test_filters_are_linear(self):
+        # the verifier's repro: repeated 300-character word lines took 6.5 s
+        # and 7.5 s per MB (quadratic backtracking, and each repeat judged again)
+        bodies = [("a" * 300 + "\n") * 3300, ("x_" * 150 + "\n") * 3300]
+        # ... and distinct lines of every shape a pattern could stall on
+        for unit in ("a", "x_", "a.", "1.", '"', "<a ", "a:", "a@", "a@a.", "a://", "a="):
+            bodies.append("".join(unit * (295 // len(unit)) + f"{i:05d}\n" for i in range(3300)))
+        with mock.patch.object(lists.log, "warning"):
+            for body in bodies:
+                t0 = time.perf_counter()
+                lists._split(body, lists.MAX_LIST_LINES)
+                self.assertLess(time.perf_counter() - t0, 1.5, body[:20])    # about 0.2 s at worst
+        judged = []
+        real = lists.looks_like_title
+        with mock.patch.object(lists, "looks_like_title", lambda t: judged.append(t) or real(t)):
+            lists._split(("a" * 300 + "\n") * 3300)
+        self.assertEqual(len(judged), 1)                          # a repeated line is judged once
+
+    def test_a_failed_provider_does_not_log_the_query(self):
+        def boom(q):
+            raise RuntimeError("HTTP Error 503: Service Unavailable")
+        with mock.patch.object(metadata.anilist, "search", boom), \
+                mock.patch.object(metadata.mangadex, "search", lambda q: []), \
+                self.assertLogs("mangarr.metadata", "WARNING") as cm:
+            metadata.lookup("password: hunter2")
+        self.assertIn("503", cm.output[0])
+        self.assertNotIn("hunter2", "\n".join(cm.output))
 
 
 class SyncTest(unittest.TestCase):

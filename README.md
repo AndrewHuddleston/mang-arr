@@ -401,23 +401,27 @@ the next refresh. See *Adopting an existing Suwayomi library* below.
 Import lists, as in Sonarr: an AniList user's manga list (chosen statuses;
 default current and planning), an AniList chart (trending / popularity /
 score / favourites, top 1-100, optional country JP / KR / CN and minimum
-chapter count; manga format only, no adult titles), or a text file at a
-URL with one title per line (`#` comments; an `anilist:123` /
-`mangadex:uuid` reference works too). The file may be on the internet or
-the LAN (a NAS is fine), not on mang-arr's own machine (localhost,
-127.0.0.1) or a link-local address; a URL that returns JSON, a web page or
-another document instead of a list of titles is refused as a whole, and
-lines that are not titles (`key=value`, markup, URLs, tokens) are skipped:
-they are neither looked up nor shown. Each list has its own sync interval
-(default 24 h), a download flag and a monitored flag, and can be disabled.
-Lists are checked every ten minutes and synced when due, or by *Sync now*;
-every series a sync yields that is not tracked yet is queued as an ordinary
-add job (at most 25 per sync; the next sync continues), with the list's
-download / monitored flags. Titles from a text list without a single exact
-database match are reported as *needs review* in the list's result, not
-added. **Exclusions** are references a list must never add: tick *exclude
-from import lists* when deleting a series, or add one by reference.
-Deleting a list keeps the series it added.
+chapter count; manga format only, no adult titles), or a text file at a URL
+with one title per line (`#` comments; an `anilist:123` / `mangadex:uuid`
+reference works too). The file may be on the internet or the LAN (a NAS is
+fine), not on mang-arr's own machine (localhost, 127.0.0.1) or a link-local
+address; a URL that returns JSON, a web page or another document instead of
+a list of titles is refused as a whole, and lines that are not titles
+(`key=value`, markup, URLs, tokens) are skipped: they are neither looked up
+nor shown. A text file only counts as a title list once AniList or MangaDex
+know its lines: when none of the first five lines looked up is a series
+they know, the sync stops with an error that quotes nothing. Each list has
+its own sync interval (default 24 h), a download flag and a monitored flag,
+and can be disabled. Lists are checked every ten minutes and synced when
+due, or by *Sync now*; every series a sync yields that is not tracked yet
+is queued as an ordinary add job (at most 25 per sync; the next sync
+continues), with the list's download / monitored flags. Titles from a text
+list without a single exact database match are reported as *needs review*
+in the list's result, not added - quoted when at least half of the lines
+looked up are series AniList or MangaDex know, by line number otherwise.
+**Exclusions** are references a list must never add: tick *exclude from
+import lists* when deleting a series, or add one by reference. Deleting a
+list keeps the series it added.
 
 #### Queue and History
 

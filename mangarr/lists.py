@@ -9,10 +9,12 @@ an exclusion on its ref. Adds are capped per sync so a first sync of a long
 list does not queue hundreds of jobs; the next sync continues where it left
 off.
 
-Each list kind is a fetch(params) -> Fetched(series, review, skipped)
+Each list kind is a fetch(params) -> Fetched(series, review, skipped, quoted)
 function in FETCHERS; review are lines of a text list that look like titles
-but could not be identified with confidence (the user adds them by hand),
-skipped counts lines that do not look like titles at all.
+but could not be identified with confidence (the user adds them by hand) -
+the lines themselves, or only "line N" when the list did not prove to be a
+title list (see fetch_url_text) - and skipped counts lines that do not look
+like titles at all.
 """
 import functools
 import http.client
@@ -31,7 +33,7 @@ from collections.abc import Callable
 from typing import NamedTuple
 
 from . import anilist, config, db, metadata, model
-from .matching import MAX_TITLE, oneline
+from .matching import oneline, query_score
 from .model import Series
 
 log = logging.getLogger(__name__)
@@ -49,6 +51,7 @@ class Fetched(NamedTuple):
     series: list[Series]
     review: list[str]           # look like titles, no confident match: listed for the user
     skipped: int = 0            # text list lines that are not titles: neither looked up nor shown
+    quoted: bool = True         # review holds the lines; False: only "line N" (see fetch_url_text)
 
 
 # -- AniList: a user's lists ----------------------------------------------------
@@ -131,6 +134,7 @@ MAX_LIST_LINES = 500            # lines looked up per sync
 MAX_LINE = 300                  # characters; longer lines are not titles (same limit as a manual ref)
 FETCH_TIMEOUT = 20              # seconds per network operation ...
 FETCH_DEADLINE = 60             # ... and for the whole download
+PROBE_LINES = 5                 # lines looked up before one must be a series AniList or MangaDex knows
 MAX_REVIEW_SHOWN = 10           # unidentified lines quoted in last_result ...
 MAX_REVIEW_CHARS = 80           # ... each cut to this many characters
 
@@ -171,7 +175,7 @@ def _refused_host(host: str) -> str | None:
     resolver accepts (127.1, 2130706433, 0x7f.0.0.1, [::ffff:127.0.0.1]).
     Other names are not resolved here - that would hold the form on a slow
     DNS server and prove nothing about the fetch later, as DNS answers
-    change - but checked on the address actually connected to (_check_peer)."""
+    change - but on every fetch, before anything is connected to (_connect)."""
     h = host.strip().lower().rstrip(".")
     if h in _LOCAL_NAMES or h.endswith(".localhost"):
         return "a name of this machine"
@@ -185,19 +189,45 @@ def _refused_host(host: str) -> str | None:
     return _refused(ip)
 
 
-def _check_peer(sock) -> None:
-    """Refuse the connection when the address actually connected to is one
-    _refused() rejects - checked right after connect, before TLS or the
-    request, so no DNS answer or redirect gets around the check."""
-    try:
-        ip = ipaddress.ip_address(sock.getpeername()[0].split("%")[0])
-    except (OSError, ValueError, IndexError):
-        return
-    why = _refused(ip)
-    if why:
-        sock.close()
-        log.warning("list fetch refused: the host resolved to %s (%s)", ip, why)
+def _connect(address, timeout=None, source_address=None) -> socket.socket:
+    """socket.create_connection() for a list fetch: the host is resolved
+    here, addresses _refused() rejects are dropped, and only the addresses
+    checked are connected to - so no second DNS answer or redirect gets
+    around the check. A refused address is never connected to, not even to
+    see whether the port is open: the error is the same for an open port
+    and a closed one, and cannot be used to scan mang-arr's own machine."""
+    host, port = address[0], address[1]
+    usable, refused = [], None
+    for family, kind, proto, _, sockaddr in socket.getaddrinfo(host, port, 0, socket.SOCK_STREAM):
+        try:
+            ip = ipaddress.ip_address(str(sockaddr[0]).split("%")[0])
+        except ValueError:
+            continue
+        why = _refused(ip)
+        if why:
+            refused = refused or (ip, why)
+            continue
+        usable.append((family, kind, proto, sockaddr))
+    if not usable:
+        if refused is None:
+            raise OSError(f"no usable address for {oneline(host, 80)}")
+        ip, why = refused
+        log.warning("list fetch refused: %s resolves to %s (%s); not connected", oneline(host, 80), ip, why)
         raise ListFetchError(f"refusing to fetch a list from {ip} ({why})")
+    err: OSError | None = None
+    for family, kind, proto, sockaddr in usable:         # in the resolver's order, as create_connection does
+        sock = socket.socket(family, kind, proto)
+        try:
+            if isinstance(timeout, (int, float)):
+                sock.settimeout(timeout)
+            if source_address:
+                sock.bind(source_address)
+            sock.connect(sockaddr)
+            return sock
+        except OSError as e:
+            err = e
+            sock.close()
+    raise err if err is not None else OSError("connect failed")
 
 
 class _Watchdog:
@@ -281,17 +311,16 @@ class _Watchdog:
 
 
 class _GuardedConnection:
-    """Mixin: every socket the connection opens is checked (_check_peer)
-    and then handed to its _Watchdog, right after the TCP connect and so
-    before any TLS handshake. http.client sets _create_connection per
-    instance in __init__, so it is wrapped there rather than overridden."""
+    """Mixin: every socket the connection opens comes from _connect (its
+    address checked before the connect) and is handed to its _Watchdog
+    right after the TCP connect, before any TLS handshake. http.client sets
+    _create_connection per instance in __init__, so it is replaced there
+    rather than overridden."""
     def __init__(self, *a, watchdog: _Watchdog | None = None, **kw):
         super().__init__(*a, **kw)
-        create = self._create_connection
 
-        def create_guarded(*ca, **ckw):
-            sock = create(*ca, **ckw)
-            _check_peer(sock)
+        def create_guarded(address, timeout=None, source_address=None, **_):
+            sock = _connect(address, timeout, source_address)
             if watchdog is not None:
                 watchdog.register(sock)
             return sock
@@ -341,22 +370,29 @@ def _opener(watchdog: _Watchdog | None = None):
                                        _SameHostRedirects)
 
 
-# Content types a plain text file of titles is served with (none at all, or
-# octet-stream for an unknown file extension on a NAS or in cloud storage)
-_TEXT_TYPES = ("", "text/plain", "text/csv", "text/markdown", "application/octet-stream", "binary/octet-stream",
-               "application/binary")
+# A text file is served with whatever type the server guesses from its name
+# (text/plain, text/markdown, text/tab-separated-values, none at all, or
+# octet-stream / x-download / force-download from a NAS or a file host), so
+# only types that are plainly something else are refused by their header;
+# the body is judged next (list_titles).
+_NOT_TEXT_MAJOR = ("image/", "audio/", "video/", "font/", "model/", "multipart/")
+_NOT_TEXT_TYPES = {"application/pdf", "application/zip", "application/gzip", "application/x-gzip",
+                   "application/x-tar", "application/x-7z-compressed", "application/vnd.rar",
+                   "application/x-rar-compressed", "application/x-bzip2", "application/x-xz", "application/zstd",
+                   "application/wasm", "application/javascript", "text/javascript", "text/css",
+                   "application/x-www-form-urlencoded"}
 
 
 def _not_text(content_type: str) -> str | None:
     """What a response of this Content-Type is, in plain words, when it is
-    not a plain text file; None when it may be one."""
+    plainly not a text file; None when it may be one."""
     ctype = content_type.split(";")[0].strip().lower()
-    if ctype in _TEXT_TYPES:
-        return None
     for key, what in (("json", "JSON"), ("html", "a web page"), ("xml", "XML")):
         if key in ctype:
             return what
-    return "not plain text"
+    if ctype.startswith(_NOT_TEXT_MAJOR) or ctype in _NOT_TEXT_TYPES:
+        return "not plain text"
+    return None
 
 
 def _fetch_error(e: Exception) -> str:
@@ -428,34 +464,55 @@ def _get_text(url: str, max_bytes: int = MAX_LIST_BYTES, deadline: float = FETCH
 
 
 # What JSON, markup, config files, logs and API answers are made of and a
-# title never is. Titles do use ':', '"', '!', '?', ';', '&', '+', '%', '[]'
-# and '//' (Re:Zero, "Oshi no Ko", Steins;Gate, [Oshi no Ko], .hack//G.U.),
-# and even '<...>' (<Infinite Dendrogram>), so none of those alone counts.
-_NOT_TITLE = re.compile(
-    r"[{}\\\t\x00-\x08\x0b-\x1f\x7f]"                           # braces, backslashes, tabs, control characters
-    r"|</[A-Za-z]|<[!?]|<[A-Za-z][\w-]*(?:\s[^>]*=|\s*/?>)"     # tags: </p>, <!doctype, <?xml, <br>, <a href=
-    r'|"[^"]*"\s*:'                                             # a JSON member: "key": ...
-    r"|^(?:export\s+)?[A-Za-z_][\w.-]*\s*="                     # KEY=value (env and ini files, query strings)
-    r"|^[a-z][a-z0-9]*_[\w-]*\s*:"                              # snake_case_key: value
-    r"|^[\w.-]+:$"                                              # a bare 'section:' line
-    r"|[A-Za-z][\w+.-]*://"                                     # a URL or connection string
-    r"|[\w.+-]+@[\w-]+\.\w"                                     # an e-mail address
-    r"|\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b")                 # an IPv4 address
+# title never is. Titles do use ':', '"', '!', '?', ';', '&', '+', '=', '%',
+# '[]' and '//' (Re:Zero, "Oshi no Ko", Steins;Gate, Love=Game, [Oshi no
+# Ko], .hack//G.U.), and even '<...>' (<Infinite Dendrogram>), so none of
+# those alone counts. Every check is linear in the line - a pattern that
+# could start anywhere in a run of word characters only starts where the
+# run does - and runs only when the line has what a match must contain.
+_TAG = re.compile(r"</[A-Za-z]|<[!?]|<[A-Za-z][\w-]*(?:\s[^<>]*=|\s*/?>)")   # </p>, <!doctype, <?xml, <br>, <a href=
+_JUNK_START = re.compile(                                       # matched at the start of the line
+    r"(?:export\s+)?(?:[A-Z][A-Z0-9_]*|[a-z_][a-z0-9_.-]*)\s*="  # KEY=value, key=value (env, ini, query strings)
+    r"|[a-z][a-z0-9]*_[\w-]*\s*:"                               # snake_case_key: value
+    r"|[\w.-]+:$")                                              # a bare 'section:' line
+_JUNK = (                                                       # (what a match contains, pattern) searched anywhere
+    ("", re.compile(r"[{}\\\x00-\x08\x0b-\x1f\x7f]")),          # braces, backslashes, control characters
+    ("<", _TAG),                                                # tags
+    ('"', re.compile(r'"[^"]*"\s*:')),                          # a JSON member: "key": ...
+    ("://", re.compile(r"(?<![\w+.-])[A-Za-z][\w+.-]*://")),    # a URL or connection string
+    ("@", re.compile(r"(?<![\w.+-])[\w.+-]+@[\w-]+\.\w")),      # an e-mail address
+    (".", re.compile(r"\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b")),   # an IPv4 address
+)
 _TOKEN = re.compile(r"[A-Za-z0-9+/_=.-]{33,}")                  # no word of a title is this long ...
+_DIGIT = re.compile(r"\d")
+_NUMBER_TITLE = re.compile(r"\d{1,4}")                          # 86, 2001: a title with no letters
+
+
+def _junk(line: str) -> bool:
+    """Whether the line has something of JSON, markup, a config file, a log
+    or an API answer in it (see above)."""
+    if ("=" in line or ":" in line) and _JUNK_START.match(line):
+        return True
+    if any(needle in line and rx.search(line) for needle, rx in _JUNK):
+        return True
+    # three ':' in one word: /etc/passwd, MAC and IPv6 addresses (Re:Zero has one)
+    return line.count(":") >= 3 and any(w.count(":") >= 3 for w in line.split())
 
 
 def looks_like_title(line: str) -> bool:
     """Whether one stripped line of a text list could be a title (or an
-    anilist:/mangadex: reference). Only such lines are looked up at
-    AniList/MangaDex and quoted in 'needs review'; a list URL can point at
-    any server, and the lines of an API answer or a config file must go
-    neither to the providers nor onto the Lists page."""
+    anilist:/mangadex: reference). Other lines are neither looked up nor
+    shown. This only keeps what is plainly not a title (an API answer, a
+    config file) away from the providers: no look at a line tells a title
+    from 'host: db' - fetch_url_text leaves that to AniList and MangaDex."""
     if model.valid_ref(line) and not line.startswith("manual:"):
         return True
-    if not any(ch.isalpha() for ch in line) or _NOT_TITLE.search(line):
+    if not any(ch.isalpha() for ch in line):
+        return bool(_NUMBER_TITLE.fullmatch(line))
+    if _junk(line):
         return False
     # ... that also has digits: a key, a hash, base64 or a token
-    return not any(any(ch.isdigit() for ch in t) for t in _TOKEN.findall(line))
+    return not any(_DIGIT.search(t) for t in _TOKEN.findall(line))
 
 
 def _body_kind(text: str) -> str | None:
@@ -474,36 +531,42 @@ def _body_kind(text: str) -> str | None:
                 return "JSON"
         except ValueError:
             pass
-    if head.startswith("<"):
+    if _TAG.match(head):                                # not <Infinite Dendrogram>, a title
         return "a web page or XML"
     return None
 
 
-def _split(text: str, max_lines: int | None = None) -> tuple[list[str], int]:
-    """(titles, lines skipped as not titles): one title per line; blank
-    lines and lines starting with # are skipped, and so are repeats, lines
-    longer than MAX_LINE and lines that do not look like titles (counts
-    logged, the lines never). With max_lines, at most that many titles."""
-    out: list[str] = []
+class Line(NamedTuple):
+    no: int                     # line number in the file, from 1
+    text: str
+
+
+def _split(text: str, max_lines: int | None = None) -> tuple[list[Line], int]:
+    """(titles, lines skipped as not titles): one title per line, a tab
+    counting as a space; blank lines and lines starting with # are skipped,
+    and so are repeats, lines longer than MAX_LINE and lines that do not
+    look like titles (counts logged, the lines never). A repeated line is
+    judged once. With max_lines, at most that many titles."""
+    out: list[Line] = []
     seen: set[str] = set()
     too_long = junk = 0
-    for line in text.splitlines():
-        line = line.strip().lstrip("\ufeff")
+    for no, line in enumerate(text.splitlines(), 1):
+        line = line.replace("\t", " ").strip().lstrip("\ufeff")
         if not line or line.startswith("#"):
             continue
         if len(line) > MAX_LINE:
             too_long += 1
             continue
-        if not looks_like_title(line):
-            junk += 1
-            continue
         if line in seen:
             continue
         seen.add(line)
+        if not looks_like_title(line):
+            junk += 1
+            continue
         if max_lines is not None and len(out) >= max_lines:
             log.warning("text list has more than %d titles; only the first %d are used", max_lines, max_lines)
             break
-        out.append(line)
+        out.append(Line(no, line))
     if too_long:
         log.warning("text list: %d line(s) longer than %d characters skipped (not titles)", too_long, MAX_LINE)
     if junk:
@@ -513,11 +576,11 @@ def _split(text: str, max_lines: int | None = None) -> tuple[list[str], int]:
 
 def parse_titles(text: str, max_lines: int | None = None) -> list[str]:
     """The titles of a text list (see _split)."""
-    return _split(text, max_lines)[0]
+    return [ln.text for ln in _split(text, max_lines)[0]]
 
 
-def list_titles(text: str, max_lines: int | None = None) -> tuple[list[str], int]:
-    """(titles, lines skipped) of a response that should be a text list.
+def list_titles(text: str, max_lines: int | None = None) -> tuple[list[Line], int]:
+    """(title lines, lines skipped) of a response that should be a text list.
     Raises ListFetchError with NOT_A_LIST - and nothing of the body - when it
     is JSON, a web page, XML or binary data, or when more of its lines are
     not titles than are: then it is some other document (a status page, a
@@ -534,36 +597,75 @@ def list_titles(text: str, max_lines: int | None = None) -> tuple[list[str], int
     return titles, skipped
 
 
+def _unknown(looked: int, failed: int) -> ListFetchError:
+    """The error for a list none of whose lines looked up is a series
+    AniList or MangaDex knows. It quotes none of them."""
+    if failed >= looked:
+        log.warning("text list: none of %d line(s) could be looked up (AniList and MangaDex unreachable?)", looked)
+        return ListFetchError("the titles could not be looked up at AniList or MangaDex; try again later")
+    log.warning("text list: none of the %d line(s) looked up is a series AniList or MangaDex knows; not taken "
+                "for a title list: nothing more looked up, nothing quoted", looked)
+    return ListFetchError(f"{NOT_A_LIST}: none of the {looked} line(s) looked up is a series AniList or MangaDex "
+                          "knows" + (f" ({failed} could not be looked up)" if failed else ""))
+
+
 def fetch_url_text(params: dict, should_cancel: Callable[[], bool] | None = None) -> Fetched:
     """Every line that looks like a title is looked up like a typed title on
     the Add page; only a confident pick is added, the rest are reported for
     review. A line that is already a reference (anilist:123, mangadex:uuid)
     is used as is. At most MAX_LIST_LINES lines are looked up;
-    should_cancel is checked during the download and between lines."""
-    titles, skipped = list_titles(_get_text(params["url"], should_cancel=should_cancel), MAX_LIST_LINES)
+    should_cancel is checked during the download and between lines.
+
+    The URL may be any server on the LAN, and no look at a line tells a
+    title from a line of some other text answer ('host: db' / 'Re:Zero'),
+    so AniList and MangaDex decide. A line is known when it is a confident
+    pick or the exact title of some series there. Until one line is known,
+    at most PROBE_LINES are looked up; when none is, the sync fails and
+    quotes nothing. Lines without a confident pick are quoted for review
+    only when at least half of the lines looked up are known - the body has
+    then proved to be a title list - and are otherwise given only by line
+    number. Lines are logged by number, never quoted."""
+    lines, skipped = list_titles(_get_text(params["url"], should_cancel=should_cancel), MAX_LIST_LINES)
     series: dict[str, Series] = {}
-    review: list[str] = []
-    for i, t in enumerate(titles):
+    unmatched: list[Line] = []
+    looked = known = failed = 0
+    cancelled = False
+    for ln in lines:
         if should_cancel and should_cancel():
-            log.info("text list sync cancelled after %d of %d line(s)", i, len(titles))
+            log.info("text list sync cancelled after %d of %d line(s)", looked, len(lines))
+            cancelled = True
             break
+        if not known and looked >= PROBE_LINES:
+            raise _unknown(looked, failed)
+        looked += 1
+        cands: list[Series] = []
         try:
-            if model.valid_ref(t) and not t.startswith("manual:"):
-                s = metadata.by_ref(t)
-                if not s or s.title == "?":
-                    raise ValueError("nothing found")
+            if model.valid_ref(ln.text) and not ln.text.startswith("manual:"):
+                s = metadata.by_ref(ln.text)
+                s = s if s and s.title != "?" else None
             else:
-                s, _ = metadata.lookup(t)
+                s, cands = metadata.lookup(ln.text)
         except Exception as e:
-            log.warning("list line %r: lookup failed: %s: %s", t[:MAX_TITLE], type(e).__name__, oneline(e, 300))
+            failed += 1
+            log.warning("list line %d: lookup failed: %s: %s", ln.no, type(e).__name__, oneline(e, 300))
             s = None
         if s:
-            log.debug("list line %r -> %s (%s)", t, oneline(s.title), s.ref)
+            known += 1
+            log.debug("list line %d -> %s (%s)", ln.no, oneline(s.title), s.ref)
             series.setdefault(s.ref, s)
-        else:
-            log.debug("list line %r: no confident match", t)
-            review.append(t)
-    return Fetched(list(series.values()), review, skipped)
+            continue
+        if any(query_score(t, ln.text) == 0 for c in cands for t in c.titles):
+            known += 1                  # several series of exactly that title: a title all the same
+        log.debug("list line %d: no confident match (%d candidate(s))", ln.no, len(cands))
+        unmatched.append(ln)
+    if looked and not known and not cancelled:
+        raise _unknown(looked, failed)
+    quoted = known > 0 and known * 2 >= looked
+    if unmatched and not quoted:
+        log.warning("text list: only %d of %d line(s) looked up are series AniList or MangaDex knows; the %d "
+                    "without a match are reported by line number, not quoted", known, looked, len(unmatched))
+    review = [ln.text if quoted else f"line {ln.no}" for ln in unmatched]
+    return Fetched(list(series.values()), review, skipped, quoted)
 
 
 FETCHERS: dict[str, Callable[[dict], Fetched]] = {
@@ -771,6 +873,7 @@ def sync(con: sqlite3.Connection, row, submit_add: Callable[[Series, bool, bool]
         mark_synced(con, row["id"], msg)
         return msg
     not_titles = more[0] if more else 0
+    quoted = more[1] if len(more) > 1 else True
     excluded = excluded_refs(con)
     added = tracked = skipped = deferred = 0
     for s in series:
@@ -801,10 +904,13 @@ def sync(con: sqlite3.Connection, row, submit_add: Callable[[Series, bool, bool]
         parts.append(f"{deferred} deferred (cap {MAX_ADDS} per sync; next sync continues)")
     msg = ", ".join(parts)
     if review:
-        # only lines that look like titles get here (looks_like_title), and
-        # they are cut short all the same: they are whatever the URL served
+        # lines are only quoted from a list that proved to be one
+        # (fetch_url_text), and cut short all the same: they are whatever
+        # the URL served
         shown = [oneline(t, MAX_REVIEW_CHARS) for t in review[:MAX_REVIEW_SHOWN]]
         msg += "; needs review: " + " | ".join(shown) + (" | ..." if len(review) > MAX_REVIEW_SHOWN else "")
+        if not quoted:
+            msg += " (not quoted: fewer than half of the lines looked up are series AniList or MangaDex knows)"
     mark_synced(con, row["id"], msg)
     log.info("list %s: %s", name, msg)
     return msg
