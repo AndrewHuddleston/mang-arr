@@ -373,6 +373,31 @@ def redact_url(url: str) -> str:
         return "..."
 
 
+def bare_host(host: str) -> str:
+    """A Host header value as a name: lower case, no port, no trailing dot.
+    'Mangarr.LAN:6789' -> 'mangarr.lan', '[::1]:6789' -> '::1'."""
+    h = (host or "").strip().lower()
+    if h.startswith("["):
+        return h[1:h.find("]")] if "]" in h else ""
+    if h.count(":") == 1:
+        h = h.split(":", 1)[0]
+    return h.rstrip(".")
+
+
+def host_name(entry: str) -> str:
+    """An Allowed Host Names entry in the form the Host check compares:
+    what bare_host() makes of the Host header, so an entry typed with a port
+    or pasted as a URL still matches. 'manga.example.com:8443' and
+    'https://manga.example.com/' -> 'manga.example.com'; '*' and a leading
+    '.' (a whole domain) are kept."""
+    h = str(entry).strip()
+    if "://" in h:
+        h = h.split("://", 1)[1]
+    for sep in "/?#":
+        h = h.split(sep, 1)[0]
+    return bare_host(h)
+
+
 def _unbind_moved_secrets(current: dict, submitted: dict, new: dict) -> list[str]:
     """When a destination changes and its secret was not re-entered (left as
     the MASK or not sent), clear the secret so it is never sent to the new
@@ -447,7 +472,15 @@ def _coerce(key: str, v):
             v = [s for s in v.replace("\n", ",").split(",")]
         elif not isinstance(v, (list, tuple, set)):
             raise ValueError(f"{key}: expected a list or comma-separated text")
-        return sorted({str(s).strip().lower() for s in v if str(s).strip()})
+        items = {str(s).strip().lower() for s in v if str(s).strip()}
+        if key == "allowed_hosts":                  # stored as compared: no port, scheme or path
+            names = {h: host_name(h) for h in items}
+            for typed, name in names.items():
+                if typed != name:
+                    log.info("allowed_hosts: %r stored as %r (only the name is compared, never the port)",
+                             typed, name)
+            items = set(names.values()) - {""}
+        return sorted(items)
     if not isinstance(v, (str, int, float)):
         raise ValueError(f"{key}: expected text")
     if key == "auth_password":

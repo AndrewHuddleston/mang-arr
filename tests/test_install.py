@@ -171,6 +171,8 @@ def respond():
             return 200, lib
         return 200, libs
     if path in ("/api/v1/ping", "/api/v1/system/status", "/api/v1/health"):
+        if path == "/api/v1/health":
+            M.setdefault("health_keys", []).append(headers.get("x-api-key"))
         return 200, {"ok": True}
     if path == "/api/v1/settings":
         s = M["settings"]
@@ -180,7 +182,11 @@ def respond():
             body = json.loads(data)
             M.setdefault("puts", []).append({"keys": sorted(body), "login_before": bool(s.get("auth_user")),
                                              "api_key_header": headers.get("x-api-key")})
+            login_before, key_before = bool(s.get("auth_user")), s.get("api_key")
             s.update(body)
+            if not login_before and s.get("auth_user") and s.get("api_key") == key_before:
+                # like mang-arr: switching the login on replaces the key anyone could read until then
+                s["api_key"] = "MANGARR-API-KEY-%d-ROTATED" % len(M["puts"])
         shown = dict(s)
         for k in ("auth_password", "komga_api_key"):
             if shown.get(k):
@@ -360,6 +366,17 @@ class FreshInstallTest(InstallerHarness):
         self.assertIn("auth_user", puts[0]["keys"])
         self.assertIn("komga_api_key", puts[0]["keys"])
 
+    def test_mangarr_api_key_read_before_the_login_is_replaced(self):
+        # finding 9, second round: the key anyone on the network could read while mang-arr had no login
+        # (between `compose up` and the PUT) must not keep working once the installer is done
+        s, puts = self.st["mangarr"]["settings"], self.st["mangarr"]["puts"]
+        self.assertEqual(puts[0]["api_key_header"], "MANGARR-API-KEY-SECRET")    # read while open, used once
+        self.assertFalse(puts[0]["login_before"])
+        self.assertNotEqual(s["api_key"], "MANGARR-API-KEY-SECRET")
+        self.assertEqual(self.st["mangarr"]["health_keys"], [s["api_key"]])       # later calls: the new key
+        self.assertIn("mang-arr replaced its API key", self.out)
+        self.assertNotIn(s["api_key"], self.out + self.err)                       # never printed
+
     def test_mangarr_password_is_saved_privately_and_never_printed(self):
         # second pass, 3: a password shown once and kept nowhere meant a lockout, and without a
         # terminal it went to stdout (cloud-init / CI logs). Now: a 0600 file, like Komga's.
@@ -379,7 +396,7 @@ class FreshInstallTest(InstallerHarness):
     def test_secrets_never_appear_in_process_arguments(self):
         # finding 99: passwords and keys travel in 0600 files / the environment, never argv
         secrets = [self.st["komga"]["password"], "KOMGA-KEY-1-SECRET", "MANGARR-API-KEY-SECRET",
-                   self.mangarr_password,
+                   self.mangarr_password, self.st["mangarr"]["settings"]["api_key"],
                    base64.b64encode(("admin@example.com:" + self.st["komga"]["password"]).encode()).decode()]
         argv = json.dumps(self.argv_log())
         with open(self.pylog) as f:
@@ -430,25 +447,35 @@ class RerunTest(InstallerHarness):
         with open(self.stack("komga-admin.txt")) as f:
             self.assertEqual(f.read(), saved)
 
-        # with the API key it looks, sees the Komga key and leaves it alone
-        rc, out, err = self.run_installer(env={"MANGARR_API_KEY": "MANGARR-API-KEY-SECRET"})
+        # with the API key (the one mang-arr made when the first run turned its login on) it looks, sees the
+        # Komga key and leaves it alone; the key read before that first login no longer opens anything
+        key = first["mangarr"]["settings"]["api_key"]
+        rc, out, err = self.run_installer(env={"MANGARR_API_KEY": key})
         self.assertInstalled(rc, out, err)
         self.assertIn("already has a Komga API key", out)
+        self.assertNotIn("replaced its API key", out)                    # a login was there: no new key
         self.assertEqual(self.state()["komga"]["keys"], first["komga"]["keys"])
+        self.assertEqual(self.state()["mangarr"]["settings"]["api_key"], key)
+        self.assertEqual(self.state()["mangarr"]["health_keys"][-1], key)
+        rc, out, err = self.run_installer(env={"MANGARR_API_KEY": "MANGARR-API-KEY-SECRET"})
+        self.assertNotEqual(rc, 0)
+        self.assertIn("rejected MANGARR_API_KEY", err)
 
     def test_rerun_replaces_a_komga_key_mangarr_lost(self):
         self.assertInstalled(*self.run_installer())
         st = self.state()
         st["mangarr"]["settings"]["komga_api_key"] = ""
         self.save_state(st)
-        rc, out, err = self.run_installer(env={"MANGARR_API_KEY": "MANGARR-API-KEY-SECRET"})
+        key = st["mangarr"]["settings"]["api_key"]
+        rc, out, err = self.run_installer(env={"MANGARR_API_KEY": key})
         self.assertInstalled(rc, out, err)
         st = self.state()
         self.assertEqual([k["id"] for k in st["komga"]["keys"]], ["K2"])       # old one removed, one new
         self.assertEqual(st["mangarr"]["settings"]["komga_api_key"], "KOMGA-KEY-2-SECRET")
         last_put = st["mangarr"]["puts"][-1]
         self.assertNotIn("auth_user", last_put["keys"])                         # login left as it was
-        self.assertEqual(last_put["api_key_header"], "MANGARR-API-KEY-SECRET")
+        self.assertEqual(last_put["api_key_header"], key)
+        self.assertEqual(st["mangarr"]["settings"]["api_key"], key)             # ... and so is the key
 
 
 class KomgaStopTest(InstallerHarness):

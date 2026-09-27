@@ -613,12 +613,17 @@ for suf in wanted:
 }
 
 # ------------------------------------------------------------------ mang-arr
-MA_HDR=""; MA_OK=0; MA_LOGIN_SET=0; MA_HAS_KOMGA=0; MA_NEW_PASSWORD=""
+MA_KEY=""; MA_HDR=""; MA_OK=0; MA_LOGIN_SET=0; MA_HAS_KOMGA=0; MA_NEW_PASSWORD=""
 MANGARR_SECRET_FILE=""
+
+use_mangarr_key() {  # use_mangarr_key <key>: send it (as X-Api-Key) on every later mang-arr call
+  MA_KEY=$1
+  MA_HDR=$(hdr mangarr "X-Api-Key: $1")
+}
 
 probe_mangarr() {  # may we change mang-arr's settings, and what does it have already?
   local st key
-  [[ -z "${MANGARR_API_KEY:-}" ]] || MA_HDR=$(hdr mangarr "X-Api-Key: $MANGARR_API_KEY")
+  [[ -z "${MANGARR_API_KEY:-}" ]] || use_mangarr_key "$MANGARR_API_KEY"
   st=$(req GET "$MANGARR/api/v1/settings" "$MA_HDR")
   case "$st" in
     2*)
@@ -626,7 +631,7 @@ probe_mangarr() {  # may we change mang-arr's settings, and what does it have al
       [[ -z "$(resp | jsonget auth_user)" ]] || MA_LOGIN_SET=1
       [[ -z "$(resp | jsonget komga_api_key)" ]] || MA_HAS_KOMGA=1
       key=$(resp | jsonget api_key) || key=""
-      if [[ -z "$MA_HDR" && -n "$key" && "$key" != "$MASK" ]]; then MA_HDR=$(hdr mangarr "X-Api-Key: $key"); fi
+      if [[ -z "$MA_HDR" && -n "$key" && "$key" != "$MASK" ]]; then use_mangarr_key "$key"; fi
       ;;
     401|403)
       [[ -z "${MANGARR_API_KEY:-}" ]] || die "mang-arr rejected MANGARR_API_KEY (HTTP $st)"
@@ -639,8 +644,10 @@ probe_mangarr() {  # may we change mang-arr's settings, and what does it have al
 
 # One PUT turns the login on and stores the Komga key, so the key never sits in a mang-arr that anyone
 # on the network could reconfigure (and point at their own "Komga") or back up without logging in.
+# Turning the login on also makes mang-arr replace its API key: the one read above was readable by
+# anyone while there was no login. The PUT answer carries the new key; later calls use that one.
 configure_mangarr() {
-  local st user="" pass=""
+  local st key user="" pass=""
   if [[ $MA_LOGIN_SET == 0 ]]; then
     user=$MANGARR_USER
     pass=${MANGARR_PASSWORD:-}
@@ -670,6 +677,11 @@ print(json.dumps(b))' >"$WORK/mangarr.json"
     die "mang-arr did not accept its settings (HTTP $st: $(resp | head -c 300))"
   fi
   [[ -z "$user" ]] || ok "mang-arr login turned on (user $user)"
+  key=$(resp | jsonget api_key 2>/dev/null) || key=""
+  if [[ -n "$key" && "$key" != "$MASK" && "$key" != "$MA_KEY" ]]; then
+    use_mangarr_key "$key"
+    ok "mang-arr replaced its API key now that it has a login (Settings -> Security shows the new one)"
+  fi
   [[ -z "$KOMGA_KEY" ]] || ok "mang-arr knows Komga (scan after every import)"
 }
 
@@ -786,7 +798,8 @@ main() {
     komga_key_and_library || warn "add a Komga API key yourself later: mang-arr -> Settings -> Komga"
   fi
   [[ $MA_OK == 0 ]] || configure_mangarr
-  if [[ "$(curl -fsS --max-time 60 "$MANGARR/api/v1/health" 2>/dev/null | jsonget ok 2>/dev/null)" =~ ^[Tt]rue$ ]]; then
+  # every mang-arr call from here on carries the current key (the new one after the rotation above)
+  if [[ "$(req GET "$MANGARR/api/v1/health" "$MA_HDR")" == 2* && "$(resp | jsonget ok 2>/dev/null)" =~ ^[Tt]rue$ ]]; then
     ok "mang-arr health: ok"
   else
     warn "mang-arr health reports problems: see System -> Status in mang-arr"

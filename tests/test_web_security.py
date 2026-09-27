@@ -2,6 +2,7 @@
 hardening, sessions, fail-closed settings, body limits, open-endpoint
 disclosure, short Suwayomi timeouts and the health cache."""
 import asyncio
+import http.cookiejar
 import logging
 import os
 import sqlite3
@@ -9,6 +10,8 @@ import tempfile
 import threading
 import time
 import unittest
+from collections import Counter
+from concurrent.futures import ThreadPoolExecutor
 from unittest import mock
 
 try:
@@ -72,6 +75,7 @@ class WebBase(unittest.TestCase):
                         mock.patch.object(lists_routes, "_app", web)]
         if security is not None:
             self.patches += [mock.patch.object(security, "throttle", security.Throttle()),
+                             mock.patch.object(security, "log_budget", security.LogBudget()),
                              mock.patch.object(security, "_verified", {})]
         if hasattr(web, "asyncio"):
             self.patches.append(mock.patch("mangarr.web.app.asyncio.sleep", self._no_sleep))
@@ -222,17 +226,48 @@ class CsrfHostTest(WebBase):
             self.assertIsNotNone(db.get_series(con, sid))
 
     def test_proxy_that_drops_the_port(self):
-        """Review 3(b): nginx `proxy_set_header Host $host` on port 8443 (Host without its port)."""
+        """Review 3(b), round 2 #48: nginx `proxy_set_header Host $host` on port 8443 (Host without its
+        port) works when the proxy names the port (X-Forwarded-Port) or the browser vouches for the
+        request (Sec-Fetch-Site); a bare Host no longer stands for any port."""
         c = self.client
         proxied = {"Origin": "https://manga.lan:8443", "Host": "manga.lan", "X-Forwarded-For": "192.168.1.4"}
-        self.assertEqual(c.post("/wanted/search", headers=proxied, follow_redirects=False).status_code, 303)
-        self.assertEqual(c.post("/wanted/search", headers={**proxied, "X-Forwarded-Port": "8443"},
-                                follow_redirects=False).status_code, 303)
-        for bad in ({**proxied, "X-Forwarded-Port": "443"},                         # proxy says another port
-                    {**proxied, "Origin": "https://evil.example:8443"},              # another host
-                    {"Origin": "https://manga.lan:8443", "Host": "manga.lan"},       # no proxy header: strict
-                    {**proxied, "Host": "manga.lan:6789"}):                          # Host has a port: strict
+        for good in ({**proxied, "X-Forwarded-Port": "8443"}, {**proxied, "Sec-Fetch-Site": "same-origin"},
+                     {**proxied, "Origin": "https://manga.lan"}):                    # default port: Host says it
+            self.assertEqual(c.post("/wanted/search", headers=good, follow_redirects=False).status_code, 303, good)
+        for bad in (proxied,                                                          # which port? not said
+                    {**proxied, "X-Forwarded-Port": "443"},                         # proxy says another port
+                    {**proxied, "Origin": "https://evil.example:8443", "X-Forwarded-Port": "8443"},  # another host
+                    {"Origin": "https://manga.lan:8443", "Host": "manga.lan"},
+                    {**proxied, "Host": "manga.lan:6789"},                           # Host has a port: strict
+                    {**proxied, "X-Forwarded-Port": "8443", "Sec-Fetch-Site": "same-site"}):   # browser says no
             self.assertEqual(c.post("/wanted/search", headers=bad).status_code, 403, bad)
+
+    def test_allowed_host_typed_with_a_port(self):
+        """Round 2 regression: an entry typed the way the 400 page quoted the Host (with its port) never
+        matched. The page now names the bare host, and entries are compared without a port."""
+        c = TestClient(self.web.app, base_url="http://manga.example.com:8443")
+        r = c.get("/api/v1/series")
+        self.assertEqual(r.status_code, 400)
+        self.assertIn("add 'manga.example.com' (the name alone, without a port)", r.text)
+        self.assertNotIn("8443", r.text)
+        self.set(allowed_hosts="Manga.Example.com:8443, https://other.example.org/x, [2001:db8::1]:6789, :80")
+        self.assertEqual(self.settings.all_values()["allowed_hosts"],
+                         ["2001:db8::1", "manga.example.com", "other.example.org"])
+        self.assertEqual(c.get("/api/v1/series").status_code, 200)
+        from mangarr import db
+        with db.connect() as con:                  # stored with its port by the previous version
+            con.execute("""UPDATE setting SET value='["manga.example.com:8443"]' WHERE key='allowed_hosts'""")
+            con.commit()
+            self.settings.refresh(con)
+        self.assertEqual(c.get("/api/v1/series").status_code, 200)
+        self.set(allowed_hosts="")
+        self.assertEqual(c.get("/api/v1/series").status_code, 400)
+        with mock.patch.dict(os.environ, {"MANGARR_ALLOWED_HOSTS": "manga.example.com:8443"}):
+            self.assertEqual(c.get("/api/v1/series").status_code, 200)
+        r = c.get("/api/v1/series", headers={"Host": "[::1"})               # garbled: no name to suggest
+        self.assertEqual(r.status_code, 400)
+        self.assertIn("is not a host name", r.text)
+        c.close()
 
     def test_host_allowlist(self):
         c = self.client
@@ -249,6 +284,64 @@ class CsrfHostTest(WebBase):
         self.set(allowed_hosts="other.example.net")
         self.assertEqual(c.get("/api/v1/series", headers={"Host": "other.example.net"}).status_code, 200)
         self.assertEqual(c.get("/api/v1/ping", headers={"Host": "evil.example"}).json(), {"ok": True})
+
+
+class SameSiteCsrfTest(WebBase):
+    """Round 2, #48: with a login and its SameSite=Lax cookie, a page on another port of the same host
+    (Suwayomi :4567, Komga :25600) or on a sibling subdomain is same-site. Its POSTs are refused however
+    the reverse proxy passes Host, while mang-arr's own pages, proxies and scripts keep working."""
+    login = ("andy", "pw")
+
+    def test_same_site_pages_refused(self):
+        self.signin()
+        proxied = {"Host": "nas.lan", "X-Forwarded-For": "192.168.1.20"}
+        attacks = (
+            {**proxied, "Origin": "http://nas.lan:4567", "Sec-Fetch-Site": "same-site"},    # the repro
+            {**proxied, "Origin": "http://nas.lan:4567"},                                   # older browser
+            {**proxied, "Origin": "http://nas.lan:4567", "X-Forwarded-Proto": "http"},
+            {**proxied, "Referer": "http://nas.lan:25600/book/1"},
+            {**proxied, "Origin": "http://komga.nas.lan", "Sec-Fetch-Site": "same-site"},   # sibling subdomain
+            {"Host": "nas.lan:6789", "Origin": "http://nas.lan:4567", "Sec-Fetch-Site": "same-site"},
+            {"Host": "nas.lan:6789", "Origin": "http://nas.lan:4567"},
+            # Sec-Fetch-Site decides when a browser sends it, even if Origin looks right
+            {"Host": "192.168.1.10:6789", "Origin": "http://192.168.1.10:6789", "Sec-Fetch-Site": "same-site"},
+            {"Host": "192.168.1.10:6789", "Sec-Fetch-Site": "cross-site"},
+        )
+        with self.assertLogs("mangarr.web.app", logging.WARNING) as logs:
+            for headers in attacks:
+                r = self.client.post("/settings", data={"auth_user": "andy", "auth_password": "attacker-pw"},
+                                     headers=headers, follow_redirects=False)
+                self.assertEqual(r.status_code, 403, headers)
+        self.assertIn("Sec-Fetch-Site 'same-site'", logs.output[0])
+        self.assertIn("'http://nas.lan:4567'", logs.output[0])
+        self.assertTrue(self.settings.verify_password(self.settings.all_values()["auth_password"], "pw"))
+        self.assertEqual(self.client.get("/api/v1/series").status_code, 200)        # still signed in
+
+    def test_own_pages_proxies_and_scripts_still_work(self):
+        self.signin()
+        traefik = {"Host": "mangarr.lan", "Origin": "http://mangarr.lan", "X-Forwarded-For": "192.168.1.4",
+                   "X-Forwarded-Proto": "http", "X-Forwarded-Port": "80", "X-Forwarded-Host": "mangarr.lan"}
+        allowed = (
+            {"Host": "192.168.1.10:6789", "Origin": "http://192.168.1.10:6789", "Sec-Fetch-Site": "same-origin"},
+            {"Host": "192.168.1.10:6789", "Origin": "http://192.168.1.10:6789"},        # no Sec-Fetch-Site
+            {"Host": "nas.local:6789", "Origin": "http://nas.local:6789", "Sec-Fetch-Site": "same-origin"},
+            {"Host": "nas.local:6789", "Referer": "http://nas.local:6789/settings"},
+            {**traefik, "Sec-Fetch-Site": "same-origin"},                                  # Traefik on port 80
+            traefik,
+            {"Host": "mangarr.lan", "Origin": "http://mangarr.lan"},
+            {"Host": "192.168.1.10:6789", "Sec-Fetch-Site": "none"},                     # the user's own action
+            {"Host": "192.168.1.10:6789"},                                                # curl: no Origin
+        )
+        for i, headers in enumerate(allowed):
+            r = self.client.post("/settings", data={"refresh_hours": str(i + 1)}, headers=headers,
+                                 follow_redirects=False)
+            self.assertEqual(r.status_code, 303, headers)
+        self.assertEqual(self.settings.all_values()["refresh_hours"], float(len(allowed)))
+        anon = TestClient(self.web.app)                  # an API client: its key skips the check
+        r = anon.put("/api/v1/settings", json={"refresh_hours": 2},
+                     headers={"X-Api-Key": self.key, "Origin": "http://nas.lan:4567", "Sec-Fetch-Site": "same-site"})
+        self.assertEqual(r.status_code, 200)
+        anon.close()
 
 
 class LoginTest(WebBase):
@@ -435,6 +528,69 @@ class LoginTest(WebBase):
         self.assertTrue(asyncio.iscoroutinefunction(self.web.login_submit))
 
 
+class ThrottleBurstTest(WebBase):
+    """Round 2, #53: password attempts are reserved before the (slow) check, so parallel guesses from one
+    address get no more checks than the same guesses one after another."""
+    login = ("andy", "pw")
+
+    def burst(self, n: int, send, cookies: bool = True) -> tuple[Counter, int]:
+        """n requests at once from one address on one event loop (like parallel connections); returns
+        (status codes, passwords checked). The check is slowed down so every request is in flight
+        before the first one fails."""
+        import httpx
+        checked, lock, real = [], threading.Lock(), self.settings.verify_password
+
+        def slow_verify(stored, given):
+            time.sleep(0.05)
+            with lock:
+                checked.append(given)
+            return real(stored, given)
+
+        async def run():
+            jar = None if cookies else http.cookiejar.CookieJar(http.cookiejar.DefaultCookiePolicy(allowed_domains=[]))
+            async with httpx.AsyncClient(transport=httpx.ASGITransport(app=self.web.app, client=("192.168.1.66", 1)),
+                                         base_url="http://testserver", cookies=jar) as ac:
+                return await asyncio.gather(*(send(ac) for _ in range(n)))
+        with mock.patch.object(self.settings, "verify_password", slow_verify):
+            responses = asyncio.run(run())
+        return Counter(r.status_code for r in responses), len(checked)
+
+    def test_reserve_is_atomic(self):
+        t = self.security.Throttle()
+        with ThreadPoolExecutor(32) as ex:
+            waits = list(ex.map(lambda _: t.reserve("10.0.0.9"), range(1000)))
+        self.assertEqual(waits.count(0), t.FREE + 1)
+        self.assertTrue(all(w >= 1 for w in waits if w))
+        t.succeeded("10.0.0.9")
+        self.assertEqual(t.reserve("10.0.0.9"), 0)
+
+    def test_parallel_wrong_logins(self):
+        allowed = self.security.Throttle.FREE + 1                  # what sequential guesses get before 429
+        with self.assertLogs("mangarr.web.app", logging.WARNING) as logs:
+            codes, checked = self.burst(1000, lambda ac: ac.post("/login", data={"username": "andy",
+                                                                                 "password": "guess"}))
+        self.assertEqual(checked, allowed)
+        self.assertEqual(codes, Counter({401: allowed, 429: 1000 - allowed}))
+        self.assertLessEqual(len(logs.output), allowed + self.security.LogBudget.PER_MINUTE + 1)
+        codes, checked = self.burst(1, lambda ac: ac.post("/login", data={"username": "andy", "password": "pw"}))
+        self.assertEqual((codes, checked), (Counter({429: 1}), 0))  # blocked, as after 6 failures in a row
+
+    def test_parallel_wrong_basic_auth(self):
+        self.set(auth_method="basic")
+        allowed = self.security.Throttle.FREE + 1
+        codes, checked = self.burst(300, lambda ac: ac.get("/api/v1/series", auth=("andy", "nope")))
+        self.assertEqual(checked, allowed)
+        self.assertEqual(codes, Counter({401: allowed, 429: 300 - allowed}))
+
+    def test_parallel_right_basic_auth_is_not_throttled(self):
+        """A Basic client without a cookie jar sends the password with every request: once it has been
+        checked, parallel requests need no reservation, so they are never refused."""
+        self.set(auth_method="basic")
+        self.assertEqual(self.client.get("/api/v1/series", auth=("andy", "pw")).status_code, 200)
+        codes, checked = self.burst(50, lambda ac: ac.get("/api/v1/series", auth=("andy", "pw")), cookies=False)
+        self.assertEqual((codes, checked), (Counter({200: 50}), 0))
+
+
 class SessionTest(WebBase):
     """#118: sessions can be revoked."""
     login = ("andy", "pw")
@@ -560,19 +716,37 @@ class ApiKeyRotationTest(WebBase):
         self.assertEqual(self.client.get("/api/v1/series", headers={"X-Api-Key": old}).status_code, 401)
         self.assertEqual(self.client.get("/api/v1/series", headers={"X-Api-Key": new}).status_code, 200)
 
-    def test_installer_flow_keeps_its_key(self):
-        """GET key -> PUT login with X-Api-Key -> the same key keeps working (install.sh)."""
+    def test_installer_flow_gets_a_new_key(self):
+        """Round 2, installer #9: GET key while open -> PUT login + Komga key with X-Api-Key (install.sh).
+        A copy of the key read in between must not survive: the key is replaced even though the PUT used
+        it, and the response carries the new one so the installer can carry on."""
+        anon = TestClient(self.web.app)
+        stolen = anon.get("/api/v1/settings").json()["api_key"]           # anyone on the LAN, before the PUT
         key = self.client.get("/api/v1/settings").json()["api_key"]
-        r = self.client.put("/api/v1/settings", json={"auth_user": "andy", "auth_password": "pw"},
-                            headers={"X-Api-Key": key})
+        self.assertEqual(stolen, key)
+        r = self.client.put("/api/v1/settings", headers={"X-Api-Key": key},
+                            json={"auth_user": "admin", "auth_password": "pw", "komga_url": "http://komga:25600",
+                                  "komga_api_key": "ADMIN-KEY-FROM-INSTALLER"})
         self.assertEqual(r.status_code, 200)
-        self.assertNotIn("x-mangarr-notice", r.headers)
-        self.assertEqual(self.client.get("/api/v1/series", headers={"X-Api-Key": key}).status_code, 200)
-        self.assertEqual(self.client.get("/api/v1/series").status_code, 401)
-        # a key chosen in the same call is kept too
+        self.assertIn("API key was regenerated", r.headers.get("x-mangarr-notice", ""))
+        new = r.json()["api_key"]
+        self.assertNotEqual(new, key)
+        self.assertEqual(new, self.settings.all_values()["api_key"])
+        for method, path in (("GET", "/api/v1/series"), ("GET", "/api/v1/settings"), ("GET", "/system/backup")):
+            self.assertEqual(anon.request(method, path, headers={"X-Api-Key": stolen}).status_code, 401, path)
+        self.assertEqual(anon.put("/api/v1/settings", json={"komga_url": "http://attacker.example"},
+                                  headers={"X-Api-Key": stolen}).status_code, 401)
+        self.assertEqual(self.client.get("/api/v1/series", headers={"X-Api-Key": new}).status_code, 200)
+        anon.close()
+        # a key chosen in the same call is kept (it was never readable); sending the old one back is not
         self.set(auth_user="")
-        r = self.client.put("/api/v1/settings", json={"auth_user": "andy", "auth_password": "pw", "api_key": "c" * 32})
+        self.client.put("/api/v1/settings", json={"auth_user": "andy", "auth_password": "pw", "api_key": "c" * 32})
         self.assertEqual(self.client.get("/api/v1/series", headers={"X-Api-Key": "c" * 32}).status_code, 200)
+        self.set(auth_user="")
+        r = self.client.put("/api/v1/settings", json={"auth_user": "andy", "auth_password": "pw", "api_key": "c" * 32},
+                            headers={"X-Api-Key": "c" * 32})
+        self.assertNotEqual(r.json()["api_key"], "c" * 32)
+        self.assertEqual(self.client.get("/api/v1/series", headers={"X-Api-Key": "c" * 32}).status_code, 401)
 
 
 class SecretDestinationTest(WebBase):

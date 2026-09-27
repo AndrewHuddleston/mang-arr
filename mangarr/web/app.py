@@ -335,12 +335,13 @@ def _job_search_wanted(job: jobs.Job):
 #   1. the body limit (security.BodyLimit): bodies over MAX_BODY (BODY_LIMITS per path) get 413
 #   2. settings: if they have never been readable, 503 (the login state is unknown: fail closed)
 #   3. the Host check: only IPs, localhost, LAN names and allowed_hosts (DNS rebinding)
-#   4. the CSRF check: a POST/PUT/PATCH/DELETE whose Origin (else Referer) names another
-#      host:port is refused (403); requests with neither header (curl, scripts) go on to
-#      the normal login check, and a valid X-Api-Key header skips this check
+#   4. the CSRF check: a POST/PUT/PATCH/DELETE is refused (403) when the browser's
+#      Sec-Fetch-Site is anything but same-origin/none, or, without it, when its Origin
+#      (else Referer) names another host:port; requests with none of these headers (curl,
+#      scripts) go on to the normal login check, and a valid X-Api-Key header skips this check
 #   5. the login check (when a login is set): X-Api-Key header, ?apikey= (GET under /api/
 #      only), the session cookie, or Basic credentials (auth_method basic only); password
-#      attempts are throttled per client address
+#      attempts are throttled per client address, each one reserved before its check
 # and every response gets the security headers (CSP: scripts only from /static).
 # The helpers live in security.py.
 
@@ -362,23 +363,30 @@ async def authentication(request: Request, call_next):
 
     host = request.headers.get("host", "")
     if not security.host_allowed(host, security.allowed_hosts(v)):
+        name = security.hostname(host)          # what to add: the name alone (ports are never compared)
         if security.log_budget.allow(ip):
             log.warning("refused request for host %s from %s: not an allowed host name (DNS rebinding protection;"
-                        " add it to MANGARR_ALLOWED_HOSTS or Settings -> Security)", security.clip(host), ip)
-        return Response(f"mang-arr: the host name {security.clip(host)} is not allowed. Open mang-arr by IP address, "
-                        "localhost or a LAN name, or add this name to MANGARR_ALLOWED_HOSTS (or Settings -> "
-                        "Security -> Allowed Host Names).\n", 400, media_type="text/plain")
+                        " add %s to MANGARR_ALLOWED_HOSTS or Settings -> Security)", security.clip(host), ip,
+                        security.clip(name) if name else "nothing: it is not a host name")
+        if not name:
+            return Response(f"mang-arr: the Host header {security.clip(host)} is not a host name.\n", 400,
+                            media_type="text/plain")
+        return Response(f"mang-arr: the host name {security.clip(name)} is not allowed. Open mang-arr by IP address, "
+                        f"localhost or a LAN name, or add {security.clip(name)} (the name alone, without a port) to "
+                        "MANGARR_ALLOWED_HOSTS or Settings -> Security -> Allowed Host Names.\n", 400,
+                        media_type="text/plain")
 
     via = "apikey" if security.key_ok(v, request.headers.get("x-api-key")) else ""
     if request.method not in security.SAFE_METHODS and not via:
-        ok, src = security.same_origin(request)
+        ok, why = security.same_origin(request)
         if not ok:
             if security.log_budget.allow(ip):
-                log.warning("refused cross-site %s %s from %s: Origin/Referer %s does not match Host %s",
-                            request.method, security.clip(path, 200), ip, security.clip(src, 200), security.clip(host))
-            return Response("mang-arr: cross-site request refused (its Origin/Referer is not this server). Behind "
-                            "a reverse proxy, pass the original Host header with its port ($http_host in nginx), "
-                            "or X-Forwarded-Host.\n", 403, media_type="text/plain")
+                log.warning("refused cross-site %s %s from %s: %s (Host %s)",
+                            request.method, security.clip(path, 200), ip, why, security.clip(host))
+            return Response("mang-arr: cross-site request refused (it did not come from mang-arr's own pages: "
+                            "another site, or another port on this host). Behind a reverse proxy, pass the "
+                            "original Host header with its port ($http_host in nginx), or X-Forwarded-Host / "
+                            "X-Forwarded-Port.\n", 403, media_type="text/plain")
 
     if not v["auth_user"]:
         request.state.authed, request.state.via = True, "open"       # no login configured: everyone is admin
@@ -393,15 +401,19 @@ async def authentication(request: Request, call_next):
             creds = security.basic_credentials(request.headers.get("authorization", ""))
             if creds:
                 wait = security.throttle.retry_after(ip)
-                if wait:
-                    return security.too_many(wait, "logins from this address")
-                if await run_in_threadpool(security.credentials_ok, v, *creds):
-                    via = "basic"
-                    security.throttle.succeeded(ip)
+                if not wait and security.remembered(v, *creds):
+                    via = "basic"                # right a moment ago: no new check, nothing to reserve
                 else:
-                    blocked = security.throttle.failed(ip)
-                    log.warning("failed basic auth for %s from %s%s", security.clip(creds[0]), ip,
-                                f"; further attempts refused for {blocked} s" if blocked else "")
+                    wait = wait or security.throttle.reserve(ip)       # before the hash: bursts count too
+                    if wait:
+                        return security.too_many(wait, "logins from this address")
+                    if await run_in_threadpool(security.credentials_ok, v, *creds):
+                        via = "basic"
+                        security.throttle.succeeded(ip)
+                    else:
+                        blocked = security.throttle.retry_after(ip)
+                        log.warning("failed basic auth for %s from %s%s", security.clip(creds[0]), ip,
+                                    f"; further attempts refused for {blocked} s" if blocked else "")
         request.state.authed, request.state.via = bool(via), via
         if not via and not (path in OPEN_PATHS or path.startswith(("/static/", "/login", "/logout"))):
             if security.log_budget.allow(ip):
@@ -451,9 +463,10 @@ def _no_password_note(v: dict) -> str | None:
 @app.post("/login")
 async def login_submit(request: Request, username: str = Form(""), password: str = Form(""), next: str = Form("/")):
     """Async on purpose: the failure delay is an asyncio sleep, so a flood of
-    bad logins holds no worker threads; the hash check runs in the pool."""
+    bad logins holds no worker threads; the hash check runs in the pool. The
+    attempt is reserved before the check, so parallel guesses count at once."""
     ip, target = security.client_ip(request), security.safe_next(next)
-    wait = security.throttle.retry_after(ip)
+    wait = security.throttle.reserve(ip)
     if wait:
         if security.log_budget.allow(ip):
             log.warning("login from %s refused: too many failures, blocked for %d s more", ip, wait)
@@ -461,7 +474,7 @@ async def login_submit(request: Request, username: str = Form(""), password: str
                            {"Retry-After": str(wait)})
     v = await run_in_threadpool(settings.all_values)
     if not await run_in_threadpool(security.credentials_ok, v, username, password):
-        blocked = security.throttle.failed(ip)
+        blocked = security.throttle.retry_after(ip)             # the failure was counted by reserve()
         log.warning("failed login for %s from %s%s", security.clip(username), ip,
                     f"; further attempts refused for {blocked} s" if blocked else "")
         await asyncio.sleep(1)                   # slow down guessing (without holding a thread)
@@ -1211,7 +1224,7 @@ def _settings_save(request: Request, form) -> Response:
     try:
         with db.connect() as con:
             notices = settings.set_many(con, values)
-            notices += _rotate_key_if_login_enabled(con, before, request, values)
+            notices += _rotate_key_if_login_enabled(con, before)
     except (ValueError, KeyError) as e:
         log.warning("settings not saved: %s", e)
         return _flash("/settings", f"invalid value, nothing saved: {e}")
@@ -1225,16 +1238,19 @@ def _settings_save(request: Request, form) -> Response:
     return resp
 
 
-def _rotate_key_if_login_enabled(con, before: dict, request: Request, submitted: dict) -> list[str]:
+def _rotate_key_if_login_enabled(con, before: dict) -> list[str]:
     """When a login is switched on, the API key minted while everything was
     open must count as disclosed (anyone could read it then), so it is
-    replaced, unless this very request authenticated with it (the installer
-    reads the key, then enables the login and keeps using the key) or set a
-    new key itself. The new key is in the PUT response / on the Settings page."""
-    if before["auth_user"] or not settings.all_values(con)["auth_user"]:
+    replaced, also when this very request authenticated with it: the
+    installer reads the key, then switches the login on, and a copy someone
+    else read in between must not keep working. Only a key this request set
+    itself (a new value, never stored while open) is kept. The new key is in
+    the PUT response, so an API client carries on with it, and on the
+    Settings page."""
+    after = settings.all_values(con)
+    if before["auth_user"] or not after["auth_user"]:
         return []
-    if security.key_ok(before, request.headers.get("x-api-key")) or \
-            str(submitted.get("api_key", settings.MASK)).strip() != settings.MASK:
+    if after["api_key"] != before["api_key"]:
         return []
     settings.rotate_api_key(con)
     msg = "login switched on, so the API key was regenerated (the old one was readable while there was no login)"
@@ -1420,13 +1436,14 @@ def api_settings_put(request: Request, body: dict):
     strings; a secret given as the mask keeps its value. Unknown keys -> 400.
     A secret cleared because its destination changed is named in the
     X-Mangarr-Notice header (and the log), and so is a new API key when this
-    call switched the login on without sending X-Api-Key (the response then
-    carries the new key)."""
+    call switched the login on: the response then carries the new key, and
+    the key the call was made with (readable while there was no login) no
+    longer works."""
     before = settings.all_values()
     try:
         with db.connect() as con:
             notices = settings.set_many(con, body)
-            notices += _rotate_key_if_login_enabled(con, before, request, body)
+            notices += _rotate_key_if_login_enabled(con, before)
     except (KeyError, ValueError) as e:
         raise HTTPException(400, f"invalid setting: {e}") from e
     headers = {"X-Mangarr-Notice": "; ".join(notices)} if notices else None
