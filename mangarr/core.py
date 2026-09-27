@@ -311,25 +311,53 @@ def delete_series(con, client: Client, series_id: int, delete_library: bool = Fa
         except SuwayomiError as e:
             log.warning("%s: could not unset library flag on %s entry: %s", title, s["source_name"], e)
     if delete_library and folder:
-        removed = 0
-        for c in db.chapters(con, series_id):
-            p = c["library_path"]
-            if p and os.path.isfile(p):
-                try:
-                    os.remove(p)
-                    removed += 1
-                except OSError as e:
-                    log.warning("%s: could not remove %s: %s", title, p, e)
-        d = library.library_dir(folder)
-        try:
-            os.rmdir(d)
-        except OSError as e:
-            log.info("%s: library folder %s kept: %s", title, d, e)
-        log.info("%s: removed %d file(s) from %s", title, removed, d)
+        _delete_library_files(con, series_id, title, folder)
     db.delete_series(con, series_id)
     db.event(con, "deleted", f"{title} removed" + (" with library files" if delete_library else ""))
     con.commit()
     log.info("%s: no longer tracked", title)
+
+
+def _delete_library_files(con, series_id: int, title: str, folder: str) -> None:
+    """Remove the library files this series recorded, then its folder if it is
+    empty. Paths come from the database, which a restored backup can fill
+    with anything, so only regular files inside this series' own library
+    folder (itself inside LIBRARY_ROOT, symlinks resolved) are touched;
+    anything else is skipped with a warning."""
+    import stat
+    root = library.config.LIBRARY_ROOT
+    d = library.library_dir(folder) if db.valid_folder(folder) else None
+    if d is None or not library.is_within(d, root) or os.path.realpath(d) == os.path.realpath(root):
+        log.warning("%s: library folder %r is not a folder inside %s; no files deleted", title, folder, root)
+        return
+    removed = 0
+    for c in db.chapters(con, series_id):
+        p = c["library_path"]
+        if not p:
+            continue
+        if not library.is_within(p, d):
+            log.warning("%s: not deleting %s: it is outside the series' library folder %s", title, p, d)
+            continue
+        try:
+            st = os.lstat(p)
+        except FileNotFoundError:
+            continue
+        except OSError as e:
+            log.warning("%s: could not check %s: %s", title, p, e)
+            continue
+        if not stat.S_ISREG(st.st_mode):
+            log.warning("%s: not deleting %s: not a regular file", title, p)
+            continue
+        try:
+            os.remove(p)
+            removed += 1
+        except OSError as e:
+            log.warning("%s: could not remove %s: %s", title, p, e)
+    try:
+        os.rmdir(d)
+    except OSError as e:
+        log.info("%s: library folder %s kept: %s", title, d, e)
+    log.info("%s: removed %d file(s) from %s", title, removed, d)
 
 
 # -- import ------------------------------------------------------------------

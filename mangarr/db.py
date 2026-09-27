@@ -2,16 +2,23 @@
 them, and the state of every chapter.
 
 Schema changes are applied as numbered migrations against PRAGMA
-user_version, so an existing database upgrades in place.
+user_version, so an existing database upgrades in place. Each migration is
+applied in one transaction together with its version bump, so a failure
+(disk full, a kill mid-upgrade) leaves the previous version intact rather
+than half a migration that every later start trips over.
 """
 import json
+import logging
 import os
 import sqlite3
+import threading
 import time
 from contextlib import contextmanager
 
 from . import config, library
 from .model import Series
+
+log = logging.getLogger(__name__)
 
 MIGRATIONS = [
     # 1: initial schema
@@ -145,6 +152,10 @@ MIGRATIONS = [
     ALTER TABLE source_stats ADD COLUMN throttled INTEGER NOT NULL DEFAULT 0;
     ALTER TABLE source_stats ADD COLUMN last_throttled TEXT;
     """,
+    # 12: per-series event lookups (series page, chapter details) without scanning every event
+    """
+    CREATE INDEX IF NOT EXISTS event_series ON event(series_id, id);
+    """,
 ]
 
 
@@ -152,37 +163,119 @@ def now() -> str:
     return time.strftime("%Y-%m-%d %H:%M:%S")
 
 
-def migrate(con: sqlite3.Connection) -> None:
-    version = con.execute("PRAGMA user_version").fetchone()[0]
-    for i, sql in enumerate(MIGRATIONS[version:], start=version + 1):
-        con.executescript(sql)
-        con.execute(f"PRAGMA user_version = {i}")
-        if i == 3:
-            _backfill_folders(con)
-    con.commit()
+def _statements(sql: str) -> list[str]:
+    """The statements of a migration script, one per entry (sqlite3 runs one
+    statement per execute(); executescript() would commit after each)."""
+    out, buf = [], ""
+    for line in sql.splitlines(keepends=True):
+        buf += line
+        if sqlite3.complete_statement(buf):
+            out.append(buf.strip())
+            buf = ""
+    if buf.strip():
+        raise ValueError(f"incomplete statement in migration: {buf.strip()[:80]!r}")
+    return out
+
+
+_migrate_lock = threading.Lock()      # threads of this process migrate one at a time
+
+
+def migrate(con: sqlite3.Connection, target: int | None = None) -> None:
+    """Bring the database up to `target` (default: the latest schema). Each
+    migration runs in its own BEGIN IMMEDIATE transaction that also bumps
+    user_version, and the version is re-read after the write lock is taken,
+    so concurrent connections (threads or processes) never apply the same
+    migration twice and a failure leaves the previous version intact."""
+    target = len(MIGRATIONS) if target is None else target
+    if con.execute("PRAGMA user_version").fetchone()[0] >= target:
+        return                                     # the common case: nothing to do, no lock
+    with _migrate_lock:
+        con.commit()                               # nothing of the caller's may ride along
+        while True:
+            con.execute("BEGIN IMMEDIATE")
+            version = -1
+            try:
+                version = con.execute("PRAGMA user_version").fetchone()[0]
+                if version >= target:
+                    con.commit()
+                    return
+                i = version + 1
+                for stmt in _statements(MIGRATIONS[version]):
+                    con.execute(stmt)
+                if i == 3:
+                    _backfill_folders(con)
+                con.execute(f"PRAGMA user_version = {i}")
+                con.commit()
+            except BaseException as e:
+                con.rollback()
+                log.error("database migration %d failed and was rolled back (schema stays at %d): %s",
+                          version + 1, version, e)
+                raise
+            log.info("database schema migrated to version %d", i)
 
 
 def _backfill_folders(con) -> None:
     taken: set[str] = set()
     for r in con.execute("SELECT id, ref, title FROM series ORDER BY id").fetchall():
-        folder = library.unique_folder(r["title"], taken, r["ref"])
+        folder = library.unique_folder(r[2], taken, r[1])
         taken.add(folder)
-        con.execute("UPDATE series SET folder=? WHERE id=?", (folder, r["id"]))
+        con.execute("UPDATE series SET folder=? WHERE id=?", (folder, r[0]))
+
+
+def valid_folder(folder) -> bool:
+    """Is this a usable series folder name: one plain path component (no
+    separator, no NUL, not absolute, not '', '.' or '..')? Folders are joined
+    onto LIBRARY_ROOT, so anything else would point outside it. This is a
+    structural check only (library.safe_title is not idempotent, e.g.
+    'Foo ...' -> 'Foo ', so "safe_title(folder) == folder" would reject
+    folders mang-arr made itself); callers that delete files also check
+    library.is_within on the resolved folder, which catches symlinks."""
+    if not isinstance(folder, str) or folder in ("", ".", "..") or "\0" in folder:
+        return False
+    # '\\' too: safe_title never makes it, and it is a separator on SMB/Windows shares
+    return not any(sep in folder for sep in ("/", "\\", os.sep, os.altsep or "/")) and not os.path.isabs(folder)
+
+
+def restrict_permissions(path: str) -> None:
+    """Make a database file (and its -wal/-shm companions) readable by the
+    owner only: it holds the login password, the API key and notifier tokens."""
+    for p in (path, path + "-wal", path + "-shm"):
+        try:
+            st = os.stat(p)
+        except OSError:
+            continue
+        if st.st_mode & 0o077:
+            try:
+                os.chmod(p, 0o600)
+            except OSError as e:
+                log.warning("cannot make %s private (chmod 600): %s", p, e)
+
+
+_restricted: set[str] = set()          # database paths already made private in this process
 
 
 @contextmanager
 def connect(path: str | None = None):
     path = path or config.DB_PATH
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    if path not in _restricted and not os.path.exists(path):
+        os.close(os.open(path, os.O_WRONLY | os.O_CREAT, 0o600))    # a new database starts private
     con = sqlite3.connect(path, timeout=30)
-    con.row_factory = sqlite3.Row
-    con.execute("PRAGMA foreign_keys = ON")
     try:
-        con.execute("PRAGMA journal_mode = WAL")   # web requests read while a job writes
-        con.execute("PRAGMA synchronous = NORMAL")
-    except sqlite3.OperationalError:               # another process holds it; next open will switch
-        pass
-    migrate(con)
+        con.row_factory = sqlite3.Row
+        con.execute("PRAGMA foreign_keys = ON")
+        try:
+            con.execute("PRAGMA journal_mode = WAL")   # web requests read while a job writes
+            con.execute("PRAGMA synchronous = NORMAL")
+        except sqlite3.OperationalError:               # another process holds it; next open will switch
+            pass
+        if path not in _restricted:
+            restrict_permissions(path)                 # also tightens a database made by an older version
+            _restricted.add(path)
+        migrate(con)
+    except BaseException:
+        con.close()
+        raise
     try:
         yield con
         con.commit()
@@ -190,9 +283,49 @@ def connect(path: str | None = None):
         con.close()
 
 
+EVENT_MESSAGE_MAX = 2000     # characters; a summary listing every gap or source cannot grow the table unbounded
+
+
 def event(con, kind: str, message: str, series_id: int | None = None) -> None:
+    if len(message) > EVENT_MESSAGE_MAX:
+        message = message[:EVENT_MESSAGE_MAX - 3] + "..."
     con.execute("INSERT INTO event (at, series_id, kind, message) VALUES (?,?,?,?)",
                 (now(), series_id, kind, message))
+
+
+# Per-pass summaries written for every series on every refresh ("Sources
+# resolved", "Needs a decision"). On a large library they are most of the
+# table, so the row cap removes these first and the chapter history
+# (downloaded, imported, failed, ...) keeps its full keep_days.
+ROUTINE_EVENT_KINDS = ("resolved", "review")
+
+
+def prune_events(con, keep_days: float, keep_rows: int) -> int:
+    """Delete events older than keep_days; then, if more than keep_rows are
+    left, the oldest routine events and only after those the oldest of any
+    kind. Returns how many were deleted. The history is for the UI; without
+    this the table (and every backup) grows forever."""
+    cutoff = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(time.time() - keep_days * 86400))
+    aged = con.execute("DELETE FROM event WHERE at < ?", (cutoff,)).rowcount
+    excess = con.execute("SELECT COUNT(*) FROM event").fetchone()[0] - max(keep_rows, 0)
+    routine = other = 0
+    if excess > 0:
+        marks = ",".join("?" for _ in ROUTINE_EVENT_KINDS)
+        routine = con.execute(f"DELETE FROM event WHERE id IN (SELECT id FROM event WHERE kind IN ({marks})"
+                              " ORDER BY id LIMIT ?)", (*ROUTINE_EVENT_KINDS, excess)).rowcount
+        excess -= routine
+    if excess > 0:
+        other = con.execute("DELETE FROM event WHERE id IN (SELECT id FROM event ORDER BY id LIMIT ?)",
+                            (excess,)).rowcount
+    con.commit()
+    if aged:
+        log.info("event history pruned: %d event(s) older than %g days removed", aged, keep_days)
+    if routine or other:
+        log.info("event history over %d events: removed the %d oldest routine (resolved/review) event(s)"
+                 "%s", keep_rows, routine,
+                 f" and, as that was not enough, the {other} oldest other event(s): raise "
+                 f"MANGARR_EVENTS_KEEP_ROWS to keep {keep_days:g} days" if other else "")
+    return aged + routine + other
 
 
 # -- series -----------------------------------------------------------------
@@ -248,7 +381,7 @@ def series_size(con, series_id: int) -> tuple[int, int]:
     total = files = 0
     for r in con.execute("SELECT library_path FROM chapter WHERE series_id=? AND status='have'", (series_id,)):
         p = r["library_path"]
-        if p:
+        if p and library.is_within(p, config.LIBRARY_ROOT):     # never stat paths outside the library
             try:
                 total += os.path.getsize(p)
                 files += 1

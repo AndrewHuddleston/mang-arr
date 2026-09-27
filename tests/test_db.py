@@ -1,10 +1,13 @@
 """Database behaviour that has bitten before: folder uniqueness, stale
 wanted rows, migrations on an existing file."""
 import os
+import sqlite3
 import tempfile
+import threading
 import unittest
+from unittest import mock
 
-from mangarr import db
+from mangarr import db, library
 from mangarr.model import Series
 from mangarr.resolver import Plan, SourceMatch
 from mangarr.suwayomi import Chapter, Source
@@ -109,6 +112,117 @@ class AutoThrottleTest(unittest.TestCase):
             self.assertEqual(db.source_stats(con)["Manganato (EN)"]["throttled"], 2)
             con.execute("UPDATE source_stats SET last_throttled='2000-01-01 00:00:00'")
             self.assertEqual(db.auto_throttled(con), set())
+
+
+class MigrationTest(unittest.TestCase):
+    """Each migration is one transaction with its version bump (#32, #74)."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.path = os.path.join(self.tmp.name, "m.db")
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def version(self):
+        con = sqlite3.connect(self.path)
+        try:
+            return con.execute("PRAGMA user_version").fetchone()[0]
+        finally:
+            con.close()
+
+    def test_failed_migration_is_rolled_back_and_retried_cleanly(self):
+        with db.connect(self.path):
+            pass
+        n = len(db.MIGRATIONS)
+        broken = [*db.MIGRATIONS, "ALTER TABLE series ADD COLUMN extra1 TEXT;\nALTER TABLE nope ADD COLUMN x TEXT;\n"]
+        with mock.patch.object(db, "MIGRATIONS", broken), self.assertRaises(sqlite3.OperationalError):
+            with db.connect(self.path):
+                pass
+        self.assertEqual(self.version(), n)                    # the version did not move ...
+        con = sqlite3.connect(self.path)
+        cols = [r[1] for r in con.execute("PRAGMA table_info(series)")]
+        con.close()
+        self.assertNotIn("extra1", cols)                       # ... and neither did the first ALTER
+        fixed = [*db.MIGRATIONS, "ALTER TABLE series ADD COLUMN extra1 TEXT;\nALTER TABLE series ADD COLUMN extra2 TEXT;\n"]
+        with mock.patch.object(db, "MIGRATIONS", fixed), db.connect(self.path) as con:   # a corrected release works
+            cols = [r[1] for r in con.execute("PRAGMA table_info(series)")]
+        self.assertIn("extra2", cols)
+        self.assertEqual(self.version(), n + 1)
+
+    def test_concurrent_first_connections_migrate_once(self):
+        con = sqlite3.connect(self.path)
+        con.row_factory = sqlite3.Row
+        db.migrate(con, target=2)
+        con.close()
+        errors = []
+
+        def open_it():
+            try:
+                with db.connect(self.path) as c:
+                    c.execute("SELECT COUNT(*) FROM series").fetchone()
+            except Exception as e:                            # noqa: BLE001 - collected for the assertion
+                errors.append(e)
+        threads = [threading.Thread(target=open_it) for _ in range(8)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        self.assertEqual(errors, [])
+        self.assertEqual(self.version(), len(db.MIGRATIONS))
+
+    def test_every_migration_splits_into_statements(self):
+        for sql in db.MIGRATIONS:
+            stmts = db._statements(sql)
+            self.assertTrue(stmts)
+            for st in stmts:
+                self.assertTrue(sqlite3.complete_statement(st))
+
+
+class EventHistoryTest(unittest.TestCase):
+    """The event table is indexed per series and bounded (#67, #90)."""
+
+    def test_index_long_messages_and_pruning(self):
+        with tempfile.TemporaryDirectory() as tmp, db.connect(os.path.join(tmp, "e.db")) as con:
+            plan = " ".join(r[3] for r in con.execute(
+                "EXPLAIN QUERY PLAN SELECT * FROM event WHERE series_id=? ORDER BY id DESC LIMIT 15", (1,)))
+            self.assertIn("event_series", plan)
+            db.event(con, "resolved", "x" * 50000, 1)
+            self.assertLessEqual(len(con.execute("SELECT message FROM event").fetchone()[0]), db.EVENT_MESSAGE_MAX)
+            for i in range(10):
+                db.event(con, "resolved", f"m{i}", 1)
+            con.execute("UPDATE event SET at='2001-01-01 00:00:00' WHERE message='m0'")
+            self.assertEqual(db.prune_events(con, keep_days=30, keep_rows=5), 6)   # m0 by age, 5 more by count
+            self.assertEqual([r[0] for r in con.execute("SELECT message FROM event ORDER BY id")],
+                             [f"m{i}" for i in range(5, 10)])
+
+
+class PathSafetyTest(unittest.TestCase):
+    def test_series_size_only_counts_library_files(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            lib = os.path.join(tmp, "lib")
+            os.makedirs(os.path.join(lib, "S"))
+            inside, outside = os.path.join(lib, "S", "c.cbz"), os.path.join(tmp, "secret")
+            for p in (inside, outside):
+                with open(p, "wb") as f:
+                    f.write(b"x" * 10)
+            with mock.patch("mangarr.config.LIBRARY_ROOT", lib), db.connect(os.path.join(tmp, "p.db")) as con:
+                sid = db.upsert_series(con, Series(anilist_id=5, english="S"))
+                db.set_have(con, sid, 1.0, None, inside)
+                db.set_have(con, sid, 2.0, None, outside)
+                self.assertEqual(db.series_size(con, sid), (10, 1))
+
+    def test_valid_folder(self):
+        for ok in ("Wind Breaker", "Wind Breaker (anilist_2)", "untitled"):
+            self.assertTrue(db.valid_folder(ok), ok)
+        for bad in ("", ".", "..", "/etc", "../x", "a/b", "a\\b", "a\0b", None, 3):
+            self.assertFalse(db.valid_folder(bad), bad)
+
+    def test_valid_folder_accepts_every_folder_mang_arr_makes(self):
+        # safe_title is not idempotent ('Foo ...' -> 'Foo '): its output must still count as valid
+        for title in ("Foo ...", "Why Me .", " x ", "a:b", "..", "...", "/", "Wind Breaker"):
+            folder = library.unique_folder(title, set(), "anilist:1")
+            self.assertTrue(db.valid_folder(folder), (title, folder))
 
 
 if __name__ == "__main__":

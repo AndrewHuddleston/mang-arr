@@ -192,6 +192,9 @@ with an asterisk to the container mounts (`/config`, `/data/staging`,
 | `MANGARR_FIRST_REFRESH_MIN` | `5` | Minutes after start-up before the first scheduled refresh. |
 | `MANGARR_BACKUP_HOURS` | `24` | Hours between scheduled database backups (`serve` only). |
 | `MANGARR_BACKUPS_KEEP` | `7` | How many backups to keep in `$MANGARR_DATA/backups`; the oldest are pruned after every backup. |
+| `MANGARR_BACKUP_UPLOAD_MAX_MB` | `512` | Largest backup file accepted by *Restore from file* (raised to twice the current database when that is larger). |
+| `MANGARR_EVENTS_KEEP_DAYS` | `90` | Days of event history (Activity, series pages) kept; older events are pruned before each scheduled backup. |
+| `MANGARR_EVENTS_KEEP_ROWS` | `100000` | Size ceiling for the event history. Above it the oldest routine *Sources resolved* / *Needs a decision* events go first, so chapter history (downloaded, imported, failed) keeps its full `MANGARR_EVENTS_KEEP_DAYS`; only if that is not enough are older events of any kind removed (logged). A library refreshed often with many hundreds of series may need more. |
 | `MANGARR_PUSHOVER_TOKEN` | unset | Default Pushover application token. Notifications are sent only when both Pushover values are set. |
 | `MANGARR_PUSHOVER_USER` | unset | Default Pushover user key. |
 | `MANGARR_WEBHOOK_URL` | unset | Default URL to POST `{"title", "message", "kind"}` JSON to on every notification. |
@@ -426,16 +429,37 @@ API, so it is safe while jobs run) to `$MANGARR_DATA/backups/mangarr-<date>-<tim
 every `MANGARR_BACKUP_HOURS` hours (default 24; the first one five minutes
 after start), keeping the newest `MANGARR_BACKUPS_KEEP` (default 7). *Back
 up now* on the System page and `POST /api/v1/system/backup` take one on
-demand; `GET /system/backup` takes one and downloads it.
+demand; `GET /system/backup` downloads a fresh copy without keeping it (it
+never adds or prunes kept backups). A backup is written under a temporary
+name and appears only once it is complete and passes an integrity check.
+The database, its backups and the backups folder are readable by the owner
+only (0600 / 0700): they hold the login password, API key and notifier
+tokens. Before each scheduled backup the event history is trimmed to the
+last `MANGARR_EVENTS_KEEP_DAYS` days (default 90). `MANGARR_EVENTS_KEEP_ROWS`
+(default 100000) is a size ceiling on top of that: when the history is larger,
+the oldest routine per-refresh events (*Sources resolved*, *Needs a decision*)
+are removed first and chapter history keeps its full 90 days; only if that is
+still not enough are the oldest events of any kind removed, with a log line
+saying so.
 
-Restore, from a kept backup or an uploaded file, first checks that the file
-is a SQLite database that passes `PRAGMA integrity_check`, has the
-`series` and `chapter` tables, and is not from a newer schema than the
-running version understands; then it takes a safety backup of the current
-database (named in the confirmation message), replaces the live database
-in place and applies any migrations the backup is missing. No restart is
-needed. A restore is refused while any job is queued or running; cancel it
-on the Queue page first.
+Restore, from a kept backup or an uploaded file (at most
+`MANGARR_BACKUP_UPLOAD_MAX_MB`, default 512, or twice the current database
+if that is larger), never changes the live database until the replacement
+is ready. The file is copied aside, checked (a SQLite database that passes
+`PRAGMA integrity_check`, with the `series` and `chapter` tables, not from a
+newer schema than the running version understands), rebuilt into a fresh
+database from mang-arr's own schema (only known tables and columns are
+copied; triggers, views and other tables are dropped) and upgraded to the
+current schema. Stored file paths that point outside `MANGARR_LIBRARY` /
+`MANGARR_STAGING` are cleared and series folders that are not plain folder
+names are renamed (the message says so). The current login, auth method and
+API key are kept: a restore never brings back old credentials or turns the
+login off. Only then is a safety backup of the current database taken
+(named in the confirmation message) and the live database replaced in
+place; no restart is needed. A file that fails any step is refused and the
+running database keeps working. A restore is refused while any job is
+queued or running (cancel it on the Queue page first), and runs on the job
+worker, so no job can start until it is done.
 
 ### CLI
 
