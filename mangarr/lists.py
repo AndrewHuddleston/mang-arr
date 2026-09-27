@@ -33,7 +33,7 @@ import urllib.request
 from collections.abc import Callable
 from typing import NamedTuple
 
-from . import anilist, config, db, metadata, model
+from . import anilist, config, db, duplicates, metadata, model
 from .matching import close_title, oneline, query_score
 from .model import Series
 
@@ -897,12 +897,14 @@ def is_due(row, now: float | None = None) -> bool:
 def sync(con: sqlite3.Connection, row, submit_add: Callable[[Series, bool, bool], object],
          should_cancel: Callable[[], bool] | None = None, progress: Callable[[str], None] | None = None) -> str:
     """Fetch one list and hand every new series to submit_add(series,
-    download, monitored) - the caller queues the actual add job; `progress`
-    hears how far a long fetch got. Records last_sync and a one-line
-    last_result, which is also returned. A fetch failure is recorded, logged
-    with the list's name and returned; it never raises. last_sync is stamped
-    before the fetch too, so a sync that crashes the process is not retried
-    right after the restart."""
+    download, monitored) - the caller queues the actual add job; a str it
+    returns instead (why not: tracked already, or its add queued already, by
+    another list or under the series' other reference) counts the series as
+    already tracked. `progress` hears how far a long fetch got. Records
+    last_sync and a one-line last_result, which is also returned. A fetch
+    failure is recorded, logged with the list's name and returned; it never
+    raises. last_sync is stamped before the fetch too, so a sync that crashes
+    the process is not retried right after the restart."""
     name, kind, params = row["name"], row["kind"], params_of(row)
     mark_synced(con, row["id"], "sync in progress (or interrupted)")
     con.commit()
@@ -920,9 +922,11 @@ def sync(con: sqlite3.Connection, row, submit_add: Callable[[Series, bool, bool]
     excluded = excluded_refs(con)
     added = tracked = skipped = deferred = 0
     for s in series:
-        if db.get_series_by_ref(con, s.ref):
+        known = duplicates.tracked_as(con, s)
+        if known is not None:
             tracked += 1
-            log.debug("list %s: %s (%s) already tracked", name, s.title, s.ref)
+            log.debug("list %s: %s (%s) already tracked%s", name, s.title, s.ref,
+                      "" if known["ref"] == s.ref else f" as {known['title']} ({known['ref']})")
             continue
         if s.ref in excluded:
             skipped += 1
@@ -932,7 +936,11 @@ def sync(con: sqlite3.Connection, row, submit_add: Callable[[Series, bool, bool]
             deferred += 1
             continue
         log.debug("list %s: adding %s (%s)", name, s.title, s.ref)
-        submit_add(s, bool(row["download"]), bool(row["monitored"]))
+        why = submit_add(s, bool(row["download"]), bool(row["monitored"]))
+        if isinstance(why, str):
+            tracked += 1
+            log.debug("list %s: %s (%s) not added: %s", name, s.title, s.ref, why)
+            continue
         added += 1
     parts = [f"{len(series)} fetched", f"{added} added"]
     if review:

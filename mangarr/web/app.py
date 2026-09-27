@@ -30,6 +30,7 @@ from .. import (
     core,
     db,
     downloader,
+    duplicates,
     health,
     jobs,
     komga,
@@ -175,8 +176,11 @@ def _job_refresh(series_id: int, download: bool):
 def _job_add(series: model.Series, download: bool, monitored: bool = True):
     def run(job: jobs.Job):
         with db.connect() as con:
-            o = core.add_series(con, client, series, download=download and monitored,
-                                should_cancel=lambda: job.cancel, progress=lambda m: setattr(job, "progress", m))
+            try:
+                o = core.add_series(con, client, series, download=download and monitored,
+                                    should_cancel=lambda: job.cancel, progress=lambda m: setattr(job, "progress", m))
+            except duplicates.AlreadyTracked as e:     # added under its other reference since this was queued
+                return str(e)
             if not monitored:
                 db.set_monitored(con, o.series_id, False)
         job.series_id = o.series_id
@@ -368,6 +372,7 @@ def _pass_stopped_text(items: list, reached: int, why: str) -> str:
 
 def _job_refresh_all(job: jobs.Job):
     with db.connect() as con:
+        duplicates.read_links(con)                 # the AniList links of MangaDex series, skipped ones too
         rows, skipped = plan_pass(db.series_rows(con))
     log.info("refresh pass: %d series (%d with missing chapters first), %d finished series skipped until due",
              len(rows), sum(1 for r in rows if r["wanted"]), skipped)
@@ -913,7 +918,7 @@ def add_page(request: Request, term: str = ""):
         if pick and pick.ref not in [c.ref for c in cands]:
             cands.insert(0, pick)
     with db.connect() as con:
-        tracked = {r["ref"]: r["id"] for r in con.execute("SELECT ref, id FROM series")}
+        tracked = duplicates.tracked_ids(con, cands)      # under their own reference or the other one
     return page(request, "add.html", term=term, pick=pick, cands=cands, tracked=tracked, error=error,
                 library_root=config.LIBRARY_ROOT)
 
@@ -937,12 +942,14 @@ def _series_from_ref(ref: str, title: str = "", aliases: list[str] | None = None
 
 def _queue_add(series: model.Series, download: bool, monitored: bool = True) -> jobs.Job | str:
     with db.connect() as con:
-        if db.get_series_by_ref(con, series.ref):
-            return "already tracked"
+        why = duplicates.refusal(con, series)
+        if why:
+            return why
+    key = duplicates.add_key(series)          # one add per series, under either reference
     for j in runner.jobs():
-        if j.kind == "add" and j.title == series.title and j.status in ("queued", "running"):
+        if j.kind == "add" and (j.title == series.title or j.key == key) and j.status in ("queued", "running"):
             return f"already queued as job #{j.id}"
-    return runner.submit("add", series.title, _job_add(series, download, monitored))
+    return runner.submit("add", series.title, _job_add(series, download, monitored), key=key)
 
 
 @app.post("/add")
@@ -966,9 +973,7 @@ _adopt_scan: dict = {"items": None, "job": None, "gen": 0}
 def _job_adopt_scan(job: jobs.Job):
     items = core.plan_adopt(client, progress=lambda m: setattr(job, "progress", m), should_cancel=lambda: job.cancel)
     with db.connect() as con:
-        tracked = {r["ref"] for r in con.execute("SELECT ref FROM series")}
-    for it in items:
-        it.tracked = bool(it.series and it.series.ref in tracked)
+        duplicates.mark_tracked(con, items)
     _adopt_scan["items"] = items
     _adopt_scan["gen"] += 1
     n_ok = sum(1 for i in items if i.series and not i.tracked)

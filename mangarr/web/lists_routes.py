@@ -16,7 +16,7 @@ from fastapi.responses import RedirectResponse
 from pydantic import BaseModel
 from starlette.concurrency import run_in_threadpool
 
-from .. import db, jobs, lists, model
+from .. import db, duplicates, jobs, lists, model
 from . import views
 
 log = logging.getLogger(__name__)
@@ -47,10 +47,12 @@ def _submit_add(series: model.Series, download: bool, monitored: bool, list_name
     """Queue the add job for one series a list yielded. Same checks as the
     Add page; an unmonitored list unmonitors the series once it exists."""
     with db.connect() as con:
-        if db.get_series_by_ref(con, series.ref):
-            return "already tracked"
+        why = duplicates.refusal(con, series)
+        if why:
+            return why
+    key = duplicates.add_key(series)          # one add per series, under either reference
     for j in _app.runner.jobs():
-        if j.kind == "add" and j.title == series.title and j.status in ("queued", "running"):
+        if j.kind == "add" and (j.title == series.title or j.key == key) and j.status in ("queued", "running"):
             return f"already queued as job #{j.id}"
     inner = _app._job_add(series, download)
 
@@ -62,7 +64,7 @@ def _submit_add(series: model.Series, download: bool, monitored: bool, list_name
                     db.set_monitored(con, job.series_id, False)
                 db.event(con, "added", f"added by import list {list_name}", job.series_id)
         return out
-    return _app.runner.submit("add", series.title, run)
+    return _app.runner.submit("add", series.title, run, key=key)
 
 
 def _job_sync(list_id: int):
@@ -74,9 +76,7 @@ def _job_sync(list_id: int):
             job.title = row["name"]
 
             def submit(series, download, monitored):
-                r = _submit_add(series, download, monitored, row["name"])
-                if isinstance(r, str):
-                    log.debug("list %s: %s: %s", row["name"], series.title, r)
+                return _submit_add(series, download, monitored, row["name"])      # a str: not added (sync says why)
             return lists.sync(con, row, submit, should_cancel=lambda: job.cancel,
                               progress=lambda m: setattr(job, "progress", m))
     return run

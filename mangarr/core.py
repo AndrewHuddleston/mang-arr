@@ -10,11 +10,12 @@ import hashlib
 import logging
 import math
 import os
+import threading
 import time
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
-from . import db, downloader, komga, library, limits, metadata, metrics
+from . import db, downloader, duplicates, komga, library, limits, metadata, metrics
 from .matching import oneline
 from .model import Series
 from .resolver import Plan, primary, resolve
@@ -53,7 +54,10 @@ def add_series(con, client: Client, series: Series, download: bool = True, do_im
     must still exist afterwards, or the work is abandoned. A cancel cuts the
     Suwayomi call in flight short: while sources are searched it raises
     limits.Cancelled with nothing saved, afterwards what was saved stays (a
-    download returns what arrived)."""
+    download returns what arrived). A new series tracked already under its
+    other reference raises duplicates.AlreadyTracked before any search."""
+    if series_id is None:
+        duplicates.check_new(con, series)
     plan = resolve(client, series, reliability=db.reliability(con), should_cancel=should_cancel, progress=progress)
     lookups = with_cancel(client, should_cancel)
     if series_id is not None and not db.get_series(con, series_id):
@@ -433,34 +437,47 @@ def delete_series(con, client: Client, series_id: int, delete_library: bool = Fa
     """Stop tracking. Optionally remove the library folder (only the links
     this series recorded; Suwayomi's staging files are never touched). The
     Suwayomi entries are taken out of its library so it stops auto-updating
-    them; a Suwayomi outage does not block the delete."""
+    them, except one another series uses too (the one kept when a series
+    tracked twice is cleaned up); a Suwayomi outage does not block the delete.
+    Komga is asked to scan once library files are gone, so the series leaves
+    it now rather than at its next scheduled scan; the scan request runs on a
+    thread of its own, so the delete does not wait for Komga's answer."""
     row = db.get_series(con, series_id)
     title, folder = row["title"], row["folder"]
     for s in db.sources(con, series_id):
+        if con.execute("SELECT 1 FROM series_source WHERE manga_id=? AND series_id!=?",
+                       (s["manga_id"], series_id)).fetchone():
+            log.info("%s: %s entry left in Suwayomi's library: another series uses it", title, s["source_name"])
+            continue
         try:
             client.set_in_library(s["manga_id"], False, retries=1, timeout=10)
         except SuwayomiError as e:
             log.warning("%s: could not unset library flag on %s entry: %s", title, s["source_name"], e)
+    removed = False
     if delete_library and folder:
-        _delete_library_files(con, series_id, title, folder)
+        removed = _delete_library_files(con, series_id, title, folder)
     db.delete_series(con, series_id)
     db.event(con, "deleted", f"{title} removed" + (" with library files" if delete_library else ""))
     con.commit()
     log.info("%s: no longer tracked", title)
+    if removed and komga.configured():
+        # a delete is a web request: it does not wait for Komga's answer (up to 20 s)
+        threading.Thread(target=komga.scan, name="mangarr-komga-scan", daemon=True).start()
 
 
-def _delete_library_files(con, series_id: int, title: str, folder: str) -> None:
+def _delete_library_files(con, series_id: int, title: str, folder: str) -> bool:
     """Remove the library files this series recorded, then its folder if it is
     empty. Paths come from the database, which a restored backup can fill
     with anything, so only regular files inside this series' own library
     folder (itself inside LIBRARY_ROOT, symlinks resolved) are touched;
-    anything else is skipped with a warning."""
+    anything else is skipped with a warning. Returns whether a file or the
+    folder was removed."""
     import stat
     root = library.config.LIBRARY_ROOT
     d = library.library_dir(folder) if db.valid_folder(folder) else None
     if d is None or not library.is_within(d, root) or os.path.realpath(d) == os.path.realpath(root):
         log.warning("%s: library folder %r is not a folder inside %s; no files deleted", title, folder, root)
-        return
+        return False
     removed = 0
     for c in db.chapters(con, series_id):
         p = c["library_path"]
@@ -484,11 +501,14 @@ def _delete_library_files(con, series_id: int, title: str, folder: str) -> None:
             removed += 1
         except OSError as e:
             log.warning("%s: could not remove %s: %s", title, p, e)
+    gone = False
     try:
         os.rmdir(d)
+        gone = True
     except OSError as e:
         log.info("%s: library folder %s kept: %s", title, d, e)
     log.info("%s: removed %d file(s) from %s", title, removed, d)
+    return bool(removed) or gone
 
 
 # -- import ------------------------------------------------------------------
@@ -800,17 +820,27 @@ def plan_adopt(client: Client, only: str | None = None, progress: Callable[[str]
 
 def apply_adopt(con, items: list[AdoptItem]) -> tuple[list[int], int]:
     """Register the identified folders. Folders of the same series (one per
-    source) merge into one tracked series. Returns (series ids, chapters)."""
-    by_ref: dict[str, list[AdoptItem]] = {}
+    source) merge into one tracked series, and a folder of a series tracked
+    under its other reference (duplicates.py) into that one. Folders of one
+    new series found under both references merge too, as the AniList one.
+    A tracked series keeps its primary source. Returns (series ids,
+    chapters)."""
+    groups: dict[str, list[AdoptItem]] = {}
     for it in items:
         if it.series:
-            by_ref.setdefault(it.series.ref, []).append(it)
+            row = duplicates.tracked_as(con, it.series)
+            if row is not None and row["ref"] != it.series.ref:
+                it = replace(it, series=db.series_to_model(row))
+            groups.setdefault(row["ref"] if row is not None else duplicates.identity(it.series), []).append(it)
     n_chapters = 0
     ids = []
-    for group in by_ref.values():
-        series = group[0].series
+    for group in groups.values():
+        series = next((it.series for it in group if it.series.anilist_id is not None), group[0].series)
         series_id = db.upsert_series(con, series)
         ids.append(series_id)
+        primary = {r[0] for r in con.execute("SELECT manga_id FROM series_source WHERE series_id=? AND is_primary=1",
+                                             (series_id,))}
+        first = next((it for it in group if it.manga_id is not None), None)
         for it in group:
             if it.manga_id is not None:
                 con.execute(
@@ -819,7 +849,7 @@ def apply_adopt(con, items: list[AdoptItem]) -> tuple[list[int], int]:
                     " is_primary, folder, seen_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
                     (series_id, it.manga_id, it.source, it.folder_name, None, 0, 1,
                      len(it.numbers), max(it.numbers) if it.numbers else 0, None,
-                     int(it is group[0]), it.path, db.now()))
+                     int(it.manga_id in primary if primary else it is first), it.path, db.now()))
             for n, path in it.numbers.items():
                 db.set_have(con, series_id, n, path, None, it.source)
                 n_chapters += 1

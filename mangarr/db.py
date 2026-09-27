@@ -156,6 +156,11 @@ MIGRATIONS = [
     """
     CREATE INDEX IF NOT EXISTS event_series ON event(series_id, id);
     """,
+    # 13: the AniList id a MangaDex series' record links to, so one series is
+    #     not tracked twice, under both references (see duplicates.py)
+    """
+    ALTER TABLE series ADD COLUMN anilist_link INTEGER;
+    """,
 ]
 
 
@@ -339,7 +344,7 @@ def upsert_series(con, s: Series) -> int:
         synonyms=json.dumps(s.synonyms), country=s.country, status=s.status,
         format=s.format, expected=s.chapters, authors=json.dumps(s.authors),
         cover=s.cover, description=(s.description or None), volumes=s.volumes,
-        genres=json.dumps(s.genres), year=s.year, demographic=s.demographic)
+        genres=json.dumps(s.genres), year=s.year, demographic=s.demographic, anilist_link=s.anilist_link)
     row = con.execute("SELECT id, folder FROM series WHERE ref=?", (s.ref,)).fetchone()
     if row:
         sets = ", ".join(f"{k}=?" for k in fields)
@@ -369,7 +374,8 @@ def series_to_model(row) -> Series:
         volumes=row["volumes"] if "volumes" in row.keys() else None,
         genres=json.loads(row["genres"] or "[]") if "genres" in row.keys() else [],
         year=row["year"] if "year" in row.keys() else None,
-        demographic=row["demographic"] if "demographic" in row.keys() else None)
+        demographic=row["demographic"] if "demographic" in row.keys() else None,
+        anilist_link=row["anilist_link"] if "anilist_link" in row.keys() else None)
 
 
 def get_series(con, series_id: int):

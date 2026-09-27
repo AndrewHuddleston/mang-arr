@@ -51,6 +51,13 @@ def _get(path: str, params: list[tuple[str, str]], retries: int = 3) -> dict:
     raise RuntimeError(f"MangaDex unreachable: {last}")
 
 
+def _anilist_link(a: dict) -> int | None:
+    """The AniList id the record links to (attributes.links.al), when it is one."""
+    links = a.get("links")
+    al = str(links.get("al") or "").strip() if isinstance(links, dict) else ""
+    return int(al) if len(al) <= 9 and al.isascii() and al.isdigit() and int(al) > 0 else None
+
+
 def _to_series(m: dict) -> Series:
     a = m.get("attributes") or {}
     title_map = a.get("title") or {}
@@ -94,6 +101,7 @@ def _to_series(m: dict) -> Series:
         status=status, chapters=chapters,
         adult=(a.get("contentRating") in ("erotica", "pornographic")),
         cover=cover, description=(a.get("description") or {}).get("en"), authors=authors,
+        anilist_link=_anilist_link(a),
     )
 
 
@@ -113,3 +121,23 @@ def by_id(uuid: str) -> Series | None:
                                  ("includes[]", "cover_art")])
     m = d.get("data")
     return _to_series(m) if m else None
+
+
+IDS_PER_REQUEST = 100    # MangaDex's cap on ids[] (and limit) per /manga request
+
+
+def anilist_links(uuids: list[str]) -> dict[str, int | None]:
+    """{uuid: the AniList id its record links to, or None} for these records,
+    IDS_PER_REQUEST per request, whatever their content rating. A record
+    MangaDex no longer has is left out. Raises RuntimeError when MangaDex
+    cannot be reached."""
+    out: dict[str, int | None] = {}
+    for i in range(0, len(uuids), IDS_PER_REQUEST):
+        batch = uuids[i:i + IDS_PER_REQUEST]
+        params = [("ids[]", u) for u in batch] + [("limit", str(len(batch)))] + \
+            [("contentRating[]", r) for r in ("safe", "suggestive", "erotica", "pornographic")]
+        for m in _get("/manga", params).get("data") or []:
+            a = m.get("attributes") if isinstance(m, dict) and m.get("id") in batch else None
+            if isinstance(a, dict):
+                out[m["id"]] = _anilist_link(a)
+    return out

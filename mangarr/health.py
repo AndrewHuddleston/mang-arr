@@ -20,7 +20,7 @@ import urllib.parse
 import urllib.request
 from dataclasses import asdict, dataclass
 
-from . import config, komga, limits, notify, settings
+from . import config, duplicates, komga, limits, notify, settings
 from .matching import oneline
 from .suwayomi import Client, SuwayomiError
 
@@ -184,6 +184,11 @@ def _compute(client: Client) -> list[Check]:
     if stalled:
         out.append(stalled)
 
+    # -- series tracked twice --
+    twice = duplicate_series()
+    if twice:
+        out.append(twice)
+
     # -- Komga (the reader) --
     if not komga.configured():
         out.append(Check("warning", "Komga", "not configured: new chapters appear only at Komga's own scan interval"))
@@ -283,6 +288,13 @@ def stalled_job(now: float | None = None) -> Check | None:
             else "cancel it on the Queue page if it is stuck")
     return Check("warning", "Jobs", f"{what} has made no progress for {idle / 60:.0f} min{last}. Other jobs "
                                     f"wait until it ends; {hint}")
+
+
+def duplicate_series() -> Check | None:
+    """A warning naming the series tracked twice, under AniList and MangaDex
+    (duplicates.pairs), so the extra one can be deleted."""
+    detail = duplicates.health_detail()
+    return Check("warning", "Duplicate series", detail) if detail else None
 
 
 def summary(client: Client, wait: float = 5) -> dict:
