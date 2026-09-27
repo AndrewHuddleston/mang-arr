@@ -5,8 +5,8 @@
 {% block toolbar %}
 <div class="page-toolbar">
   <div class="toolbar-section left">
-    {{ m.toolbar_button('Refresh & Scan', 'refresh', form='/series/' ~ s.id ~ '/refresh', hidden={'download': '0'}, disabled=busy, title='Re-check every source for this series and rescan the library folder') }}
-    {{ m.toolbar_button('Search Missing', 'search', form='/series/' ~ s.id ~ '/refresh', hidden={'download': '1'}, disabled=busy, title='Search the sources for every missing chapter and download it') }}
+    {{ m.toolbar_button('Refresh & Scan', 'refresh', form='/series/' ~ s.id ~ '/refresh' ~ page_q, hidden={'download': '0'}, disabled=busy, title='Re-check every source for this series and rescan the library folder') }}
+    {{ m.toolbar_button('Search Missing', 'search', form='/series/' ~ s.id ~ '/refresh' ~ page_q, hidden={'download': '1'}, disabled=busy, title='Search the sources for every missing chapter and download it') }}
     {{ m.toolbar_separator() }}
     {{ m.toolbar_button('History', 'history', href='#history') }}
     {{ m.toolbar_button('Sources', 'network', href='#sources') }}
@@ -39,7 +39,7 @@
     <div class="header-info">
       <div class="title-row">
         <div class="title-container">
-          <form method="post" action="/series/{{ s.id }}/monitor" class="iconform toggle-monitored-container" data-async="monitor" data-id="{{ s.id }}">
+          <form method="post" action="/series/{{ s.id }}/monitor{{ page_q }}" class="iconform toggle-monitored-container" data-async="monitor" data-id="{{ s.id }}">
             <input type="hidden" name="monitored" value="{{ 0 if s.monitored else 1 }}">
             <button type="submit" class="iconbtn monitor-toggle big {{ 'monitored' if s.monitored }}" title="{{ 'Monitored: click to unmonitor' if s.monitored else 'Unmonitored: click to monitor' }}" aria-label="{{ 'Monitored: click to unmonitor' if s.monitored else 'Unmonitored: click to monitor' }}">{{ m.icon('bookmark' if s.monitored else 'bookmark-off') }}</button>
           </form>
@@ -143,7 +143,7 @@
         {% set n = '%g'|format(c.number) %}
         <tr class="episode-row {{ c.status }}" data-number="{{ n }}" data-status="{{ c.status }}">
           <td class="col-number">{{ n }}</td>
-          <td class="col-title"><button type="button" class="episode-title-link" data-chapter-url="/api/v1/series/{{ s.id }}/chapter/{{ c.number }}" data-manual="/api/v1/series/{{ s.id }}/chapter/{{ c.number }}/releases" data-download="/series/{{ s.id }}/chapter/{{ c.number }}/download" data-search="/series/{{ s.id }}/chapter/{{ c.number }}/search" data-number="{{ n }}" data-name="{{ c.name or ('Chapter ' ~ n) }}">{{ c.name or ('Chapter ' ~ n) }}</button></td>
+          <td class="col-title"><button type="button" class="episode-title-link" data-chapter-url="/api/v1/series/{{ s.id }}/chapter/{{ c.number }}" data-manual="/api/v1/series/{{ s.id }}/chapter/{{ c.number }}/releases" data-download="/series/{{ s.id }}/chapter/{{ c.number }}/download{{ page_q }}" data-search="/series/{{ s.id }}/chapter/{{ c.number }}/search{{ page_q }}" data-number="{{ n }}" data-name="{{ c.name or ('Chapter ' ~ n) }}">{{ c.name or ('Chapter ' ~ n) }}</button></td>
           <td class="col-date nowrap">{{ (c.uploaded or '')[:10] or '-' }}</td>
           <td class="col-source">{{ c.source_name or '' }}</td>
           <td class="col-status">{{ m.label(cs.text, cs.kind, 'medium', title=(c.reason or '')) }}</td>
@@ -151,11 +151,11 @@
           {% else %}<td class="col-reason {{ 'text-danger' if c.status == 'failed' }}">{{ c.reason or ('waiting for a download pass' if c.status == 'wanted' else '') }}</td>{% endif %}
           <td class="col-actions">
             {% if c.status in ['wanted','failed','unavailable','ignored'] %}
-            <form method="post" action="/series/{{ s.id }}/chapter/{{ c.number }}/search" class="iconform"><button class="iconbtn" title="Automatic search: the trusted sources, best first" {% if busy %}disabled{% endif %}>{{ m.icon('search') }}</button></form>
-            <button type="button" class="iconbtn" data-interactive data-chapter-url="/api/v1/series/{{ s.id }}/chapter/{{ c.number }}" data-manual="/api/v1/series/{{ s.id }}/chapter/{{ c.number }}/releases" data-download="/series/{{ s.id }}/chapter/{{ c.number }}/download" data-search="/series/{{ s.id }}/chapter/{{ c.number }}/search" data-number="{{ n }}" data-name="{{ c.name or ('Chapter ' ~ n) }}" title="Interactive search: what every source has for this chapter">{{ m.icon('interactive') }}</button>
+            <form method="post" action="/series/{{ s.id }}/chapter/{{ c.number }}/search{{ page_q }}" class="iconform"><button class="iconbtn" title="Automatic search: the trusted sources, best first" {% if busy %}disabled{% endif %}>{{ m.icon('search') }}</button></form>
+            <button type="button" class="iconbtn" data-interactive data-chapter-url="/api/v1/series/{{ s.id }}/chapter/{{ c.number }}" data-manual="/api/v1/series/{{ s.id }}/chapter/{{ c.number }}/releases" data-download="/series/{{ s.id }}/chapter/{{ c.number }}/download{{ page_q }}" data-search="/series/{{ s.id }}/chapter/{{ c.number }}/search{{ page_q }}" data-number="{{ n }}" data-name="{{ c.name or ('Chapter ' ~ n) }}" title="Interactive search: what every source has for this chapter">{{ m.icon('interactive') }}</button>
             {% endif %}
-            {% if c.status in ['wanted','failed','unavailable'] %}<form method="post" action="/series/{{ s.id }}/chapter/{{ c.number }}/ignore" class="iconform"><button class="iconbtn" title="Ignore this chapter (stop trying)">{{ m.icon('ignore') }}</button></form>
-            {% elif c.status == 'ignored' %}<form method="post" action="/series/{{ s.id }}/chapter/{{ c.number }}/unignore" class="iconform"><button class="iconbtn" title="Want this chapter again">{{ m.icon('bookmark') }}</button></form>{% endif %}
+            {% if c.status in ['wanted','failed','unavailable'] %}<form method="post" action="/series/{{ s.id }}/chapter/{{ c.number }}/ignore{{ page_q }}" class="iconform"><button class="iconbtn" title="Ignore this chapter (stop trying)">{{ m.icon('ignore') }}</button></form>
+            {% elif c.status == 'ignored' %}<form method="post" action="/series/{{ s.id }}/chapter/{{ c.number }}/unignore{{ page_q }}" class="iconform"><button class="iconbtn" title="Want this chapter again">{{ m.icon('bookmark') }}</button></form>{% endif %}
           </td>
         </tr>
         {% endfor %}
@@ -194,7 +194,7 @@
 
 {# -- Edit Series modal --------------------------------------------------- #}
 {% call m.modal('edit-modal', 'medium') %}
-<form method="post" action="/series/{{ s.id }}/monitor" id="edit-form" class="form">
+<form method="post" action="/series/{{ s.id }}/monitor{{ page_q }}" id="edit-form" class="form">
   <div class="modal-header" id="edit-modal-title">Edit - {{ s.title }}</div>
   <div class="modal-body">
     {% call m.form_group('Monitored', 'Download new chapters as they are listed by the sources', 'edit-monitored') %}

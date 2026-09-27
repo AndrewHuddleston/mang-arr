@@ -132,7 +132,13 @@ def _ago(ts) -> str:
 
 
 def _flash(path: str, msg: str) -> RedirectResponse:
-    return RedirectResponse(f"{path}?{views.flash_query(msg)}", 303)
+    return RedirectResponse(f"{path}{'&' if '?' in path else '?'}{views.flash_query(msg)}", 303)
+
+
+def _series_url(series_id: int, page_no: int = 1) -> str:
+    """The series page, on the page of chapter rows an action came from (the
+    forms there carry ?page=N), so working through page 2 stays on page 2."""
+    return f"/series/{series_id}" + (f"?page={page_no}" if page_no > 1 else "")
 
 
 # -- jobs ---------------------------------------------------------------------
@@ -607,30 +613,31 @@ def series_page(request: Request, series_id: int, page_no: int = Query(1, alias=
     return page(request, "series.html", s=r, series=db.series_to_model(r), sources=srcs,
                 by=by, events=events, busy=runner.pending_for(series_id),
                 groups=groups, paging=paging, counts=views.counts(chs),
+                page_q=f"?page={paging['page']}" if paging["page"] > 1 else "",     # actions come back to this page
                 description=views.plain_description(r["description"]),
                 library_path=library.library_dir(r["folder"] or ""), size_bytes=size_bytes, size_files=size_files,
                 size_human=views.human_size(size_bytes), ref_url=views.ref_url(r))
 
 
 @app.post("/series/{series_id}/refresh")
-def series_refresh(series_id: int, download: str = Form("1")):
+def series_refresh(series_id: int, download: str = Form("1"), page_no: int = Query(1, alias="page")):
     with db.connect() as con:
         r = db.get_series(con, series_id)
     if not r:
         raise HTTPException(404)
     if runner.pending_for(series_id):
-        return _flash(f"/series/{series_id}", "a job for this series is already queued")
+        return _flash(_series_url(series_id, page_no), "a job for this series is already queued")
     runner.submit("refresh", r["title"], _job_refresh(series_id, download == "1"), series_id)
-    return _flash(f"/series/{series_id}", "refresh queued")
+    return _flash(_series_url(series_id, page_no), "refresh queued")
 
 
 @app.post("/series/{series_id}/monitor")
-def series_monitor(series_id: int, monitored: str = Form("1")):
+def series_monitor(series_id: int, monitored: str = Form("1"), page_no: int = Query(1, alias="page")):
     with db.connect() as con:
         if not db.get_series(con, series_id):
             raise HTTPException(404)
         db.set_monitored(con, series_id, monitored == "1")
-    return RedirectResponse(f"/series/{series_id}", 303)
+    return RedirectResponse(_series_url(series_id, page_no), 303)
 
 
 def _job_chapter(series_id: int, number: float, manga_id: int | None):
@@ -647,28 +654,29 @@ def _chapter_key(series_id: int, number: float, manga_id: int | None) -> str:
 
 
 @app.post("/series/{series_id}/chapter/{number}/search")
-def chapter_search(series_id: int, number: float):
+def chapter_search(series_id: int, number: float, page_no: int = Query(1, alias="page")):
     with db.connect() as con:
         r = db.get_series(con, series_id)
     if not r:
         raise HTTPException(404)
     runner.submit("chapter", f"{r['title']} ch {number:g}", _job_chapter(series_id, number, None), series_id,
                   key=_chapter_key(series_id, number, None))
-    return _flash(f"/series/{series_id}", f"search for chapter {number:g} queued")
+    return _flash(_series_url(series_id, page_no), f"search for chapter {number:g} queued")
 
 
 @app.post("/series/{series_id}/chapter/{number}/download")
-def chapter_download(series_id: int, number: float, manga_id: int = Form(...)):
+def chapter_download(series_id: int, number: float, manga_id: int = Form(...),
+                     page_no: int = Query(1, alias="page")):
     with db.connect() as con:
         r = db.get_series(con, series_id)
         src = next((x for x in db.sources(con, series_id) if x["manga_id"] == manga_id), None)
     if not r:
         raise HTTPException(404)
     if not src:
-        return _flash(f"/series/{series_id}", "that source entry does not belong to this series")
+        return _flash(_series_url(series_id, page_no), "that source entry does not belong to this series")
     runner.submit("chapter", f"{r['title']} ch {number:g} from {src['source_name']}",
                   _job_chapter(series_id, number, manga_id), series_id, key=_chapter_key(series_id, number, manga_id))
-    return _flash(f"/series/{series_id}", f"download of chapter {number:g} from {src['source_name']} queued")
+    return _flash(_series_url(series_id, page_no), f"download of chapter {number:g} from {src['source_name']} queued")
 
 
 @app.get("/api/v1/series/{series_id}/chapter/{number}")
@@ -710,19 +718,19 @@ def api_chapter_search(series_id: int, number: float, manga_id: int | None = Non
 
 
 @app.post("/series/{series_id}/chapter/{number}/ignore")
-def chapter_ignore(series_id: int, number: float):
+def chapter_ignore(series_id: int, number: float, page_no: int = Query(1, alias="page")):
     with db.connect() as con:
         db.set_status(con, series_id, number, "ignored")
         db.event(con, "ignore", f"chapter {number:g} ignored", series_id)
-    return RedirectResponse(f"/series/{series_id}", 303)
+    return RedirectResponse(_series_url(series_id, page_no), 303)
 
 
 @app.post("/series/{series_id}/chapter/{number}/unignore")
-def chapter_unignore(series_id: int, number: float):
+def chapter_unignore(series_id: int, number: float, page_no: int = Query(1, alias="page")):
     with db.connect() as con:
         db.set_status(con, series_id, number, "wanted")
         db.event(con, "ignore", f"chapter {number:g} wanted again", series_id)
-    return RedirectResponse(f"/series/{series_id}", 303)
+    return RedirectResponse(_series_url(series_id, page_no), 303)
 
 
 @app.post("/series/{series_id}/delete")
@@ -1323,15 +1331,19 @@ API_CHAPTERS = 5000        # chapters per GET /api/v1/series/{id} (default and m
 def api_series_one(series_id: int, limit: int = API_CHAPTERS, offset: int = 0):
     """One series with its sources and chapters (by number). The chapters
     come in pages of at most API_CHAPTERS; chapterTotal, limit and offset
-    say where this page is, so a client pages on with offset=offset+limit."""
-    limit, offset = max(1, min(limit, API_CHAPTERS)), max(0, offset)
+    say where this page is, so a client pages on with offset=offset+limit.
+    An offset past the end is the end (an empty page): any integer the
+    caller sends stays within what SQLite can bind."""
+    limit = max(1, min(limit, API_CHAPTERS))
     with db.connect() as con:
         r = db.get_series(con, series_id)
         if not r:
             raise HTTPException(404)
+        total = db.chapter_count(con, series_id)
+        offset = min(max(0, offset), total)
         return {"series": dict(r), "sources": [dict(s) for s in db.sources(con, series_id)],
                 "chapters": [dict(c) for c in db.chapters(con, series_id, limit=limit, offset=offset)],
-                "chapterTotal": db.chapter_count(con, series_id), "limit": limit, "offset": offset}
+                "chapterTotal": total, "limit": limit, "offset": offset}
 
 
 @app.post("/api/v1/series")

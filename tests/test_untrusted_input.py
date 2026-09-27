@@ -253,6 +253,9 @@ class SeriesPagingWebTest(WebBase):
         r = self.client.get(f"/series/{self.sid}")
         self.assertEqual(r.text.count('<tr class="episode-row'), 30)
         self.assertNotIn("chapter-paging", r.text)
+        self.assertIn(f'"/series/{self.sid}/chapter/30.0/search"', r.text)       # one page: plain action URLs
+        r = self.client.post(f"/series/{self.sid}/chapter/30/ignore", follow_redirects=False)
+        self.assertEqual(r.headers["location"], f"/series/{self.sid}")
 
     def test_api_pages_chapters(self):
         h = {"X-Api-Key": self.key}
@@ -265,6 +268,43 @@ class SeriesPagingWebTest(WebBase):
         self.assertEqual((d["limit"], d["offset"], len(d["chapters"])), (5000, 0, 4100))
         d = self.client.get(f"/api/v1/series/{self.sid}?limit=0&offset=4099", headers=h).json()
         self.assertEqual((d["limit"], [c["number"] for c in d["chapters"]]), (1, [4100.0]))
+
+    def test_api_offset_past_the_end_is_an_empty_page(self):
+        # the verifier's repro: an offset past SQLite's INTEGER range was an
+        # OverflowError (HTTP 500)
+        h = {"X-Api-Key": self.key}
+        for offset in (4100, 5000, 99999999999999999999):
+            r = self.client.get(f"/api/v1/series/{self.sid}?offset={offset}", headers=h)
+            self.assertEqual(r.status_code, 200, offset)
+            d = r.json()
+            self.assertEqual((d["chapters"], d["offset"], d["chapterTotal"]), ([], 4100, 4100))
+        d = self.client.get(f"/api/v1/series/{self.sid}?offset=-99999999999999999999", headers=h).json()
+        self.assertEqual((d["offset"], len(d["chapters"])), (0, 4100))
+
+    def test_chapter_actions_come_back_to_the_same_page(self):
+        # the verifier's repro: on page 2 every chapter action redirected to page 1
+        sid = self.sid
+        page2 = self.client.get(f"/series/{sid}?page=2").text                # rows 2100 down to 101
+        for url in (f"/series/{sid}/chapter/2000.0/search?page=2", f"/series/{sid}/chapter/2000.0/ignore?page=2",
+                    f"/series/{sid}/chapter/2000.0/download?page=2", f"/series/{sid}/refresh?page=2",
+                    f"/series/{sid}/monitor?page=2"):
+            self.assertIn(f'"{url}"', page2)
+        r = self.client.post(f"/series/{sid}/chapter/2000/ignore?page=2", follow_redirects=False)
+        self.assertEqual((r.status_code, r.headers["location"]), (303, f"/series/{sid}?page=2"))
+        r = self.client.post(f"/series/{sid}/chapter/2000/unignore?page=2", follow_redirects=False)
+        self.assertEqual(r.headers["location"], f"/series/{sid}?page=2")
+        with mock.patch.object(self.web.runner, "submit", lambda *a, **k: None):
+            r = self.client.post(f"/series/{sid}/refresh?page=2", follow_redirects=False)
+            self.assertTrue(r.headers["location"].startswith(f"/series/{sid}?page=2&m="), r.headers["location"])
+            r = self.client.post(f"/series/{sid}/chapter/2000/search?page=2", follow_redirects=False)
+        self.assertTrue(r.headers["location"].startswith(f"/series/{sid}?page=2&m="), r.headers["location"])
+        back = self.client.get(r.headers["location"]).text
+        self.assertIn("search for chapter 2000 queued", back)
+        self.assertIn('data-number="2000"', back)
+        self.assertNotIn('data-number="4100"', back)
+        r = self.client.post(f"/series/{sid}/chapter/2000/download?page=2", data={"manga_id": "7"},
+                             follow_redirects=False)                          # no such source entry: a flash
+        self.assertTrue(r.headers["location"].startswith(f"/series/{sid}?page=2&m="))
 
 
 
