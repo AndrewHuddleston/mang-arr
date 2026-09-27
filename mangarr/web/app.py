@@ -640,28 +640,46 @@ def index(request: Request, q: str = ""):
 @app.get("/series/{series_id}")
 def series_page(request: Request, series_id: int, page_no: int = Query(1, alias="page")):
     """The series details page. The counts cover every chapter; the chapter
-    rows are paged (views.page_groups), so a source listing tens of
-    thousands of chapters cannot make one response huge."""
+    rows are paged (views.page_slices), so a source listing tens of
+    thousands of chapters cannot make one response huge.
+
+    The counts, the tooltips' runs of numbers and the groups' totals need
+    every row: one pass reads number, status and name of each as a plain
+    tuple and keeps totals (views.chapter_summary; a season keeps its
+    chapter numbers too), and whole rows are read for the page shown only.
+    That pass still grows with the rows stored. Measured with 100,000 rows:
+    about 0.7 s and 2 MB for a series in blocks (was 1 s and 26 MB), about
+    1.7 s and 5 MB for one in seasons, whose names are parsed (was about
+    2 s and 45 MB); rendering the page's 2000 rows adds about 0.8 s either
+    way. Going below that would need the totals kept in the database and
+    updated with every chapter write, the runs of numbers included: more
+    machinery than a count real series stay far below is worth."""
     with db.connect() as con:
         r = db.get_series(con, series_id)
         if not r:
             raise HTTPException(404, "no such series")
         srcs = db.sources(con, series_id)
-        chs = db.chapters(con, series_id)
+        if not con.in_transaction:
+            con.execute("BEGIN")                    # one snapshot: the totals agree with the rows shown
+        summary = views.chapter_summary(db.chapter_marks(con, series_id))
+
+        def read(slices, info):
+            if slices and "numbers" not in summary["groups"][slices[0][0]]:     # blocks: one range by number
+                return db.chapters_newest_first(con, series_id, info["last"] - info["first"] + 1, info["first"] - 1)
+            numbers = [n for gi, start, take in slices for n in summary["groups"][gi]["numbers"][start:start + take]]
+            whole = db.chapters_by_number(con, series_id, numbers)
+            return [whole[n] for n in numbers if n in whole]
+        groups, paging = views.page_summary(summary["groups"], page_no, read)
         events = con.execute("SELECT * FROM event WHERE series_id=? ORDER BY id DESC LIMIT 15",
                              (series_id,)).fetchall()
         size_fn = getattr(db, "series_size", None)          # lands on main; (bytes, files)
         size_bytes, size_files = size_fn(con, series_id) if size_fn else (0, 0)
-    by: dict[str, list] = {}
-    for c in chs:
-        by.setdefault(c["status"], []).append(c["number"])
-    groups, paging = views.page_groups(views.group_chapters(chs, r), page_no)
     if paging["pages"] > 1:
         log.debug("series %d: %d chapter rows, showing page %d of %d", series_id, paging["total"], paging["page"],
                   paging["pages"])
     return page(request, "series.html", s=r, series=db.series_to_model(r), sources=srcs,
-                by=by, events=events, busy=runner.pending_for(series_id),
-                groups=groups, paging=paging, counts=views.counts(chs),
+                runs=summary["runs"], events=events, busy=runner.pending_for(series_id),
+                groups=groups, paging=paging, counts=summary["counts"],
                 page_q=f"?page={paging['page']}" if paging["page"] > 1 else "",     # actions come back to this page
                 description=views.plain_description(r["description"]),
                 library_path=library.library_dir(r["folder"] or ""), size_bytes=size_bytes, size_files=size_files,
@@ -877,7 +895,9 @@ def _job_adopt_scan(job: jobs.Job):
     _adopt_scan["items"] = items
     _adopt_scan["gen"] += 1
     n_ok = sum(1 for i in items if i.series and not i.tracked)
-    return f"{len(items)} folders, {n_ok} identified, {sum(1 for i in items if not i.series)} need a choice"
+    n_failed = sum(1 for i in items if i.lookup_error)
+    return f"{len(items)} folders, {n_ok} identified, {sum(1 for i in items if not i.series)} need a choice" + \
+        (f" ({n_failed} not looked up: AniList and MangaDex could not be reached; scan again)" if n_failed else "")
 
 
 @app.get("/import")
@@ -1191,50 +1211,52 @@ def system_backups_restore(request: Request, name: str):
 _upload_slot = threading.Lock()
 
 
-def _upload_refused(msg: str) -> Response:
-    """The flash redirect for a refused upload. The connection is closed
-    afterwards, so the server does not go on reading a body nobody wants."""
+async def _upload_answer(body: uploads.Body, msg: str) -> Response:
+    """The flash redirect for an upload, sent once the rest of a small body
+    has been read (uploads.Body.drain), so a browser still sending gets the
+    message. A bigger one is not read: the connection is closed after the
+    answer instead."""
     resp = _flash("/system", msg)
-    resp.headers["Connection"] = "close"
+    if not await body.drain():
+        resp.headers["Connection"] = "close"
     return resp
 
 
 @app.post("/system/backups/upload")
 async def system_backups_upload(request: Request):
+    body = uploads.Body(request)
     if (why := _restore_guard()):
-        return _upload_refused(why)
+        return await _upload_answer(body, why)
     if not request.headers.get("content-type", "").lower().startswith("multipart/form-data"):
-        return _upload_refused("choose a .db file to restore")
+        return await _upload_answer(body, "choose a .db file to restore")
     if not _upload_slot.acquire(blocking=False):
         log.warning("backup upload from %s refused: another upload is still in progress", security.client_ip(request))
-        return _upload_refused("restore refused: another backup upload is in progress; try again when it has finished")
+        return await _upload_answer(body, "restore refused: another backup upload is in progress; try again when "
+                                          "it has finished")
     spool = None
     try:
-        try:
-            declared = int(request.headers.get("content-length") or 0)
-        except ValueError:
-            declared = 0
         # size and free-space checks, then the file part streams into the backups folder (not /tmp)
-        spool = await run_in_threadpool(backup.UploadSpool, declared)
-        name = await uploads.receive(request, spool)
+        spool = await run_in_threadpool(backup.UploadSpool, max(body.declared, 0))
+        name = await uploads.receive(body, spool)
         if not name:
-            return _upload_refused("choose a .db file to restore")
-        # blocking work (checks, swap) runs off the event loop, on the job worker; the file is moved, not copied
-        msg = await run_in_threadpool(_restore_exclusive, f"uploaded {name}",
-                                      lambda: backup.restore(spool, still_allowed=_still(request)))
+            msg = "choose a .db file to restore"
+        else:
+            # blocking work (checks, swap) runs off the event loop, on the job worker; the file is moved, not copied
+            msg = await run_in_threadpool(_restore_exclusive, f"uploaded {name}",
+                                          lambda: backup.restore(spool, still_allowed=_still(request)))
     except uploads.Disconnected:
         log.info("backup upload cancelled: the client went away after %d bytes", spool.size if spool else 0)
         return Response(status_code=400)
     except uploads.UploadError as e:
         log.warning("backup upload refused after %d bytes: %s", spool.size if spool else 0, e)
-        return _upload_refused(f"restore refused: {e}")
+        msg = f"restore refused: {e}"
     except backup.FAILURES as e:
-        return _upload_refused(f"restore refused: {e}")
+        msg = f"restore refused: {e}"
     finally:
         if spool is not None:
             spool.discard()                       # a partial or refused upload (restore() moved a used one away)
         _upload_slot.release()
-    return _flash("/system", msg)
+    return await _upload_answer(body, msg)       # the slot is free while the rest of a refused body is read
 
 
 @app.get("/api/v1/system/backup")

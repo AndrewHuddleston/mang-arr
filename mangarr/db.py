@@ -536,11 +536,20 @@ def set_have(con, series_id: int, number: float, staging_path: str | None,
     con.execute(
         "INSERT INTO chapter (series_id, number, status, source_name, staging_path, library_path, updated_at)"
         " VALUES (?,?,'have',?,?,?,?)"
-        " ON CONFLICT(series_id, number) DO UPDATE SET status='have',"
+        " ON CONFLICT(series_id, number) DO UPDATE SET status='have', reason=NULL,"
         " staging_path=COALESCE(excluded.staging_path, chapter.staging_path),"
         " library_path=COALESCE(excluded.library_path, chapter.library_path),"
         " source_name=COALESCE(excluded.source_name, chapter.source_name), updated_at=excluded.updated_at",
         (series_id, number, source_name, staging_path, library_path, now()))
+
+
+def set_reason(con, series_id: int, number: float, reason: str) -> bool:
+    """Say why a chapter is where it is without changing its status (a
+    downloaded file that could not be checked in time). A chapter the
+    library has is left alone. Returns whether a row changed."""
+    cur = con.execute("UPDATE chapter SET reason=?, updated_at=? WHERE series_id=? AND number=? AND status != 'have'",
+                      (reason[:300], now(), series_id, number))
+    return cur.rowcount > 0
 
 
 RETRY_HOURS = (0, 24, 72, 168)      # after the 1st failure: next pass; then 1 day, 3 days, a week (cap)
@@ -584,6 +593,33 @@ def chapters(con, series_id: int, limit: int | None = None, offset: int = 0):
         return con.execute("SELECT * FROM chapter WHERE series_id=? ORDER BY number", (series_id,)).fetchall()
     return con.execute("SELECT * FROM chapter WHERE series_id=? ORDER BY number LIMIT ? OFFSET ?",
                        (series_id, limit, offset)).fetchall()
+
+
+def chapter_marks(con, series_id: int):
+    """(number, status, name) of every chapter row, by number, as plain
+    tuples read as they are used (a cursor): the series page keeps only
+    totals of them (views.chapter_summary)."""
+    cur = con.cursor()
+    cur.row_factory = None
+    return cur.execute("SELECT number, status, name FROM chapter WHERE series_id=? ORDER BY number", (series_id,))
+
+
+def chapters_newest_first(con, series_id: int, limit: int, offset: int = 0):
+    """`limit` whole chapter rows from `offset`, highest number first."""
+    return con.execute("SELECT * FROM chapter WHERE series_id=? ORDER BY number DESC LIMIT ? OFFSET ?",
+                       (series_id, limit, offset)).fetchall()
+
+
+def chapters_by_number(con, series_id: int, numbers) -> dict:
+    """{number: whole chapter row} for these chapter numbers, in statements
+    of at most 500 (SQLite limits the parameters of one)."""
+    numbers, out = list(numbers), {}
+    for i in range(0, len(numbers), 500):
+        part = numbers[i:i + 500]
+        for r in con.execute(f"SELECT * FROM chapter WHERE series_id=? AND number IN ({','.join('?' * len(part))})",
+                             (series_id, *part)):
+            out[r["number"]] = r
+    return out
 
 
 def chapter_count(con, series_id: int) -> int:

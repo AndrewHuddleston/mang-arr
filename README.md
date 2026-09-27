@@ -209,6 +209,8 @@ is clamped to it; both are logged at start-up.
 | `MANGARR_BACKUP_HOURS` | `24` | Hours between scheduled database backups (`serve` only). |
 | `MANGARR_BACKUPS_KEEP` | `7` | How many backups to keep in `$MANGARR_DATA/backups`; the oldest are pruned after every backup. |
 | `MANGARR_BACKUP_UPLOAD_MAX_MB` | `512` | Largest backup file accepted by *Restore from file* (raised to twice the current database when that is larger). |
+| `MANGARR_UPLOAD_MIN_KBPS` | `128` | *Restore from file* cuts off an upload that averages fewer KB a second than this (it gets `MANGARR_UPLOAD_IDLE_SECS` plus one second per this many KB). Lower it for a slow link, or copy the file (named `mangarr-<date>-<time>.db`, as downloaded) into the backups folder and restore it from the list. |
+| `MANGARR_UPLOAD_IDLE_SECS` | `30` | ... and one that sends nothing for this many seconds (5 to 3600). |
 | `MANGARR_EVENTS_KEEP_DAYS` | `90` | Days of event history (Activity, series pages) kept; older events are pruned before each scheduled backup. |
 | `MANGARR_EVENTS_KEEP_ROWS` | `100000` | Size ceiling for the event history. Above it the oldest routine *Sources resolved* / *Needs a decision* events go first, so chapter history (downloaded, imported, failed) keeps its full `MANGARR_EVENTS_KEEP_DAYS`; only if that is not enough are older events of any kind removed (logged). A library refreshed often with many hundreds of series may need more. |
 | `MANGARR_PUSHOVER_TOKEN` | unset | Default Pushover application token. Notifications are sent only when both Pushover values are set. |
@@ -407,13 +409,26 @@ score / favourites, top 1-100, optional country JP / KR / CN and minimum
 chapter count; manga format only, no adult titles), or a text file at a URL
 with one title per line (`#` comments; an `anilist:123` / `mangadex:uuid`
 reference works too). The file may be on the internet or the LAN (a NAS is
-fine), not on mang-arr's own machine (localhost, 127.0.0.1) or a link-local
-address; a URL that returns JSON, a web page or another document instead of
-a list of titles is refused as a whole, and lines that are not titles
-(`key=value`, markup, URLs, tokens) are skipped: they are neither looked up
-nor shown. A text file only counts as a title list once AniList or MangaDex
-know its lines: when none of the first five lines looked up is a series
-they know, the sync stops with an error that quotes nothing. Each list has
+fine). Only loopback addresses (`localhost`, `127.0.0.1`, `::1`: mang-arr's
+own container or machine), link-local ones (`169.254.x.x`, `fe80::`, where
+cloud metadata services answer), multicast addresses and `0.0.0.0` are
+refused. Private addresses are allowed by design, and that includes the
+other addresses of the machine mang-arr runs on (its LAN IP, Docker's
+`172.17.0.1`): a service there that listens on all interfaces can be
+fetched, and a failed sync's error (connection refused, no answer in time,
+HTTP 404) shows whether a port answers. A URL that returns JSON, a web page
+or another document instead of a list of titles is refused as a whole, and
+lines that are not titles (`key=value`, markup, URLs, tokens) are skipped:
+they are neither looked up nor shown. A text file only counts as a title
+list once AniList or MangaDex know its lines: the lines are looked up until
+one is a series they know, and when none of the first 20 is, the sync stops
+with an error that quotes nothing. If neither AniList nor MangaDex can be
+reached before then, or no line is known and one of them could not be
+asked about some of those lines, the sync stops with "try again later"
+instead (the list is kept, and the next sync tries again). Up to 20 lines
+of whatever the URL returns are sent to AniList and MangaDex as searches
+that way. With one of them down, the lines the other does not know are
+counted as *not checked* and looked up again at the next sync. Each list has
 its own sync interval (default 24 h), a download flag and a monitored flag,
 and can be disabled. Lists are checked every ten minutes and synced when
 due, or by *Sync now*; every series a sync yields that is not tracked yet
@@ -421,7 +436,9 @@ is queued as an ordinary add job (at most 25 per sync; the next sync
 continues), with the list's download / monitored flags. Titles from a text
 list without a single exact database match are reported as *needs review*
 in the list's result, not added - quoted when at least half of the lines
-looked up are series AniList or MangaDex know, by line number otherwise.
+looked up are series AniList or MangaDex know and the line is nearly the
+title of a series they suggested for it (a misspelt or ambiguous title, so
+what is quoted is close to a public title), by line number otherwise.
 **Exclusions** are references a list must never add: tick *exclude from
 import lists* when deleting a series, or add one by reference. Deleting a
 list keeps the series it added.
@@ -511,11 +528,19 @@ into the restore from there. Only one upload is accepted at a time (a second
 one is refused at once). An upload that sends nothing for 30 seconds, or
 averages less than 128 KB a second (it gets 30 seconds plus one second per
 128 KB received), is cut off, so a stalled or dripping client cannot hold
-the upload for long. An upload is refused, before the first byte and with
-every write while it arrives, when it would leave less free space on that
-disk than its own size, up to 256 MB: a small backup can still be restored
-on a nearly full disk, a big one cannot take the last of it. A refused or
-cut-off upload leaves nothing behind.
+the upload for long (`MANGARR_UPLOAD_IDLE_SECS`, `MANGARR_UPLOAD_MIN_KBPS`).
+Over a slower link, copy the file (named `mangarr-<date>-<time>.db`, as
+downloaded) into the backups folder and restore it from the list instead.
+Besides the file's data a form may hold at most 8 KB (boundaries, part
+headers, fields, line breaks before the first part), and nothing after its
+closing boundary is waited for. A refused upload of up to 8 MB is read to
+its end before the answer, so the browser shows the message; a bigger one
+is not read, and the connection is closed after the answer. An upload is
+refused, before the first byte and with every write while it arrives, when
+it would leave less free space on that disk than its own size, up to
+256 MB: a small backup can still be restored on a nearly full disk, a big
+one cannot take the last of it. A refused or cut-off upload leaves nothing
+behind.
 
 ### CLI
 
@@ -984,10 +1009,19 @@ What the web server refuses, and what to do if it refuses you:
   with its port if it is not 80/443 (`proxy_set_header Host $http_host;`
   in nginx, or `X-Forwarded-Host`), and `X-Forwarded-Proto` if the proxy
   serves HTTPS. A proxy that drops the port (nginx `$host`) must send
-  `X-Forwarded-Port` when it listens on a port other than 80/443: without
-  it a `Host` with no port stands for 80 (443 over HTTPS), so over plain
-  HTTP every browser gets 403 on another port. The log line of a refusal
-  says which of these a proxy is missing.
+  `X-Forwarded-Port` when it listens on a port other than 80/443. Without
+  it a `Host` with no port stands for 80 (443 with `X-Forwarded-Proto:
+  https`): over plain HTTP every browser gets 403 from mang-arr's own
+  pages on the proxy's port, while a page on port 80 of the same host name
+  counts as mang-arr's own for browsers that send no `Sec-Fetch-Site`.
+  One exception keeps a TLS proxy on 443 that sends no `X-Forwarded-Proto`
+  working for those browsers (Safari before 16.4): for a request that came
+  through a proxy (`X-Forwarded-For`, `X-Real-IP`, `Forwarded` or
+  `X-Forwarded-Host`, or a peer in `MANGARR_TRUSTED_PROXIES`) with a `Host`
+  without a port and no `X-Forwarded-Proto`, `https://` on the same host
+  name counts as well as `http://`. Send `X-Forwarded-Proto` to have the
+  scheme checked too. The log line of a refusal says which of these a
+  proxy is missing.
 - **Unknown host names (DNS rebinding).** The UI answers only when the
   `Host` header is an IP address, `localhost`, a single-label name
   (`mangarr`), a LAN name (`.local`, `.lan`, `.home`, `.home.arpa`,
@@ -1000,7 +1034,8 @@ What the web server refuses, and what to do if it refuses you:
   dropped. `/api/v1/ping` is exempt.
 - **Large requests.** Bodies over 1 MB get 413 (the backup upload takes up
   to `MANGARR_MAX_UPLOAD_MB`, one at a time, and is cut off after 30 s
-  without data or when it averages less than 128 KB/s; see Backups).
+  without data, when it averages less than 128 KB/s, or when the form holds
+  more than 8 KB besides the file; see Backups).
 - **Password guessing.** Failed sign-ins (login page and basic auth alike)
   are counted per client address: after 5 failures in 15 minutes each
   further attempt is refused with 429 for 2 s, 4 s, 8 s ... up to 15

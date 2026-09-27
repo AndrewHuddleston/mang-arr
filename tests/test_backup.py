@@ -588,11 +588,13 @@ class BackupRoutesTest(_Base):
         many seconds first); with stall=True the client then stops sending
         without going away. Returns (status, headers, flash text)."""
         chunks = list(chunks)
+        self.consumed = 0                              # body bytes the server read
 
         async def receive():
             while chunks and isinstance(chunks[0], float):
                 await asyncio.sleep(chunks.pop(0))     # a slow client
             if chunks:
+                self.consumed += len(chunks[0])
                 return {"type": "http.request", "body": chunks.pop(0), "more_body": bool(chunks) or stall}
             await asyncio.sleep(3600)                  # stalled: only the server's idle cut-off ends this
         sent = []
@@ -633,7 +635,7 @@ class BackupRoutesTest(_Base):
         with mock.patch.object(uploads, "IDLE_SECS", 0.5):
             spooled, took, second, first = asyncio.run(scenario())
         self.assertEqual(len(spooled), 1)                        # in the backups folder, not /tmp
-        self.assertEqual((second[0], second[1].get("connection")), (303, "close"))
+        self.assertEqual((second[0], second[1].get("connection")), (303, None))   # small: read, then answered
         self.assertIn("another backup upload is in progress", second[2])
         self.assertLess(took, 0.5)                               # refused at once, not queued
         self.assertEqual(first[0], 303)
@@ -686,6 +688,8 @@ class BackupRoutesTest(_Base):
         self.assertEqual(first[0], 303)
         self.assertIn("the upload is too slow", first[2])                 # ... until it fell behind the rate
         self.assertIn("at least 256 KB a second", first[2])
+        self.assertIn("copy the file, keeping its mangarr-<date>-<time>.db name, into the backups folder "
+                      f"({backup.backup_dir()}) and restore it from the list", first[2])   # round 3: around a slow link
         self.assertLess(took, 2.5)                                        # 0.5 s + 64 KB at 256 KB/s, not 5 s
         self.assertEqual(self.backups_dir_extras(), [])
         with db.connect() as con:
@@ -746,7 +750,7 @@ class BackupRoutesTest(_Base):
         msg = urllib.parse.unquote(r.headers["location"])
         self.assertIn(f"not enough free disk space in {backup.backup_dir()} (12 KB free; an upload of 9 KB "
                       "must leave 9 KB free)", msg)
-        self.assertEqual(r.headers.get("connection"), "close")
+        self.assertIsNone(r.headers.get("connection"))          # the small body was read before answering
         free.assert_called_once_with(backup.backup_dir())       # before the first byte was stored
         self.assertEqual(self.backups_dir_extras(), [])
         self.assertEqual(self.titles(), ["Live"])
@@ -795,6 +799,104 @@ class BackupRoutesTest(_Base):
         self.assertIn("restore%20refused", r.headers["location"])
         r = self.client.post("/system/backups/mangarr-20200101-000000.db/restore", follow_redirects=False)
         self.assertIn("restore%20refused", r.headers["location"])
+
+    # -- round 3: bytes besides the file are capped and not waited for, small refused bodies are read before
+    # the answer, and the rate limits can be set
+
+    def _backup_bytes(self) -> bytes:
+        with open(backup.create("t"), "rb") as f:
+            return f.read()
+
+    def test_bytes_after_the_closing_boundary_do_not_hold_the_slot(self):
+        """The verifier's repro: bytes after the closing boundary did not count against the upload limit, so a
+        client could keep the only upload slot for MANGARR_MAX_UPLOAD_MB at MIN_RATE (hours). Reading stops at
+        the closing boundary: the restore runs and the slot is free while the junk still drips."""
+        from mangarr.web import uploads
+        data = self._backup_bytes()
+        with db.connect() as con:
+            con.execute("DELETE FROM series")
+
+        async def scenario():
+            t0 = time.monotonic()
+            first = asyncio.ensure_future(self._asgi_upload([self.HEAD, data, self.TAIL] + [0.1, b"y"] * 100))
+            for _ in range(500):                                 # restored while the junk still drips
+                if self.titles() == ["Live"] and not self.web._restore_guard():
+                    break
+                await asyncio.sleep(0.01)
+            with db.connect() as con:
+                con.execute("DELETE FROM series")
+            second = await self._asgi_upload([self.HEAD, data, self.TAIL])
+            return second, await first, time.monotonic() - t0
+        with mock.patch.object(uploads, "IDLE_SECS", 0.5), mock.patch.object(uploads, "MIN_RATE", 256 << 10):
+            second, first, took = asyncio.run(scenario())
+        self.assertIn("restored", second[2])                     # not "another backup upload is in progress"
+        self.assertEqual((first[0], first[1].get("connection")), (303, "close"))
+        self.assertIn("restored", first[2])
+        self.assertLess(took, 5)                                 # the drip is cut off, not read for 10 s
+        self.assertEqual(self.titles(), ["Live"])
+        self.assertEqual(self.backups_dir_extras(), [])
+
+    def test_bytes_besides_the_file_are_capped(self):
+        """The same repro before the first boundary: python-multipart skips any number of line breaks there.
+        At most MAX_OTHER_BYTES of anything but the file's data is read."""
+        from mangarr.web import uploads
+        with mock.patch.object(uploads, "IDLE_SECS", 0.5):
+            t0 = time.monotonic()
+            status, _, msg = asyncio.run(self._asgi_upload([b"\r\n" * 2048] * 10, stall=True))
+        self.assertEqual(status, 303)
+        self.assertIn("the form holds more than 8 KB besides the file", msg)
+        self.assertLess(time.monotonic() - t0, 2)
+        self.assertEqual(self.backups_dir_extras(), [])
+        body = self.HEAD + b"x" * 5000 + b'\r\n--b\r\nContent-Disposition: form-data; name="note"\r\n\r\n' \
+            + b"n" * 4000 + self.TAIL                            # a field within its limits still passes the cap
+        status, _, msg = asyncio.run(self._asgi_upload([body]))
+        self.assertNotIn("besides the file", msg)
+        self.assertIn("restore refused", msg)                    # (not a database: refused by restore itself)
+
+    def test_small_refused_bodies_are_read_before_the_answer(self):
+        """The verifier's repro: a refusal sent before the body was read closed the connection with data
+        unread, and the kernel's reset can cost a browser (typically on Windows) the answer: most likely the
+        job guard during a scheduled refresh. Up to DRAIN_MAX the body is now read first and the connection
+        kept; a bigger one is not read at all, and the connection is closed after the answer."""
+        from mangarr.web import uploads
+        mb = b"x" * (1 << 20)
+        for size_mb, drained in ((5, True), ((uploads.DRAIN_MAX >> 20) + 1, False)):
+            chunks = [self.HEAD] + [mb] * size_mb + [self.TAIL]
+            length = sum(len(c) for c in chunks)
+            with self.subTest(size_mb=size_mb), \
+                    mock.patch.object(self.web, "_restore_guard", return_value="cannot restore while a job is queued"):
+                status, h, msg = asyncio.run(self._asgi_upload(chunks, headers=[(b"content-length",
+                                                                                 str(length).encode())]))
+                self.assertEqual(status, 303)
+                self.assertIn("cannot restore while a job is queued", msg)
+                if drained:
+                    self.assertEqual((self.consumed, h.get("connection")), (length, None))
+                else:
+                    self.assertEqual((self.consumed, h.get("connection")), (0, "close"))
+        # without a Content-Length the body is read up to DRAIN_MAX, then given up on
+        chunks = [self.HEAD] + [mb] * ((uploads.DRAIN_MAX >> 20) + 2) + [self.TAIL]
+        with mock.patch.object(self.web, "_restore_guard", return_value="cannot restore while a job is queued"):
+            status, h, msg = asyncio.run(self._asgi_upload(chunks))
+        self.assertEqual(h.get("connection"), "close")
+        self.assertLess(self.consumed, sum(len(c) for c in chunks))
+
+    def test_upload_rate_limits_from_the_environment(self):
+        """Round 3: a restore over a slow link (64 KB/s: a phone over Tailscale) was cut off after about 60 s
+        with no way to allow it. MANGARR_UPLOAD_MIN_KBPS / MANGARR_UPLOAD_IDLE_SECS set the limits, through
+        the same safe parser as every numeric variable."""
+        import importlib
+
+        from mangarr.web import uploads
+        self.addCleanup(importlib.reload, uploads)
+        with mock.patch.dict(os.environ, {"MANGARR_UPLOAD_MIN_KBPS": "32", "MANGARR_UPLOAD_IDLE_SECS": "120"}):
+            importlib.reload(uploads)
+        self.assertEqual((uploads.MIN_RATE, uploads.IDLE_SECS), (32 << 10, 120.0))
+        with mock.patch.dict(os.environ, {"MANGARR_UPLOAD_MIN_KBPS": "1M", "MANGARR_UPLOAD_IDLE_SECS": "0"}), \
+                self.assertLogs("mangarr.config", "WARNING") as logs:
+            importlib.reload(uploads)
+        self.assertEqual((uploads.MIN_RATE, uploads.IDLE_SECS), (128 << 10, 5.0))
+        self.assertIn("MANGARR_UPLOAD_MIN_KBPS='1M' is not a number; using the default 128", "\n".join(logs.output))
+        self.assertIn("MANGARR_UPLOAD_IDLE_SECS='0' is outside 5..3600; using 5", "\n".join(logs.output))
 
     # -- #93: no job runs alongside a restore
 

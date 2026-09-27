@@ -39,6 +39,7 @@
   <td class="num">{{ it.numbers|length }}</td>
   <td>
     {% if it.series %}<b>{{ it.series.title }}</b> <span class="muted">{{ it.series.ref }}</span>
+    {% elif it.lookup_error %}{{ m.label('not looked up', 'danger', title=it.lookup_error ~ '; scan again') }}
     {% else %}{{ m.label('no exact match', 'warning') }}{% endif %}
   </td>
   <td>

@@ -94,11 +94,11 @@
       <dt>Year</dt><dd>{{ year or '-' }}</dd>
       <dt>Demographic</dt><dd>{{ demographic or '-' }}</dd>
       <dt>Chapters</dt><dd>{{ counts.have }} / {{ listed }}{% if s.expected %} <span class="muted">({{ s.expected }} expected)</span>{% endif %}
-        {% if counts.wanted %}{{ m.label(counts.wanted ~ ' missing', 'danger', 'small', title=by['wanted']|ranges) }}{% endif %}
-        {% if counts.failed %}{{ m.label(counts.failed ~ ' failed', 'danger', 'small', outline=true, title=by['failed']|ranges) }}{% endif %}
-        {% if counts.unavailable %}{{ m.label(counts.unavailable ~ ' unavailable', 'purple', 'small', title=by['unavailable']|ranges) }}{% endif %}
-        {% if counts.ignored %}{{ m.label(counts.ignored ~ ' ignored', 'disabled', 'small', title=by['ignored']|ranges) }}{% endif %}
-        {% if counts.junk %}{{ m.label(counts.junk ~ ' junk', 'default', 'small', title=by['junk']|ranges) }}{% endif %}</dd>
+        {% if counts.wanted %}{{ m.label(counts.wanted ~ ' missing', 'danger', 'small', title=runs['wanted']) }}{% endif %}
+        {% if counts.failed %}{{ m.label(counts.failed ~ ' failed', 'danger', 'small', outline=true, title=runs['failed']) }}{% endif %}
+        {% if counts.unavailable %}{{ m.label(counts.unavailable ~ ' unavailable', 'purple', 'small', title=runs['unavailable']) }}{% endif %}
+        {% if counts.ignored %}{{ m.label(counts.ignored ~ ' ignored', 'disabled', 'small', title=runs['ignored']) }}{% endif %}
+        {% if counts.junk %}{{ m.label(counts.junk ~ ' junk', 'default', 'small', title=runs['junk']) }}{% endif %}</dd>
       {% if series.volumes %}<dt>Volumes</dt><dd>{{ series.volumes }}</dd>{% endif %}
       <dt>Reading direction</dt><dd>{{ 'right to left' if series.right_to_left else 'left to right' }}</dd>
       <dt>Primary source</dt><dd>{% if primary %}{{ primary.source_name }} <span class="muted">({{ primary.title }})</span>{% else %}-{% endif %}</dd>
@@ -109,7 +109,7 @@
   </details>
 
   {# -- Chapter groups (Sonarr SeriesDetailsSeason) ------------------------ #}
-  {# a long chapter list is paged (views.page_groups); the counts above cover all of it #}
+  {# a long chapter list is paged (views.page_summary); the counts above cover all of it #}
   {% macro paging_nav(where) %}
   <div class="alert info compact chapter-paging" id="chapter-pages-{{ where }}">
     {{ paging.total }} chapters are listed, more than one page shows: rows {{ paging.first }}-{{ paging.last }}, newest first (page {{ paging.page }} of {{ paging.pages }}).

@@ -199,6 +199,8 @@ def cmd_adopt(a):
     out(f"\n{len(items)} folders: {len(ok)} identified, {len(review)} need review")
     for it in review:
         out(f"\n  REVIEW  {it.source} / {it.folder_name}  ({len(it.numbers)} ch)")
+        if it.lookup_error:
+            out(f"      {it.lookup_error}; run adopt again to identify it")
         print_candidates(it.candidates[:4])
         out("      adopt it with:  mangarr add --anilist ID   (or --mangadex UUID / --manual \"Title\")")
     if a.dry_run:

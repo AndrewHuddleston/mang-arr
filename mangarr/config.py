@@ -1,9 +1,33 @@
 """Runtime settings. Environment variables override the defaults."""
+import atexit
 import logging
 import math
 import os
 
 log = logging.getLogger(__name__)
+
+# Warnings from before logging is set up (this module is imported before the
+# CLI reads its options): held back and logged by logsetup.setup(), so they
+# get the configured format and reach MANGARR_LOG_FILE. Whatever is still
+# held at exit (a command that never set up logging) is logged then.
+_held: list[tuple[str, tuple]] = []
+
+
+def _warn(msg: str, *args) -> None:
+    if log.hasHandlers():
+        log.warning(msg, *args)
+    else:
+        _held.append((msg, args))
+
+
+def replay_warnings() -> None:
+    """Log the warnings held back until logging was set up (logsetup.setup)."""
+    while _held:
+        msg, args = _held.pop(0)
+        log.warning(msg, *args)
+
+
+atexit.register(replay_warnings)
 
 
 def env_number(name: str, default: float, lo: float, hi: float, integer: bool = False) -> float:
@@ -21,14 +45,14 @@ def env_number(name: str, default: float, lo: float, hi: float, integer: bool = 
     except ValueError:
         v = math.nan
     if not math.isfinite(v):
-        log.warning("%s=%r is not a number; using the default %.15g", name, raw, default)
+        _warn("%s=%r is not a number; using the default %.15g", name, raw, default)
         return default
     out = min(max(v, lo), hi)
     if out != v:           # %.15g: the exact bound (plain %g would print 1048576 as 1.04858e+06)
-        log.warning("%s=%r is outside %.15g..%.15g; using %.15g", name, raw, lo, hi, out)
+        _warn("%s=%r is outside %.15g..%.15g; using %.15g", name, raw, lo, hi, out)
     if integer:
         if out != int(out):
-            log.warning("%s=%r is not a whole number; using %d", name, raw, round(out))
+            _warn("%s=%r is not a whole number; using %d", name, raw, round(out))
         return int(round(out))
     return out
 

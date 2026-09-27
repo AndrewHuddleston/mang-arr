@@ -686,6 +686,81 @@ class ThrottleBurstTest(WebBase):
         self.assertEqual((codes, checked), (Counter({200: len(paths)}), 1))
 
 
+class Round3AuthTest(WebBase):
+    """Round 3 leftovers in security.py: a remembered sign-in clears the failure counter, and the Origin
+    check behind proxies that pass a Host without a port."""
+    login = ("andy", "pw")
+
+    def post_login(self, headers=None, password="pw"):
+        return self.client.post("/login", data={"username": "andy", "password": password}, headers=headers or {},
+                                follow_redirects=False)
+
+    def test_remembered_sign_in_resets_the_failure_counter(self):
+        """The verifier's repro: a right password answered from the remembered-password memo left earlier
+        failures counting, so one more typo later meant 429 for the right password."""
+        self.signin()                                           # checked once: now remembered
+        self.client.cookies.clear()
+        for _ in range(5):
+            self.assertEqual(self.post_login(password="typo").status_code, 401)
+        self.assertEqual(self.post_login().status_code, 303)   # remembered: no hash, but it counts as a success
+        self.assertNotIn("testclient", self.security.throttle._d)
+        self.client.cookies.clear()
+        self.assertEqual(self.post_login(password="typo").status_code, 401)
+        self.assertEqual(self.post_login().status_code, 303)
+        self.set(auth_method="basic")                           # a Basic client without cookies alike
+        with TestClient(self.web.app, cookies=None) as c:
+            for _ in range(5):
+                c.cookies.clear()
+                self.assertEqual(c.get("/api/v1/series", auth=("andy", "typo")).status_code, 401)
+            c.cookies.clear()
+            self.assertEqual(c.get("/api/v1/series", auth=("andy", "pw")).status_code, 200)
+            self.assertNotIn("testclient", self.security.throttle._d)
+
+    def test_tls_proxy_without_forwarded_proto_keeps_older_browsers_working(self):
+        """The verifier's repro: behind a TLS proxy that passes `$host` and no X-Forwarded-Proto, a browser
+        that sends no Sec-Fetch-Site (Safari before 16.4) got 403 on every POST, /login included."""
+        proxied = {"Host": "nas.lan", "X-Forwarded-For": "1.2.3.4", "Origin": "https://nas.lan"}
+        for headers in (proxied, {**proxied, "Sec-Fetch-Site": "same-origin"},
+                        {"Host": "nas.lan", "X-Real-IP": "1.2.3.4", "Origin": "https://nas.lan"},
+                        {**proxied, "Origin": None, "Referer": "https://nas.lan/login"},
+                        {**proxied, "X-Forwarded-Port": "443"}):
+            headers = {k: v for k, v in headers.items() if v is not None}
+            self.client.cookies.clear()
+            self.assertEqual(self.post_login(headers).status_code, 303, headers)
+        with mock.patch.dict(os.environ, {"MANGARR_TRUSTED_PROXIES": "127.0.0.1"}), \
+                TestClient(self.web.app, client=("127.0.0.1", 5000)) as c:      # a trusted peer: no header needed
+            r = c.post("/login", data={"username": "andy", "password": "pw"},
+                       headers={"Host": "nas.lan", "Origin": "https://nas.lan"}, follow_redirects=False)
+            self.assertEqual(r.status_code, 303)
+        refused = (
+            {"Host": "nas.lan", "Origin": "https://nas.lan"},               # no proxy: the connection is http
+            {**proxied, "X-Forwarded-Proto": "http"},                       # the proxy says http: strict
+            {**proxied, "X-Forwarded-Port": "8443"},                        # the proxy says another port
+            {**proxied, "Host": "nas.lan:80"},                              # Host has its port: strict
+            {**proxied, "Origin": "https://nas.lan:8443"},                  # not the default port
+            {**proxied, "Origin": "http://nas.lan:443"},                    # another scheme's default port
+            {**proxied, "Origin": "https://nas.lan:80"},
+            {**proxied, "Origin": "https://other.lan"},
+            {**proxied, "Origin": "http://nas.lan:4567"},                   # Suwayomi
+            {**proxied, "Sec-Fetch-Site": "same-site"},                     # the browser says no
+        )
+        for headers in refused:
+            self.assertEqual(self.post_login(headers).status_code, 403, headers)
+
+    def test_proxy_on_another_port_accepts_its_page_only_when_it_names_the_port(self):
+        """Round 3: nginx `$host` on :8080. Without X-Forwarded-Port nothing tells which port the browser
+        used: mang-arr's own page is refused (the log says what to send) and a Host without a port stands
+        for 80. With the port named, the page on :8080 passes and pages on the default ports do not."""
+        self.signin()
+        own = {"Host": "nas.lan", "X-Forwarded-For": "1.2.3.4", "Origin": "http://nas.lan:8080"}
+        self.assertEqual(self.client.post("/wanted/search", headers=own).status_code, 403)
+        named = {**own, "X-Forwarded-Port": "8080"}
+        self.assertEqual(self.client.post("/wanted/search", headers=named, follow_redirects=False).status_code, 303)
+        for origin in ("http://nas.lan", "https://nas.lan", "http://nas.lan:443", "http://nas.lan:4567"):
+            self.assertEqual(self.client.post("/wanted/search", headers={**named, "Origin": origin}).status_code,
+                             403, origin)
+
+
 class SessionTest(WebBase):
     """#118: sessions can be revoked."""
     login = ("andy", "pw")

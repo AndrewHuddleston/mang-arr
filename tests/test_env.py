@@ -1,6 +1,7 @@
 """Numeric MANGARR_* environment variables: a typo or an out-of-range value
 is logged and replaced, never a crash while the app loads (with `restart:
 unless-stopped` that is a container restart loop)."""
+import json
 import os
 import re
 import subprocess
@@ -16,7 +17,8 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 # every numeric variable read at import time, with a typo a user could make
 GARBAGE = {"MANGARR_LOCK_WAIT_SECS": "6h", "MANGARR_REFRESH_HOURS": "6h", "MANGARR_FIRST_REFRESH_MIN": "5m",
            "MANGARR_BACKUPS_KEEP": "seven", "MANGARR_BACKUP_HOURS": "1d", "MANGARR_BACKUP_UPLOAD_MAX_MB": "1G",
-           "MANGARR_EVENTS_KEEP_DAYS": "90d", "MANGARR_EVENTS_KEEP_ROWS": "100k", "MANGARR_MAX_UPLOAD_MB": "2G"}
+           "MANGARR_EVENTS_KEEP_DAYS": "90d", "MANGARR_EVENTS_KEEP_ROWS": "100k", "MANGARR_MAX_UPLOAD_MB": "2G",
+           "MANGARR_UPLOAD_MIN_KBPS": "1M", "MANGARR_UPLOAD_IDLE_SECS": "30s"}
 
 try:
     import fastapi  # noqa: F401
@@ -75,19 +77,46 @@ class EnvNumberTest(unittest.TestCase):
         # the review's repro: MANGARR_EVENTS_KEEP_DAYS=90d made `import mangarr.web.app` raise ValueError
         code = ("import mangarr.web.app\n"
                 "from mangarr import backup, config, downloader\n"
-                "from mangarr.web import security\n"
+                "from mangarr.web import security, uploads\n"
                 "print(downloader.LOCK_WAIT_SECS, config.REFRESH_HOURS, config.FIRST_REFRESH_MIN, backup.KEEP,"
                 " backup.INTERVAL_HOURS, backup.UPLOAD_MAX_MB, backup.EVENTS_KEEP_DAYS, backup.EVENTS_KEEP_ROWS,"
-                " security.BODY_LIMITS['/system/backups/upload'] >> 20)\n")
+                " security.BODY_LIMITS['/system/backups/upload'] >> 20, uploads.MIN_RATE >> 10, uploads.IDLE_SECS)\n")
         with tempfile.TemporaryDirectory() as tmp:
             env = {k: v for k, v in os.environ.items() if not k.startswith("MANGARR_")}
             env.update(GARBAGE, MANGARR_DATA=tmp, PYTHONPATH=ROOT)
             out = subprocess.run([sys.executable, "-c", code], env=env, cwd=tmp, capture_output=True, text=True,
                                  timeout=120)
         self.assertEqual(out.returncode, 0, out.stderr)
-        self.assertEqual(out.stdout.split(), ["21600", "6.0", "5.0", "7", "24.0", "512.0", "90.0", "100000", "2048"])
-        for name, raw in GARBAGE.items():
+        self.assertEqual(out.stdout.split(), ["21600", "6.0", "5.0", "7", "24.0", "512.0", "90.0", "100000", "2048",
+                                              "128", "30.0"])
+        for name, raw in GARBAGE.items():                       # never set up logging: still said, at exit
             self.assertIn(f"{name}={raw!r} is not a number", out.stderr)
+
+    def test_warnings_from_before_logging_is_set_up_are_logged_like_the_rest(self):
+        """Round 3: variables read when mangarr.config is imported (before the CLI sets up logging) warned
+        through logging's last resort: a bare stderr line, not in MANGARR_LOG_FILE, never JSON."""
+        with tempfile.TemporaryDirectory() as tmp:
+            log_file = os.path.join(tmp, "m.log")
+            env = {k: v for k, v in os.environ.items() if not k.startswith("MANGARR_")}
+            env.update(MANGARR_DATA=tmp, MANGARR_LOG_FILE=log_file, MANGARR_REFRESH_HOURS="6h",
+                       MANGARR_LOCK_WAIT_SECS="-1", PYTHONPATH=ROOT)
+            out = subprocess.run([sys.executable, "-m", "mangarr", "status"], env=env, cwd=tmp, capture_output=True,
+                                 text=True, timeout=120)
+            self.assertEqual(out.returncode, 0, out.stderr)
+            with open(log_file, encoding="utf-8") as f:
+                logged = f.read()
+            env["MANGARR_LOG_JSON"] = "1"
+            js = subprocess.run([sys.executable, "-m", "mangarr", "status"], env=env, cwd=tmp, capture_output=True,
+                                text=True, timeout=120)
+        want = r"\d{4}-\d\d-\d\d \d\d:\d\d:\d\d WARNING mangarr.config: MANGARR_REFRESH_HOURS='6h' is not a number; " \
+               r"using the default 6\n"
+        self.assertRegex(out.stderr, want)
+        self.assertRegex(logged, want)
+        self.assertIn("MANGARR_LOCK_WAIT_SECS='-1' is outside 0..604800; using 0", logged)
+        self.assertNotRegex(out.stderr, r"(?m)^MANGARR_")        # no bare lines
+        self.assertEqual(logged.count("MANGARR_REFRESH_HOURS"), 1)     # once, not again at exit
+        first = json.loads(js.stderr.splitlines()[0])
+        self.assertEqual((first["level"], first["logger"]), ("WARNING", "mangarr.config"))
 
 
 if __name__ == "__main__":
