@@ -175,14 +175,15 @@ def capped_search_titles(series: Series) -> list[str]:
     the series, and aliases can be user-typed or come from a provider. The
     native title is always kept (last, as in search_titles) even when the
     Latin titles alone would fill the cap: Korean, Chinese and Japanese
-    sources often index only that one."""
+    sources often index only that one. Linear in the number of titles, and
+    search_titles is computed once (not again for the log line)."""
     titles = series.search_titles
     if len(titles) > MAX_SEARCH_TITLES:
+        total = len(titles)
         native = series.native if series.native in titles[MAX_SEARCH_TITLES:] else None
         kept = [t for t in titles if t != native][:MAX_SEARCH_TITLES - (1 if native else 0)]
         titles = kept + ([native] if native else [])
-        log.debug("%s: %d titles; searching with %d of them", oneline(series.title), len(series.search_titles),
-                  len(titles))
+        log.debug("%s: %d titles; searching with %d of them", oneline(series.title), total, len(titles))
     return [t[:MAX_TITLE] for t in titles]
 
 

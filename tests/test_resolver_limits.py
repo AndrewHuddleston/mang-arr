@@ -131,8 +131,8 @@ class ResolveTest(unittest.TestCase):
         self.assertIn("more than any real series", plan.matches[0].note)
 
     def test_search_titles_are_capped(self):
-        aliases = [f"Alias {i} " + "y" * 1000 for i in range(5000)]
-        series = Series(anilist_id=1, english="Nothing Matches", synonyms=aliases)
+        aliases = [f"Alias {i} " + "y" * 250 for i in range(5000)]
+        series = Series(anilist_id=1, english="Nothing Matches " + "z" * 1000, synonyms=aliases)
         client = FakeClient([1], hit_title="Other")
         plan = resolve(client, series, sources=[SRC])
         self.assertEqual(len(client.searches), resolver.MAX_SEARCH_TITLES)

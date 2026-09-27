@@ -1,9 +1,21 @@
 """The one thing every module agrees on: what a series is."""
+import logging
 import re
 from dataclasses import dataclass, field
 
+from .matching import oneline
+
+log = logging.getLogger(__name__)
+
 REF_RE = re.compile(r"^(anilist:\d{1,9}|mangadex:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
                     r"|manual:.{1,300})$")
+_LATIN = re.compile(r"[A-Za-z]")
+
+# Aliases are typed on the Add page or sent to the API, or come from a
+# provider (AniList lists 20-40 synonyms for some series), and every one is a
+# title that matching works through: a series keeps at most this many ...
+MAX_ALIASES = 50
+MAX_ALIAS_LEN = 300     # ... of at most this many characters (the manual-ref limit)
 
 
 @dataclass
@@ -27,6 +39,11 @@ class Series:
     genres: list[str] = field(default_factory=list)
     year: int | None = None
     demographic: str | None = None      # shounen, shoujo, seinen, josei (when known)
+
+    def __post_init__(self):
+        # every way a Series is made (Add form, API, import lists, provider
+        # records, a stored row) passes through here, so the cap holds for all
+        self.synonyms = cap_aliases(self.synonyms, self.title)
 
     @property
     def ref(self) -> str:
@@ -58,9 +75,11 @@ class Series:
     @property
     def search_titles(self) -> list[str]:
         """Titles worth typing into a source search: Latin script ones first;
-        the native title last, as only MangaDex-style sources index it."""
-        latin = [t for t in self.titles if re.search(r"[A-Za-z]", t)]
-        other = [t for t in self.titles if t not in latin]
+        the native title last, as only MangaDex-style sources index it.
+        One pass over the titles: linear in their number."""
+        latin, other = [], []
+        for t in self.titles:
+            (latin if _LATIN.search(t) else other).append(t)
         return latin + other
 
     @property
@@ -82,10 +101,41 @@ class Series:
         return self.country == "JP" and self.format != "WEBTOON"
 
 
+def cap_aliases(aliases, series_title: str = "?") -> list[str]:
+    """The aliases worth keeping, in their order: stripped, each once (case
+    ignored), none longer than MAX_ALIAS_LEN, at most MAX_ALIASES. The rest
+    are dropped without an error - a long synonym list is not the user's
+    mistake - and logged at DEBUG. Linear in the input."""
+    out: list[str] = []
+    seen: set[str] = set()
+    too_long = surplus = 0
+    for a in aliases or []:
+        if not isinstance(a, str):
+            continue
+        a = a.strip()
+        if not a:
+            continue
+        if len(a) > MAX_ALIAS_LEN:
+            too_long += 1
+            continue
+        key = a.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        if len(out) >= MAX_ALIASES:
+            surplus += 1
+            continue
+        out.append(a)
+    if too_long or surplus:
+        log.debug("%s: kept %d alias(es); dropped %d longer than %d characters and %d over the cap of %d",
+                  oneline(series_title, 80), len(out), too_long, MAX_ALIAS_LEN, surplus, MAX_ALIASES)
+    return out
+
+
 def manual(title: str, *aliases: str) -> Series:
     """A series no database has (some Western webtoons). Its identity is the
     typed title; strict matching still applies to source hits."""
-    return Series(english=title.strip(), synonyms=[a.strip() for a in aliases if a.strip()])
+    return Series(english=title.strip(), synonyms=list(aliases))
 
 
 def valid_ref(ref: str | None) -> bool:

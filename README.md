@@ -382,7 +382,9 @@ index's *wanted* number is the same sum.
 Type a title; get AniList / MangaDex candidates with covers, status, format,
 country and chapter counts, and a mark on the ones already tracked. A
 single exact match is highlighted. Pick one, or add by exact title with
-aliases when no database has it. Adding is queued as a job.
+aliases when no database has it (at most 50 aliases of up to 300
+characters are kept, here, from the API and from the databases' synonyms).
+Adding is queued as a job.
 
 #### Library Import
 
