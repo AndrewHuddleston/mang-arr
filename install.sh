@@ -136,7 +136,7 @@ fi
 
 # ---------------------------------------------------------------- up
 say "pulling images and starting containers"
-( cd "$STACK_DIR" && docker compose pull -q && docker compose up -d )
+( cd "$STACK_DIR" && (docker compose pull -q --ignore-pull-failures || warn "some images could not be pulled; using local copies if present") && docker compose up -d )
 SUWA="http://127.0.0.1:$SUWAYOMI_PORT"; KOMGA="http://127.0.0.1:$KOMGA_PORT"; MANGARR="http://127.0.0.1:$MANGARR_PORT"
 wait_http "$SUWA/api/graphql?query=%7Bsettings%7BdownloadAsCbz%7D%7D" 90 suwayomi; ok "Suwayomi is up"
 wait_http "$KOMGA/api/v1/claim" 90 komga; ok "Komga is up"
@@ -146,13 +146,20 @@ wait_http "$MANGARR/api/v1/system/status" 60 mangarr; ok "mang-arr is up"
 say "configuring Suwayomi"
 gql "$SUWA" '{"query":"mutation { setSettings(input:{settings:{downloadAsCbz:true, autoDownloadNewChapters:false}}) { settings { downloadAsCbz } } }"}' >/dev/null
 ok "chapters saved as CBZ; Suwayomi's own auto-download off (mang-arr drives downloads)"
-repos=$(gql "$SUWA" '{"query":"{ settings { extensionRepos } }"}' | jsonget data.settings.extensionRepos)
+repos=$( (gql "$SUWA" '{"query":"{ extensionStores { indexUrl } }"}' 2>/dev/null; gql "$SUWA" '{"query":"{ settings { extensionRepos } }"}' 2>/dev/null) | tr -d '\n')
 if [[ "$repos" != *keiyoushi* ]]; then
   gql "$SUWA" "{\"query\":\"mutation { addExtensionStore(input:{indexUrl:\\\"$EXT_REPO\\\"}) { clientMutationId } }\"}" >/dev/null 2>&1 \
     || gql "$SUWA" "{\"query\":\"mutation { setSettings(input:{settings:{extensionRepos:[\\\"$EXT_REPO\\\"]}}) { clientMutationId } }\"}" >/dev/null
   ok "extension repository added"
 fi
-gql "$SUWA" '{"query":"mutation { fetchExtensions(input:{}) { extensions { pkgName } } }"}' >/dev/null
+gql "$SUWA" '{"query":"mutation { fetchExtensions(input:{}) { extensions { pkgName } } }"}' >/dev/null 2>&1 || true
+# the index is fetched in the background; wait until the catalogue is populated
+for i in $(seq 1 30); do
+  total=$(gql "$SUWA" '{"query":"{ extensions { totalCount } }"}' | jsonget data.extensions.totalCount)
+  [[ "${total:-0}" -gt 0 ]] && break
+  sleep 2
+done
+[[ "${total:-0}" -gt 0 ]] && ok "extension catalogue: $total extensions" || warn "extension catalogue is empty; sources must be installed in Suwayomi's UI"
 catalog=$(gql "$SUWA" '{"query":"{ extensions { nodes { pkgName name lang isInstalled isNsfw } } }"}')
 IFS=',' read -r -a wanted <<< "$SOURCES"
 for suffix in "${wanted[@]}"; do
@@ -160,7 +167,7 @@ for suffix in "${wanted[@]}"; do
 import json,sys
 suf=sys.argv[1]
 for e in json.load(sys.stdin)["data"]["extensions"]["nodes"]:
-    if e["pkgName"].endswith("."+suf) and not e["isNsfw"]:
+    if e["pkgName"].endswith("."+suf):        # requested explicitly: the loose NSFW flag in the catalogue does not apply
         print(e["pkgName"], "installed" if e["isInstalled"] else "missing", e["name"]); break' "$suffix")
   [[ -z "$line" ]] && { warn "extension '$suffix' not in the catalogue; skipped"; continue; }
   set -- $line; pkg=$1; state=$2; shift 2; name="$*"

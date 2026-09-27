@@ -867,7 +867,7 @@ def metrics_endpoint():
 
 @app.get("/api/v1/health")
 def api_health():
-    checks = health.run(client)
+    checks = health.run(client, force=True)          # monitoring wants the truth now, not a cached minute
     problems = [f"{c.name}: {c.detail}" for c in checks if c.level == "error"]
     warnings = [f"{c.name}: {c.detail}" for c in checks if c.level == "warning"]
     status = 200 if not problems else 503
