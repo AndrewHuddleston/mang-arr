@@ -35,6 +35,7 @@ def _get(path: str, params: list[tuple[str, str]], retries: int = 3) -> dict:
             log.debug("mangadex %s -> ok in %.1fs", path, time.monotonic() - t0)
             return d
         except urllib.error.HTTPError as e:
+            e.close()                    # the answer's connection: only its status and headers are used
             if e.code == 429:
                 wait = retry_after(e.headers, 5)
                 log.debug("mangadex rate limited, waiting %gs", wait)
