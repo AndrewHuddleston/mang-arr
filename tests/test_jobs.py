@@ -12,7 +12,7 @@ import unittest
 import urllib.error
 from unittest import mock
 
-from mangarr import core, db, downloader, jobs, limits, resolver, suwayomi
+from mangarr import config, core, db, downloader, jobs, limits, resolver, suwayomi
 from mangarr.model import Series
 from mangarr.resolver import Plan, SourceMatch
 from mangarr.suwayomi import Chapter, Client, Source, SuwayomiError, SuwayomiUnreachable
@@ -289,12 +289,13 @@ class DownloaderTest(TmpData):
                                     should_cancel=lambda: True)
 
     def test_bad_lock_wait_env_falls_back_to_the_default(self):     # second pass, regression 3
-        for bad in ("6h", "nan", "-5", "inf"):
+        # parsed by the shared config.env_number now (tests/test_env.py); negative is clamped to "do not wait"
+        for bad, want in (("6h", 21600), ("nan", 21600), ("inf", 21600), ("-5", 0)):
             with mock.patch.dict(os.environ, {"MANGARR_LOCK_WAIT_SECS": bad}), \
-                 self.assertLogs("mangarr.downloader", "WARNING"):
-                self.assertEqual(downloader._env_secs("MANGARR_LOCK_WAIT_SECS", 21600), 21600)
+                 self.assertLogs("mangarr.config", "WARNING"):
+                self.assertEqual(config.env_number("MANGARR_LOCK_WAIT_SECS", 21600, 0, 7 * 86400), want)
         with mock.patch.dict(os.environ, {"MANGARR_LOCK_WAIT_SECS": "90"}):
-            self.assertEqual(downloader._env_secs("MANGARR_LOCK_WAIT_SECS", 21600), 90)
+            self.assertEqual(config.env_number("MANGARR_LOCK_WAIT_SECS", 21600, 0, 7 * 86400), 90)
 
     def test_queue_outage_warns_once_not_every_poll(self):          # second pass, regression 6
         class Down:

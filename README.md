@@ -187,7 +187,10 @@ There are two layers.
 for the two backup ones) set paths, the Suwayomi URL, logging, backups, and
 the defaults for everything else. The Docker image presets the ones marked
 with an asterisk to the container mounts (`/config`, `/data/staging`,
-`/data/library`, `/config/mangarr.log`, `http://suwayomi:4567`).
+`/data/library`, `/config/mangarr.log`, `http://suwayomi:4567`). A numeric
+variable whose value is not a number (a typo like `90d` or `1G`) falls back
+to its default, and one outside a sane range (e.g. `MANGARR_BACKUPS_KEEP=0`)
+is clamped to it; both are logged at start-up.
 
 | Variable | Default | Meaning |
 |---|---|---|

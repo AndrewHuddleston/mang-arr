@@ -38,13 +38,13 @@ from . import config, db, library
 log = logging.getLogger(__name__)
 
 NAME_RE = re.compile(r"^mangarr-(\d{8}-\d{6})(?:-(\d+))?\.db$")
-KEEP = int(os.environ.get("MANGARR_BACKUPS_KEEP", "7"))
-INTERVAL_HOURS = float(os.environ.get("MANGARR_BACKUP_HOURS", "24"))
+KEEP = config.env_number("MANGARR_BACKUPS_KEEP", 7, 1, 1000, integer=True)
+INTERVAL_HOURS = config.env_number("MANGARR_BACKUP_HOURS", 24.0, 1.0, 8760.0)
 # Largest backup accepted through the upload form (MB); a bigger live database raises it to twice its size.
-UPLOAD_MAX_MB = float(os.environ.get("MANGARR_BACKUP_UPLOAD_MAX_MB", "512"))
+UPLOAD_MAX_MB = config.env_number("MANGARR_BACKUP_UPLOAD_MAX_MB", 512.0, 1.0, 1048576.0)
 # Event history kept (Activity/series pages); older events are pruned before each scheduled backup.
-EVENTS_KEEP_DAYS = float(os.environ.get("MANGARR_EVENTS_KEEP_DAYS", "90"))
-EVENTS_KEEP_ROWS = int(os.environ.get("MANGARR_EVENTS_KEEP_ROWS", "100000"))   # a size ceiling, see README
+EVENTS_KEEP_DAYS = config.env_number("MANGARR_EVENTS_KEEP_DAYS", 90.0, 1.0, 36500.0)
+EVENTS_KEEP_ROWS = config.env_number("MANGARR_EVENTS_KEEP_ROWS", 100000, 1000, 100_000_000, integer=True)  # see README
 
 # Security settings a restore keeps from the CURRENT database instead of the
 # backup's (a key the current database does not have is removed from the

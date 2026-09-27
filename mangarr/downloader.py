@@ -15,7 +15,6 @@ chapters no source could deliver end up 'failed'.
 """
 import fcntl
 import logging
-import math
 import os
 import socket
 import time
@@ -36,28 +35,10 @@ STALL_SECS = 600
 CHUNK_CAP_SECS = 3 * 3600
 # every try errored out faster than this: a dead chapter, not rate limiting
 INSTANT_FAIL_SECS = 45
-
-
-def _env_secs(name: str, default: float) -> float:
-    """A duration in seconds from the environment. A value that is not a
-    finite number >= 0 (a typo like '6h') falls back to the default with a
-    warning instead of stopping the app from starting."""
-    raw = os.environ.get(name)
-    if raw is None or not raw.strip():
-        return default
-    try:
-        v = float(raw)
-    except ValueError:
-        v = math.nan
-    if not math.isfinite(v) or v < 0:
-        log.warning("%s=%r is not a number of seconds >= 0; using %g", name, raw, default)
-        return default
-    return v
-
-
 # How long a run waits for another process (the CLI) to finish its download
-# before giving up with an error, and how often it checks meanwhile.
-LOCK_WAIT_SECS = _env_secs("MANGARR_LOCK_WAIT_SECS", 6 * 3600)
+# before giving up with an error (a bad value: see config.env_number), and
+# how often it checks meanwhile.
+LOCK_WAIT_SECS = config.env_number("MANGARR_LOCK_WAIT_SECS", 6 * 3600, 0, 7 * 86400)
 LOCK_POLL_SECS = 2.0
 # Suwayomi itself not answering for this long while we watch a chunk ends the
 # run (the caller's pass then stops) instead of waiting out STALL_SECS

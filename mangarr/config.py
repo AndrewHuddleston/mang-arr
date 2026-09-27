@@ -1,5 +1,37 @@
 """Runtime settings. Environment variables override the defaults."""
+import logging
+import math
 import os
+
+log = logging.getLogger(__name__)
+
+
+def env_number(name: str, default: float, lo: float, hi: float, integer: bool = False) -> float:
+    """A number from the environment, read once at start-up. A value that is
+    not a number (a typo like '90d', '1G' or '6h') falls back to the default,
+    and one outside lo..hi is clamped to it, both with a warning: a bad
+    variable must neither stop the app from starting (the container would
+    restart in a loop) nor turn into a value that breaks it (no backups kept,
+    a NaN interval). Every numeric MANGARR_* variable goes through here."""
+    raw = os.environ.get(name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        v = float(raw)
+    except ValueError:
+        v = math.nan
+    if not math.isfinite(v):
+        log.warning("%s=%r is not a number; using the default %g", name, raw, default)
+        return default
+    out = min(max(v, lo), hi)
+    if out != v:
+        log.warning("%s=%r is outside %g..%g; using %g", name, raw, lo, hi, out)
+    if integer:
+        if out != int(out):
+            log.warning("%s=%r is not a whole number; using %d", name, raw, round(out))
+        return int(round(out))
+    return out
+
 
 USER_AGENT = "mang-arr/0.1 (+https://github.com/AndrewHuddleston/mang-arr)"
 
@@ -21,9 +53,9 @@ STAGING_ROOT = os.environ.get("MANGARR_STAGING", os.path.join(DATA_DIR, "staging
 LIBRARY_ROOT = os.environ.get("MANGARR_LIBRARY", os.path.join(DATA_DIR, "library"))
 
 # The worker re-checks every monitored series this often, starting this many
-# minutes after launch.
-REFRESH_HOURS = float(os.environ.get("MANGARR_REFRESH_HOURS", "6"))
-FIRST_REFRESH_MIN = float(os.environ.get("MANGARR_FIRST_REFRESH_MIN", "5"))
+# minutes after launch. (The interval range is the one limits.RANGES enforces.)
+REFRESH_HOURS = env_number("MANGARR_REFRESH_HOURS", 6.0, 0.25, 168.0)
+FIRST_REFRESH_MIN = env_number("MANGARR_FIRST_REFRESH_MIN", 5.0, 0.0, 1440.0)
 
 # Notifications: Pushover, and/or a generic JSON webhook.
 PUSHOVER_TOKEN = os.environ.get("MANGARR_PUSHOVER_TOKEN")
