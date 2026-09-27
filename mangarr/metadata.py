@@ -133,3 +133,32 @@ def by_ref(ref: str) -> Series | None:
     except Exception as e:
         raise LookupError_(f"{kind} lookup for {value} failed: {type(e).__name__}: {e}") from e
     return model.manual(value)
+
+
+def statuses(refs: list[str]) -> dict[str, tuple[str | None, int | None]]:
+    """(status, chapter count) as the provider has them now, per series
+    reference: every AniList one in a query per 50, every MangaDex one in a
+    request per 100, no source searched. Manual series have no provider and
+    are left out; so are the series of a provider that cannot be reached
+    (logged): the caller keeps what it stored."""
+    out: dict[str, tuple[str | None, int | None]] = {}
+    kinds: dict[str, list[str]] = {}
+    for ref in refs:
+        if model.valid_ref(ref):
+            kind, _, value = ref.partition(":")
+            kinds.setdefault(kind, []).append(value)
+    for kind, lookup, key in (("anilist", lambda v: anilist.statuses([int(x) for x in v]), int),
+                              ("mangadex", mangadex.statuses, str)):
+        values = kinds.get(kind)
+        if not values:
+            continue
+        try:
+            found = lookup(values)
+        except Exception as e:
+            log.warning("could not check the status of %d series on %s: %s: %s", len(values),
+                        "AniList" if kind == "anilist" else "MangaDex", type(e).__name__, oneline(str(e), 200))
+            continue
+        for v in values:
+            if key(v) in found:
+                out[f"{kind}:{v}"] = found[key(v)]
+    return out

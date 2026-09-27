@@ -428,6 +428,18 @@ def set_monitored(con, series_id: int, monitored: bool) -> None:
     event(con, "monitor", "monitored" if monitored else "unmonitored", series_id)
 
 
+def chapters_due(con) -> dict[int, int]:
+    """Per series id, how many of its chapters a download would fetch now,
+    as core._due picks them: wanted ones, and failed ones whose next attempt
+    is due. In order too: a failed chapter waiting for its next attempt
+    holds up the later ones only within the pass that failed it."""
+    now_, out = now(), {}
+    for r in con.execute("SELECT series_id, status, next_try FROM chapter WHERE status IN ('wanted','failed')"):
+        if r["status"] == "wanted" or not r["next_try"] or r["next_try"] <= now_:
+            out[r["series_id"]] = out.get(r["series_id"], 0) + 1
+    return out
+
+
 def wanted_all(con):
     """One row per series with wanted/failed chapters, numbers as a range string."""
     from .resolver import ranges

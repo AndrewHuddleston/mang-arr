@@ -43,6 +43,16 @@ name pattern should come with a case in the relevant test file; the
 `cases` dict in `tests/test_library.py` is the place for new chapter file
 name shapes seen in the wild.
 
+`tests/fake_suwayomi.py` is a fake Suwayomi (download queue, downloader,
+page cache, source search) for tests of whole passes. A change to the
+resolver, the download lanes or the pass order should keep
+`tests/test_lane_sim.py` passing: it runs a whole refresh pass on a scaled
+clock and checks how busy the lanes stay. To see the numbers:
+
+```sh
+MANGARR_SIM_REPORT=1 .venv/bin/python -m unittest tests.test_lane_sim
+```
+
 ## Lint
 
 ```sh

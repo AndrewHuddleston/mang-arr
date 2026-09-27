@@ -24,6 +24,46 @@ SAINT = S(anilist_id=192094, english="The Abandoned Saintess' Vow: To Deny the P
 CAT = S(anilist_id=121647, english="Stray Cat & Wolf", romaji="Noraneko to Ookami")
 
 
+class StatusesTest(unittest.TestCase):
+    """The status of many series at once, for a pass that skips complete finished ones."""
+
+    def test_anilist_in_pages_of_fifty_mangadex_in_hundreds_manual_left_out(self):
+        from mangarr import anilist, mangadex
+        asked = {"anilist": [], "mangadex": []}
+
+        def post(query, variables, retries=3):
+            asked["anilist"].append(variables)
+            media = [{"id": i, "status": "RELEASING" if i == 7 else "FINISHED", "chapters": 10 if i != 7 else None}
+                     for i in variables["ids"] if i != 8] + [{"id": 999, "status": "FINISHED", "chapters": 1},
+                                                            {"id": 9, "status": ["odd"], "chapters": True}]
+            return {"data": {"Page": {"media": media}}}
+
+        uuid = "0123abcd-0000-4000-8000-000000000000"
+
+        def get(path, params, retries=3):
+            asked["mangadex"].append(params)
+            return {"data": [{"id": uuid, "attributes": {"status": "completed", "lastChapter": "52"}}]}
+        refs = [f"anilist:{i}" for i in range(1, 61)] + [f"mangadex:{uuid}", "manual:Let's Play"]
+        with mock.patch.object(anilist, "_post", post), mock.patch.object(mangadex, "_get", get):
+            out = metadata.statuses(refs)
+        self.assertEqual([len(v["ids"]) for v in asked["anilist"]], [50, 10])
+        self.assertEqual(len(asked["mangadex"]), 1)
+        self.assertEqual(out["anilist:7"], ("RELEASING", None))
+        self.assertEqual(out["anilist:1"], ("FINISHED", 10))
+        self.assertEqual(out["anilist:9"], (None, None))            # odd values are not taken
+        self.assertNotIn("anilist:8", out)                         # AniList did not answer for it
+        self.assertNotIn("anilist:999", out)                       # not asked for
+        self.assertEqual(out[f"mangadex:{uuid}"], ("FINISHED", 52))
+        self.assertNotIn("manual:Let's Play", out)
+
+    def test_a_provider_that_fails_leaves_its_series_out(self):
+        from mangarr import anilist
+        with mock.patch.object(anilist, "_post", side_effect=RuntimeError("AniList unreachable")), \
+                self.assertLogs("mangarr.metadata", "WARNING") as cm:
+            self.assertEqual(metadata.statuses(["anilist:1", "manual:X"]), {})
+        self.assertIn("could not check the status of 1 series on AniList", cm.output[0])
+
+
 class NormTest(unittest.TestCase):
     def test_folder_sanitising(self):
         self.assertEqual(norm("The Abandoned Saintess' Vow_ To Deny"), norm("The Abandoned Saintess' Vow: To Deny"))

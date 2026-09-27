@@ -79,6 +79,9 @@ _FIELDS = """
 _SEARCH = ("query($q: String, $n: Int) { Page(page: 1, perPage: $n) {"  # noqa: UP031
            " media(search: $q, type: MANGA) { %s } } }" % _FIELDS)
 _BY_ID = "query($id: Int) { Media(id: $id, type: MANGA) { %s } }" % _FIELDS  # noqa: UP031
+_STATUSES = ("query($ids: [Int], $n: Int) { Page(page: 1, perPage: $n) {"
+             " media(id_in: $ids, type: MANGA) { id status chapters } } }")
+IDS_PER_PAGE = 50               # AniList's cap on perPage
 
 
 def _post(query: str, variables: dict, retries: int = 3) -> dict:
@@ -194,6 +197,22 @@ def search(query: str, limit: int = 12) -> list[Series]:
     out.sort(key=lambda s: (min(query_score(t, query) for t in s.titles) if s.titles else 9,
                             0 if s.format in ("MANGA", "ONE_SHOT") else 1,
                             -s.popularity))
+    return out
+
+
+def statuses(ids: list[int]) -> dict[int, tuple[str | None, int | None]]:
+    """{id: (status, chapter count)} for these AniList ids, IDS_PER_PAGE per
+    query: only what a pass needs to see that a finished series goes on
+    after all. An id AniList does not know is left out. Raises like by_id."""
+    out: dict[int, tuple[str | None, int | None]] = {}
+    for i in range(0, len(ids), IDS_PER_PAGE):
+        batch = ids[i:i + IDS_PER_PAGE]
+        d = _post(_STATUSES, {"ids": batch, "n": len(batch)})
+        for m in ((d.get("data") or {}).get("Page") or {}).get("media") or []:
+            if isinstance(m, dict) and m.get("id") in batch:
+                status, chapters = m.get("status"), m.get("chapters")
+                out[m["id"]] = (status if isinstance(status, str) else None,
+                                chapters if isinstance(chapters, int) and not isinstance(chapters, bool) else None)
     return out
 
 

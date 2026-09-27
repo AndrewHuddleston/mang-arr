@@ -4,6 +4,7 @@ of one series (SeriesSteps), the wait on Suwayomi's queue on a fake clock,
 the rate-limit backoff and the split download lock."""
 import fcntl
 import os
+import random
 import tempfile
 import threading
 import unittest
@@ -81,9 +82,13 @@ class FallbackTest(unittest.TestCase):
     def test_falls_back_per_chapter(self):
         a, b = match("A", 1, [1, 2, 3]), match("B", 2, [1, 2, 3])
         client = FakeClient(broken={1020})            # A's chapter 2 is broken
-        res = self.run_download(client, plan_for([a, b]), {1.0, 2.0, 3.0})
+        attempts = []
+        with mock.patch.object(downloader.config, "LOCK_PATH", self.lock):
+            res = downloader.download(client, plan_for([a, b]), only={1.0, 2.0, 3.0}, attempts=attempts)
         self.assertEqual(res, {1.0: "ok", 2.0: "ok", 3.0: "ok"})
         self.assertIn(2020, client.have)              # came from B
+        self.assertEqual(sorted(attempts), [("A", 1.0, "ok"), ("A", 2.0, "failed"), ("A", 3.0, "ok"),
+                                            ("B", 2.0, "ok")])      # who did it, not the first choice
 
     def test_fails_when_every_source_fails(self):
         a, b = match("A", 1, [5]), match("B", 2, [5])
@@ -110,7 +115,15 @@ class FallbackTest(unittest.TestCase):
         res = self.run_download(client, plan_for([a, b]), {1.0, 2.0, 3.0})
         self.assertEqual(res, {1.0: "ok", 2.0: "ok", 3.0: "ok"})
         starts_on_a = [c for c in client.calls if "[1010" in c or "[1020" in c]
-        self.assertLessEqual(len(starts_on_a), 2)     # short backoff since B has them, then dropped
+        self.assertLessEqual(len(starts_on_a), 2)     # short backoff since B has them, then asked last
+
+    def test_a_dead_source_still_gets_a_chapter_the_others_fail(self):
+        # A's ch 1 is broken, so A delivered nothing in its first run; B's ch 2 is broken: ch 2 comes from A
+        a, b = match("A", 1, [1, 2]), match("B", 2, [1, 2])
+        client = FakeClient(broken={1010, 2020})
+        res = self.run_download(client, plan_for([a, b]), {1.0, 2.0})
+        self.assertEqual(res, {1.0: "ok", 2.0: "ok"})
+        self.assertEqual(client.have, {2010, 1020})
 
     def test_no_source_at_all(self):
         a = match("A", 1, [1])
@@ -182,6 +195,55 @@ class InOrderTest(unittest.TestCase):
 def steps_for(matches, wanted, in_order=True):
     reasons = {}
     return downloader.SeriesSteps(plan_for(matches), set(map(float, wanted)), in_order, "T", reasons), reasons
+
+
+def drive(steps, broken, choose, tiers=None):
+    """Run a series' steps to the end the way _download_source would: in
+    order a run stops at its first broken chapter ((source name, number) in
+    `broken`). choose(wants, alternatives) picks the site of each run.
+    Returns [(source name, chapters asked)]. With `tiers` (a TestCase), check
+    that a run on an alternative is never of a worse tier than the chapter's
+    next source, nor on a source that delivered nothing."""
+    runs = []
+    while keys := steps.wants(set()):
+        alts = steps.alternatives(set())
+        key = choose(keys, alts)
+        if tiers is not None and key in alts:
+            n = steps.order[steps.idx] if steps.in_order else None
+            first = steps._next_source(n) if n is not None else None
+            run = steps.take(key, set())
+            tiers.assertNotIn(run.match.manga_id, steps.dead)
+            if first is not None:
+                tiers.assertLessEqual(run.match.source.tier, first.source.tier)
+        else:
+            run = steps.take(key, set())
+        if run is None:
+            continue
+        ok, failed = [], []
+        for c in run.todo:
+            if (run.match.source.name, c.number) in broken:
+                failed.append(c.number)
+                if run.in_order:
+                    break
+            else:
+                ok.append(c.number)
+        steps.record(run, ok, failed, {n: "broken" for n in failed})
+        runs.append((run.match.source.name, [c.number for c in run.todo]))
+        if len(runs) > 100:
+            raise AssertionError(f"no end in sight: {runs}")
+    return runs
+
+
+def switch_once():
+    """choose() for drive: the first time there is an alternative, take it (the next site is busy)."""
+    done = []
+
+    def choose(keys, alts):
+        if alts and not done:
+            done.append(alts[0])
+            return alts[0]
+        return keys[0]
+    return choose
 
 
 class SeriesStepsTest(unittest.TestCase):
@@ -267,6 +329,136 @@ class SeriesStepsTest(unittest.TestCase):
         steps, _ = steps_for([m], [1, 2, 3], in_order=False)
         run = steps.take("comick (unoriginal)", set())
         self.assertEqual((run.batch, len(run.todo)), (1, 3))
+
+    def test_in_order_alternatives_are_other_sites_of_no_worse_tier(self):
+        a, b, d = match("A (EN)", 1, [1, 2, 3]), match("B", 2, [1, 2]), match("A (ALL)", 4, [1, 2, 3])
+        c = match("C", 3, [1, 2])
+        c.source = Source("3", "C", "en", page_warm=True)
+        steps, reasons = steps_for([a, d, b, c], [1, 2, 3])
+        self.assertEqual(steps.wants(set()), ["a"])
+        self.assertEqual(steps.alternatives(set()), ["b"])   # not A (ALL): the same site; not C: page by page
+        self.assertIsNone(steps.take("c", set()))
+        run = steps.take("b", set())                        # A is busy: B lists ch 1 and 2 as well
+        self.assertEqual((run.match.source.name, [x.number for x in run.todo], run.patient), ("B", [1.0, 2.0], False))
+        steps.record(run, [1.0], [2.0], {2.0: "broken"})
+        self.assertEqual((steps.wants(set()), steps.alternatives(set())), (["a"], []))
+        run = steps.take("a", set())
+        self.assertEqual((run.match.source.name, [x.number for x in run.todo]), ("A (EN)", [2.0, 3.0]))
+        steps.record(run, [2.0, 3.0], [], {})
+        self.assertEqual(steps.wants(set()), [])
+        self.assertEqual(steps.results, {1.0: "ok", 2.0: "ok", 3.0: "ok"})
+
+    def test_every_source_is_tried_before_a_chapter_fails(self):
+        for in_order in (True, False):
+            with self.subTest(in_order=in_order):
+                steps, reasons = steps_for([match("A", 1, [1]), match("B", 2, [1]), match("C", 3, [1])], [1],
+                                           in_order)
+                seen = []
+                while keys := steps.wants(set()):
+                    alts = steps.alternatives(set())
+                    run = steps.take(alts[0] if alts else keys[0], set())   # A stays busy while there is another
+                    seen.append(run.match.source.name)
+                    steps.record(run, [], [1.0], {1.0: "broken"})
+                self.assertEqual(seen, ["B", "C", "A"])
+                self.assertEqual(steps.results, {1.0: "failed"})
+                self.assertIn("B: broken; C: broken; A: broken", reasons[1.0])
+
+    def test_out_of_order_a_free_site_takes_chapters_of_a_busy_one(self):
+        a, b = match("A", 1, [1, 2, 3, 4]), match("B", 2, [3, 4, 5, 6])
+        steps, _ = steps_for([a, b], [1, 2, 3, 4, 5, 6], in_order=False)
+        self.assertEqual((steps.wants(set()), steps.alternatives(set())), (["a", "b"], []))
+        run_b = steps.take("b", set())
+        self.assertEqual([x.number for x in run_b.todo], [5.0, 6.0])
+        self.assertEqual((steps.wants(set()), steps.alternatives(set())), (["a"], ["b"]))
+        steps.record(run_b, [5.0, 6.0], [], {})
+        run = steps.take("b", set())                        # A is busy: B takes the chapters it lists too
+        self.assertEqual(([x.number for x in run.todo], run.batch, run.patient), ([3.0, 4.0], 4, False))
+        steps.record(run, [3.0], [4.0], {4.0: "broken"})    # 4 still gets its turn on A
+        run = steps.take("a", set())
+        self.assertEqual([x.number for x in run.todo], [1.0, 2.0])
+        steps.record(run, [1.0, 2.0], [], {})
+        run = steps.take("a", set())
+        self.assertEqual([x.number for x in run.todo], [4.0])
+        steps.record(run, [4.0], [], {})
+        self.assertEqual(steps.wants(set()), [])
+        self.assertEqual(set(steps.results.values()), {"ok"})
+
+    def test_a_switch_never_fails_a_chapter_another_source_has(self):
+        # a run taken from a free site is often one chapter: one broken chapter there must not keep
+        # that source from the chapters it has, nor fail one the busy source was never asked for
+        a, b = match("A", 1, [1, 2]), match("B", 2, [1, 2])
+        steps, reasons = steps_for([a, b], [1, 2])
+        runs = drive(steps, {("A", 2.0), ("B", 1.0)}, switch_once())
+        self.assertEqual(runs, [("B", [1.0, 2.0]), ("A", [1.0, 2.0]), ("B", [2.0])])
+        self.assertEqual(steps.results, {1.0: "ok", 2.0: "ok"})
+        b, c = match("B", 2, [1, 2]), match("C", 3, [1])
+        steps, reasons = steps_for([b, c], [1, 2], in_order=False)
+        runs = drive(steps, {("B", 2.0), ("C", 1.0)}, switch_once())
+        self.assertEqual(runs, [("C", [1.0]), ("B", [2.0]), ("B", [1.0])])
+        self.assertEqual(steps.results, {1.0: "ok", 2.0: "failed"})
+        self.assertEqual(reasons[2.0], "B: broken (no other source has this chapter)")
+
+    def test_a_source_that_delivered_nothing_is_asked_last(self):
+        a, b = match("A", 1, [1, 2]), match("B", 2, [1, 2])
+        steps, reasons = steps_for([a, b], [1, 2])
+        with self.assertLogs("mangarr.downloader", "WARNING") as cm:
+            runs = drive(steps, {("A", 1.0), ("B", 2.0)}, lambda keys, alts: keys[0])
+        self.assertEqual(runs, [("A", [1.0, 2.0]), ("B", [1.0, 2.0]), ("A", [2.0])])   # A: ch 1 was broken
+        self.assertEqual(steps.results, {1.0: "ok", 2.0: "ok"})
+        self.assertIn("A delivered nothing this run; asking the other sources first from now on", cm.output[0])
+        steps, _ = steps_for([match("A", 1, [1, 2, 3]), match("B", 2, [1, 2, 3]), match("C", 3, [2, 3])], [1, 2, 3])
+        run = steps.take("a", set())
+        steps.record(run, [], [1.0], {1.0: "broken"})               # A is dead
+        self.assertEqual((steps.wants(set()), steps.alternatives(set())), (["b"], []))
+        steps.record(steps.take("b", set()), [1.0], [2.0], {2.0: "broken"})
+        self.assertEqual((steps.wants(set()), steps.alternatives(set())), (["c"], []))   # never A instead
+        run = steps.take("c", set())
+        self.assertTrue(run.patient)                                # only A is left besides it
+        self.assertEqual(steps.attempts, [("A", 1.0, "failed"), ("B", 1.0, "ok"), ("B", 2.0, "failed")])
+
+    def test_every_chapter_gets_every_source_whatever_is_switched(self):
+        # random series, broken copies and switching choices: a chapter fails only once every source
+        # that lists it was asked, in order the series stops only at such a chapter, and a switch
+        # never goes to a worse tier or to a source that delivered nothing
+        rnd = random.Random(7)
+        for case in range(400):
+            names = ["A", "B", "C", "D"][:rnd.randint(1, 4)]
+            nums = [float(n) for n in range(1, rnd.randint(2, 6))]
+            ms = []
+            for k, name in enumerate(names, 1):
+                listed = [n for n in nums if rnd.random() < 0.7] or [rnd.choice(nums)]
+                ms.append(match(name, k, listed))
+                ms[-1].source = Source(str(k), name, "en", throttled=rnd.random() < 0.25)
+            wanted = sorted({n for m in ms for n in m.numbers})
+            broken = {(m.source.name, n) for m in ms for n in m.numbers if rnd.random() < 0.35}
+            in_order = case % 2 == 0
+            steps, reasons = steps_for(ms, wanted, in_order)
+            with self.subTest(case=case):
+                with mock.patch.object(downloader.log, "warning"):
+                    drive(steps, broken, lambda keys, alts: rnd.choice(keys + alts), tiers=self)
+                good = {n: any((m.source.name, n) not in broken for m in ms if n in m.numbers) for n in wanted}
+                expect = {}
+                for n in wanted:
+                    expect[n] = "ok" if good[n] else "failed"
+                    if in_order and not good[n]:
+                        break
+                self.assertEqual(steps.results, expect, (ms, broken))
+                for n, r in expect.items():
+                    if r == "failed":
+                        for m in ms:
+                            if n in m.numbers:
+                                self.assertIn(f"{m.source.name}: broken", reasons[n])
+
+    def test_a_worse_tier_is_never_an_alternative(self):
+        for flag in ("throttled", "page_warm"):
+            for in_order in (True, False):
+                a, c = match("A", 1, [1]), match("C", 2, [1])
+                c.source = Source("2", "C", "en", **{flag: True})
+                steps, _ = steps_for([a, c], [1], in_order)
+                self.assertEqual((steps.wants(set()), steps.alternatives(set())), (["a"], []), (flag, in_order))
+        a, c = match("A", 1, [1]), match("C", 2, [1])
+        a.source, c.source = Source("1", "A", "en", throttled=True), Source("2", "C", "en", throttled=True)
+        self.assertEqual(steps_for([a, c], [1])[0].alternatives(set()), ["c"])      # the same tier is fine
 
     def test_en_and_all_variants_are_one_site(self):
         self.assertEqual(downloader.lanes_key("Comick (Unoriginal) (EN)"), downloader.lanes_key("Comick (Unoriginal) (ALL)"))
@@ -447,17 +639,46 @@ class RateLimitTest(unittest.TestCase):
         def run(chapter):
             memo = downloader.RunMemo(shared=shared)                   # each series of the pass has its own
             downloader._download_source(client, 1, [chapter], 1, "T", "A", True, lambda: False, lambda m: None, memo)
-            return memo.unstarted
+            return memo.unstarted, memo.unqueued
         with self.assertLogs("mangarr.downloader", "WARNING"):
-            self.assertEqual(run(a.chapters[0]), [1.0])
+            self.assertEqual(run(a.chapters[0]), ([1.0], []))          # queued, not started
         with self.assertLogs("mangarr.downloader", "INFO") as cm:
-            self.assertEqual(run(a.chapters[1]), [2.0])
+            self.assertEqual(run(a.chapters[1]), ([], [2.0]))          # not even queued
         self.assertIn("not queueing ch 2 there now", "\n".join(cm.output))
         self.assertEqual(client.enqueued, [[1010]])
         self.clock.advance(downloader.QUEUED_BUSY_SECS)
         with self.assertLogs("mangarr.downloader", "WARNING"):
-            self.assertEqual(run(a.chapters[2]), [3.0])                # tried again after a while
+            self.assertEqual(run(a.chapters[2]), ([3.0], []))          # tried again after a while
         self.assertEqual(client.enqueued, [[1010], [1030]])
+
+    def test_a_chapter_never_queued_says_so(self):
+        # the second series of a pass does not queue on the busy source at all: its reason must not
+        # claim Suwayomi was given the chapter and did not start it
+        shared, client = downloader.PassShared(), BusyForOneSource()
+        shared.note_unstarted("A", self.clock.now())
+        for in_order in (True, False):
+            with self.subTest(in_order=in_order):
+                reasons = {}
+                plan = plan_for([match("A", 1, [1, 2, 3]), match("B", 2, [1, 2])])
+                steps = downloader.SeriesSteps(plan, {1.0, 2.0, 3.0}, in_order, "T", reasons)
+                memo = downloader.RunMemo(shared=shared)
+                run = steps.take("a", set())
+                with self.assertLogs("mangarr.downloader", "INFO"):
+                    ok, failed, why = downloader._download_source(client, 1, run.todo, run.batch, "T", "A",
+                                                                  run.patient, lambda: False, lambda m: None, memo)
+                self.assertEqual((ok, failed, memo.unstarted, memo.unqueued), ([], [], [], [1.0, 2.0, 3.0]))
+                steps.record(run, ok, failed, why)
+                steps.not_started(run, memo.unqueued, queued=False)
+                while keys := steps.wants(set()):
+                    run = steps.take(keys[0], set())
+                    self.assertEqual(run.match.source.name, "B")
+                    steps.record(run, [c.number for c in run.todo], [], {})
+                self.assertEqual(steps.results, {1.0: "ok", 2.0: "ok"})
+                self.assertEqual(reasons[3.0], "not attempted: A is busy with other downloads; tried again next pass")
+                self.assertEqual(downloader.busy_source(reasons[3.0]), "A")
+                self.assertEqual(steps.tried[3.0], ["A: not queued: its download queue was busy with other downloads"])
+        self.assertEqual(client.enqueued, [])
+        self.assertIsNone(downloader.busy_source(downloader.UNSTARTED_REASON))
 
     def test_download_one_says_it_was_not_started(self):
         a = match("A", 1, [4])

@@ -9,6 +9,7 @@ through get(), so a change on the Settings page applies to the next job.
     throttled_sources    list   THROTTLED_SOURCES
     page_warm_sources    list   PAGE_WARM_SOURCES  fetched page by page (image server refuses bursts)
     download_lanes       int    3      sources downloading at once in a pass (1-8; Suwayomi's cap wins)
+    search_parallel      int    5      sites searched at once while a series is resolved (1-8)
     page_delay_seconds   float  2.5    starting and minimum gap between page requests (page by page)
     pushover_token       str    PUSHOVER_TOKEN
     pushover_user        str    PUSHOVER_USER
@@ -53,6 +54,7 @@ DEFAULTS: dict[str, object] = {
     "min_pages": config.MIN_PAGES,
     "throttled_delay_seconds": 8.0,  # pause between chapters on a rate-limited source (avoids 429 -> long backoff)
     "download_lanes": 3,             # sources downloading at once in a pass, one series each (see limits.RANGES)
+    "search_parallel": 5,            # sites searched at once while a series is resolved, one search each
     "page_delay_seconds": 2.5,       # gap between page requests on a page-by-page source (grows when it is busy)
     "unusable_sources": sorted(config.UNUSABLE_SOURCES),
     "throttled_sources": sorted(config.THROTTLED_SOURCES),

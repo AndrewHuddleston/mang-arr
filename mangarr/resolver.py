@@ -12,6 +12,7 @@
 import logging
 import math
 import statistics
+import threading
 from collections.abc import Callable
 from dataclasses import dataclass, field
 
@@ -47,6 +48,11 @@ SEARCH_GAP_SECS = 1.0
 GENTLE_SEARCH_GAP_SECS = 3.0
 GENTLE_SEARCH_TITLES = 3
 SEARCHES = limits.Spacer()
+# One resolve searches up to search_parallel sites at once (Settings), each
+# on a thread of its own; the sources of one site are searched one after the
+# other on the same thread, so a site never sees two searches at once. The
+# main thread looks at the cancel this often while it waits for them.
+SEARCH_POLL_SECS = 0.25
 
 
 @dataclass
@@ -149,11 +155,14 @@ class Plan:
 def resolve(client: Client, series: Series, sources: list[Source] | None = None,
             reliability: dict[str, float] | None = None, should_cancel: Callable[[], bool] | None = None,
             progress: Callable[[str], None] | None = None) -> Plan:
-    """The plan for a series. A cancel (should_cancel) is noticed between
-    sources and cuts the Suwayomi call in flight short, raising Cancelled
-    with nothing decided; `progress` hears which source is being searched."""
+    """The plan for a series. Several sites are searched at once
+    (search_parallel; _search_parallel), and the plan is the same whatever
+    order they answer in. A cancel (should_cancel) is noticed between
+    sources and cuts the Suwayomi calls in flight short, raising Cancelled
+    with nothing decided; `progress` hears how far the search is."""
     cancel = should_cancel or (lambda: False)
     report = progress or (lambda m: None)
+    raw = client
     client = with_cancel(client, should_cancel)   # each search title, each chapter list: never a full timeout
     sources = sources if sources is not None else client.sources()
     reliability = reliability or {}
@@ -168,12 +177,19 @@ def resolve(client: Client, series: Series, sources: list[Source] | None = None,
     if skipped:
         log.debug("not searching disabled source(s): %s", ", ".join(skipped))
     searched = [s for s in sources if not s.unusable]   # disabled in Settings: not searched, not downloaded from
-    for i, src in enumerate(searched, 1):
-        if cancel():
-            raise Cancelled()
-        report(f"searching {src.name} ({i} of {len(searched)} sources)")
-        found = _search_source(client, src, series, gentle_titles(series, titles) if src.page_warm else titles,
-                               rejected, cancel)
+    width = min(int(limits.setting("search_parallel")), len({site_key(s.name) for s in searched}))
+    if width > 1:
+        results = _search_parallel(raw, series, searched, titles, width, cancel, report)
+    else:
+        results = []
+        for i, src in enumerate(searched, 1):
+            if cancel():
+                raise Cancelled()
+            report(f"searching {src.name} ({i} of {len(searched)} sources)")
+            results.append(_search_one(client, src, series, titles, cancel))
+    # in the order of the sources, whatever order the searches finished in
+    for src, (found, hits) in zip(searched, results, strict=True):
+        rejected.extend(hits)
         if isinstance(found, str):
             unreachable.append((src, found))
             log.warning("%s unreachable: %s", src.name, found)
@@ -224,6 +240,114 @@ def gentle_titles(series: Series, titles: list[str]) -> list[str]:
         native = None
     kept = [t for t in titles if t != native][:GENTLE_SEARCH_TITLES - (1 if native else 0)]
     return kept + ([native] if native else [])
+
+
+def _search_one(client, src: Source, series: Series, titles: list[str],
+                should_cancel: Callable[[], bool]) -> tuple[object, list[Rejected]]:
+    """(what _search_source returned, the hits it rejected) for one source.
+    An unexpected error in one source's search (an odd answer it could not
+    read) costs only that source this time: it counts as not searched, so
+    its stored entry is kept (see Plan.unreachable), and the other sources
+    still count. Cancelled and SuwayomiUnreachable are raised."""
+    rejected: list[Rejected] = []
+    try:
+        found = _search_source(client, src, series, gentle_titles(series, titles) if src.page_warm else titles,
+                               rejected, should_cancel)
+    except (Cancelled, SuwayomiUnreachable):
+        raise
+    except Exception as e:
+        log.exception("%s: searching %s failed unexpectedly", oneline(series.title), src.name)
+        found = f"{type(e).__name__}: {e}"[:80]
+    return found, rejected
+
+
+def _search_parallel(client, series: Series, sources: list[Source], titles: list[str], width: int,
+                     cancel: Callable[[], bool], report: Callable[[str], None]) -> list:
+    """_search_one for every source, up to `width` sites at once, each site
+    on one of `width` threads (the sources of a site, its EN and ALL
+    variants, one after the other: never two searches on one site at once,
+    and SEARCHES keeps each site's spacing). The sites with the most to do
+    start first. Returns the results in the order of `sources`.
+
+    Every thread stops at its next step once one of them meets Suwayomi not
+    answering or a cancel, and their Suwayomi calls in flight are cut short
+    (each thread asks Suwayomi through a cancellable client); the first
+    SuwayomiUnreachable (in source order) is raised once all of them have
+    ended, so an outage the searches ran into together counts once, and a
+    resolve never leaves a search behind."""
+    sites: dict[str, list[int]] = {}
+    for i, src in enumerate(sources):
+        sites.setdefault(site_key(src.name), []).append(i)
+
+    def cost(group: list[int]) -> float:              # the most seconds of spacing a site's searches can take
+        return sum((GENTLE_SEARCH_GAP_SECS * min(len(titles), GENTLE_SEARCH_TITLES)) if sources[i].page_warm
+                   else SEARCH_GAP_SECS * len(titles) for i in group)
+    todo = sorted(sites.values(), key=lambda g: (-cost(g), g[0]))
+    results: list = [None] * len(sources)
+    fatal: dict[int, BaseException] = {}
+    stop = threading.Event()
+    lock, say_lock = threading.Lock(), threading.Lock()
+    done = [0]
+
+    def halted() -> bool:
+        return stop.is_set() or cancel()
+    ops = with_cancel(client, halted)
+
+    def say() -> None:
+        with say_lock:                                  # one after the other: the count never goes back
+            report(f"searching {len(sources)} sources, {width} at a time ({done[0]} done)")
+
+    def work() -> None:
+        while not halted():
+            with lock:
+                group = todo.pop(0) if todo else None
+            if group is None:
+                return
+            for i in group:
+                if halted():
+                    return
+                try:
+                    res = _search_one(ops, sources[i], series, titles, halted)
+                except BaseException as e:              # Cancelled, SuwayomiUnreachable, or worse: ends them all
+                    with lock:
+                        fatal[i] = e
+                    stop.set()
+                    return
+                with lock:
+                    results[i] = res
+                    done[0] += 1
+                say()
+
+    say()
+    threads = []
+    for k in range(1, width + 1):
+        t = threading.Thread(target=work, name=f"mangarr-search-{k}", daemon=True)
+        try:
+            t.start()
+        except RuntimeError as e:                       # a thread limit: go on with the threads there are
+            log.warning("could start only %d of %d search thread(s) (%s)", k - 1, width, e)
+            break
+        threads.append(t)
+    if not threads:
+        work()                                          # not even one: search here, one site after the other
+    try:
+        for t in threads:
+            while t.is_alive():
+                t.join(SEARCH_POLL_SECS)
+                if not stop.is_set() and cancel():
+                    stop.set()
+    finally:
+        stop.set()                                      # only matters when this thread was interrupted
+        for t in threads:
+            t.join()
+    for i in sorted(fatal):
+        if isinstance(fatal[i], SuwayomiUnreachable):
+            raise fatal[i]
+    if fatal:
+        raise fatal[min(fatal)]
+    if cancel() or any(r is None for r in results):
+        raise Cancelled()
+    return results
 
 
 _unreachable: dict[str, tuple[float, str]] = {}   # source id -> (when, why); skip it for a while

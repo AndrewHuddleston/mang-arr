@@ -3,6 +3,7 @@ of chapters, a pile of aliases or a hostile title must not blow up memory,
 the plan or the logs."""
 import math
 import os
+import random
 import tempfile
 import threading
 import time
@@ -13,7 +14,7 @@ from unittest import mock
 from mangarr import core, db, limits, resolver
 from mangarr.model import Series
 from mangarr.resolver import Plan, Rejected, SourceMatch, plausible_chapters, primary, resolve
-from mangarr.suwayomi import Chapter, Source
+from mangarr.suwayomi import Chapter, Source, SuwayomiError, SuwayomiUnreachable, site_key
 
 SRC = Source("1", "Src", "en")
 
@@ -207,7 +208,8 @@ class SearchPacingTest(unittest.TestCase):
         def pause(secs, should_cancel=None):
             self.t[0] += max(secs, 0.0)
             return bool(should_cancel and should_cancel())
-        for p in (mock.patch("mangarr.settings.get", lambda k: 3),
+        # one search at a time: the fake clock is moved by whoever searches (ParallelSearchTest has the rest)
+        for p in (mock.patch("mangarr.settings.get", lambda k: 1 if k == "search_parallel" else 3),
                   mock.patch.object(resolver, "SEARCHES", limits.Spacer(clock=lambda: self.t[0], pause=pause))):
             p.start()
             self.addCleanup(p.stop)
@@ -268,6 +270,164 @@ class SearchPacingTest(unittest.TestCase):
             resolve(self.client, Series(anilist_id=1, english="A", romaji="B"), sources=[Source("1", "Weeb", "en")],
                     should_cancel=lambda: bool(self.starts))
         self.assertEqual(len(self.starts), 1)              # the second title is never searched
+
+
+class SiteClient:
+    """Sources with their own answers and speeds, searched from several
+    threads: what each source's site sees at once is counted."""
+
+    def __init__(self, entries: dict, delay: dict | None = None, fail: dict | None = None):
+        self.entries = entries                  # source name -> (hit title, chapter numbers) or None
+        self.delay, self.fail = delay or {}, fail or {}
+        self.lock = threading.Lock()
+        self.now: dict[str, int] = {}           # site -> searches in flight
+        self.most: dict[str, int] = {}
+        self.total = self.peak = 0
+        self.searches: list[tuple[str, str]] = []
+        self.ids = {name: k for k, name in enumerate(entries, 1)}
+
+    def search(self, src, q):
+        site = site_key(src.name)
+        with self.lock:
+            self.searches.append((src.name, q))
+            self.now[site] = self.now.get(site, 0) + 1
+            self.most[site] = max(self.most.get(site, 0), self.now[site])
+            self.total += 1
+            self.peak = max(self.peak, self.total)
+        try:
+            threading.Event().wait(self.delay.get(src.name, 0.01))
+            if src.name in self.fail:
+                raise self.fail[src.name]
+            e = self.entries.get(src.name)
+            return [{"id": self.ids[src.name], "title": e[0] if e else "Something Else", "author": None}]
+        finally:
+            with self.lock:
+                self.now[site] -= 1
+                self.total -= 1
+
+    def manga(self, manga_id):
+        name = next(n for n, k in self.ids.items() if k == manga_id)
+        title, numbers = self.entries[name]
+        return {"title": title, "author": None}, [Chapter(manga_id * 1000 + i, float(n), None, None, False)
+                                                  for i, n in enumerate(numbers)]
+
+    def page_count(self, chapter_id):
+        return 20
+
+
+class ParallelSearchTest(unittest.TestCase):
+    """Several sites searched at once: never two searches on one site, at most
+    search_parallel at a time, the same plan whatever order they answer in,
+    and a cancel, Suwayomi not answering or one broken search handled once
+    for all of them, with no search thread left behind."""
+
+    def setUp(self):
+        resolver._unreachable.clear()
+        self.width = 3
+        for p in (mock.patch("mangarr.settings.get", lambda k: self.width if k == "search_parallel" else 3),
+                  mock.patch.object(resolver, "SEARCHES", limits.Spacer(pause=lambda s, c=None: bool(c and c())))):
+            p.start()
+            self.addCleanup(p.stop)
+        self.addCleanup(self.assert_no_search_threads)
+
+    def assert_no_search_threads(self):
+        self.assertEqual([t.name for t in threading.enumerate() if t.name.startswith("mangarr-search-")], [])
+
+    @staticmethod
+    def sources(*names):
+        return [Source(str(k), n, "en", page_warm=n.startswith("Comick")) for k, n in enumerate(names, 1)]
+
+    def plan_key(self, plan):
+        return ([(m.source.name, m.manga_id, m.note) for m in plan.matches],
+                {n: [m.source.name for m in c] for n, c in plan.candidates.items()},
+                [(r.source.name, r.query) for r in plan.rejected], [(s.name, why) for s, why in plan.unreachable])
+
+    def test_the_plan_does_not_depend_on_who_answers_first(self):
+        names = [f"Site {k}" for k in range(1, 9)]
+        entries = {n: ("Title", range(1, 3 + k)) if k % 3 else None for k, n in enumerate(names)}
+        series = Series(anilist_id=1, english="Title", romaji="Taitoru")
+        plans = []
+        for width, seed in ((1, 0), (3, 1), (5, 2), (8, 3)):
+            rnd = random.Random(seed)
+            self.width = width
+            client = SiteClient(entries, delay={n: rnd.uniform(0, 0.02) for n in names},
+                                fail={"Site 5": SuwayomiError("HTTP 403")})
+            plans.append(self.plan_key(resolve(client, series, sources=self.sources(*names))))
+        self.assertEqual(plans[1:], [plans[0]] * 3)
+        self.assertEqual([s for s, _ in plans[0][3]], ["Site 5"])
+
+    def test_never_two_searches_on_one_site_and_at_most_the_setting(self):
+        names = ["Comick (Unoriginal) (EN)", "Comick (Unoriginal) (ALL)", "Weeb (EN)", "Weeb (ALL)", "A", "B", "C",
+                 "D"]
+        client = SiteClient({n: None for n in names}, delay={n: 0.03 for n in names})
+        series = Series(anilist_id=1, english="Title", romaji="Taitoru", synonyms=["T2", "T3"])
+        plan = resolve(client, series, sources=self.sources(*names))
+        self.assertEqual(plan.matches, [])
+        self.assertEqual(set(client.most.values()), {1})           # one search at a time on every site
+        self.assertEqual(client.peak, 3)                            # several sites at once, never more than that
+        self.assertEqual(len(client.searches), 2 * 3 + 6 * 4)       # page by page: fewer titles, as before
+
+    def test_same_site_searches_keep_their_spacing(self):
+        starts, lock = [], threading.Lock()
+
+        class Stamp(SiteClient):
+            def search(self, src, q):
+                with lock:
+                    starts.append((site_key(src.name), time.monotonic()))
+                return super().search(src, q)
+        names = ["Weeb (EN)", "Weeb (ALL)", "A", "B"]
+        with mock.patch.object(resolver, "SEARCHES", limits.Spacer()), \
+                mock.patch.object(resolver, "SEARCH_GAP_SECS", 0.05):
+            resolve(Stamp({n: None for n in names}, delay={n: 0.001 for n in names}),
+                    Series(anilist_id=1, english="Title", romaji="Taitoru"), sources=self.sources(*names))
+        weeb = sorted(t for k, t in starts if k == "weeb")
+        self.assertEqual(len(weeb), 4)
+        self.assertGreaterEqual(min(b - a for a, b in zip(weeb, weeb[1:], strict=False)), 0.045)
+        first = {k: min(t for kk, t in starts if kk == k) for k in ("weeb", "a", "b")}
+        self.assertLess(max(first.values()) - min(first.values()), 0.04)   # the other sites did not wait
+
+    def test_suwayomi_not_answering_ends_every_search_and_is_raised_once(self):
+        names = [f"Site {k}" for k in range(1, 7)]
+        down = SuwayomiUnreachable("Suwayomi at http://x unreachable: timed out")
+        client = SiteClient({n: None for n in names}, delay={**{n: 0.05 for n in names}, "Site 2": 0.01},
+                            fail={"Site 2": down})
+        series = Series(anilist_id=1, english="Title", romaji="Taitoru", synonyms=["T2", "T3"])
+        with self.assertRaises(SuwayomiUnreachable) as cm:
+            resolve(client, series, sources=self.sources(*names))
+        self.assertIs(cm.exception, down)
+        self.assertLess(len(client.searches), 12)                  # the others stopped at their next step
+        self.assertNotIn("Site 6", {n for n, _ in client.searches})  # and nothing new was started
+
+    def test_an_unexpected_error_costs_only_that_source(self):
+        names = ["A", "B", "C"]
+        client = SiteClient({"A": ("Title", [1, 2]), "B": ("Title", [1]), "C": ("Title", [3])},
+                            fail={"B": KeyError("mangas")})
+        with self.assertLogs("mangarr.resolver", "ERROR") as cm:
+            plan = resolve(client, Series(anilist_id=1, english="Title"), sources=self.sources(*names))
+        self.assertIn("searching B failed unexpectedly", cm.output[0])
+        self.assertEqual([m.source.name for m in plan.matches], ["A", "C"])
+        self.assertEqual([(s.name, why) for s, why in plan.unreachable], [("B", "KeyError: 'mangas'")])
+        self.assertEqual(plan.chapters, [1.0, 2.0, 3.0])
+
+    def test_a_cancel_ends_every_search(self):
+        names = [f"Site {k}" for k in range(1, 9)]
+        client = SiteClient({n: None for n in names}, delay={n: 0.05 for n in names})
+        series = Series(anilist_id=1, english="Title", romaji="Taitoru", synonyms=["T2", "T3"])
+        t0 = time.monotonic()
+        with self.assertRaises(limits.Cancelled):
+            resolve(client, series, sources=self.sources(*names), should_cancel=lambda: len(client.searches) >= 4)
+        self.assertLess(time.monotonic() - t0, 1.0)
+        self.assertLessEqual(len(client.searches), 4 + self.width)
+
+    def test_progress_counts_up(self):
+        names = [f"Site {k}" for k in range(1, 7)]
+        seen = []
+        resolve(SiteClient({n: None for n in names}), Series(anilist_id=1, english="Title"),
+                sources=self.sources(*names), progress=seen.append)
+        counts = [int(t.rsplit("(", 1)[1].split()[0]) for t in seen if t.startswith("searching 6 sources")]
+        self.assertEqual(seen[0], "searching 6 sources, 3 at a time (0 done)")
+        self.assertEqual(counts, sorted(counts))
+        self.assertEqual(counts[-1], 6)
 
 
 class GentleTitlesTest(unittest.TestCase):

@@ -2,6 +2,7 @@
 hardening, sessions, fail-closed settings, body limits, open-endpoint
 disclosure, short Suwayomi timeouts and the health cache."""
 import asyncio
+import base64
 import hashlib
 import hmac
 import http.cookiejar
@@ -439,7 +440,10 @@ class LoginTest(WebBase):
         from mangarr import db
         stored = self.settings.all_values()["auth_password"]
         self.assertTrue(stored.startswith("pbkdf2_sha256$"))
-        self.assertNotIn("pw", stored.split("$", 2)[2])
+        # a 16-byte salt and a 32-byte hash, nothing else (not "'pw' is not in it": base64 can contain it)
+        _, rounds, salt, digest = stored.split("$")
+        self.assertEqual((int(rounds) > 0, len(base64.b64decode(salt)), len(base64.b64decode(digest))), (True, 16, 32))
+        self.assertTrue(self.settings.verify_password(stored, "pw"))
         with db.connect() as con:                              # an old version / old backup: clear text
             con.execute("UPDATE setting SET value='\"legacy pw\"' WHERE key='auth_password'")
             con.commit()

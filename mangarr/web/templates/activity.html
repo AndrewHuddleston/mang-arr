@@ -67,21 +67,23 @@
 </tbody></table></div>
 {% endif %}
 {% set items = pass_job.items %}
-{% set n_done = items|selectattr('state', 'in', ['done', 'nomatch', 'failed', 'error'])|list|length %}
+{% set n_done = items|selectattr('state', 'in', ['done', 'nomatch', 'failed', 'error', 'skipped'])|list|length %}
+{% set n_skipped = items|selectattr('state', 'equalto', 'skipped')|list|length %}
 <h2 class="section-title" id="pass">{{ 'Current' if pass_job.status == 'running' else 'Last' }} {{ pass_job.kind }} pass: {{ n_done }} of {{ items|length }} series
   <span class="muted small">
     {{ items|selectattr('state', 'equalto', 'queued')|list|length }} queued ·
     {{ items|selectattr('state', 'equalto', 'waiting')|list|length }} waiting ·
     {{ items|selectattr('state', 'equalto', 'done')|list|length }} ok ·
     {{ items|selectattr('state', 'equalto', 'nomatch')|list|length }} no match ·
-    {{ items|selectattr('state', 'in', ['failed', 'error'])|list|length }} failed
+    {{ items|selectattr('state', 'in', ['failed', 'error'])|list|length }} failed{% if n_skipped %} ·
+    {{ n_skipped }} skipped{% endif %}
   </span></h2>
 <div class="table-container"><table class="table queue pass">
 <thead><tr><th class="col-icon"></th><th class="num">#</th><th>Series</th><th>Status</th><th>What happened / what it is doing</th></tr></thead>
 <tbody>
 {% for it in items %}
 {% set lk = {'running': 'info', 'done': 'success', 'nomatch': 'warning', 'failed': 'danger', 'error': 'danger', 'cancelled': 'default'}.get(it.state, 'default') %}
-{% set lt = {'running': 'working', 'done': 'done', 'nomatch': 'no match', 'failed': 'failed', 'error': 'error', 'cancelled': 'cancelled', 'queued': 'queued', 'waiting': 'waiting'}.get(it.state, it.state) %}
+{% set lt = {'running': 'working', 'done': 'done', 'nomatch': 'no match', 'failed': 'failed', 'error': 'error', 'cancelled': 'cancelled', 'queued': 'queued', 'waiting': 'waiting', 'skipped': 'skipped'}.get(it.state, it.state) %}
 <tr class="queue-row pass-{{ it.state }}" data-status="{{ 'active' if it.state in ['queued', 'running', 'waiting'] else ('failed' if it.state in ['failed', 'error', 'nomatch'] else 'done') }}">
   <td class="col-icon">{% if it.state == 'running' %}{{ m.icon('spinner', 'sm spin') }}{% elif it.state in ['queued', 'waiting'] %}{{ m.icon('clock', 'sm') }}{% elif it.state in ['failed', 'error', 'nomatch'] %}{{ m.icon('warning', 'sm') }}{% elif it.state == 'cancelled' %}{{ m.icon('ignore', 'sm') }}{% else %}{{ m.icon('check-circle', 'sm') }}{% endif %}</td>
   <td class="num muted">{{ loop.index }}</td>

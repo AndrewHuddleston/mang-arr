@@ -181,6 +181,108 @@ class PageByPageTest(PipelineBase):
         self.assertTrue(st[3.0][1].startswith("waiting for chapter 2"))
 
 
+class CompleteSeriesTest(PipelineBase):
+    """A scheduled pass skips a complete finished series checked lately,
+    after one status question for all of them, unless its provider says it
+    goes on; a manual refresh of it always runs."""
+
+    def test_skipped_unless_it_goes_on(self):
+        fake = self.fake()
+        plans = {"Done": [entry(fake, X, 1, "Done", [1, 2])], "Back": [entry(fake, Y, 2, "Back", [1, 2])],
+                 "Going": [entry(fake, Z, 3, "Going", [1])]}
+        with db.connect() as con:
+            for t, status in (("Done", "FINISHED"), ("Back", "FINISHED"), ("Going", "RELEASING")):
+                sid = db.upsert_series(con, Series(english=t, status=status, chapters=2))
+                if t != "Going":
+                    for n in (1.0, 2.0):
+                        con.execute("INSERT INTO chapter (series_id, number, status, updated_at) VALUES (?, ?,"
+                                    " 'have', ?)", (sid, n, db.now()))
+            con.execute("UPDATE series SET last_resolved=?", (db.now(),))
+            con.commit()
+            ids = {r["title"]: r["id"] for r in db.series_rows(con)}
+        asked = []
+
+        def statuses(refs):
+            asked.append(sorted(refs))
+            return {"manual:Done": ("FINISHED", 2), "manual:Back": ("RELEASING", None)}
+        job = jobs.Job(1, "refresh-all", "all")
+        with mock.patch.object(web, "client", fake), mock.patch.object(core, "resolve", resolver_for(fake, plans)), \
+                mock.patch.object(web.metadata, "statuses", statuses), self.assertLogs("mangarr.web.app", "INFO") as cm:
+            msg = web._job_refresh_all(job)
+        self.assertEqual(asked, [["manual:Back", "manual:Done"]])            # one question for all of them
+        self.assertEqual([(i["title"], i["state"]) for i in job.items],
+                         [("Going", "done"), ("Back", "done"), ("Done", "skipped")])
+        self.assertEqual(job.items[2]["result"], "skipped: complete and finished; next check in about 7 day(s)")
+        self.assertIn("Back: now RELEASING", "\n".join(cm.output))
+        self.assertEqual(fake.kinds("enqueue", X), [])                       # Done's source never asked
+        self.assertEqual(msg, "2 series, 1 downloaded, 1 imported, 0 errors, 1 complete finished series skipped")
+        with mock.patch.object(core, "resolve", resolver_for(fake, plans)) as _, \
+                mock.patch.object(web, "client", fake):
+            out = web._job_refresh(ids["Done"], download=False)(jobs.Job(2, "refresh", "Done"))
+        self.assertEqual(out, "2 listed, 0 downloaded, 0 failed, 0 imported")   # a manual refresh always runs
+
+    def test_the_status_check_failing_skips_them_as_planned(self):
+        fake = self.fake()
+        with db.connect() as con:
+            sid = db.upsert_series(con, Series(english="Done", status="CANCELLED"))
+            con.execute("INSERT INTO chapter (series_id, number, status, updated_at) VALUES (?, 1, 'have', ?)",
+                        (sid, db.now()))
+            con.execute("UPDATE series SET last_resolved=?", (db.now(),))
+            con.commit()
+
+        def statuses(refs):
+            raise RuntimeError("AniList unreachable")
+        job = jobs.Job(1, "refresh-all", "all")
+        with mock.patch.object(web, "client", fake), mock.patch.object(web.metadata, "statuses", statuses), \
+                self.assertLogs("mangarr.web.app", "WARNING"):
+            web._job_refresh_all(job)
+        self.assertEqual([(i["state"], i["result"]) for i in job.items],
+                         [("skipped", "skipped: complete and cancelled; next check in about 7 day(s)")])
+
+
+    def test_a_series_no_source_has_is_not_complete(self):
+        # nothing matched: the resolve still stamps last_resolved, but the series has nothing, so every
+        # pass looks again instead of calling it complete for a week
+        fake = self.fake()
+        with db.connect() as con:
+            db.upsert_series(con, Series(english="Nobody Has It", status="CANCELLED", chapters=40))
+        for _ in range(2):
+            job = jobs.Job(1, "refresh-all", "all")
+            with mock.patch.object(web, "client", fake), mock.patch.object(core, "resolve", resolver_for(fake, {})), \
+                    mock.patch.object(web.metadata, "statuses", lambda refs: {}):
+                web._job_refresh_all(job)
+            self.assertEqual([i["state"] for i in job.items], ["nomatch"])
+
+
+class DueFirstTest(PipelineBase):
+    def test_a_series_whose_first_missing_chapter_waits_for_its_retry_still_goes_first(self):
+        # in order, ch 1 failed and waits for its next try; the pass still fetches 2 and 3, so the
+        # series has chapters due and goes before a continuing series with nothing due
+        fake = self.fake()
+        plans = {"A continuing": [entry(fake, Y, 1, "A continuing", [1])],
+                 "B held": [entry(fake, X, 2, "B held", [1, 2, 3])]}
+        with db.connect() as con:
+            a = db.upsert_series(con, Series(english="A continuing", status="RELEASING"))
+            b = db.upsert_series(con, Series(english="B held", status="FINISHED"))
+            con.execute("INSERT INTO chapter (series_id, number, status, updated_at) VALUES (?, 1, 'have', ?)",
+                        (a, db.now()))
+            con.execute("INSERT INTO chapter (series_id, number, status, next_try, reason, updated_at) VALUES"
+                        " (?, 1, 'failed', '2999-01-01 00:00:00', 'broken', ?)", (b, db.now()))
+            for n in (2, 3):
+                con.execute("INSERT INTO chapter (series_id, number, status, updated_at) VALUES (?, ?, 'wanted', ?)",
+                            (b, n, db.now()))
+            con.commit()
+            settings.set_many(con, {"download_in_order": True})
+        settings._cache.clear()
+        job = jobs.Job(1, "refresh-all", "all")
+        with mock.patch.object(web, "client", fake), mock.patch.object(core, "resolve", resolver_for(fake, plans)), \
+                self.assertLogs("mangarr.web.app", "INFO") as cm:
+            web._job_refresh_all(job)
+        self.assertEqual([i["title"] for i in job.items], ["B held", "A continuing"])
+        self.assertIn("refresh pass: 2 series (1 with chapters due first, then 1 continuing)", "\n".join(cm.output))
+        self.assertEqual({n: st for n, (st, _) in self.status(b).items()}, {1.0: "failed", 2.0: "have", 3.0: "have"})
+
+
 class ChapterSearchTest(PassBase):
     """A chapter's Search button (core.download_chapter without an entry)
     asks the sources in the order a resolve ranks them."""
@@ -261,7 +363,7 @@ class StopTest(PipelineBase):
         fake.on_finish = on_finish
         sent = []
         with mock.patch.object(web, "client", fake), mock.patch.object(core, "resolve", resolver_for(fake, plans)), \
-             mock.patch.object(web, "plan_pass", lambda r: (rows, 0)), \
+             mock.patch.object(web, "plan_pass", lambda r, due=None: (rows, [])), \
              mock.patch.object(web.notify, "send", lambda title, body, kind: sent.append(kind)), \
              self.assertLogs(level="ERROR"):
             with self.assertRaises(web.PassStopped) as cm:
@@ -335,12 +437,19 @@ class StopTest(PipelineBase):
         for r in rows:
             st = self.status(r["id"])
             self.assertEqual({n: s for n, (s, _) in st.items()}, {1.0: "have", 2.0: "have", 3.0: "wanted"})
-            self.assertEqual(st[3.0][1], downloader.UNSTARTED_REASON)
+        first, *others = rows
+        self.assertEqual(self.status(first["id"])[3.0][1], downloader.UNSTARTED_REASON)
+        for r in others:                                    # never queued: the reason says just that
+            self.assertEqual(self.status(r["id"])[3.0][1],
+                             f"not attempted: {X} is busy with other downloads; tried again next pass")
         self.assertEqual(out, (3, 6, 6, 0))
-        for it in job.items:
+        self.assertEqual((job.items[0]["state"], job.items[0]["result"]),
+                         ("done", "2 downloaded; 1 not started (Suwayomi's download queue was busy with other "
+                                  "downloads)"))
+        for it in job.items[1:]:
             self.assertEqual((it["state"], it["result"]),
-                             ("done", "2 downloaded; 1 not started (Suwayomi's download queue was busy with other "
-                                      "downloads)"))
+                             ("done", f"2 downloaded; 1 not attempted ({X} busy with other downloads; tried again "
+                                      "next pass)"))
         with db.connect() as con:
             self.assertEqual(db.auto_throttled(con), set())
         self.assertEqual(fake.items, [])

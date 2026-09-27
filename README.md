@@ -241,9 +241,10 @@ applies to the next job.
 | Sources: enabled / one by one | One row per Suwayomi source: *Enabled* (default from `MANGARR_UNUSABLE_SOURCES`), its reliability, the rate limiting detected (default list from `MANGARR_THROTTLED_SOURCES`), and *one by one*: fetch it page by page (default from `MANGARR_PAGE_WARM_SOURCES`; see [How it works](#how-it-works)). A *one by one* entry for a source that is not installed right now is kept. |
 | Refresh every (hours) | The scheduler and the daemon pick a change up within seconds. |
 | Download in order | On by default. Each series downloads strictly in chapter order, one chapter at a time; a chapter that fails is tried on the other sources at once, and if none can deliver it the series waits there (later chapters show "waiting for chapter N") while the pass carries on with the next series. Off: chapters are fetched from whichever source has them, faster but out of order and with possible gaps. |
-| Download lanes | How many sources download at the same time during a refresh pass or *Search all wanted now* (1-8, default 3). Each source serves one series at a time and keeps its pacing, so a slow or rate-limited source holds up only the series that need it. Suwayomi's own *max sources in parallel* must allow as many: a pass uses the lower of the two. The field shows Suwayomi's value and, when it is lower, a *Save and let Suwayomi use N* button that changes it in Suwayomi: the only Suwayomi setting mang-arr ever changes, and only on that button. Adding one series, refreshing one and a chapter search still download from one source at a time. |
+| Download lanes | How many sources download at the same time during a refresh pass or *Search all wanted now* (1-8, default 3). Each source serves one series at a time and keeps its pacing, so a slow or rate-limited source holds up only the series that need it, and a series whose next source is busy takes the same chapters from another free source of the same kind (see [How it works](#how-it-works)). Suwayomi's own *max sources in parallel* must allow as many: a pass uses the lower of the two. The field shows Suwayomi's value and, when it is lower, a *Save and let Suwayomi use N* button that changes it in Suwayomi: the only Suwayomi setting mang-arr ever changes, and only on that button. Adding one series, refreshing one and a chapter search still download from one source at a time. |
+| Parallel searches | How many sites are searched at the same time while a series is resolved (1-8, default 5), so a pass gets to its downloads sooner. The sources of one site (its `(EN)` and `(ALL)` variants) are still searched one after the other with the usual spacing (1 s between searches, 3 s on a page-by-page source), and the result does not depend on which site answers first. 1 searches one source after the other. |
 | Page delay (seconds) | Spacing between page requests on sources fetched page by page (default 2.5, 0.5-60). It is the start and the minimum: it widens 1.5× after each busy answer from the image server (up to 30 s) and eases back 0.85× every five pages that arrive. |
-| Re-check complete finished series every (days) | A pass does series with missing chapters first, then the rest; a *finished* series with nothing missing is skipped until this many days (default 7) have passed since its last check. 0 re-checks everything every pass. |
+| Re-check complete finished series every (days) | Under `serve`, a scheduled pass (and *Update All*) does series with chapters due first (wanted, or failed with their next try reached), then continuing series, then the rest, so downloads start within its first minute. A complete *finished* or *cancelled* series (chapters on disk, nothing wanted or failed, and its last check found a source) is skipped until this many days (default 7) have passed since its last check: at the end of the pass AniList and MangaDex are asked for the status of all of them at once (no source is searched), and one that goes on after all (continuing again, or another chapter count) is checked in that pass; the others show *skipped: complete and finished; next check in about N day(s)* (or *nothing to download* when some chapters are *unavailable*). A pass that stops early skips them all the same. A series with failed chapters is never skipped, so their retries keep their schedule, nor is one no source matched, and refreshing one series always checks it. 0 re-checks everything every pass. `mangarr daemon` goes through the series in title order and skips none. |
 | Minimum pages for a fractional chapter | A `12.5` with fewer pages than this is treated as a notice image and marked junk. Default 8. |
 | Komga URL, API key, library id | When URL and key are set, every import that linked at least one chapter asks Komga to scan (the given library, or all of them). The key comes from Komga's account menu → API keys. *Save & test Komga* lists the libraries it can see; the health check calls the same API. |
 | Notifications | Discord webhook, Telegram bot token + chat id, ntfy topic URL (+ token), Gotify URL + app token, Pushover token + user key, Slack webhook, Notifiarr API key + Discord channel id, SMTP email, Apprise API URL, webhook URL. Every configured channel gets each message; each has a *Test* button that sends to that channel only. *Notify on* picks the events: new chapters, series added, failed downloads (after a pass, with the reasons), health problems (when a check turns red). |
@@ -462,7 +463,8 @@ pass it lists every series with its state: *queued* (not resolved yet),
 *working*, *waiting* (resolved, waiting for a download lane: the source it
 needs is busy with another series or resting between series, or Suwayomi
 is not answering; the text says which), then *done*, *no match*, *failed*,
-*error* or *cancelled*. While the pass downloads, a *Download lanes* table
+*error*, *cancelled* or *skipped* (complete and finished, not due for a
+check yet). While the pass downloads, a *Download lanes* table
 above it shows each lane: the source, the series, what it is doing and
 since when, or *idle*. History is the last 200 events
 across all series.
@@ -675,6 +677,10 @@ series every `--interval` hours (default: the *Refresh every* setting, or
 `MANGARR_REFRESH_HOURS`), with notifications. `--once` runs one cycle and
 exits (for cron or a systemd timer). Stops cleanly on SIGTERM after the
 current series. Do not run it next to `serve`, which has its own scheduler.
+It is the simple loop: one series after the other in title order, each
+downloaded from one source at a time (it searches several sites at once
+like `serve`). Download lanes, the due-first pass order and skipping
+complete finished series are `serve`'s.
 
 #### `mangarr serve [--host HOST] [--port PORT]`
 
@@ -833,6 +839,8 @@ are exempt from the login.
    its title matches one of AniList's titles exactly (after normalising
    punctuation). Prefix and substring matches are rejected - that is how
    anthologies and promos win. Author names are compared as a second check.
+   Several sites are searched at once (*Parallel searches*), each site one
+   search at a time.
 3. **Chapters are tracked per chapter, not per series.** The wanted list is the
    union of chapter numbers across every accepted source, minus what is on disk.
 4. **Each chapter picks its own source**, preferring healthy, unthrottled ones,
@@ -869,20 +877,33 @@ minutes (or after three hours in total), so a slow 150-page webtoon chapter
 is not mistaken for a dead source. Within a source the batch size shrinks
 to one and backs off when it errors and grows back when downloads succeed.
 A chapter that fails on its first source is retried on the next source
-that lists it; a source that fails everything it was asked for is dropped
-for the rest of the run; only chapters no source could deliver end up
-`failed`, with the reason from every source tried. A file lock
+that lists it; a source that delivered nothing of what it was asked for is
+asked last for the rest of the run (its chapters go to the other sources
+first, and it is asked again only for a chapter those fail too, since one
+broken chapter can be all it was asked for); only chapters no source could
+deliver end up `failed`, with the reason from every source tried. A
+source's reliability counts what that source itself delivered or failed,
+also when it was a fallback or taken instead of a busy source. A file lock
 (`MANGARR_LOCK`) makes sure only one download run exists at a time across
 the web worker and the CLI; a second one waits. A per-chapter search or
 manual download is the same machinery for one chapter from one entry.
 
 A refresh pass (and *Search all wanted now*) resolves its series one after
 the other and hands every series with chapters due to the download lanes,
-then goes on resolving. A lane downloads one series from one source at a
+then goes on resolving. A scheduled pass takes the series with chapters due
+first, then continuing ones, then the rest, and leaves complete finished
+series for the end (see *Re-check complete finished series*). A lane downloads one series from one source at a
 time: a free lane takes the first waiting series, in pass order, that wants
 a source no other lane is on. So each source serves one series at a time
 and keeps its pacing, a rate-limited source rests *Throttled delay* seconds
 between series, and a slow source holds up only the series that need it.
+When no waiting series can have the source it wants next (busy with another
+series, or resting), a free lane takes the first one that can get the same
+chapters from another free source instead of staying idle, as long as that
+source is no worse a kind (normal, then rate-limited, then page by page:
+a series never moves from a normal source to a page-by-page one just to
+start sooner). The source it skipped still gets its turn if that one fails:
+a chapter fails only once every source that lists it has been tried.
 The `(EN)` and `(ALL)` variants of one extension count as one source. The
 lane count is *Download lanes*, but never more than Suwayomi's own *max
 sources in parallel*, which a pass reads and never changes. Download in
@@ -898,7 +919,9 @@ their next source, like a failure but without marking the source as
 rate-limited; a chapter no other source lists waits for the next pass, and
 the pass shows the series as *failed* (*N not started*) when nothing of it
 arrived. For 30 minutes after that nothing more of the pass is queued on
-that source.
+that source: chapters that were due there go on to their next source, and
+one no other source lists says *not attempted: (source) is busy with other
+downloads; tried again next pass*.
 
 Some image servers (Comick's) answer the burst of page requests Suwayomi
 makes for a chapter with HTTP 429, yet serve the same pages one at a time.
@@ -925,7 +948,8 @@ that minute and goes on; if Suwayomi is down again right after, the pass
 stops with one error. Lanes that run into the same outage together count
 it once. A source search that times
 out is followed by a quick question to Suwayomi itself: a slow website only
-costs that source, a frozen Suwayomi ends the pass within minutes. Cancel
+costs that source, a frozen Suwayomi ends the pass within minutes (searches
+that run into it side by side count it once, and the others stop). Cancel
 never waits out a Suwayomi request: a refresh, search, download or
 chapter job stops waiting for the answer within about a second (a running
 download batch is looked at every few seconds), and a cancelled batch gets

@@ -141,6 +141,8 @@ def describe_outcome(con, series_id: int, o: Outcome) -> tuple[str, str]:
     later = [r for r in rows if r["status"] == "failed" and r["next_try"] and r["next_try"] > now_]
     unavailable = sum(1 for r in rows if r["status"] == "unavailable")
     unstarted = sum(1 for r in rows if r["status"] == "wanted" and r["reason"] == downloader.UNSTARTED_REASON)
+    # left for the next pass without being queued: the source's queue was busy with other downloads
+    busy = [b for r in rows if r["status"] == "wanted" and (b := downloader.busy_source(r["reason"]))]
     parts = []
     state = "done"
     if o.results:
@@ -157,8 +159,11 @@ def describe_outcome(con, series_id: int, o: Outcome) -> tuple[str, str]:
     if unstarted:
         # Suwayomi's queue did not get to them: nothing arrived, which the user must hear about
         parts.append(f"{unstarted} not started (Suwayomi's download queue was busy with other downloads)")
-        if not o.downloaded:
-            state = "failed"
+    if busy:
+        parts.append(f"{len(busy)} not attempted ({', '.join(sorted(set(busy))[:3])} busy with other downloads; "
+                     "tried again next pass)")
+    if (unstarted or busy) and not o.downloaded:
+        state = "failed"
     if later:
         nxt = min(r["next_try"] for r in later)[:16]
         parts.append(f"{len(later)} failed chapter(s) waiting for retry (next {nxt})")
@@ -262,18 +267,26 @@ def dropped_chapters(con, series_id: int, wanted: set) -> set:
 
 
 def record_downloads(con, series_id: int, plan: Plan, wanted: list[float], results: dict, reasons: dict,
-                     throttled: set) -> None:
+                     throttled: set, attempts: list | None = None) -> None:
     """Write what a download run did: sources that rate-limited us, source
     results, failed chapters and the ones not reached (never over a status
-    the user set meanwhile), and the event. Committed."""
+    the user set meanwhile), and the event. Committed. Source results come
+    from `attempts` (downloader.SeriesSteps.attempts: the source that
+    actually delivered or failed each chapter, a fallback or a free site
+    taken instead of a busy one too); without it every result counts for
+    the chapter's first choice."""
     for name in throttled:
         db.record_throttle(con, name)
         log.info("%s rate-limited us; it is paced automatically from now on", name)
+    if attempts is None:
+        attempts = [(m.source.name, n, r) for n, r in results.items() if (m := plan.assignment.get(n))]
+    for name, _, r in attempts:
+        metrics.record_download(name, r)
+        db.record_source_result(con, name, "ok" if r == "ok" else "failed")
+    tried = {n for _, n, _ in attempts}
     for n, r in results.items():
-        m = plan.assignment.get(n)
-        metrics.record_download(m.source.name if m else "?", r)
-        if m:
-            db.record_source_result(con, m.source.name, "ok" if r == "ok" else "failed")
+        if n not in tried:                        # failed before any source was asked (none lists it)
+            metrics.record_download("?", r)
         if r != "ok" and not db.set_status(con, series_id, n, "failed", reasons.get(n, "download failed"),
                                            only_from=_JOB_OWNED):
             log.info("%s: ch %g failed, but its status was changed meanwhile; keeping that", plan.series.title, n)
@@ -316,10 +329,11 @@ def download_wanted(con, client: Client, series_id: int, plan: Plan,
     wanted_set = set(wanted)
     reasons: dict = {}
     seen_throttle: set = set()
+    attempts: list = []
     results = downloader.download(client, plan, only=wanted_set, should_cancel=should_cancel, reasons=reasons,
                                   progress=progress, throttled=seen_throttle,
-                                  dropped=lambda: dropped_chapters(con, series_id, wanted_set))
-    record_downloads(con, series_id, plan, wanted, results, reasons, seen_throttle)
+                                  dropped=lambda: dropped_chapters(con, series_id, wanted_set), attempts=attempts)
+    record_downloads(con, series_id, plan, wanted, results, reasons, seen_throttle, attempts)
     return results
 
 

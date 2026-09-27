@@ -29,6 +29,18 @@ class DbTest(unittest.TestCase):
     def tearDown(self):
         self.tmp.cleanup()
 
+    def test_chapters_due(self):
+        soon = "2999-01-01 00:00:00"
+        with db.connect(self.path) as con:
+            sids = [db.upsert_series(con, Series(anilist_id=i, english=f"S{i}")) for i in range(1, 5)]
+            rows = [(sids[0], 1, "wanted", None), (sids[0], 2, "failed", "2000-01-01 00:00:00"),
+                    (sids[1], 1, "failed", soon), (sids[1], 2, "wanted", None),     # 2 is fetched, in order too
+                    (sids[2], 1, "have", None), (sids[2], 2, "failed", None),
+                    (sids[3], 1, "failed", soon)]
+            con.executemany("INSERT INTO chapter (series_id, number, status, next_try, updated_at) VALUES (?, ?, ?, ?,"
+                            " '2000-01-01 00:00:00')", rows)
+            self.assertEqual(db.chapters_due(con), {sids[0]: 2, sids[1]: 1, sids[2]: 1})
+
     def test_same_title_gets_distinct_folders(self):
         with db.connect(self.path) as con:
             a = db.upsert_series(con, Series(anilist_id=1, english="Wind Breaker"))
