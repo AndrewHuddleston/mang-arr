@@ -34,6 +34,10 @@ web = [
     "python-multipart>=0.0.31",
     "prometheus-client>=0.20",
 ]
+# E-reader conversion (mangarr/convert/engine.py); 12.3 is the release it was tested with.
+convert = [
+    "Pillow>=12.3",
+]
 
 [project.urls]
 Homepage = "https://github.com/AndrewHuddleston/mang-arr"
