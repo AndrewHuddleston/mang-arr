@@ -45,6 +45,10 @@ class FakeSuwayomi:
     downloaded. `foreign` items (chapter id -> source name) were queued by
     someone else: they keep their source busy for good.
 
+    For a real resolve (resolver.resolve with sources given), search()
+    finds an entry by its title in `catalog` after search_secs, and manga()
+    lists its chapters; source_secs gives a source a chapter time of its own.
+
     `down` makes every call raise SuwayomiUnreachable. `events` records
     (t, kind, source, manga id, chapter id) for enqueue, start, finish,
     error, dequeue and page; `violations` whatever breaks the lane rules:
@@ -53,9 +57,14 @@ class FakeSuwayomi:
 
     def __init__(self, sources: dict | None = None, max_parallel: int = 3, secs: float = 0.03,
                  page_warm=(), pages: int = 4, busy_pages: dict | None = None, broken=(), foreign: dict | None = None,
-                 staging_titles: dict | None = None, lanes: int | None = None, page_secs: float = 0.0):
+                 staging_titles: dict | None = None, lanes: int | None = None, page_secs: float = 0.0,
+                 source_secs: dict | None = None, search_secs: dict | None = None):
         self.sources = dict(sources or {})              # manga id -> source name
         self.max_parallel, self.secs, self.pages, self.page_secs = max_parallel, secs, pages, page_secs
+        self.source_secs = dict(source_secs or {})      # source name -> secs a chapter takes there (else secs)
+        self.search_secs = dict(search_secs or {})      # source name -> secs a search takes there
+        self.catalog: dict[str, dict[str, int]] = {}    # source name -> {entry title: manga id} (search)
+        self.searches: list[tuple[float, str, str]] = []    # (t, source name, query)
         self.page_warm = set(page_warm)
         self.busy_pages = dict(busy_pages or {})        # (chapter id, page) -> busy answers left
         self.broken = set(broken)
@@ -144,6 +153,21 @@ class FakeSuwayomi:
         self._check()
         self.in_library[manga_id] = in_library
 
+    def search(self, src: Source, query: str) -> list[dict]:
+        """What a source search finds: its entry whose title is the query,
+        after search_secs (real time)."""
+        self._check()
+        with self._lock:
+            self.searches.append((time.perf_counter() - self.t0, src.name, query))
+        if self.search_secs.get(src.name):
+            threading.Event().wait(self.search_secs[src.name])
+        with self._lock:
+            mid = self.catalog.get(src.name, {}).get(query)
+            return [] if mid is None else [{"id": mid, "title": query, "author": None, "status": "ONGOING"}]
+
+    def manga(self, manga_id: int) -> tuple[dict, list[Chapter]]:
+        return {"id": manga_id, "title": self.staging_titles[manga_id], "author": None}, self.chapters(manga_id)
+
     def max_sources_in_parallel(self) -> int | None:
         return None if self.down or self.cap_unreadable else self.max_parallel
 
@@ -224,11 +248,12 @@ class FakeSuwayomi:
                 for x in [x for x in self.items if x["state"] == "DOWNLOADING"]:
                     if self._holding(x, now):
                         continue
-                    if now - x["t0"] >= self.secs:
+                    secs = self.source_secs.get(x["source"], self.secs)
+                    if now - x["t0"] >= secs:
                         if self._finish(x):
                             arrived.append(x["id"])
                     else:
-                        x["progress"] = min(0.99, (now - x["t0"]) / self.secs)
+                        x["progress"] = min(0.99, (now - x["t0"]) / secs)
                 busy = {x["source"] for x in self.items if x["state"] == "DOWNLOADING"} | set(self.foreign.values())
                 for x in self.items:
                     if x["state"] == "QUEUED" and x["source"] not in busy and len(busy) < self.max_parallel:
@@ -275,6 +300,7 @@ def entry(fake: FakeSuwayomi, source_name: str, manga_id: int, title: str, numbe
     src = Source(source_name, source_name, "en", throttled=throttled, page_warm=warm)
     nums = [float(n) for n in numbers]
     fake.sources[manga_id], fake.staging_titles[manga_id], fake.listing[manga_id] = source_name, title, nums
+    fake.catalog.setdefault(source_name, {})[title] = manga_id
     chapters = [Chapter(chapter_id(manga_id, n), n, f"Chapter {n:g}", None, False) for n in nums]
     return SourceMatch(src, manga_id, title, None, 0, title, 1, chapters)
 
