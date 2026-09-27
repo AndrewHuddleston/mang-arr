@@ -189,6 +189,31 @@ class RunnerTest(unittest.TestCase):
             r._loop()
         self.assertEqual(j.status, "cancelled")
 
+    def run_one(self, fn) -> jobs.Job:
+        r = jobs.Runner()
+        j = r.submit("refresh", "S", fn)
+        r._pending.append((None, None))                    # sentinel: ends the loop after the job
+        with self.assertRaises(AttributeError), mock.patch.object(jobs.metrics, "record_job"), \
+             self.assertLogs("mangarr.jobs", "INFO"):
+            r._loop()
+        return j
+
+    def test_cancel_during_the_search_says_so_in_words(self):     # round 3: it said "Cancelled: "
+        def fn(job):
+            job.progress = "searching Weeb Central (3 of 30 sources)"
+            job.cancel = True
+            raise limits.Cancelled()
+        j = self.run_one(fn)
+        self.assertEqual(j.status, "cancelled")
+        self.assertEqual(j.message, "cancelled; last step: searching Weeb Central (3 of 30 sources)")
+
+        def before_any_step(job):
+            job.cancel = True
+            raise limits.Cancelled()
+        self.assertEqual(self.run_one(before_any_step).message, "cancelled")
+        broke = self.run_one(lambda job: {}["x"])
+        self.assertEqual((broke.status, broke.message), ("failed", "KeyError: 'x'"))
+
 
 class SchedulerTest(unittest.TestCase):              # findings 80, 89
     def test_bad_interval_never_breaks_next_at(self):

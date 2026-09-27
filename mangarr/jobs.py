@@ -164,7 +164,7 @@ class Runner:
                 job.message = str(result) if result is not None else job.progress
                 log.info("job #%d done: %s %s - %s", job.id, job.kind, job.title, job.message)
             except Exception as e:
-                job.message = f"{type(e).__name__}: {e}"
+                job.message = _failure_text(job, e)
                 if job.cancel:             # it stopped because it was asked to
                     job.status = "cancelled"
                     log.warning("job #%d cancelled: %s %s - %s", job.id, job.kind, job.title, job.message)
@@ -181,6 +181,15 @@ class Runner:
                 metrics.record_job(job.kind, job.status)
                 if job.kind == "refresh-all" and job.status == "done":
                     metrics.record_refresh_done(job.finished_at)
+
+
+def _failure_text(job: Job, e: Exception) -> str:
+    """The message of a job that ended with an exception: its type and text,
+    or for a cancel (limits.Cancelled has no text) plain words with the step
+    it was at."""
+    if isinstance(e, limits.Cancelled):
+        return f"cancelled; last step: {job.progress}"[:300] if job.progress else "cancelled"
+    return f"{type(e).__name__}: {e}"
 
 
 class Scheduler:
