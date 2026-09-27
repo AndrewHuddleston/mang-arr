@@ -355,6 +355,8 @@ def download_chapter(con, client: Client, series_id: int, number: float, manga_i
                if (manga_id is None and not s["note"]) or s["manga_id"] == manga_id]
     if not entries:
         raise ValueError("no such source entry for this series")
+    if manga_id is None:
+        entries = _search_order(con, series_id, number, entries)
     cancel = should_cancel or (lambda: False)
     ask = with_cancel(client, should_cancel)       # a cancel cuts a hung chapter list short
     tried = []
@@ -393,6 +395,38 @@ def download_chapter(con, client: Client, series_id: int, number: float, manga_i
     con.commit()
     log.warning("%s: chapter %g: %s", title, number, reason)
     return f"chapter {number:g} failed: {reason}"
+
+
+def _search_order(con, series_id: int, number: float, entries: list) -> list:
+    """The order an automatic chapter search asks the source entries in, as
+    a resolve ranks them: the entry the plan chose for the chapter first,
+    then normal sources, rate-limited ones and page-by-page ones (slow)
+    last; within each, the primary entry first, then by name."""
+    row = con.execute("SELECT manga_id FROM chapter WHERE series_id=? AND number=?", (series_id, number)).fetchone()
+    chosen = row["manga_id"] if row else None
+    tier = _source_tier(con)
+    return sorted(entries, key=lambda s: (s["manga_id"] != chosen, tier(s["source_name"]), not s["is_primary"]))
+
+
+def _source_tier(con) -> Callable[[str], int]:
+    """Source.tier by name, for entries stored without their Source: from
+    Settings and the rate limits seen lately, as Client.sources() stamps
+    them. A setting that cannot be read counts as not set."""
+    from . import settings
+
+    def listed(key: str) -> set:
+        try:
+            v = settings.get(key)
+        except Exception as e:
+            log.debug("could not read %s: %s: %s", key, type(e).__name__, e)
+            return set()
+        return set(v) if isinstance(v, list) else set()
+    warm, throttled = listed("page_warm_sources"), listed("throttled_sources") | db.auto_throttled(con)
+
+    def tier(name: str) -> int:
+        key = name.lower().strip()
+        return 2 if key in warm else 1 if key in throttled else 0
+    return tier
 
 
 def delete_series(con, client: Client, series_id: int, delete_library: bool = False) -> None:

@@ -15,7 +15,7 @@ from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from fake_suwayomi import PassBase, chapter_id, entry, number_of, resolver_for  # noqa: E402
+from fake_suwayomi import PassBase, add_series, chapter_id, entry, number_of, resolver_for  # noqa: E402
 
 from mangarr import core, db, downloader, jobs, lanes, settings  # noqa: E402
 from mangarr.model import Series  # noqa: E402
@@ -179,6 +179,32 @@ class PageByPageTest(PipelineBase):
                       "path); the normal download failed instantly on every try", st[2.0][1])
         self.assertNotIn("no working pages", st[2.0][1])               # it does have them: page by page did not run
         self.assertTrue(st[3.0][1].startswith("waiting for chapter 2"))
+
+
+class ChapterSearchTest(PassBase):
+    """A chapter's Search button (core.download_chapter without an entry)
+    asks the sources in the order a resolve ranks them."""
+
+    def search(self, title, forget_choice=False):
+        fake = self.fake(page_warm={COMICK})
+        plans = {title: [entry(fake, "Weeb Central", 1, title, [1, 2, 3, 4, 6]), entry(fake, COMICK, 2, title, [5]),
+                         entry(fake, "MangaDex", 3, title, [5])]}
+        with mock.patch.object(core, "resolve", resolver_for(fake, plans)), db.connect() as con, \
+             self.assertLogs("mangarr", "INFO"):
+            sid = add_series(con, fake, title)
+            if forget_choice:                           # no chapter row choice: the tiers alone
+                con.execute("UPDATE chapter SET manga_id=NULL WHERE series_id=?", (sid,))
+                con.commit()
+            msg = core.download_chapter(con, fake, sid, 5.0)
+        return fake, msg
+
+    def test_the_chapters_chosen_source_first_and_page_by_page_last(self):
+        for title, forget in (("T", False), ("U", True)):
+            with self.subTest(forget_choice=forget):
+                fake, msg = self.search(title, forget)
+                self.assertEqual(msg, "chapter 5 downloaded from MangaDex and linked")
+                self.assertEqual(fake.kinds("page"), [])        # Comick (sorted first by name) never asked
+                self.assertEqual({e[2] for e in fake.kinds("enqueue")}, {"MangaDex"})
 
 
 class StopTest(PipelineBase):

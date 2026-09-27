@@ -353,9 +353,11 @@ the chapter was or will be taken from, the reason (or the library file
 name for a chapter on disk), and the actions:
 
 - **Search** (wanted, failed, unavailable or ignored chapters): queue a
-  *chapter* job that tries the trusted source entries in order (primary
-  first) and downloads the chapter from the first one that lists it and
-  delivers it; the chapter is linked into the library straight away.
+  *chapter* job that tries the trusted source entries in the order a
+  refresh ranks them (the entry chosen for the chapter first, then normal,
+  rate-limited and page-by-page sources, the primary first within each)
+  and downloads the chapter from the first one that lists it and delivers
+  it; the chapter is linked into the library straight away.
 - **Manual**: open a panel listing every source entry of the series - the
   ones the automatic search would not use too - with whether it lists the
   chapter, the chapter title and scanlator there, whether Suwayomi already
