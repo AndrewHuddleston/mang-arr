@@ -158,11 +158,21 @@ class RunnerTest(unittest.TestCase):
         self.assertTrue(r.cancel(j.id))
         self.assertTrue(j.cancel)                          # set in both branches (no check-then-set race)
         r2 = jobs.Runner()
-        r2._q, r2._jobs = r._q, r._jobs
-        r2._q.put((None, None))                            # sentinel: ends the loop after the job
+        r2._pending, r2._jobs = r._pending, r._jobs
+        r2._pending.append((None, None))                   # sentinel: ends the loop after the job
         with self.assertRaises(AttributeError):
             r2._loop()
         self.assertEqual(ran, [])
+
+    def test_cancel_and_resubmit_does_not_grow_the_queue(self):     # second pass, regression 5
+        r = jobs.Runner(max_queued=3)
+        busy = r.submit("refresh-all", "long pass", lambda j: None)
+        for i in range(50):
+            j = r.submit("chapter", f"c{i}", lambda j: None)
+            self.assertTrue(r.cancel(j.id))
+        self.assertEqual([e[0] for e in r._pending], [busy])   # cancelled ones are gone at once
+        for i in range(2):
+            r.submit("chapter", f"more{i}", lambda j: None)    # and never counted against the bound
 
     def test_cancelled_job_that_raises_is_cancelled_not_failed(self):
         r = jobs.Runner()
@@ -171,7 +181,7 @@ class RunnerTest(unittest.TestCase):
             job.cancel = True
             raise downloader.Cancelled()
         j = r.submit("chapter", "c", fn)
-        r._q.put((None, None))
+        r._pending.append((None, None))
         with self.assertRaises(AttributeError), mock.patch.object(jobs.metrics, "record_job"), \
              self.assertLogs("mangarr.jobs", "WARNING"):
             r._loop()
@@ -205,17 +215,36 @@ class LimitsTest(unittest.TestCase):
         self.assertEqual(limits.clamp("refresh_hours", math.inf), 6.0)
         self.assertEqual(limits.clamp("recheck_finished_days", 7), 7)
 
-    def test_bad_values_rejected_when_saved(self):
+    def test_bad_values_clamped_when_saved(self):
         from mangarr import settings
         with tempfile.TemporaryDirectory() as tmp, db.connect(tmp + "/s.db") as con:
             settings._cache.clear()
-            for key, bad in (("throttled_delay_seconds", "1e9"), ("refresh_hours", "inf"),
-                             ("refresh_hours", "nan"), ("recheck_finished_days", "-1")):
-                with self.assertRaises(ValueError), self.assertLogs("mangarr.settings", "WARNING"):
+            for key, bad, saved in (("throttled_delay_seconds", "1e9", 600.0), ("refresh_hours", "inf", 6.0),
+                                    ("refresh_hours", "nan", 6.0), ("recheck_finished_days", "-1", 0.0)):
+                with self.assertLogs("mangarr.settings", "WARNING"):
                     settings.set_many(con, {key: bad})
+                self.assertEqual(settings.all_values(con)[key], saved)
             settings.set_many(con, {"refresh_hours": "12", "throttled_delay_seconds": "0"})
             self.assertEqual(settings.all_values(con)["refresh_hours"], 12.0)
         settings._cache.clear()
+
+    def test_stale_out_of_range_value_does_not_block_saving(self):     # second pass, regression 2
+        from mangarr import settings
+        with tempfile.TemporaryDirectory() as tmp, db.connect(tmp + "/s.db") as con:
+            settings._cache.clear()
+            # written by an older version that did not check ranges
+            con.execute("INSERT INTO setting (key, value) VALUES ('refresh_hours', '0.1')")
+            con.commit()
+            settings.refresh(con)
+            form = {k: str(v) for k, v in settings.all_values(con).items() if isinstance(v, float)}
+            with self.assertLogs("mangarr.settings", "WARNING"):
+                settings.set_many(con, form)                        # the whole form posted back, unchanged
+            self.assertEqual(settings.all_values(con)["refresh_hours"], 0.25)
+        settings._cache.clear()
+
+    def test_out_of_range_default_is_bounded(self):
+        with mock.patch.dict("mangarr.settings.DEFAULTS", {"refresh_hours": 0.01}):
+            self.assertEqual(limits.bound("refresh_hours", "nan"), 0.25)
 
     def test_pause_honours_cancel(self):
         calls = []
@@ -258,6 +287,28 @@ class DownloaderTest(TmpData):
         with self.assertRaises(downloader.Cancelled):
             downloader.download_one(FakeClient(broken={1010}), 1, _match("A", 1, [1]).chapters[0], "T", "A",
                                     should_cancel=lambda: True)
+
+    def test_bad_lock_wait_env_falls_back_to_the_default(self):     # second pass, regression 3
+        for bad in ("6h", "nan", "-5", "inf"):
+            with mock.patch.dict(os.environ, {"MANGARR_LOCK_WAIT_SECS": bad}), \
+                 self.assertLogs("mangarr.downloader", "WARNING"):
+                self.assertEqual(downloader._env_secs("MANGARR_LOCK_WAIT_SECS", 21600), 21600)
+        with mock.patch.dict(os.environ, {"MANGARR_LOCK_WAIT_SECS": "90"}):
+            self.assertEqual(downloader._env_secs("MANGARR_LOCK_WAIT_SECS", 21600), 90)
+
+    def test_queue_outage_warns_once_not_every_poll(self):          # second pass, regression 6
+        class Down:
+            calls = 0
+
+            def queue(self):
+                Down.calls += 1
+                if Down.calls <= 10:
+                    raise SuwayomiUnreachable("Suwayomi at x unreachable")
+                return []
+        with self.assertLogs("mangarr.downloader", "DEBUG") as cm:
+            self.assertEqual(downloader._wait(Down(), [1], lambda: False, every=2), "done")
+        warnings = [r for r in cm.records if r.levelname == "WARNING"]
+        self.assertEqual(len(warnings), 1, [r.getMessage() for r in warnings])
 
     def test_lock_wait_polls_cancel_and_gives_up(self):     # findings 79, 85
         path = self.tmp.name + "/lock"
@@ -363,6 +414,36 @@ class CoreTest(TmpData):
         with db.connect() as con:                          # once A answers and no longer lists 7, it is
             db.save_plan(con, sid, _plan([b]), 2)
         self.assertEqual(self.status(sid)[7], "unavailable")
+
+    def test_a_source_down_for_too_long_loses_its_state(self):         # second pass, regression 4
+        sid = self.seed({7: "wanted"}, sources=(("A", 1), ("B", 2)))
+        old = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(time.time() - (db.UNREACHABLE_KEEP_DAYS + 1) * 86400))
+        with db.connect() as con:
+            con.execute("UPDATE series_source SET seen_at=? WHERE series_id=? AND source_name='A'", (old, sid))
+            con.commit()
+        down = [(Source("1", "A", "en"), "search failed: HTTP 403")]      # e.g. blocked for good
+        with db.connect() as con:
+            dropped = db.save_plan(con, sid, _plan([_match("B", 2, [1])], unreachable=down), 2)
+            names = {r["source_name"] for r in db.sources(con, sid)}
+        self.assertEqual(dropped, ["A"])
+        self.assertEqual(names, {"B"})
+        self.assertEqual(self.status(sid)[7], "unavailable")
+
+    def test_a_down_former_primary_leaves_suwayomis_library(self):     # second pass, regression 4
+        sid = self.seed({}, sources=(("A", 1), ("B", 2)))
+        with db.connect() as con:
+            con.execute("UPDATE series_source SET is_primary=1 WHERE series_id=? AND source_name='A'", (sid,))
+            con.commit()
+        plan = _plan([_match("B", 2, [1])], series=Series(anilist_id=1, english="T"),
+                     unreachable=[(Source("1", "A", "en"), "DNS/network: unable to resolve host")])
+        flags = {}
+        client = mock.MagicMock()
+        client.set_in_library.side_effect = lambda mid, on, **kw: flags.__setitem__(mid, on)
+        with db.connect() as con, mock.patch.object(core, "resolve", lambda *a, **kw: plan):
+            core.add_series(con, client, plan.series, download=False, do_import=False, series_id=sid)
+            names = {r["source_name"] for r in db.sources(con, sid)}
+        self.assertEqual(names, {"A", "B"})                 # A's entry is kept for now ...
+        self.assertEqual(flags, {2: True, 1: False})        # ... but only B stays in Suwayomi's library
 
     def test_add_series_stops_if_deleted_during_download(self):       # finding 92
         sid = self.seed({})
@@ -518,6 +599,31 @@ class RunPassOutageTest(unittest.TestCase):
         self.assertIn("pass stopped after 2 of 10", str(out))
         self.assertEqual(calls, [1, 2])                         # not 10 timeouts
         self.assertEqual([i["state"] for i in job.items[2:]], ["cancelled"] * 8)
+
+    def test_refresh_all_still_notifies_when_the_pass_stops(self):   # second pass, regression 1
+        class R:
+            downloaded = imported = 1
+
+        def first_then_down(con, client, sid, **kw):
+            if sid == 1:
+                return R()
+            raise SuwayomiUnreachable("Suwayomi at x unreachable")
+        rows = [{"id": i, "title": f"S{i}", "wanted": 1} for i in range(1, 6)]
+        job = jobs.Job(1, "refresh-all", "all")
+        sent = []
+        with mock.patch.object(core, "refresh_series", first_then_down), \
+             mock.patch.object(core, "describe_outcome", lambda con, sid, o: ("done", "1 downloaded")), \
+             mock.patch.object(web.db, "connect", mock.MagicMock()), \
+             mock.patch.object(web, "plan_pass", lambda r: (rows, 0)), \
+             mock.patch.object(web, "_record_error", lambda sid, e: None), \
+             mock.patch.object(web.limits, "pause", lambda s, c=None: False), \
+             mock.patch.object(web.notify, "send", lambda title, body, kind: sent.append((kind, title))), \
+             self.assertLogs(web.log, "ERROR"):
+            with self.assertRaises(SuwayomiUnreachable) as cm:
+                web._job_refresh_all(job)
+        self.assertIn("pass stopped after 3 of 5", str(cm.exception))
+        self.assertIn(("new", "mang-arr: 1 new chapter(s)"), sent)       # S1's chapter is still announced
+        self.assertIn("failed", [k for k, _ in sent])
 
     def test_record_error_failure_does_not_end_the_pass(self):     # finding 33
         class R:

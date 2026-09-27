@@ -1,7 +1,7 @@
 """Numeric settings as the jobs use them, clamped to sane ranges, and a sleep
 that a cancel interrupts.
 
-Settings are validated when they are saved, but a value already in the
+Settings are clamped to RANGES when they are saved, but a value already in the
 database (or written by an older version, or by hand) must not be able to
 wedge the single job thread: a pause of 1e9 s, a NaN refresh interval or an
 infinite recheck window. So every job-side read goes through setting(),
@@ -26,19 +26,30 @@ RANGES: dict[str, tuple[float, float]] = {
 _warned: dict[str, object] = {}                 # key -> last bad value logged (log once per value)
 
 
-def clamp(key: str, value) -> float:
-    """value as a float inside RANGES[key]; the default when it is not a
-    finite number. Logs a warning (once per bad value) when it changes it."""
+def bound(key: str, value) -> float:
+    """value as a float inside RANGES[key]; the (equally bounded) default
+    when it is not a finite number. No logging: see clamp."""
     lo, hi = RANGES[key]
-    default = float(settings.DEFAULTS[key])
     try:
         v = float(value)
     except (TypeError, ValueError):
         v = math.nan
     if not math.isfinite(v):
-        out = default
-    else:
-        out = min(max(v, lo), hi)
+        v = float(settings.DEFAULTS[key])       # an env default can be out of range (or NaN) too
+        if not math.isfinite(v):
+            v = lo
+    return min(max(v, lo), hi)
+
+
+def clamp(key: str, value) -> float:
+    """bound(key, value), with a warning (once per bad value) when that
+    changes it."""
+    lo, hi = RANGES[key]
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        v = math.nan
+    out = bound(key, value)
     if out != v and _warned.get(key) != repr(value):
         _warned[key] = repr(value)
         log.warning("setting %s = %r is outside %g..%g; using %g", key, value, lo, hi, out)

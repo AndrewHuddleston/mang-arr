@@ -15,6 +15,7 @@ chapters no source could deliver end up 'failed'.
 """
 import fcntl
 import logging
+import math
 import os
 import socket
 import time
@@ -35,9 +36,28 @@ STALL_SECS = 600
 CHUNK_CAP_SECS = 3 * 3600
 # every try errored out faster than this: a dead chapter, not rate limiting
 INSTANT_FAIL_SECS = 45
+
+
+def _env_secs(name: str, default: float) -> float:
+    """A duration in seconds from the environment. A value that is not a
+    finite number >= 0 (a typo like '6h') falls back to the default with a
+    warning instead of stopping the app from starting."""
+    raw = os.environ.get(name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        v = float(raw)
+    except ValueError:
+        v = math.nan
+    if not math.isfinite(v) or v < 0:
+        log.warning("%s=%r is not a number of seconds >= 0; using %g", name, raw, default)
+        return default
+    return v
+
+
 # How long a run waits for another process (the CLI) to finish its download
 # before giving up with an error, and how often it checks meanwhile.
-LOCK_WAIT_SECS = float(os.environ.get("MANGARR_LOCK_WAIT_SECS", str(6 * 3600)))
+LOCK_WAIT_SECS = _env_secs("MANGARR_LOCK_WAIT_SECS", 6 * 3600)
 LOCK_POLL_SECS = 2.0
 # Suwayomi itself not answering for this long while we watch a chunk ends the
 # run (the caller's pass then stops) instead of waiting out STALL_SECS
@@ -419,6 +439,15 @@ def _dequeue(client, ids: list[int], label: str, outcome: str) -> None:
             time.sleep(2)
 
 
+def _queue_unreadable(again: bool, e: Exception, extra: str = "") -> None:
+    """Log a failed read of the download queue: a warning the first time,
+    debug while it keeps failing (it is polled every few seconds)."""
+    if again:
+        log.debug("still cannot read the download queue: %s", e)
+    else:
+        log.warning("could not read the download queue: %s (still watching%s)", e, extra)
+
+
 def _wait(client, ids: list[int], cancel, every: int = 5) -> str:
     """Watch our chapter ids until they leave the queue.
     Returns 'done', 'stalled' (every remaining one errored out), 'timeout'
@@ -427,13 +456,16 @@ def _wait(client, ids: list[int], cancel, every: int = 5) -> str:
     started = last_change = time.monotonic()
     last_seen: dict[int, tuple] = {}
     down_since: float | None = None
+    failing = False                  # the queue could not be read last time: warn once per streak, not per poll
     while True:
         time.sleep(every)
         if cancel():
             return "cancelled"
         try:
             items = [x for x in client.queue() if x["id"] in ours]
-            down_since = None
+            if failing:
+                log.info("the download queue can be read again")
+            down_since, failing = None, False
         except SuwayomiUnreachable as e:
             now = time.monotonic()
             down_since = down_since or now
@@ -441,11 +473,11 @@ def _wait(client, ids: list[int], cancel, every: int = 5) -> str:
                 log.error("Suwayomi has not answered for %d s while downloading; giving up: %s",
                           now - down_since, e)
                 raise
-            log.warning("could not read the download queue: %s", e)
-            items = None
+            _queue_unreadable(failing, e, f"; giving up after {UNREACHABLE_GIVE_UP_SECS} s")
+            failing, items = True, None
         except SuwayomiError as e:
-            log.warning("could not read the download queue: %s", e)
-            items = None
+            _queue_unreadable(failing, e)
+            failing, items = True, None
         now = time.monotonic()
         if items is not None:
             if not items:

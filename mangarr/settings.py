@@ -173,14 +173,17 @@ def _coerce(key: str, v):
     if isinstance(d, bool):
         return str(v).lower() in ("1", "true", "on", "yes")
     if isinstance(d, float):
-        import math
-
-        from .limits import RANGES  # imported here: limits imports this module
+        from .limits import RANGES, bound  # imported here: limits imports this module
         f = float(v)
-        lo, hi = RANGES.get(key, (-math.inf, math.inf))
-        if not math.isfinite(f) or not lo <= f <= hi:
-            log.warning("setting %s = %r rejected: outside %g..%g", key, v, lo, hi)
-            raise ValueError(f"{key} must be a number from {lo:g} to {hi:g}, not {v!r}")
+        if key in RANGES:
+            # Clamped with a warning, not refused: the Settings form posts
+            # every field back, so an out-of-range value stored by an older
+            # version (or an out-of-range env default) must not make every
+            # later save fail until the user spots and edits that field.
+            out = bound(key, f)
+            if out != f:                        # also true for NaN
+                log.warning("setting %s = %r is outside %g..%g; saved as %g", key, v, *RANGES[key], out)
+            return out
         return f
     if isinstance(d, int):
         return int(v)

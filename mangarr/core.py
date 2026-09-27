@@ -54,7 +54,13 @@ def add_series(con, client: Client, series: Series, download: bool = True, do_im
         raise Gone(f"{series.title} was deleted during the refresh")
     series_id = db.upsert_series(con, series)
     p = primary(plan)
-    db.save_plan(con, series_id, plan, p.manga_id if p else None)
+    expired = db.save_plan(con, series_id, plan, p.manga_id if p else None)
+    if expired:
+        log.warning("%s: %s could not be searched for over %d days; its entry is dropped and the chapters "
+                    "only it listed count as unavailable", series.title, ", ".join(expired), db.UNREACHABLE_KEEP_DAYS)
+    # entries kept for a source that could not be searched this time (see save_plan)
+    stale = [r["manga_id"] for r in db.sources(con, series_id)
+             if r["manga_id"] not in {m.manga_id for m in plan.matches}]
     db.event(con, "resolved", _resolve_summary(plan), series_id)
     if not p:
         db.event(con, "review", _review_summary(plan), series_id)
@@ -63,7 +69,7 @@ def add_series(con, client: Client, series: Series, download: bool = True, do_im
     con.commit()
     out = Outcome(series_id, plan)
     if p:
-        _set_library_entries(client, plan, p.manga_id)
+        _set_library_entries(client, plan, p.manga_id, stale)
     if do_import:
         out.imported += import_series(con, series_id, client)
     if download and p:
@@ -177,14 +183,19 @@ def _review_summary(plan: Plan) -> str:
     return "; ".join(parts) or "no source returned anything"
 
 
-def _set_library_entries(client: Client, plan: Plan, primary_manga_id: int) -> None:
+def _set_library_entries(client: Client, plan: Plan, primary_manga_id: int, stale: list[int] | None = None) -> None:
     """Only the primary entry stays in Suwayomi's library, so its own update
-    fetches new chapters from one source, not five copies."""
-    for m in plan.matches:
+    fetches new chapters from one source, not five copies. `stale` entries
+    (kept for a source that could not be searched, e.g. a former primary)
+    are taken out too: that is Suwayomi's own flag, the source site need
+    not answer."""
+    flags = [(m.manga_id, m.manga_id == primary_manga_id) for m in plan.matches]
+    flags += [(mid, False) for mid in stale or () if mid != primary_manga_id]
+    for manga_id, in_library in flags:
         try:
-            client.set_in_library(m.manga_id, m.manga_id == primary_manga_id, retries=1, timeout=30)
+            client.set_in_library(manga_id, in_library, retries=1, timeout=30)
         except SuwayomiError as e:
-            log.debug("could not set library flag on %d: %s", m.manga_id, e)
+            log.debug("could not set library flag on %d: %s", manga_id, e)
 
 
 # statuses a background job may overwrite; anything else ('ignored', 'have')

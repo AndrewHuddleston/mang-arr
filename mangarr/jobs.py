@@ -7,8 +7,8 @@ would fight). The scheduler thread submits a "refresh all" job every
 REFRESH_HOURS. Every job's progress and outcome is visible on the Activity
 page and in the log.
 """
+import collections
 import logging
-import queue
 import threading
 import time
 import traceback
@@ -56,9 +56,13 @@ class Job:
 
 class Runner:
     def __init__(self, max_queued: int = MAX_QUEUED, history: int = HISTORY):
-        self._q: queue.Queue = queue.Queue()
+        # (job, fn) waiting to run, oldest first. A plain deque under _lock
+        # rather than a queue.Queue, so that cancelling a queued job takes it
+        # out at once: cancelled entries never pile up behind a long job.
+        self._pending: collections.deque = collections.deque()
         self._jobs: list[Job] = []
         self._lock = threading.Lock()
+        self._ready = threading.Condition(self._lock)      # signalled when _pending gains an entry
         self._next = 1
         self.max_queued, self.history = max_queued, history
         self.current: Job | None = None
@@ -87,7 +91,8 @@ class Runner:
             self._next += 1
             self._jobs.append(job)
             self._trim()
-        self._q.put((job, fn))
+            self._pending.append((job, fn))
+            self._ready.notify()
         log.info("job #%d queued: %s %s", job.id, kind, title)
         return job
 
@@ -123,6 +128,8 @@ class Runner:
             if j.status == "queued":
                 j.status = "cancelled"
                 j.finished_at = time.time()
+                # out of the waiting line now, not when the worker reaches it
+                self._pending = collections.deque(e for e in self._pending if e[0] is not j)
             return True
 
     def pending_for(self, series_id: int) -> bool:
@@ -133,8 +140,10 @@ class Runner:
 
     def _loop(self) -> None:
         while True:
-            job, fn = self._q.get()
-            with self._lock:
+            with self._ready:
+                while not self._pending:
+                    self._ready.wait()
+                job, fn = self._pending.popleft()
                 if job.status == "cancelled" or job.cancel:
                     if job.status != "cancelled":
                         job.status, job.finished_at = "cancelled", time.time()

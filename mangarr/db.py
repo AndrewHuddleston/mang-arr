@@ -317,11 +317,22 @@ def events(con, limit: int = 50):
 
 # -- plan / chapters ---------------------------------------------------------
 
-def save_plan(con, series_id: int, plan, primary_manga_id: int | None) -> None:
+UNREACHABLE_KEEP_DAYS = 7       # how long a source that cannot be searched keeps its entry (see save_plan)
+
+
+def save_plan(con, series_id: int, plan, primary_manga_id: int | None) -> list[str]:
+    """Store a resolve's outcome. Returns the names of sources whose entry
+    was dropped because they have not been searchable for too long."""
     # A source that could not be searched this time (plan.unreachable) says
     # nothing about the series: its stored entry (and staging folder) stays,
-    # and the chapters only it lists are not marked unavailable.
-    down = sorted({src.name for src, _ in getattr(plan, "unreachable", None) or []})
+    # and the chapters only it lists are not marked unavailable. But only for
+    # UNREACHABLE_KEEP_DAYS since it last answered (seen_at): a source that
+    # fails for good (a permanent block) must not keep them 'wanted' forever.
+    unreachable = {src.name for src, _ in getattr(plan, "unreachable", None) or []}
+    cutoff = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(time.time() - UNREACHABLE_KEEP_DAYS * 86400))
+    stored = con.execute("SELECT source_name, seen_at FROM series_source WHERE series_id=?", (series_id,)).fetchall()
+    down = sorted({r["source_name"] for r in stored if r["source_name"] in unreachable and r["seen_at"] >= cutoff})
+    expired = sorted({r["source_name"] for r in stored if r["source_name"] in unreachable} - set(down))
     marks = ",".join("?" * len(down))
     con.execute(f"DELETE FROM series_source WHERE series_id=? AND source_name NOT IN ({marks})", (series_id, *down))
     if down and primary_manga_id is not None:
@@ -376,6 +387,7 @@ def save_plan(con, series_id: int, plan, primary_manga_id: int | None) -> None:
                         " WHERE series_id=? AND number=?",
                         ("no trusted source lists this chapter any more", now(), series_id, n))
     con.execute("UPDATE series SET last_resolved=?, last_error=NULL WHERE id=?", (now(), series_id))
+    return expired
 
 
 def set_have(con, series_id: int, number: float, staging_path: str | None,

@@ -169,6 +169,16 @@ def plan_pass(rows) -> tuple[list, int]:
     return keep, skipped
 
 
+class PassStopped(SuwayomiUnreachable):
+    """A pass gave up because Suwayomi stopped answering. Carries what the
+    pass got done before that, (done, downloaded, imported, errors), so the
+    job can still report and notify about it."""
+
+    def __init__(self, msg: str, counts: tuple[int, int, int, int]):
+        super().__init__(msg)
+        self.counts = counts
+
+
 def _run_pass(job: jobs.Job, rows, label: str) -> tuple[int, int, int, int]:
     """Refresh every series in rows, one at a time, keeping job.items current
     so the Activity page shows the whole pass: what is queued, what is running
@@ -176,7 +186,8 @@ def _run_pass(job: jobs.Job, rows, label: str) -> tuple[int, int, int, int]:
 
     When Suwayomi itself stops answering, the pass waits one breaker window
     and tries the next series; if Suwayomi is still down it stops with one
-    clear error (SuwayomiUnreachable) instead of timing out on every series."""
+    clear error (PassStopped, with the counts so far) instead of timing out
+    on every series."""
     job.items = [{"series_id": r["id"], "title": r["title"], "state": "queued", "result": ""} for r in rows]
     done = downloaded = imported = errors = 0
     outages = 0                                    # consecutive series that failed because Suwayomi is down
@@ -222,8 +233,8 @@ def _run_pass(job: jobs.Job, rows, label: str) -> tuple[int, int, int, int]:
                         it["state"], it["result"] = "cancelled", "pass stopped: Suwayomi is not answering"
                     log.error("%s: Suwayomi is not answering; stopping the pass after %d of %d series (%d left)",
                               label, i, len(rows), len(rest))
-                    raise SuwayomiUnreachable(f"pass stopped after {i} of {len(rows)} series, "
-                                              f"{len(rest)} not checked: {e}") from e
+                    raise PassStopped(f"pass stopped after {i} of {len(rows)} series, {len(rest)} not checked: {e}",
+                                      (done + 1, downloaded, imported, errors)) from e
                 job.progress = f"{head} - Suwayomi is not answering; waiting {BREAKER_SECS} s before going on"
                 log.warning("%s: Suwayomi is not answering; waiting %d s, the pass stops if it still is",
                             label, BREAKER_SECS)
@@ -239,7 +250,11 @@ def _job_refresh_all(job: jobs.Job):
         rows, skipped = plan_pass(db.series_rows(con))
     log.info("refresh pass: %d series (%d with missing chapters first), %d finished series skipped until due",
              len(rows), sum(1 for r in rows if r["wanted"]), skipped)
-    done, downloaded, imported, errors = _run_pass(job, rows, "refresh-all")
+    stopped = None
+    try:
+        done, downloaded, imported, errors = _run_pass(job, rows, "refresh-all")
+    except PassStopped as e:        # Suwayomi went away: still notify about what the pass did before that
+        stopped, (done, downloaded, imported, errors) = e, e.counts
     msg = f"{done} series, {downloaded} downloaded, {imported} imported, {errors} errors" + \
         (f", {skipped} complete finished series skipped" if skipped else "")
     if imported:
@@ -249,6 +264,8 @@ def _job_refresh_all(job: jobs.Job):
     bad = [f"{i['title']}: {i['result']}" for i in job.items if i["state"] in ("failed", "error")]
     if bad:
         notify.send(f"mang-arr: {len(bad)} series with failed downloads", "\n".join(bad[:10]), "failed")
+    if stopped:
+        raise stopped               # the job still ends failed, with the one clear error
     return msg
 
 
