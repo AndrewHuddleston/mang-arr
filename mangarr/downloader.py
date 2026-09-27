@@ -18,8 +18,10 @@ Within a source the batch size adapts: it shrinks to 1 and backs off when
 the source errors, and grows back when downloads succeed. A chapter that
 fails on its first source is retried on the next source that lists it (the
 plan keeps every usable source per chapter, best first). A source that
-fails everything it was asked for is dropped for the rest of the run. Only
-chapters no source could deliver end up 'failed'.
+delivered nothing of what it was asked for is asked last for the rest of
+the run: its chapters go to the other sources first, and it gets them only
+when those fail too. Only chapters no source could deliver (every source
+that lists them was tried) end up 'failed'.
 
 A source whose image server refuses bursts (Settings: page by page) goes one
 chapter at a time: its pages are first requested through Suwayomi one by one
@@ -302,7 +304,8 @@ class SeriesSteps:
     """The bookkeeping of one series' download, apart from the loop that runs
     it: which source to ask next for which chapters (wants/take), what came
     of it (record), fallbacks to the next source, sources that delivered
-    nothing, and the reason for every chapter that did not arrive. No I/O.
+    nothing (asked last from then on), and the reason for every chapter
+    that did not arrive. No I/O.
 
     In order, chapters go strictly one after the other, consecutive ones
     from the same source fetched together; a chapter that fails is retried
@@ -314,16 +317,19 @@ class SeriesSteps:
     no source left it is not attempted this time instead of failed.
 
     Each chapter's sources are tried best first (plan.candidates), every one
-    of them before the chapter fails. When the sites wants() names are busy
-    with other series, a caller may take the same chapters from another
-    source that lists them (alternatives: no worse a tier, on another site);
-    the source skipped that way is still tried if that one fails."""
+    of them before the chapter fails; an entry that delivered nothing in a
+    run (dead: one broken chapter can be all a short run asks) is not
+    dropped but moved behind the others, and is never an alternative. When
+    the sites wants() names are busy with other series, a caller may take
+    the same chapters from another source that lists them (alternatives: no
+    worse a tier, on another site); the source skipped that way is still
+    tried if that one fails."""
 
     def __init__(self, plan: Plan, wanted: set[float], in_order: bool, label: str, reasons: dict):
         self.plan, self.in_order, self.label, self.reasons = plan, in_order, label, reasons
         self.results: dict[float, str] = {}
         self.tried: dict[float, list[str]] = {}            # what happened on each source, per chapter
-        self.dead: set[int] = set()                        # manga ids that failed everything
+        self.dead: set[int] = set()                        # manga ids that delivered nothing: asked last
         self.held: dict[float, str] = {}                   # its last source did not start it -> reason if none left
         self.finished = False
         pending = {n for n in wanted if plan.candidates.get(n)}
@@ -338,21 +344,26 @@ class SeriesSteps:
         self.round: list[_Group] = []
 
     def _open(self, n: float) -> list[SourceMatch]:
-        """Chapter n's entries not tried yet for it (nor dead), best first."""
+        """Chapter n's entries not tried yet for it, best first, the dead
+        ones (delivered nothing this run) after the others."""
         used, dead = self.used[n], self.dead
-        return [c for c in self.plan.candidates[n] if c.manga_id not in used and c.manga_id not in dead]
+        left = [c for c in self.plan.candidates[n] if c.manga_id not in used]
+        return [c for c in left if c.manga_id not in dead] + [c for c in left if c.manga_id in dead]
 
     def _next_source(self, n: float):
         return next(iter(self._open(n)), None)
 
     def _others(self, n: float, m: SourceMatch) -> bool:
-        """Whether chapter n has an entry left to try besides m."""
-        return any(c.manga_id != m.manga_id for c in self._open(n))
+        """Whether chapter n has an entry left to try besides m, not counting
+        dead ones (a run is patient when it has none)."""
+        return any(c.manga_id != m.manga_id and c.manga_id not in self.dead for c in self._open(n))
 
     def _instead(self, n: float) -> list[SourceMatch]:
         """The entries chapter n could come from now instead of its next
         source: not tried yet, on other sites (one each, the best), and no
-        worse a tier (normal, rate-limited, page by page: Source.tier)."""
+        worse a tier (normal, rate-limited, page by page: Source.tier). Never
+        a dead entry: waiting for the next source beats a switch to one that
+        delivered nothing."""
         left = self._open(n)
         if not left:
             return []
@@ -360,7 +371,7 @@ class SeriesSteps:
         seen = {lanes_key(first.source.name)}
         for c in left[1:]:
             k = lanes_key(c.source.name)
-            if k not in seen and c.source.tier <= first.source.tier:
+            if k not in seen and c.manga_id not in self.dead and c.source.tier <= first.source.tier:
                 seen.add(k)
                 out.append(c)
         return out
@@ -551,8 +562,7 @@ class SeriesSteps:
                     self.idx = run.end
                 return
             if not ok:
-                self.dead.add(m.manga_id)
-                log.warning("%s: %s delivered nothing this run; not retrying it", self.label, m.source.name)
+                self._delivered_nothing(m)
             for x in failed:
                 self.used[x].add(m.manga_id)
                 self.tried.setdefault(x, []).append(f"{m.source.name}: {why.get(x, 'failed')}")
@@ -562,8 +572,7 @@ class SeriesSteps:
         if not failed:
             return
         if not ok:
-            self.dead.add(m.manga_id)
-            log.warning("%s: %s delivered nothing this run; not retrying it", self.label, m.source.name)
+            self._delivered_nothing(m)
         for n in failed:
             self.used[n].add(m.manga_id)
             self.tried.setdefault(n, []).append(f"{m.source.name}: {why.get(n, 'failed')}")
@@ -578,6 +587,15 @@ class SeriesSteps:
                 self.reasons[n] = ("; ".join(self.tried[n]) +
                                    (" (no other source has this chapter)" if only_one else ""))
                 log.warning("%s: ch %g failed: %s", self.label, n, self.reasons[n])
+
+    def _delivered_nothing(self, m: SourceMatch) -> None:
+        """A run of entry m delivered nothing: the other entries get its
+        chapters first from now on, and it is asked only for the ones they
+        fail too (a short run may have hit just one broken chapter)."""
+        if m.manga_id not in self.dead:
+            self.dead.add(m.manga_id)
+            log.warning("%s: %s delivered nothing this run; asking the other sources first from now on",
+                        self.label, m.source.name)
 
     def not_started(self, run: Run, nums: list[float], queued: bool = True) -> None:
         """Chapters Suwayomi did not start from the run's source (its queue

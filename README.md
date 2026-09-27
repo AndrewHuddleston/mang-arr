@@ -873,9 +873,11 @@ minutes (or after three hours in total), so a slow 150-page webtoon chapter
 is not mistaken for a dead source. Within a source the batch size shrinks
 to one and backs off when it errors and grows back when downloads succeed.
 A chapter that fails on its first source is retried on the next source
-that lists it; a source that fails everything it was asked for is dropped
-for the rest of the run; only chapters no source could deliver end up
-`failed`, with the reason from every source tried. A file lock
+that lists it; a source that delivered nothing of what it was asked for is
+asked last for the rest of the run (its chapters go to the other sources
+first, and it is asked again only for a chapter those fail too, since one
+broken chapter can be all it was asked for); only chapters no source could
+deliver end up `failed`, with the reason from every source tried. A file lock
 (`MANGARR_LOCK`) makes sure only one download run exists at a time across
 the web worker and the CLI; a second one waits. A per-chapter search or
 manual download is the same machinery for one chapter from one entry.
