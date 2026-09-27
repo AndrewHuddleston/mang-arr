@@ -37,6 +37,7 @@ import sqlite3
 import threading
 import time
 import urllib.parse
+from collections.abc import Callable
 
 from . import config
 
@@ -100,6 +101,7 @@ DESTINATION_SECRETS = {"komga_url": ("komga_api_key",), "gotify_url": ("gotify_t
                        "ntfy_url": ("ntfy_token",), "smtp_host": ("smtp_password",)}
 # changing any of these signs every browser session out
 SESSION_KEYS = ("auth_user", "auth_password", "api_key")
+Allowed = Callable[[dict], bool]    # still_allowed(stored values): may this change still be made? (see write)
 
 
 def masked(values: dict) -> dict:
@@ -160,17 +162,17 @@ def reset_login(con: sqlite3.Connection) -> None:
                 "MANGARR_RESET_LOGIN, or the login is cleared again at the next start")
 
 
-def rotate_api_key(con: sqlite3.Connection) -> str:
+def rotate_api_key(con: sqlite3.Connection, still_allowed: Allowed | None = None) -> str:
     """A new random API key (Settings -> Security -> Regenerate). Signs every
-    browser session out too."""
-    set_many(con, {"api_key": secrets.token_hex(16)})
-    return str(all_values(con)["api_key"])
+    browser session out too. still_allowed: see write()."""
+    return str(write(con, {"api_key": secrets.token_hex(16)}, still_allowed=still_allowed)[1]["api_key"])
 
 
-def logout_everywhere(con: sqlite3.Connection) -> None:
-    """Invalidate every session cookie issued so far."""
+def logout_everywhere(con: sqlite3.Connection, still_allowed: Allowed | None = None) -> None:
+    """Invalidate every session cookie issued so far. still_allowed: see write()."""
     v = all_values(con)
-    set_many(con, {"session_epoch": int(v["session_epoch"] or 0) + 1, "revoked_sessions": []}, internal=True)
+    set_many(con, {"session_epoch": int(v["session_epoch"] or 0) + 1, "revoked_sessions": []}, internal=True,
+             still_allowed=still_allowed)
     log.info("every web session signed out")
 
 
@@ -245,6 +247,13 @@ def _load(con: sqlite3.Connection) -> dict[str, object]:
     return out
 
 
+def stored(con: sqlite3.Connection) -> dict[str, object]:
+    """The values stored in this database now (all_values() may answer from
+    its cache): for a decision that must see the latest write, or for another
+    database file such as a backup."""
+    return _load(con)
+
+
 def refresh(con: sqlite3.Connection) -> None:
     global _cache, _loaded_at, _good
     values = _load(con)
@@ -300,14 +309,65 @@ def get(key: str):
     return all_values().get(key, DEFAULTS[key])
 
 
-def set_many(con: sqlite3.Connection, values: dict[str, object], internal: bool = False) -> list[str]:
+class NotAllowed(PermissionError):
+    """A settings write refused because the caller's sign-in no longer holds
+    (write()'s still_allowed): nothing was stored."""
+
+
+# One settings write at a time in this process, and none while a restore swaps the database
+# (backup.restore holds it from reading the current login until the swap), so neither undoes the other.
+write_lock = threading.RLock()
+LOGIN_ON_NOTICE = ("login switched on, so the API key was regenerated (the old one was readable while there was "
+                   "no login)")
+
+
+def set_many(con: sqlite3.Connection, values: dict[str, object], internal: bool = False,
+             still_allowed: Allowed | None = None) -> list[str]:
+    """Store values; returns notices for the user. See write()."""
+    return write(con, values, internal, still_allowed)[0]
+
+
+def write(con: sqlite3.Connection, values: dict[str, object], internal: bool = False,
+          still_allowed: Allowed | None = None) -> tuple[list[str], dict[str, object]]:
     """Store values. A secret submitted as MASK (the form's placeholder for a
     stored secret) keeps its current value; anything else, including an
     empty field, is stored as given. Everything is validated before anything
     is written (ValueError / KeyError, nothing stored). Returns notices for
-    the user, e.g. a secret cleared because its destination changed.
-    INTERNAL_KEYS can only be set with internal=True."""
-    current = all_values(con)
+    the user (e.g. a secret cleared because its destination changed) and the
+    values as this write left them. INTERNAL_KEYS can only be set with
+    internal=True.
+
+    Reading, deciding and writing happen in one IMMEDIATE transaction, so no
+    other write lands in between. still_allowed(stored values) is asked
+    inside it: a web request's sign-in is checked again there, against what
+    is stored now (NotAllowed when it no longer holds). A request can wait a
+    while between the login check and its handler, and a login switched on,
+    or a key replaced, meanwhile must not let it through.
+
+    Switching a login on also replaces the API key (unless this write sets a
+    new one) and the session secret: both were readable by anyone while
+    there was no login (GET /api/v1/settings, a database download), and a
+    copy must not open the new login."""
+    with write_lock:
+        began = not con.in_transaction
+        if began:
+            con.execute("BEGIN IMMEDIATE")
+        try:
+            current = _load(con)
+            if still_allowed is not None and not still_allowed(current):
+                raise NotAllowed("the sign-in this change was made with no longer holds")
+            new, notices = _changes(con, current, values, internal)
+            con.commit()
+        except BaseException:
+            if began:
+                con.rollback()
+            raise
+        refresh(con)
+    return notices, {**current, **new}
+
+
+def _changes(con: sqlite3.Connection, current: dict, values: dict, internal: bool) -> tuple[dict, list[str]]:
+    """write()'s body, inside its transaction: validate, then store what changed."""
     new: dict[str, object] = {}
     for k, v in values.items():
         if k not in DEFAULTS or (k in INTERNAL_KEYS and not internal):
@@ -333,6 +393,16 @@ def set_many(con: sqlite3.Connection, values: dict[str, object], internal: bool 
         _validate({**current, **new})
     if "auth_password" in new and new["auth_password"]:
         new["auth_password"] = hash_password(str(new["auth_password"]))
+    if not current.get("auth_user") and new.get("auth_user"):
+        if "api_key" not in new:                         # a key set in this same write was never readable
+            new["api_key"] = secrets.token_hex(16)
+            notices.append(LOGIN_ON_NOTICE)
+        new["session_secret"] = secrets.token_hex(32)   # a cookie forged with the old one must not pass
+        if LOGIN_ON_NOTICE in notices:
+            log.warning("settings: %s; the session secret was replaced too", LOGIN_ON_NOTICE)
+        else:
+            log.info("settings: login switched on with a new API key; the session secret was replaced (the old "
+                     "one was readable while there was no login)")
     if not internal and any(k in new for k in SESSION_KEYS):
         new["session_epoch"] = int(current.get("session_epoch") or 0) + 1
         new["revoked_sessions"] = []
@@ -341,9 +411,7 @@ def set_many(con: sqlite3.Connection, values: dict[str, object], internal: bool 
         _store(con, k, v)
         if k not in INTERNAL_KEYS:
             log.info("setting %s = %s", k, _loggable(k, v))
-    con.commit()
-    refresh(con)
-    return notices
+    return new, notices
 
 
 def _store(con: sqlite3.Connection, k: str, v) -> None:
@@ -371,6 +439,31 @@ def redact_url(url: str) -> str:
         return f"{u.scheme}://{host}" + ("/..." if (u.path.strip("/") or u.query) else "") if u.scheme else "..."
     except ValueError:
         return "..."
+
+
+def bare_host(host: str) -> str:
+    """A Host header value as a name: lower case, no port, no trailing dot.
+    'Mangarr.LAN:6789' -> 'mangarr.lan', '[::1]:6789' -> '::1'."""
+    h = (host or "").strip().lower()
+    if h.startswith("["):
+        return h[1:h.find("]")] if "]" in h else ""
+    if h.count(":") == 1:
+        h = h.split(":", 1)[0]
+    return h.rstrip(".")
+
+
+def host_name(entry: str) -> str:
+    """An Allowed Host Names entry in the form the Host check compares:
+    what bare_host() makes of the Host header, so an entry typed with a port
+    or pasted as a URL still matches. 'manga.example.com:8443' and
+    'https://manga.example.com/' -> 'manga.example.com'; '*' and a leading
+    '.' (a whole domain) are kept."""
+    h = str(entry).strip()
+    if "://" in h:
+        h = h.split("://", 1)[1]
+    for sep in "/?#":
+        h = h.split(sep, 1)[0]
+    return bare_host(h)
 
 
 def _unbind_moved_secrets(current: dict, submitted: dict, new: dict) -> list[str]:
@@ -447,7 +540,15 @@ def _coerce(key: str, v):
             v = [s for s in v.replace("\n", ",").split(",")]
         elif not isinstance(v, (list, tuple, set)):
             raise ValueError(f"{key}: expected a list or comma-separated text")
-        return sorted({str(s).strip().lower() for s in v if str(s).strip()})
+        items = {str(s).strip().lower() for s in v if str(s).strip()}
+        if key == "allowed_hosts":                  # stored as compared: no port, scheme or path
+            names = {h: host_name(h) for h in items}
+            for typed, name in names.items():
+                if typed != name:
+                    log.info("allowed_hosts: %r stored as %r (only the name is compared, never the port)",
+                             typed, name)
+            items = set(names.values()) - {""}
+        return sorted(items)
     if not isinstance(v, (str, int, float)):
         raise ValueError(f"{key}: expected text")
     if key == "auth_password":

@@ -238,7 +238,7 @@ applies to the next job.
 | Notifications | Discord webhook, Telegram bot token + chat id, ntfy topic URL (+ token), Gotify URL + app token, Pushover token + user key, Slack webhook, Notifiarr API key + Discord channel id, SMTP email, Apprise API URL, webhook URL. Every configured channel gets each message; each has a *Test* button that sends to that channel only. *Notify on* picks the events: new chapters, series added, failed downloads (after a pass, with the reasons), health problems (when a check turns red). |
 | Login method | *login page* (a form and a signed session cookie that lasts 30 days, with a *Sign out* button in the top bar) or *browser prompt* (HTTP basic auth, accepted only in this mode; once the prompt's credentials are accepted the browser also gets a session cookie that ends when the browser closes). Only active once a username is set. |
 | Web username / password | The login for the UI and API. Empty username means no login; the health check then warns that anyone on the network can use the page. A password is required while a username is set (clear the username to turn the login off); the username cannot contain `:`. The password is stored as a salted PBKDF2-SHA256 hash (a password an older version stored in clear is converted at start-up or on the next sign-in). |
-| API key | Generated on first start, shown as `********` (*Show* reveals it). When a login is set, a request carrying it as an `X-Api-Key` header is accepted without a session or basic auth; `?apikey=` works only for `GET` requests under `/api/`. *Regenerate* makes a new one. Switching a login on regenerates it too, because anyone could read the key while there was no login (the new key is on the Settings page and in the `PUT /api/v1/settings` response), unless that request itself sent the current key as `X-Api-Key` (as the installer does) or set a new one. It is not taken from the general Settings form; `PUT /api/v1/settings` can set it. |
+| API key | Generated on first start, shown as `********` (*Show* reveals it). When a login is set, a request carrying it as an `X-Api-Key` header is accepted without a session or basic auth; `?apikey=` works only for `GET` requests under `/api/`. *Regenerate* makes a new one. Switching a login on regenerates it too, because anyone could read the key while there was no login, even when that request itself sent the current key as `X-Api-Key` (as the installer does); only a new key set in the same request is kept. The new key is on the Settings page and in the `PUT /api/v1/settings` response, so a script (the installer, too) carries on with it. The secret that signs login cookies is replaced at the same moment, since it too was in any database download made while there was no login. It is not taken from the general Settings form; `PUT /api/v1/settings` can set it. |
 | Sessions | *Sign out everywhere* invalidates every login cookie. Changing the username, password or API key does the same (the browser that made the change stays signed in); *Sign out* also invalidates that one cookie on the server, so a copy of it stops working. |
 | Allowed host names | Extra host names the UI answers to, see `MANGARR_ALLOWED_HOSTS`. |
 
@@ -919,17 +919,26 @@ reverse proxy in that case.
 What the web server refuses, and what to do if it refuses you:
 
 - **Requests from other web sites.** A `POST`, `PUT`, `PATCH` or `DELETE`
-  whose `Origin` (or, without one, `Referer`) header names a different
-  host and port than the request's `Host` is refused with 403, whether or
-  not a login is set: a web page you visit cannot submit mang-arr's forms
-  (delete series, change settings, restore a backup) through your browser.
-  Requests with neither header (curl, scripts) go on to the normal login
-  check, and a valid `X-Api-Key` header skips this check. Behind a reverse
-  proxy, pass the original host through, with its port if it is not 80/443
-  (`proxy_set_header Host $http_host;` in nginx, or `X-Forwarded-Host`). A
-  proxy that drops the port (nginx `$host`) also works as long as it adds
-  `X-Forwarded-For` / `X-Real-IP` / `X-Forwarded-Proto`: then only the host
-  names are compared (and the port, if it sends `X-Forwarded-Port`).
+  that did not come from mang-arr's own pages is refused with 403, whether
+  or not a login is set: a web page you visit cannot submit mang-arr's
+  forms (delete series, change settings, restore a backup) through your
+  browser. That includes pages on another port of the same host (Suwayomi,
+  Komga) and on sibling subdomains, which browsers treat as the same site
+  and send the login cookie along with. Over HTTPS (and on `localhost`)
+  browsers say where a request came from (`Sec-Fetch-Site`): only
+  `same-origin` and `none` pass. Over plain HTTP, the usual way mang-arr is
+  opened on a LAN, browsers do not send it, and neither do older ones;
+  then `Origin` (or, without one, `Referer`) must be mang-arr's own
+  `scheme://host:port`. Requests with none of these headers (curl,
+  scripts) go on to the normal login check, and a valid `X-Api-Key` header
+  skips this check. Behind a reverse proxy, pass the original host through,
+  with its port if it is not 80/443 (`proxy_set_header Host $http_host;`
+  in nginx, or `X-Forwarded-Host`), and `X-Forwarded-Proto` if the proxy
+  serves HTTPS. A proxy that drops the port (nginx `$host`) must send
+  `X-Forwarded-Port` when it listens on a port other than 80/443: without
+  it a `Host` with no port stands for 80 (443 over HTTPS), so over plain
+  HTTP every browser gets 403 on another port. The log line of a refusal
+  says which of these a proxy is missing.
 - **Unknown host names (DNS rebinding).** The UI answers only when the
   `Host` header is an IP address, `localhost`, a single-label name
   (`mangarr`), a LAN name (`.local`, `.lan`, `.home`, `.home.arpa`,
@@ -937,16 +946,26 @@ What the web server refuses, and what to do if it refuses you:
   `.fritz.box`, `.docker`, Tailscale's `.ts.net`), or listed in
   `MANGARR_ALLOWED_HOSTS` / Settings → Security → Allowed Host Names;
   anything else (for example a public name like `manga.example.com` behind
-  a reverse proxy) gets 400 with that hint. `/api/v1/ping` is exempt.
+  a reverse proxy) gets 400 with that hint, naming the host to add. Only
+  names are compared: a port (or a whole URL) typed into the list is
+  dropped. `/api/v1/ping` is exempt.
 - **Large requests.** Bodies over 1 MB get 413 (the backup upload takes up
   to `MANGARR_MAX_UPLOAD_MB`).
 - **Password guessing.** Failed sign-ins (login page and basic auth alike)
   are counted per client address: after 5 failures in 15 minutes each
   further attempt is refused with 429 for 2 s, 4 s, 8 s ... up to 15
-  minutes; a successful sign-in resets it. A browser that is already
-  signed in (login page or browser prompt) keeps working meanwhile. Behind
-  a reverse proxy every client shares the proxy's address unless the proxy
-  is listed in `MANGARR_TRUSTED_PROXIES`.
+  minutes; a successful sign-in resets it. An attempt counts from the
+  moment its check starts, so parallel guesses get no more checks than
+  the same guesses one after another; requests carrying the same
+  credentials at the same time share one check, so a basic-auth client
+  that sends the right password on many requests at once is not refused.
+  A browser that is already signed in (login page or browser prompt)
+  keeps working meanwhile. Behind a reverse proxy every client shares the
+  proxy's address unless the proxy is listed in `MANGARR_TRUSTED_PROXIES`.
+- **Changes while a request waits.** A request let in with no login set,
+  or with a key, password or session that is replaced before its turn
+  comes, is refused if it would change settings, show the API key, or
+  download or restore the database: nothing it asked for is done.
 - **Locked out.** Restart once with `MANGARR_RESET_LOGIN=1` to clear the
   login, then set a new one and remove the variable. A login whose stored
   value cannot be read stays on (nobody can sign in with a password; the

@@ -4,8 +4,10 @@ check (CSRF), signed and revocable session cookies, password checks with a
 per-address failure throttle, and the security response headers. No routes
 here; app.py wires them up (see the comment above its middleware).
 """
+import asyncio
 import base64
 import binascii
+import concurrent.futures
 import functools
 import hashlib
 import hmac
@@ -19,6 +21,7 @@ import urllib.parse
 
 from fastapi import HTTPException, Request
 from fastapi.responses import Response
+from starlette.concurrency import run_in_threadpool
 
 from .. import db, settings
 
@@ -34,8 +37,7 @@ BODY_LIMITS: dict[str, int] = {"/system/backups/upload": int(os.environ.get("MAN
 # router and container names (FRITZ!Box, Docker) and Tailscale MagicDNS (*.ts.net, controlled by Tailscale)
 LAN_SUFFIXES = (".local", ".lan", ".home.arpa", ".internal", ".localdomain", ".home", ".corp", ".intranet",
                 ".private", ".fritz.box", ".docker", ".ts.net")
-# headers only a reverse proxy adds (a cross-site page cannot set them without a CORS preflight)
-PROXY_HEADERS = ("x-forwarded-for", "x-real-ip", "forwarded", "x-forwarded-proto")
+DEFAULT_PORTS = {"http": 80, "https": 443}
 CSP = ("default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src * data:; "
        "connect-src 'self'; object-src 'none'; base-uri 'self'; form-action 'self'")
 MAX_REVOKED = 200                            # sessions signed out one by one; more -> sign everyone out
@@ -117,16 +119,23 @@ log_budget = LogBudget()
 
 
 class Throttle:
-    """Failed password attempts per client address, for the login form and
-    Basic auth alike. The first FREE failures within WINDOW seconds are only
+    """Password attempts per client address, for the login form and Basic
+    auth alike. The first FREE failures within WINDOW seconds are only
     slowed down; after that the address is refused (429, no password check)
     for a delay that doubles with each further failure (2 s, 4 s ... up to
-    MAX_DELAY). A success clears it. Memory is bounded."""
+    MAX_DELAY). A success clears it. Memory is bounded.
+
+    An attempt is reserved (reserve(), from check_password) before the slow
+    password check and counts as a failure from that moment, so attempts
+    still in flight count against the limit: a burst of parallel guesses
+    gets no more checks than the same guesses one after another. A failure
+    then needs nothing more, and a request dropped halfway (client gone)
+    cannot leave a reservation behind."""
     FREE, WINDOW, MAX_DELAY, MAX_KEYS = 5, 900.0, 900.0, 4096
 
     def __init__(self):
         self._lock = threading.Lock()
-        self._d: dict[str, list[float]] = {}     # address -> [failures, first failure at, blocked until]
+        self._d: dict[str, list[float]] = {}     # address -> [attempts, first attempt at, blocked until]
 
     def _entry(self, key: str, now: float) -> list[float] | None:
         e = self._d.get(key)
@@ -142,11 +151,16 @@ class Throttle:
             e = self._entry(key, now)
             return max(0, int(e[2] - now + 0.999)) if e else 0
 
-    def failed(self, key: str) -> int:
-        """Record a failure; returns how many seconds the address is now blocked."""
+    def reserve(self, key: str) -> int:
+        """Claim one password attempt for this address, atomically, before
+        checking the password: 0 = go ahead (it counts as a failure until
+        succeeded() clears the address), else the seconds the address must
+        still wait (nothing claimed, no check allowed)."""
         with self._lock:
             now = time.monotonic()
             e = self._entry(key, now)
+            if e and now < e[2]:
+                return max(1, int(e[2] - now + 0.999))
             if e is None:
                 e = self._d[key] = [0, now, 0.0]
             e[0] += 1
@@ -155,7 +169,7 @@ class Throttle:
             if len(self._d) > self.MAX_KEYS:     # forget the oldest
                 for k in sorted(self._d, key=lambda k: self._d[k][1])[:len(self._d) - self.MAX_KEYS]:
                     del self._d[k]
-            return max(0, int(e[2] - now + 0.999))
+            return 0
 
     def succeeded(self, key: str) -> None:
         with self._lock:
@@ -227,18 +241,15 @@ class BodyLimit:
 
 def hostname(host_header: str) -> str:
     """'Mangarr.LAN:6789' -> 'mangarr.lan', '[::1]:6789' -> '::1'."""
-    h = (host_header or "").strip().lower()
-    if h.startswith("["):
-        return h[1:h.find("]")] if "]" in h else ""
-    if h.count(":") == 1:
-        h = h.split(":", 1)[0]
-    return h.rstrip(".")
+    return settings.bare_host(host_header)
 
 
 def allowed_hosts(v: dict) -> set[str]:
-    """MANGARR_ALLOWED_HOSTS (comma-separated) plus the allowed_hosts setting."""
+    """MANGARR_ALLOWED_HOSTS (comma-separated) plus the allowed_hosts setting,
+    as bare names (settings.host_name): an entry typed with a port, or one
+    stored so by an older version, still matches."""
     env = os.environ.get("MANGARR_ALLOWED_HOSTS", "").split(",")
-    return {h.strip().lower().rstrip(".") for h in [*env, *(v.get("allowed_hosts") or [])] if h.strip()}
+    return {settings.host_name(h) for h in [*env, *(v.get("allowed_hosts") or [])]} - {""}
 
 
 def host_allowed(host_header: str, extra: set[str]) -> bool:
@@ -266,42 +277,79 @@ def host_allowed(host_header: str, extra: set[str]) -> bool:
 def _host_port(netloc: str, scheme: str) -> tuple[str, int | None]:
     try:
         u = urllib.parse.urlsplit(f"//{netloc.strip()}")
-        return (u.hostname or "").rstrip("."), u.port or {"http": 80, "https": 443}.get(scheme)
+        return (u.hostname or "").rstrip("."), u.port or DEFAULT_PORTS.get(scheme)
     except ValueError:
         return "", None
 
 
+def request_scheme(request: Request) -> str:
+    """The scheme the browser used to reach mang-arr: X-Forwarded-Proto from
+    a reverse proxy (a page cannot add it without a CORS preflight), else the
+    connection's own."""
+    proto = request.headers.get("x-forwarded-proto", "").split(",")[0].strip().lower()
+    return proto if proto in DEFAULT_PORTS else request.url.scheme
+
+
 def same_origin(request: Request) -> tuple[bool, str]:
-    """CSRF check for state-changing requests: (ok, the Origin/Referer seen).
-    A browser always sends Origin (or at least Referer) with a cross-site
-    POST, so a request with neither is not a browser form and goes on to the
-    normal login check. Behind a reverse proxy X-Forwarded-Host counts too (a
-    cross-site page cannot add that header without a CORS preflight), and so
-    does a proxy that drops the port from Host (nginx `$host`): when a proxy
-    header (PROXY_HEADERS) is present and Host has no port, the host names
-    must match and the port only if X-Forwarded-Port says which it was."""
+    """CSRF check for state-changing requests: (ok, why it was refused, for
+    the log). Refused unless the request comes from mang-arr's own pages:
+
+    - Sec-Fetch-Site, which browsers set and pages cannot, decides when
+      present: only 'same-origin' and 'none' (the user's own action) pass.
+      'same-site' is refused too: another port on this host (Suwayomi on
+      :4567, Komga on :25600) or a sibling subdomain is same-site, and the
+      SameSite=Lax session cookie goes along with its requests. Browsers
+      send it only to HTTPS addresses and localhost.
+    - Without it (plain HTTP on the LAN, which is how most people open
+      mang-arr, and older browsers) the Origin, else the Referer, must be
+      this server's own scheme://host:port. The scheme is the request's
+      (X-Forwarded-Proto behind a TLS proxy); the host and port are the Host
+      header's, or X-Forwarded-Host's (a page cannot add either X- header
+      without a CORS preflight). A Host without a port stands for the port
+      X-Forwarded-Port names, else the default port of the request's scheme
+      (80/443), never of the Origin's: a proxy that drops the port (nginx
+      `$host`) on another port must say which it was, or a page on another
+      port or scheme of the same host name would pass.
+    - A request with none of these headers is not a browser form (curl,
+      scripts) and goes on to the normal login check."""
     src = request.headers.get("origin") or request.headers.get("referer")
-    if request.headers.get("sec-fetch-site") == "cross-site":
-        return False, src or "Sec-Fetch-Site: cross-site"
+    site = request.headers.get("sec-fetch-site", "").strip().lower()
+    if site:
+        if site in ("same-origin", "none"):
+            return True, ""
+        return False, f"the browser says it came from another site (Sec-Fetch-Site {clip(site)}, " \
+                      f"Origin/Referer {clip(src or '-', 200)})"
     if not src:
         return True, ""
+    refused = f"Origin/Referer {clip(src, 200)} is not this server"
     try:
         u = urllib.parse.urlsplit(src)
     except ValueError:
-        return False, src
+        return False, refused
     if u.scheme not in ("http", "https") or not u.netloc:
-        return False, src                        # 'null' (sandboxed frames, no-referrer pages), file:, ...
+        return False, refused                    # 'null' (sandboxed frames, no-referrer pages), file:, ...
+    scheme = request_scheme(request)
     want = _host_port(u.netloc, u.scheme)
-    host = request.headers.get("host", "")
-    for h in (host, request.headers.get("x-forwarded-host", "").split(",")[0]):
-        if h and _host_port(h, u.scheme) == want:
-            return True, src
-    name, port = _host_port(host, "")            # port None: Host carries none
-    if host and port is None and name == want[0] and any(request.headers.get(h) for h in PROXY_HEADERS):
-        fport = request.headers.get("x-forwarded-port", "").split(",")[0].strip()
-        if not fport or (fport.isdigit() and int(fport) == want[1]):
-            return True, src
-    return False, src
+    fport = request.headers.get("x-forwarded-port", "").split(",")[0].strip()
+    named, portless = False, None               # for the log: the host name matched, what a portless Host meant
+    for h in (request.headers.get("host", ""), request.headers.get("x-forwarded-host", "").split(",")[0]):
+        if not h:
+            continue
+        name, port = _host_port(h, "")           # port None: this header carries none
+        if port is None:
+            port = int(fport) if fport.isdigit() else DEFAULT_PORTS.get(scheme)
+            if name == want[0] and portless is None:
+                portless = (h, port)
+        named = named or name == want[0]
+        if (name, port) == want and u.scheme == scheme:
+            return True, ""
+    if named and u.scheme != scheme:
+        return False, f"{refused}: it is {u.scheme}, this request came over {scheme} (a TLS proxy must send " \
+                      "X-Forwarded-Proto)"
+    if portless and not fport:                   # the usual cause: a proxy on another port passing `$host`
+        return False, f"{refused}: Host {clip(portless[0])} has no port, so it stands for port {portless[1]}; " \
+                      "a reverse proxy on another port must send X-Forwarded-Port or pass Host with its port"
+    return False, refused
 
 
 def key_ok(v: dict, given: str | None) -> bool:
@@ -357,6 +405,25 @@ _verified: dict[str, float] = {}             # sha256(stored hash, user, passwor
 _verified_lock = threading.Lock()
 
 
+def _memo(v: dict, user: str, password: str) -> str:
+    """Key of a remembered check: the stored login and the credentials given
+    (a change of either user name or password forgets it)."""
+    stored = (str(v.get("auth_user") or ""), str(v.get("auth_password") or ""))
+    return hashlib.sha256("\0".join((*stored, user, password)).encode("utf-8", "surrogatepass")).hexdigest()
+
+
+def remembered(v: dict, user: str, password: str) -> bool:
+    """These credentials were checked and right in the last few minutes (no
+    hash). Only a correct password is ever remembered, so a hit is never a
+    guess: a Basic client without cookies need not reserve an attempt for
+    every request (see check_password)."""
+    if not (user and password and v.get("auth_password") and v.get("auth_user")):
+        return False
+    memo, now = _memo(v, user, password), time.monotonic()
+    with _verified_lock:
+        return _verified.get(memo, 0) > now
+
+
 def credentials_ok(v: dict, user: str, password: str) -> bool:
     """Username + password against the login (blocking: PBKDF2, so call it
     from a worker thread). Successes are remembered for a few minutes so a
@@ -366,11 +433,9 @@ def credentials_ok(v: dict, user: str, password: str) -> bool:
     stored, want_user = str(v.get("auth_password") or ""), str(v.get("auth_user") or "")
     if not (user and password and stored and want_user):
         return False
-    memo = hashlib.sha256("\0".join((stored, user, password)).encode("utf-8", "surrogatepass")).hexdigest()
-    now = time.monotonic()
-    with _verified_lock:
-        if _verified.get(memo, 0) > now:
-            return True
+    if remembered(v, user, password):
+        return True
+    memo, now = _memo(v, user, password), time.monotonic()
     user_ok = hmac.compare_digest(user.encode("utf-8", "surrogatepass"), want_user.encode("utf-8"))
     ok = settings.verify_password(stored, password) and user_ok
     if ok:
@@ -401,6 +466,82 @@ def basic_credentials(header: str) -> tuple[str, str] | None:
 def basic_ok(v: dict, header: str) -> bool:
     creds = basic_credentials(header)
     return bool(creds) and credentials_ok(v, *creds)
+
+
+_checking: dict[str, concurrent.futures.Future] = {}    # _memo -> the check running for exactly these credentials
+_checking_lock = threading.Lock()
+
+
+async def check_password(v: dict, ip: str, user: str, password: str) -> tuple[bool, int]:
+    """One password attempt from a client address, for /login and Basic
+    auth alike: (right, seconds to wait). A wait > 0 means refused without
+    any check: the address is throttled (a remembered password is not looked
+    at then either, that would be a free check).
+
+    Every check reserves an attempt (throttle.reserve) before the slow hash,
+    so a burst of different guesses gets no more checks than the same
+    guesses one after another. Requests that carry the same credentials
+    while those are being checked share that one check and its result
+    instead: one guess sent many times is still one guess, and a client
+    without cookies that sends the right password on many parallel requests
+    (a Basic API client, a browser loading a page's files) is not refused."""
+    while True:
+        wait = throttle.retry_after(ip)
+        if wait:
+            return False, wait
+        if remembered(v, user, password):
+            return True, 0
+        memo = _memo(v, user, password)
+        with _checking_lock:
+            running = _checking.get(memo)
+            if running is None:
+                mine = _checking[memo] = concurrent.futures.Future()
+                mine.set_running_or_notify_cancel()      # a waiter that goes away cannot cancel it for the rest
+        if running is not None:
+            ok = await asyncio.wrap_future(running)
+            if ok is None:
+                continue                         # that check never finished (reserve refused, client gone)
+            return ok, 0
+        try:
+            wait = throttle.reserve(ip)
+            if wait:
+                return False, wait
+            ok = await run_in_threadpool(credentials_ok, v, user, password)
+            if ok:
+                throttle.succeeded(ip)
+            mine.set_result(ok)
+            return ok, 0
+        finally:
+            with _checking_lock:
+                _checking.pop(memo, None)
+            if not mine.done():
+                mine.set_result(None)
+
+
+def login_of(v: dict) -> tuple[str, str]:
+    """The stored login a password was checked against (user, password hash)."""
+    return str(v.get("auth_user") or ""), str(v.get("auth_password") or "")
+
+
+def still_authorized(request: Request, v: dict) -> bool:
+    """Whether the middleware's sign-in decision for this request
+    (request.state.via) still holds against the stored values v. A handler
+    can run a while after that decision (the worker pool may be busy), so
+    one that changes settings or hands out secrets asks again, against the
+    values it acts on: a login switched on, a key replaced or sessions
+    signed out meanwhile must not let an earlier request through."""
+    via = getattr(request.state, "via", "")
+    if via == "open":
+        return not v.get("auth_user")
+    if via == "apikey":
+        query = request.query_params.get("apikey") \
+            if request.method in ("GET", "HEAD") and request.url.path.startswith("/api/") else None
+        return key_ok(v, request.headers.get("x-api-key")) or key_ok(v, query)
+    if via == "session":
+        return session_ok(v, request.cookies.get(SESSION_COOKIE))
+    if via == "basic":                           # the middleware kept the login it checked the password against
+        return v.get("auth_method") == "basic" and getattr(request.state, "login", None) == login_of(v)
+    return False
 
 
 def too_many(wait: int, what: str) -> Response:
