@@ -445,7 +445,15 @@ class FrozenPassTest(Base):
                 db.upsert_series(con, Series(english=f"S{i}", **ref(i)))
             return [dict(r) for r in db.series_rows(con)]
 
+    def one_search_at_a_time(self):
+        # the fake clock adds up every hung request, also those that wait side by side: timing
+        # checks search one site at a time (searches at once: test_freeze_while_several_sites_are_searched)
+        with db.connect() as con:
+            settings.set_many(con, {"search_parallel": 1})
+        settings._cache.clear()
+
     def test_freeze_after_the_first_sources_call_ends_the_pass_in_minutes(self):   # the round-2 evidence
+        self.one_search_at_a_time()
         self.fake.sources = 30
         self.fake.after["sources"] = ("hang", 10**6)
         rows = self.seed(3)
@@ -460,6 +468,22 @@ class FrozenPassTest(Base):
         self.assertIn(self.client.api, suwayomi._down)                           # the breaker is open
         self.assertEqual([i["state"] for i in job.items], ["error", "error", "cancelled"])
         self.assertIn("stopped answering", job.items[0]["result"])
+
+    def test_freeze_while_several_sites_are_searched(self):
+        # five searches hang side by side: one error for the series, not one per search, and the
+        # rest of the sources are never asked
+        self.fake.sources = 30
+        self.fake.after["sources"] = ("hang", 10**6)
+        rows = self.seed(3)
+        job = jobs.Job(1, "refresh-all", "all")
+        with mock.patch.object(web, "client", self.client), self.assertLogs(level="ERROR"):
+            with self.assertRaises(web.PassStopped):
+                web._run_pass(job, rows, "sim")
+        self.assertLessEqual(len(self.fake.requests("fetchSourceManga")), 5)     # the searches in flight only
+        self.assertIn(self.client.api, suwayomi._down)
+        self.assertEqual([i["state"] for i in job.items], ["error", "error", "cancelled"])
+        self.assertIn("stopped answering", job.items[0]["result"])
+        self.assertEqual([t.name for t in threading.enumerate() if t.name.startswith("mangarr-search-")], [])
 
     def test_slow_sites_are_not_an_outage(self):
         self.fake.sources = 3
@@ -500,6 +524,9 @@ class ResolveCancelTest(Base):
                 searched.append(src.name)
                 return []
         sources = [Source(str(i), f"S{i}", "en") for i in range(1, 4)]
+        with db.connect() as con:
+            settings.set_many(con, {"search_parallel": 1})      # at once: test_resolver_limits.ParallelSearchTest
+        settings._cache.clear()
         with self.assertRaises(limits.Cancelled):
             resolver.resolve(Sources(), Series(english="T"), sources=sources,
                              should_cancel=lambda: bool(searched), progress=said.append)

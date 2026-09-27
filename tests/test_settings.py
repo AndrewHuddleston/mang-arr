@@ -170,6 +170,15 @@ class LaneSettingsTest(unittest.TestCase):
                 self.save("download_lanes", bad)
         self.assertEqual(settings.all_values()["download_lanes"], 8)            # nothing stored
 
+    def test_search_parallel(self):
+        from mangarr import limits
+        self.assertEqual(settings.all_values()["search_parallel"], 5)
+        self.assertEqual(self.save("search_parallel", "2"), 2)
+        for given, want in (("0", 1), ("99", 8)):
+            with self.assertLogs("mangarr.settings", "WARNING"):
+                self.assertEqual(self.save("search_parallel", given), want)
+        self.assertEqual(int(limits.setting("search_parallel")), 8)
+
     def test_hand_written_values_are_clamped_when_read(self):
         from mangarr import limits
         with db.connect() as con:

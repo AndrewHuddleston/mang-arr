@@ -242,6 +242,7 @@ applies to the next job.
 | Refresh every (hours) | The scheduler and the daemon pick a change up within seconds. |
 | Download in order | On by default. Each series downloads strictly in chapter order, one chapter at a time; a chapter that fails is tried on the other sources at once, and if none can deliver it the series waits there (later chapters show "waiting for chapter N") while the pass carries on with the next series. Off: chapters are fetched from whichever source has them, faster but out of order and with possible gaps. |
 | Download lanes | How many sources download at the same time during a refresh pass or *Search all wanted now* (1-8, default 3). Each source serves one series at a time and keeps its pacing, so a slow or rate-limited source holds up only the series that need it. Suwayomi's own *max sources in parallel* must allow as many: a pass uses the lower of the two. The field shows Suwayomi's value and, when it is lower, a *Save and let Suwayomi use N* button that changes it in Suwayomi: the only Suwayomi setting mang-arr ever changes, and only on that button. Adding one series, refreshing one and a chapter search still download from one source at a time. |
+| Parallel searches | How many sites are searched at the same time while a series is resolved (1-8, default 5), so a pass gets to its downloads sooner. The sources of one site (its `(EN)` and `(ALL)` variants) are still searched one after the other with the usual spacing (1 s between searches, 3 s on a page-by-page source), and the result does not depend on which site answers first. 1 searches one source after the other. |
 | Page delay (seconds) | Spacing between page requests on sources fetched page by page (default 2.5, 0.5-60). It is the start and the minimum: it widens 1.5× after each busy answer from the image server (up to 30 s) and eases back 0.85× every five pages that arrive. |
 | Re-check complete finished series every (days) | A pass does series with missing chapters first, then the rest; a *finished* series with nothing missing is skipped until this many days (default 7) have passed since its last check. 0 re-checks everything every pass. |
 | Minimum pages for a fractional chapter | A `12.5` with fewer pages than this is treated as a notice image and marked junk. Default 8. |
@@ -833,6 +834,8 @@ are exempt from the login.
    its title matches one of AniList's titles exactly (after normalising
    punctuation). Prefix and substring matches are rejected - that is how
    anthologies and promos win. Author names are compared as a second check.
+   Several sites are searched at once (*Parallel searches*), each site one
+   search at a time.
 3. **Chapters are tracked per chapter, not per series.** The wanted list is the
    union of chapter numbers across every accepted source, minus what is on disk.
 4. **Each chapter picks its own source**, preferring healthy, unthrottled ones,
@@ -925,7 +928,8 @@ that minute and goes on; if Suwayomi is down again right after, the pass
 stops with one error. Lanes that run into the same outage together count
 it once. A source search that times
 out is followed by a quick question to Suwayomi itself: a slow website only
-costs that source, a frozen Suwayomi ends the pass within minutes. Cancel
+costs that source, a frozen Suwayomi ends the pass within minutes (searches
+that run into it side by side count it once, and the others stop). Cancel
 never waits out a Suwayomi request: a refresh, search, download or
 chapter job stops waiting for the answer within about a second (a running
 download batch is looked at every few seconds), and a cancelled batch gets
