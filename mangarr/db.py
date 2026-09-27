@@ -595,12 +595,19 @@ def chapters(con, series_id: int, limit: int | None = None, offset: int = 0):
                        (series_id, limit, offset)).fetchall()
 
 
-def chapter_index(con, series_id: int):
-    """Number, status and name of every chapter row, by number: all the
-    series page groups, counts and pages by (chapters_by_number for the
-    whole rows of the page it shows)."""
-    return con.execute("SELECT number, status, name FROM chapter WHERE series_id=? ORDER BY number",
-                       (series_id,)).fetchall()
+def chapter_marks(con, series_id: int):
+    """(number, status, name) of every chapter row, by number, as plain
+    tuples read as they are used (a cursor): the series page keeps only
+    totals of them (views.chapter_summary)."""
+    cur = con.cursor()
+    cur.row_factory = None
+    return cur.execute("SELECT number, status, name FROM chapter WHERE series_id=? ORDER BY number", (series_id,))
+
+
+def chapters_newest_first(con, series_id: int, limit: int, offset: int = 0):
+    """`limit` whole chapter rows from `offset`, highest number first."""
+    return con.execute("SELECT * FROM chapter WHERE series_id=? ORDER BY number DESC LIMIT ? OFFSET ?",
+                       (series_id, limit, offset)).fetchall()
 
 
 def chapters_by_number(con, series_id: int, numbers) -> dict:

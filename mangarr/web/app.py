@@ -640,37 +640,46 @@ def index(request: Request, q: str = ""):
 @app.get("/series/{series_id}")
 def series_page(request: Request, series_id: int, page_no: int = Query(1, alias="page")):
     """The series details page. The counts cover every chapter; the chapter
-    rows are paged (views.page_groups), so a source listing tens of
-    thousands of chapters cannot make one response huge. Grouping and
-    counting need only number, status and name of every row
-    (db.chapter_index); whole rows are read for the page shown only. That
-    still reads those three columns of every row on each view, so the cost
-    grows with the rows stored (100,000: about 1 s and 35 MB, from 2.5 s
-    and 70 MB); keeping per-group counts in the database would be needed
-    to go below that."""
+    rows are paged (views.page_slices), so a source listing tens of
+    thousands of chapters cannot make one response huge.
+
+    The counts, the tooltips' runs of numbers and the groups' totals need
+    every row: one pass reads number, status and name of each as a plain
+    tuple and keeps totals (views.chapter_summary; a season keeps its
+    chapter numbers too), and whole rows are read for the page shown only.
+    That pass still grows with the rows stored. Measured with 100,000 rows:
+    about 0.7 s and 2 MB for a series in blocks (was 1 s and 26 MB), about
+    1.7 s and 5 MB for one in seasons, whose names are parsed (was about
+    2 s and 45 MB); rendering the page's 2000 rows adds about 0.8 s either
+    way. Going below that would need the totals kept in the database and
+    updated with every chapter write, the runs of numbers included: more
+    machinery than a count real series stay far below is worth."""
     with db.connect() as con:
         r = db.get_series(con, series_id)
         if not r:
             raise HTTPException(404, "no such series")
         srcs = db.sources(con, series_id)
-        chs = db.chapter_index(con, series_id)
-        groups, paging = views.page_groups(views.group_chapters(chs, r), page_no)
-        whole = db.chapters_by_number(con, series_id, [c["number"] for g in groups for c in g["chapters"]])
+        if not con.in_transaction:
+            con.execute("BEGIN")                    # one snapshot: the totals agree with the rows shown
+        summary = views.chapter_summary(db.chapter_marks(con, series_id))
+
+        def read(slices, info):
+            if slices and "numbers" not in summary["groups"][slices[0][0]]:     # blocks: one range by number
+                return db.chapters_newest_first(con, series_id, info["last"] - info["first"] + 1, info["first"] - 1)
+            numbers = [n for gi, start, take in slices for n in summary["groups"][gi]["numbers"][start:start + take]]
+            whole = db.chapters_by_number(con, series_id, numbers)
+            return [whole[n] for n in numbers if n in whole]
+        groups, paging = views.page_summary(summary["groups"], page_no, read)
         events = con.execute("SELECT * FROM event WHERE series_id=? ORDER BY id DESC LIMIT 15",
                              (series_id,)).fetchall()
         size_fn = getattr(db, "series_size", None)          # lands on main; (bytes, files)
         size_bytes, size_files = size_fn(con, series_id) if size_fn else (0, 0)
-    for g in groups:
-        g["chapters"] = [whole.get(c["number"], c) for c in g["chapters"]]
-    by: dict[str, list] = {}
-    for c in chs:
-        by.setdefault(c["status"], []).append(c["number"])
     if paging["pages"] > 1:
         log.debug("series %d: %d chapter rows, showing page %d of %d", series_id, paging["total"], paging["page"],
                   paging["pages"])
     return page(request, "series.html", s=r, series=db.series_to_model(r), sources=srcs,
-                by=by, events=events, busy=runner.pending_for(series_id),
-                groups=groups, paging=paging, counts=views.counts(chs),
+                runs=summary["runs"], events=events, busy=runner.pending_for(series_id),
+                groups=groups, paging=paging, counts=summary["counts"],
                 page_q=f"?page={paging['page']}" if paging["page"] > 1 else "",     # actions come back to this page
                 description=views.plain_description(r["description"]),
                 library_path=library.library_dir(r["folder"] or ""), size_bytes=size_bytes, size_files=size_files,

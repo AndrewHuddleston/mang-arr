@@ -75,7 +75,10 @@ def parse_number(filename: str) -> float | None:
 
 
 def parse_season(filename: str) -> tuple[int, float] | None:
-    m = _SEASON.search(os.path.splitext(os.path.basename(filename or ""))[0][:MAX_PARSE])
+    name = filename or ""
+    if "/" in name or "." in name:          # (without either, the name is its own base name, with no extension)
+        name = os.path.splitext(os.path.basename(name))[0]
+    m = _SEASON.search(name[:MAX_PARSE])
     return (int(m.group(1)), float(m.group(2))) if m else None
 
 

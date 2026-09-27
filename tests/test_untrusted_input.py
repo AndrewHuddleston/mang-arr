@@ -5,6 +5,7 @@ has, and one series page or API call never renders every chapter a source
 lists."""
 import json
 import os
+import random
 import tempfile
 import time
 import unittest
@@ -217,6 +218,35 @@ class PageGroupsTest(unittest.TestCase):
         self.assertEqual((info["page"], len(out), info["last"]), (3, 100, 500))
         self.assertEqual(views.page_groups([], 5), ([], {"page": 1, "pages": 1, "total": 0, "first": 0, "last": 0}))
 
+    def test_summary_shows_what_grouping_every_row_did(self):
+        """The series page groups from totals (chapter_summary) and reads only one page's rows; it must show
+        what grouping every whole row did (group_chapters, page_groups, counts, short_ranges)."""
+        rnd = random.Random(5)
+        statuses = list(views.CHAPTER_STATUSES) + ["other"]
+        for case in range(90):
+            seasons = case % 3 == 0
+            numbers = sorted({float(rnd.choice([rnd.randint(-2, 300), rnd.randint(0, 300) + 0.5]))
+                              for _ in range(rnd.randint(0, 400))})
+            names = ([None, "", "S{} - Episode {}"] if seasons else
+                     [None, "", "Chapter {1}", "S{} - Episode {}"])
+            chs = [{"number": n, "status": rnd.choice(statuses),
+                    "name": (lambda f: f and f.format(rnd.randint(1, 4), int(n)))(rnd.choice(names))} for n in numbers]
+            summary = views.chapter_summary([(c["number"], c["status"], c["name"]) for c in chs])
+            self.assertEqual(summary["counts"], views.counts(chs))
+            self.assertEqual(summary["runs"], {st: views.short_ranges([c["number"] for c in chs if c["status"] == st])
+                                               for st in views.RANGE_STATUSES if any(c["status"] == st for c in chs)})
+            by_number = {c["number"]: c for c in chs}
+
+            def read(slices, info, groups=summary["groups"], by_number=by_number):
+                if slices and "numbers" not in groups[slices[0][0]]:
+                    return [by_number[n] for n in sorted(by_number, reverse=True)[info["first"] - 1:info["last"]]]
+                return [by_number[n] for gi, start, take in slices for n in groups[gi]["numbers"][start:start + take]]
+            grouped = views.group_chapters(chs)
+            for page in (1, 2, 3, 9):
+                got, info = views.page_summary(summary["groups"], page, read, rows=60, max_groups=4)
+                want = views.page_groups(grouped, page, rows=60, max_groups=4)
+                self.assertEqual(([{k: v for k, v in g.items() if k != "numbers"} for g in got], info), want, case)
+
     def test_short_ranges(self):
         self.assertEqual(views.short_ranges([1, 2, 3, 5]), "1-3, 5")
         self.assertEqual(views.short_ranges(range(1, 200, 2), 3), "1, 3, 5, ... (97 more)")
@@ -249,22 +279,42 @@ class SeriesPagingWebTest(WebBase):
 
     def test_series_page_reads_whole_rows_for_the_page_only(self):
         """Round 3: every view loaded and grouped every whole chapter row, although a page shows at most
-        PAGE_CHAPTERS. Only number, status and name are read for all of them now, and names are parsed for
-        seasons only until one is not season-numbered."""
+        PAGE_CHAPTERS. Then number, status and name of every row were still loaded and grouped. Now one pass
+        over them keeps totals, whole rows are read for the page only (one range, since blocks are in number
+        order), and names are parsed for seasons only until one is not season-numbered."""
         from mangarr import library
-        fetched, parsed = [], []
-        real_fetch, real_parse = db.chapters_by_number, library.parse_season
+        read, parsed = [], []
+        real_read, real_parse = db.chapters_newest_first, library.parse_season
         with mock.patch.object(db, "chapters", side_effect=AssertionError("whole rows of every chapter")), \
-                mock.patch.object(db, "chapters_by_number",
-                                  lambda con, sid, numbers: fetched.append(len(numbers)) or real_fetch(con, sid, numbers)), \
+                mock.patch.object(db, "chapters_newest_first",
+                                  lambda con, sid, limit, offset: read.append((limit, offset)) or
+                                  real_read(con, sid, limit, offset)), \
                 mock.patch.object(library, "parse_season", lambda name: parsed.append(name) or real_parse(name)):
             r = self.client.get(f"/series/{self.sid}?page=2")
         self.assertEqual(r.status_code, 200)
-        self.assertEqual(fetched, [views.PAGE_CHAPTERS])
+        self.assertEqual(read, [(views.PAGE_CHAPTERS, views.PAGE_CHAPTERS)])
         self.assertEqual(parsed, ["Chapter 1"])
         self.assertEqual(r.text.count('<tr class="episode-row'), views.PAGE_CHAPTERS)
         self.assertIn("waiting", r.text)                               # the rows shown are whole rows
+        self.assertIn('data-number="2100"', r.text)
+        self.assertIn('data-number="101"', r.text)
+        self.assertNotIn('data-number="2101"', r.text)
         self.assertIn("4100 missing", r.text)                          # the counts still cover every chapter
+        self.assertIn('title="1-4100"', r.text)                        # ... and so do the tooltips' runs
+
+    def test_series_in_seasons_reads_whole_rows_for_the_page_only(self):
+        with db.connect() as con:
+            con.execute("UPDATE chapter SET name = 'S' || (CAST(number AS INTEGER) / 1000 + 1) || ' - Episode ' || "
+                        "(CAST(number AS INTEGER) % 1000) WHERE series_id=?", (self.sid,))
+        fetched = []
+        real_fetch = db.chapters_by_number
+        with mock.patch.object(db, "chapters", side_effect=AssertionError("whole rows of every chapter")), \
+                mock.patch.object(db, "chapters_by_number",
+                                  lambda con, sid, numbers: fetched.append(len(numbers)) or real_fetch(con, sid, numbers)):
+            r = self.client.get(f"/series/{self.sid}?page=2")
+        self.assertEqual(fetched, [views.PAGE_CHAPTERS])
+        self.assertIn('data-group="season-3"', r.text)
+        self.assertIn("waiting", r.text)
 
     def test_short_series_has_no_paging(self):
         with db.connect() as con:

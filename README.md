@@ -530,16 +530,17 @@ averages less than 128 KB a second (it gets 30 seconds plus one second per
 128 KB received), is cut off, so a stalled or dripping client cannot hold
 the upload for long (`MANGARR_UPLOAD_IDLE_SECS`, `MANGARR_UPLOAD_MIN_KBPS`).
 Over a slower link, copy the file (named `mangarr-<date>-<time>.db`, as
-downloaded) into the backups folder and restore it from the list instead. Besides the file's data a form may hold at most 8 KB
-(boundaries, part headers, fields, line breaks before the first part), and
-nothing after its closing boundary is waited for. A refused upload of up to
-8 MB is read to its end before the answer, so the browser shows the
-message; a bigger one is not read, and the connection is closed after the
-answer. An upload is refused, before the first byte and with
-every write while it arrives, when it would leave less free space on that
-disk than its own size, up to 256 MB: a small backup can still be restored
-on a nearly full disk, a big one cannot take the last of it. A refused or
-cut-off upload leaves nothing behind.
+downloaded) into the backups folder and restore it from the list instead.
+Besides the file's data a form may hold at most 8 KB (boundaries, part
+headers, fields, line breaks before the first part), and nothing after its
+closing boundary is waited for. A refused upload of up to 8 MB is read to
+its end before the answer, so the browser shows the message; a bigger one
+is not read, and the connection is closed after the answer. An upload is
+refused, before the first byte and with every write while it arrives, when
+it would leave less free space on that disk than its own size, up to
+256 MB: a small backup can still be restored on a nearly full disk, a big
+one cannot take the last of it. A refused or cut-off upload leaves nothing
+behind.
 
 ### CLI
 

@@ -5,6 +5,7 @@ made plain. No database, no network - unit-testable on plain rows/dicts.
 import hashlib
 import hmac
 import html
+import itertools
 import re
 import secrets
 import urllib.parse
@@ -20,6 +21,7 @@ BLOCK = 20                       # chapters per group when a series has no seaso
 PAGE_CHAPTERS = 2000
 PAGE_GROUPS = 200
 MAX_RANGE_SPANS = 40             # spans in a '1-3, 5, 7-9' tooltip
+RANGE_STATUSES = frozenset(("wanted", "failed", "unavailable", "ignored", "junk"))  # the series page's tooltips
 
 STATUS_LABELS = {"RELEASING": "Continuing", "FINISHED": "Ended", "HIATUS": "Hiatus", "CANCELLED": "Cancelled"}
 CHAPTER_STATUSES = ("have", "wanted", "failed", "junk", "unavailable", "ignored")
@@ -129,7 +131,11 @@ def group_chapters(chapters, series_row=None) -> list[dict]:
     When every chapter that has a name is season-numbered ('S2 - Episode 5'),
     groups are seasons; chapters without a name then go into a trailing
     'Unnumbered' group. Otherwise groups are blocks of 20 by the integer
-    part of the number, so 12.5 sits with 12 in 'Chapters 1-20'."""
+    part of the number, so 12.5 sits with 12 in 'Chapters 1-20'.
+
+    This is the rule over whole rows. The series page gets the same groups
+    from totals (chapter_summary, page_summary), and the tests hold the two
+    to the same answer."""
     rows = list(chapters)
     if not rows:
         return []
@@ -173,37 +179,156 @@ def group_chapters(chapters, series_row=None) -> list[dict]:
     return out
 
 
+def chapter_summary(rows, limit: int = MAX_RANGE_SPANS) -> dict:
+    """What the series page shows about all of a series' chapters, from one
+    pass over (number, status, name) by number (db.chapter_marks) that keeps
+    totals, not the rows:
+
+    - counts: counts() of them;
+    - runs: {status: short_ranges() text} for RANGE_STATUSES, from the
+      first `limit` runs and the number of runs;
+    - groups: group_chapters()' groups without their rows, each with its
+      `size`; a season's also with its chapter numbers, newest first (a
+      season is not one range of numbers), while a block of BLOCK keeps
+      only totals. page_summary() fills in one page's rows.
+
+    Names are parsed only until the first plain one: from there on the
+    series is in blocks, and what was kept for seasons is dropped."""
+    counts = dict.fromkeys(CHAPTER_STATUSES, 0)
+    adds = {st: (st == "have", st in COUNTED, st in ("wanted", "failed")) for st in CHAPTER_STATUSES}
+    blocks: dict[int, list] = {}             # first number -> [rows, have, counted, wanted]
+    seasons: dict | None = {}                # season (None: no name) -> [rows, have, counted, wanted, numbers]
+    runs: dict[str, list] = {}               # status -> [first `limit` runs as [first, last], runs, last number]
+    for number, status, name in rows:        # (this runs once per chapter row: kept to plain operations)
+        add = adds.get(status, (0, 0, 0))
+        if status in counts:
+            counts[status] += 1
+        n = float(number or 0)
+        i = int(n)
+        start = 1 if i < 1 else (i - 1) // BLOCK * BLOCK + 1          # _block_start()
+        b = blocks.get(start)
+        if b is None:
+            b = blocks[start] = [0, 0, 0, 0]
+        b[0] += 1
+        b[1] += add[0]
+        b[2] += add[1]
+        b[3] += add[2]
+        if seasons is not None:
+            sn = library.parse_season(name) if name else None
+            if name and sn is None:
+                seasons = None               # one plain name: blocks, and the other names need no parsing
+            else:
+                g = seasons.get(key := sn[0] if sn else None)
+                if g is None:
+                    g = seasons[key] = [0, 0, 0, 0, []]
+                g[0] += 1
+                g[1] += add[0]
+                g[2] += add[1]
+                g[3] += add[2]
+                g[4].append(n)
+        if status in RANGE_STATUSES:
+            r = runs.get(status)
+            if r is None:
+                runs[status] = [[[n, n]], 1, n]
+            else:
+                if n == r[2] + 1 and n == i:                             # resolver.ranges(): the run goes on
+                    if r[1] <= limit:
+                        r[0][-1][1] = n
+                else:
+                    r[1] += 1
+                    if r[1] <= limit:
+                        r[0].append([n, n])
+                r[2] = n
+    text = {}
+    for status, (spans, n_runs, _) in runs.items():
+        text[status] = ", ".join(f"{a:g}" if a == b else f"{a:g}-{b:g}" for a, b in spans) + \
+            (f", ... ({n_runs - limit} more)" if n_runs > limit else "")
+    if seasons and any(k is not None for k in seasons):
+        groups = [_totals(f"season-{k}", f"Season {k}", *seasons[k][:4], numbers=seasons[k][4][::-1])
+                  for k in sorted((k for k in seasons if k is not None), reverse=True)]
+        if None in seasons:
+            groups.append(_totals("unnumbered", "Unnumbered", *seasons[None][:4], numbers=seasons[None][4][::-1]))
+    else:
+        groups = [_totals(f"block-{k}", f"Chapters {k}-{k + BLOCK - 1}", *b) for k, b in
+                  sorted(blocks.items(), reverse=True)]
+    if groups:
+        next((g for g in groups if g["key"] != "unnumbered"), groups[0])["open"] = True
+    return {"counts": counts, "runs": text, "groups": groups}
+
+
+def _totals(key: str, name: str, rows: int, have: int, total: int, wanted: int, numbers=None) -> dict:
+    """One of chapter_summary()'s groups: group_chapters()' fields, `size`
+    for its rows and no chapters yet."""
+    g = {"key": key, "name": name, "chapters": [], "have": have, "total": total,
+         "pct": round(100 * have / total) if total else 0, "wanted": wanted, "open": False, "size": rows}
+    if numbers is not None:
+        g["numbers"] = numbers
+    return g
+
+
+def page_slices(sizes: list[int], page: int = 1, rows: int = PAGE_CHAPTERS,
+                max_groups: int = PAGE_GROUPS) -> tuple[list[tuple[int, int, int]], dict]:
+    """Which rows of groups of these sizes one page shows: at most `rows`
+    rows in at most `max_groups` groups, in order. A group that does not fit
+    is split across pages. A page past the last one shows the last. Returns
+    ([(group index, first row in it, rows)], info) with info = {page, pages,
+    total, first, last}: first/last are row positions (from 1) of the
+    page's rows among all `total` rows."""
+    page = max(page, 1)
+    total = sum(sizes)
+    at, used, n_groups, row = 1, 0, 0, 0         # page being filled, its rows and groups, rows before it
+    out: list[tuple[int, int, int]] = []
+    first = last = 0
+    for gi, size in enumerate(sizes):
+        start = 0
+        while start < size:
+            if used >= rows or n_groups >= max_groups:
+                at, used, n_groups = at + 1, 0, 0
+            take = min(size - start, rows - used)
+            if at == page:
+                first = first or row + 1
+                last = row + take
+                out.append((gi, start, take))
+            used, n_groups, row, start = used + take, n_groups + 1, row + take, start + take
+    if not out and page > at:
+        return page_slices(sizes, at, rows, max_groups)
+    return out, {"page": page, "pages": at, "total": total, "first": first, "last": last}
+
+
+def _open_first(out: list[dict]) -> list[dict]:
+    if out and not any(g["open"] for g in out):
+        out[0]["open"] = True                    # a later page opens its first group
+    return out
+
+
 def page_groups(groups: list[dict], page: int = 1, rows: int = PAGE_CHAPTERS,
                 max_groups: int = PAGE_GROUPS) -> tuple[list[dict], dict]:
     """One page of group_chapters()' groups: at most `rows` chapter rows in
     at most `max_groups` groups, in the same order (newest first). A group
     that does not fit is split across pages: the part keeps the whole
     group's header numbers, with `part` set and `size` its full length.
-    A page past the last one shows the last. Returns (groups, info) with
-    info = {page, pages, total, first, last}: first/last are row positions
-    (from 1) of the page's rows among all `total` rows."""
-    page = max(page, 1)
-    total = sum(len(g["chapters"]) for g in groups)
-    at, used, n_groups, row = 1, 0, 0, 0         # page being filled, its rows and groups, rows before it
-    out: list[dict] = []
-    first = last = 0
-    for g in groups:
+    A page past the last one shows the last. Returns (groups, info) as
+    page_slices does."""
+    slices, info = page_slices([len(g["chapters"]) for g in groups], page, rows, max_groups)
+    out = []
+    for gi, start, take in slices:
+        g = groups[gi]
         chs = g["chapters"]
-        start = 0
-        while start < len(chs):
-            if used >= rows or n_groups >= max_groups:
-                at, used, n_groups = at + 1, 0, 0
-            take = min(len(chs) - start, rows - used)
-            if at == page:
-                first = first or row + 1
-                last = row + take
-                out.append(dict(g, chapters=chs[start:start + take], part=take < len(chs), size=len(chs)))
-            used, n_groups, row, start = used + take, n_groups + 1, row + take, start + take
-    if not out and page > at:
-        return page_groups(groups, at, rows, max_groups)
-    if out and not any(g["open"] for g in out):
-        out[0]["open"] = True                    # a later page opens its first group
-    return out, {"page": page, "pages": at, "total": total, "first": first, "last": last}
+        out.append(dict(g, chapters=chs[start:start + take], part=take < len(chs), size=len(chs)))
+    return _open_first(out), info
+
+
+def page_summary(groups: list[dict], page: int, read, rows: int = PAGE_CHAPTERS,
+                 max_groups: int = PAGE_GROUPS) -> tuple[list[dict], dict]:
+    """page_groups() for chapter_summary()'s groups: read(slices, info) gets
+    page_slices()' answer and returns the page's rows in order, which fill
+    the groups on the page. For blocks those rows are one range of numbers,
+    highest first (db.chapters_newest_first); a season's come by number."""
+    slices, info = page_slices([g["size"] for g in groups], page, rows, max_groups)
+    got = iter(read(slices, info) if slices else ())
+    out = [dict(groups[gi], chapters=list(itertools.islice(got, take)), part=take < groups[gi]["size"])
+           for gi, _start, take in slices]
+    return _open_first(out), info
 
 
 def short_ranges(numbers, limit: int = MAX_RANGE_SPANS) -> str:
