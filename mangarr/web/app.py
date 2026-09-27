@@ -886,7 +886,9 @@ def _job_adopt_scan(job: jobs.Job):
     _adopt_scan["items"] = items
     _adopt_scan["gen"] += 1
     n_ok = sum(1 for i in items if i.series and not i.tracked)
-    return f"{len(items)} folders, {n_ok} identified, {sum(1 for i in items if not i.series)} need a choice"
+    n_failed = sum(1 for i in items if i.lookup_error)
+    return f"{len(items)} folders, {n_ok} identified, {sum(1 for i in items if not i.series)} need a choice" + \
+        (f" ({n_failed} not looked up: AniList and MangaDex could not be reached; scan again)" if n_failed else "")
 
 
 @app.get("/import")

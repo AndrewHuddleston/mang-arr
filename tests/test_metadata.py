@@ -98,8 +98,10 @@ class ProviderFailureTest(unittest.TestCase):
                 mock.patch.object(metadata.mangadex, "search", lambda q, limit=8: list(md)), \
                 self.assertLogs("mangarr.metadata"):
             self.assertEqual(metadata.lookup("Berserk"), (None, md))          # the Add page still shows these
-            with self.assertRaises(metadata.LookupError_) as cm:
-                metadata.lookup("Berserk", strict=True)                        # ... but AniList was not asked
-            self.assertEqual(str(cm.exception), "AniList could not be reached")
-            self.assertEqual(metadata.lookup("Berserk of Gluttony", strict=True)[0], md[0])  # a pick is a pick
+            unreached = []
+            self.assertEqual(metadata.lookup("Berserk", unreached=unreached), (None, md))
+            self.assertEqual(unreached, ["AniList"])                           # ... but AniList was not asked
+            unreached = []
+            self.assertEqual(metadata.lookup("Berserk of Gluttony", unreached=unreached)[0], md[0])
+            self.assertEqual(unreached, [])                                    # a pick is a pick
 

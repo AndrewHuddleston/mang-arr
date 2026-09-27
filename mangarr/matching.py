@@ -9,6 +9,7 @@ Titles come from scraped sites, metadata providers and user input, so every
 function here is linear in its input and caps it first (MAX_TITLE): a
 50 KB "title" must cost microseconds, not a GIL-holding regex backtrack.
 """
+import difflib
 import re
 import unicodedata
 
@@ -16,6 +17,7 @@ _QUOTES = str.maketrans({"’": "'", "‘": "'", "“": '"', "”": '"', "…": 
 
 MAX_TITLE = 500          # chars; Suwayomi itself truncates titles to 512
 MAX_KNOWN_TITLES = 200   # known titles compared per hit (AniList/MangaDex list ~50 at most)
+CLOSE = 0.8              # difflib ratio of two normalised titles: 'One Peice' ~ 'One Piece' (0.89)
 _OPENERS, _CLOSERS = "([", ")]"
 _CONTROL = re.compile(r"[\x00-\x1f\x7f\u2028\u2029]+")
 
@@ -146,3 +148,22 @@ def query_score(title: str | None, query: str) -> int:
         return 2
     qw, tw = set(q.split()), set(t.split())
     return 3 + len(qw - tw)
+
+
+def close_title(text: str | None, titles) -> bool:
+    """Whether `text` is nearly one of `titles` once both are normalised: a
+    misspelling ('One Peice', 'Naurto'), never a title with words added
+    ('One Piece hunter2' is 0.69). Both sides are capped (MAX_TITLE,
+    MAX_KNOWN_TITLES), and the cheap upper bounds of the ratio are tried
+    first: most titles differ in length too much to be close."""
+    t = norm(_cap(text))
+    if not t:
+        return False
+    for title in list(titles)[:MAX_KNOWN_TITLES]:
+        k = norm(_cap(title))
+        if not k:
+            continue
+        m = difflib.SequenceMatcher(None, t, k, autojunk=False)
+        if m.real_quick_ratio() >= CLOSE and m.quick_ratio() >= CLOSE and m.ratio() >= CLOSE:
+            return True
+    return False

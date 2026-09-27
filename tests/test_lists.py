@@ -39,12 +39,12 @@ class ListsTest(unittest.TestCase):
         picks = {"One Piece": S(30013, "One Piece"), "Berserk": None}
         with mock.patch.object(lists, "_get_text", lambda url, **kw: "One Piece\n\n# c\nBerserk\nanilist:30002\n"), \
                 mock.patch.object(lists.metadata, "lookup",
-                                  lambda t, **kw: (picks[t], [] if picks[t] else [S(1, "Berserk: The Prototype")])), \
+                                  lambda t, **kw: (picks[t], [] if picks[t] else [S(1, "Berserk Z")])), \
                 mock.patch.object(lists.metadata, "by_ref", lambda r: S(30002, "Berserk (by ref)")):
-            series, review, skipped, quoted = lists.fetch_url_text({"url": "http://x/list.txt"})
+            series, review, skipped, quoted, unchecked = lists.fetch_url_text({"url": "http://x/list.txt"})
         self.assertEqual([s.ref for s in series], ["anilist:30013", "anilist:30002"])
         self.assertEqual(review, ["Berserk"])
-        self.assertEqual(skipped, 0)
+        self.assertEqual((skipped, unchecked), (0, 0))
         self.assertTrue(quoted)                         # two of three lines are known series: a title list
 
     def test_url_text_lookup_failure_is_an_error_not_a_crash(self):

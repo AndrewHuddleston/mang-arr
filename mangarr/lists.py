@@ -13,8 +13,9 @@ Each list kind is a fetch(params) -> Fetched(series, review, skipped, quoted)
 function in FETCHERS; review are lines of a text list that look like titles
 but could not be identified with confidence (the user adds them by hand) -
 the lines themselves, or only "line N" when the list did not prove to be a
-title list or nothing like the line is known (see fetch_url_text) - and
-skipped counts lines that do not look like titles at all.
+title list or the line is not close to a title AniList or MangaDex suggested
+(see fetch_url_text) - skipped counts lines that do not look like titles at
+all, and unchecked the lines that could not be looked up at both.
 """
 import functools
 import http.client
@@ -33,7 +34,7 @@ from collections.abc import Callable
 from typing import NamedTuple
 
 from . import anilist, config, db, metadata, model
-from .matching import oneline, query_score
+from .matching import close_title, oneline, query_score
 from .model import Series
 
 log = logging.getLogger(__name__)
@@ -52,6 +53,7 @@ class Fetched(NamedTuple):
     review: list[str]           # look like titles, no confident match: listed for the user
     skipped: int = 0            # text list lines that are not titles: neither looked up nor shown
     quoted: bool = True         # the list proved to be one; False: review holds only "line N" (fetch_url_text)
+    unchecked: int = 0          # lines AniList or MangaDex could not be asked about; the next sync tries again
 
 
 # -- AniList: a user's lists ----------------------------------------------------
@@ -601,14 +603,15 @@ def list_titles(text: str, max_lines: int | None = None) -> tuple[list[Line], in
 UNREACHABLE = "AniList or MangaDex could not be reached, so the list's titles could not be checked; try again later"
 
 
-def _unknown(looked: int, failed: int) -> ListFetchError:
+def _unknown(looked: int, unasked: int) -> ListFetchError:
     """The error for a list none of whose lines looked up is known to be a
-    series AniList or MangaDex knows: not a title list, or - when a lookup
-    failed - not known yet (the list stays as it is; the next sync tries
-    again). It quotes none of the lines."""
-    if failed:
-        log.warning("text list: %d of %d line(s) could not be looked up (AniList or MangaDex unreachable); "
-                    "nothing more looked up", failed, looked)
+    series AniList or MangaDex knows: not a title list, or - when some of
+    them could not be asked about all of those lines - not known yet (the
+    list stays as it is; the next sync tries again). It quotes none of the
+    lines."""
+    if unasked:
+        log.warning("text list: %d of %d line(s) could not be looked up at both AniList and MangaDex "
+                    "(unreachable); nothing more looked up", unasked, looked)
         return ListFetchError(UNREACHABLE)
     log.warning("text list: none of the %d line(s) looked up is a series AniList or MangaDex knows; not taken "
                 "for a title list: nothing more looked up, nothing quoted", looked)
@@ -630,40 +633,54 @@ def fetch_url_text(params: dict, should_cancel: Callable[[], bool] | None = None
     so AniList and MangaDex decide. A line is known when it is a confident
     pick or the exact title of some series there. Until one line is known,
     at most PROBE_LINES are looked up; when none is, the sync fails and
-    quotes nothing. A lookup that fails before then (a provider down or
-    rate-limiting) ends the sync with "try again later" instead: whether
-    the lines are titles is not known. Lines without a confident pick are
-    quoted for review only when at least half of the lines looked up are
-    known - the body has then proved to be a title list - and AniList or
-    MangaDex suggested some series for that line (a misspelt or ambiguous
-    title); the others are given only by line number. Lines are logged by
-    number, never quoted."""
+    quotes nothing.
+
+    A provider that does not answer is not a verdict. A line neither
+    answered for ends the sync with "try again later" while no line is
+    known yet, and a probe that found nothing but could not ask both about
+    every line does too: whether the lines are titles is not known. A line
+    only one answered for is reviewed on that one's suggestions when one is
+    close to it, else counted as unchecked; later lines are still looked
+    up. Unchecked lines are neither quoted nor listed: the next sync looks
+    them up again.
+
+    A line without a confident pick is quoted for review only when at least
+    half of the lines looked up are known - the body has then proved to be
+    a title list - and the line is close to the title of a series AniList
+    or MangaDex suggested for it (matching.close_title: a misspelt or
+    ambiguous title, nearly a public title itself); the others are given
+    only by line number. Lines are logged by number, never quoted."""
     lines, skipped = list_titles(_get_text(params["url"], should_cancel=should_cancel), MAX_LIST_LINES)
     series: dict[str, Series] = {}
-    unmatched: list[tuple[Line, bool]] = []     # (line, AniList or MangaDex suggested series for it)
-    looked = known = failed = 0
+    unmatched: list[tuple[Line, bool]] = []     # (line, close to a series AniList or MangaDex suggested for it)
+    looked = known = unchecked = unasked = 0     # unasked: lines AniList or MangaDex could not be asked about
     cancelled = False
     for ln in lines:
         if should_cancel and should_cancel():
             log.info("text list sync cancelled after %d of %d line(s)", looked, len(lines))
             cancelled = True
             break
-        if not known and (failed or looked >= PROBE_LINES):
-            raise _unknown(looked, failed)
+        if not known and looked >= PROBE_LINES:
+            raise _unknown(looked, unasked)
         if progress:
             progress(f"looking up line {looked + 1} of {len(lines)}")
         looked += 1
         cands: list[Series] = []
+        unreached: list[str] = []
+        ref = model.valid_ref(ln.text) and not ln.text.startswith("manual:")
         try:
-            if model.valid_ref(ln.text) and not ln.text.startswith("manual:"):
+            if ref:
                 s = metadata.by_ref(ln.text)
                 s = s if s and s.title != "?" else None
             else:
-                s, cands = metadata.lookup(ln.text, strict=True)
+                s, cands = metadata.lookup(ln.text, unreached=unreached)
         except Exception as e:
-            failed += 1
+            unchecked += 1
+            unasked += 1
             log.warning("list line %d: lookup failed: %s: %s", ln.no, type(e).__name__, oneline(e, 300))
-            s = None
+            if not known and not ref:           # neither answered: the next lines would fare no better
+                raise _unknown(looked, unasked) from None
+            continue
         if s:
             known += 1
             log.debug("list line %d -> %s (%s)", ln.no, oneline(s.title), s.ref)
@@ -671,16 +688,24 @@ def fetch_url_text(params: dict, should_cancel: Callable[[], bool] | None = None
             continue
         if any(query_score(t, ln.text) == 0 for c in cands for t in c.titles):
             known += 1                  # several series of exactly that title: a title all the same
+        close = any(close_title(ln.text, c.titles) for c in cands)
+        unasked += bool(unreached)
+        if unreached and not close:
+            unchecked += 1
+            log.info("list line %d: no match at the provider that answered; %s could not be reached, so the next "
+                     "sync looks it up again", ln.no, " and ".join(unreached))
+            continue
         log.debug("list line %d: no confident match (%d candidate(s))", ln.no, len(cands))
-        unmatched.append((ln, bool(cands)))
+        unmatched.append((ln, close))
     if looked and not known and not cancelled:
-        raise _unknown(looked, failed)
-    quoted = known > 0 and known * 2 >= looked
+        raise _unknown(looked, unasked)
+    checked = looked - unchecked
+    quoted = known > 0 and known * 2 >= checked
     if unmatched and not quoted:
         log.warning("text list: only %d of %d line(s) looked up are series AniList or MangaDex knows; the %d "
-                    "without a match are reported by line number, not quoted", known, looked, len(unmatched))
-    review = [ln.text if quoted and like else f"line {ln.no}" for ln, like in unmatched]
-    return Fetched(list(series.values()), review, skipped, quoted)
+                    "without a match are reported by line number, not quoted", known, checked, len(unmatched))
+    review = [ln.text if quoted and close else f"line {ln.no}" for ln, close in unmatched]
+    return Fetched(list(series.values()), review, skipped, quoted, unchecked)
 
 
 FETCHERS: dict[str, Callable[[dict], Fetched]] = {
@@ -891,6 +916,7 @@ def sync(con: sqlite3.Connection, row, submit_add: Callable[[Series, bool, bool]
         return msg
     not_titles = more[0] if more else 0
     quoted = more[1] if len(more) > 1 else True
+    unchecked = more[2] if len(more) > 2 else 0
     excluded = excluded_refs(con)
     added = tracked = skipped = deferred = 0
     for s in series:
@@ -911,6 +937,9 @@ def sync(con: sqlite3.Connection, row, submit_add: Callable[[Series, bool, bool]
     parts = [f"{len(series)} fetched", f"{added} added"]
     if review:
         parts.append(f"{len(review)} review")
+    if unchecked:
+        parts.append(f"{unchecked} line(s) not checked (AniList or MangaDex could not be reached; the next sync "
+                     "tries again)")
     if not_titles:
         parts.append(f"{not_titles} line(s) skipped (not titles)")
     if tracked:
@@ -929,7 +958,7 @@ def sync(con: sqlite3.Connection, row, submit_add: Callable[[Series, bool, bool]
         if not quoted:
             msg += " (not quoted: fewer than half of the lines looked up are series AniList or MangaDex knows)"
         elif any(_BY_NUMBER.fullmatch(t) for t in review):
-            msg += " (lines AniList and MangaDex found nothing like are given by number)"
+            msg += " (lines not close to the title of a series AniList or MangaDex suggested are given by number)"
     mark_synced(con, row["id"], msg)
     log.info("list %s: %s", name, msg)
     return msg

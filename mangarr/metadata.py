@@ -64,15 +64,17 @@ def _safe(provider: str, fn, query, failed: list[str]):
         return []
 
 
-def lookup(query: str, strict: bool = False) -> tuple[Series | None, list[Series]]:
+def lookup(query: str, unreached: list[str] | None = None) -> tuple[Series | None, list[Series]]:
     """(confident pick or None, candidates shown to the user). The query is
     typed, or a line of an import list: anything past MAX_TITLE characters
     is cut (logged) before it is matched or sent to the providers.
 
     Raises LookupError_ when no pick was found and no provider answered at
-    all: "no candidates" would be untrue. With strict, also when one of
-    them did not answer: the caller must not take the title for one neither
-    knows (an import list deciding whether its lines are titles)."""
+    all: "no candidates" would be untrue. When only one of them did not
+    answer, the other's candidates are returned, and a caller that must not
+    take the title for one neither knows (an import list deciding whether
+    its lines are titles) passes a list as `unreached`: the names of the
+    providers that were not asked are added to it."""
     query = (query or "").strip()
     if len(query) > MAX_TITLE:
         log.info("lookup query cut to %d characters: %s", MAX_TITLE, oneline(query, 80))
@@ -106,8 +108,10 @@ def lookup(query: str, strict: bool = False) -> tuple[Series | None, list[Series
             pick = _pick(md, target, hint)
             if pick:
                 return pick, list(seen.values())
-    if failed and (strict or len(failed) == asked):
+    if failed and len(failed) == asked:
         raise LookupError_(f"{' and '.join(dict.fromkeys(failed))} could not be reached")
+    if unreached is not None:
+        unreached.extend(p for p in dict.fromkeys(failed) if p not in unreached)
     cands = list(seen.values())
     cands.sort(key=lambda s: (min(query_score(t, base) for t in s.titles) if s.titles else 9,
                               -s.popularity))

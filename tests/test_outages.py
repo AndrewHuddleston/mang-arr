@@ -782,6 +782,36 @@ class LongJobProgressTest(Base):
             core.plan_adopt(self.NoEntries(), should_cancel=lambda: len(looked) >= 2)
         self.assertEqual(looked, ["One", "Three"])
 
+    def test_a_folder_not_looked_up_does_not_stop_the_scan(self):
+        """The verifier's repro: with AniList and MangaDex failing only for the 3rd folder (a network or DNS
+        blip), the whole scan failed and the folders already looked up were thrown away. Now only that folder
+        is not identified, and says why; a scan in which no lookup got an answer still stops with the error."""
+        for name in ("One", "Two", "Three"):
+            os.makedirs(os.path.join(self.tmp, "staging", "Src", name))
+
+        def lookup(name):
+            if name == "Two":
+                raise core.metadata.LookupError_("AniList and MangaDex could not be reached")
+            return Series(anilist_id=len(name), english=name), []
+        with mock.patch.object(core.metadata, "lookup", lookup), self.assertLogs("mangarr.core", "WARNING") as cm:
+            items = core.plan_adopt(self.NoEntries())
+        self.assertEqual([(i.folder_name, i.series and i.series.title, i.lookup_error) for i in items],
+                         [("One", "One", None), ("Three", "Three", None),
+                          ("Two", None, "not looked up: AniList and MangaDex could not be reached")])
+        self.assertIn("1 of 3 folder(s) could not be looked up", "\n".join(cm.output))
+        if web is not None:
+            with mock.patch.object(core, "plan_adopt", lambda *a, **kw: items), \
+                    mock.patch.dict(web._adopt_scan, {"items": None, "gen": 0}):
+                msg = web._job_adopt_scan(jobs.Job(1, "adopt-scan", "staging folders"))
+                self.assertEqual(web._adopt_scan["items"], items)
+            self.assertEqual(msg, "3 folders, 2 identified, 1 need a choice (1 not looked up: AniList and MangaDex "
+                                  "could not be reached; scan again)")
+
+        def down(name):
+            raise core.metadata.LookupError_("AniList and MangaDex could not be reached")
+        with mock.patch.object(core.metadata, "lookup", down), self.assertRaises(core.metadata.LookupError_):
+            core.plan_adopt(self.NoEntries())
+
     @unittest.skipIf(web is None, "web extras not installed")
     def test_adopt_job_reports_each_series_and_stops_on_cancel(self):
         job = jobs.Job(1, "adopt", "3 folder(s)")

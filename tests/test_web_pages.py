@@ -323,6 +323,12 @@ class PagesTest(unittest.TestCase):
 
     def test_other_pages(self):
         self._ok("/import", "Scan Folders", "No scan yet")
+        from mangarr import core
+        items = [core.AdoptItem("Src", "Two", "/staging/Src/Two", {1.0: "x"}, [],
+                                lookup_error="not looked up: AniList and MangaDex could not be reached")]
+        with mock.patch.dict(self.web._adopt_scan, {"items": items, "job": None, "gen": 1}):
+            self._ok("/import", ">not looked up<", 'title="not looked up: AniList and MangaDex could not be reached; '
+                     'scan again"')
         self._ok("/lists", "Add a list", 'id="addlist"', 'name="sync_hours"', "Exclusions",
                  # round 3: the help says exactly what is refused (it claimed "not on the machine mang-arr runs on")
                  "Refused are only loopback (localhost, 127.0.0.1, ::1), link-local, multicast and 0.0.0.0 "

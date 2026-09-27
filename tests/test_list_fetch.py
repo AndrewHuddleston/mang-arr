@@ -376,13 +376,13 @@ class ContentTest(ServerTest):
 
     def _sync(self, path, known=(), similar=()):
         """(last_result, lines looked up); lines in `known` are confident
-        picks, AniList suggests other series for lines in `similar`. Nothing
-        secret may reach last_result or any log line."""
+        picks, AniList suggests a series of nearly that title for lines in
+        `similar`. Nothing secret may reach last_result or any log line."""
         looked_up = []
 
-        def lookup(t, strict=False):
+        def lookup(t, unreached=None):
             looked_up.append(t)
-            like = [Series(anilist_id=900 + len(looked_up), english=f"{t} Gaiden")] if t in similar else []
+            like = [Series(anilist_id=900 + len(looked_up), english=f"{t}s")] if t in similar else []
             return (Series(anilist_id=len(looked_up), english=t) if t in known else None), like
         with tempfile.TemporaryDirectory() as tmp, db.connect(os.path.join(tmp, "l.db")) as con:
             lid = lists.add_list(con, "L", "url_text", {"url": self.base + path})
@@ -447,8 +447,8 @@ class ContentTest(ServerTest):
 
 class ProviderAndProbeTest(ServerTest):
     """Round 3: a text list is judged only on what AniList and MangaDex answered, a few unrecognised lines
-    at its start do not throw the rest away, and a review line is quoted only when the providers suggested
-    some series for it."""
+    at its start do not throw the rest away, and a review line is quoted only when it is nearly the title of a
+    series the providers suggested for it."""
 
     def sync(self, body: bytes, lookup=None) -> tuple[str, list]:
         """(last_result, series handed to the add job) of a sync of `body`, with lists.metadata.lookup
@@ -490,7 +490,7 @@ class ProviderAndProbeTest(ServerTest):
 
     def test_unknown_lines_first_do_not_throw_the_good_ones_away(self):
         """The verifier's repro: five misspelt titles before the good ones made the whole list fail."""
-        def lookup(t, strict=False):
+        def lookup(t, unreached=None):
             return (Series(mangadex_id=f"md-{t}", english=t) if t in ("One Piece", "Naruto") else None), \
                 [Series(anilist_id=1000 + len(t), english=t + " Gaiden")]
         msg, added = self.sync(b"One Peice\nNaurto\nBleech\nBerserkk\nMonstr\nOne Piece\nNaruto\n", lookup)
@@ -499,25 +499,72 @@ class ProviderAndProbeTest(ServerTest):
                                        "line 4 | line 5 (not quoted"), msg)
         looked = []
         body = "".join(f"Unknown {chr(65 + i)}\n" for i in range(lists.PROBE_LINES)).encode() + b"One Piece\n"
-        msg, added = self.sync(body, lambda t, strict=False: looked.append(t) or lookup(t))
+        msg, added = self.sync(body, lambda t, **kw: looked.append(t) or lookup(t))
         self.assertEqual((len(looked), added), (lists.PROBE_LINES, []))  # the probe still ends somewhere
         self.assertTrue(msg.startswith(f"error: {lists.NOT_A_LIST}"), msg)
 
-    def test_a_review_line_is_quoted_only_when_something_like_it_is_known(self):
+    def test_a_review_line_is_quoted_only_when_it_is_nearly_a_known_title(self):
         """The verifier's repro: once at least half of the lines looked up were known titles, every other
-        line was quoted in last_result, secrets included. A line is now quoted only when AniList or MangaDex
-        suggested series for it (a misspelt or ambiguous title), else given by number."""
+        line was quoted in last_result, secrets included. Then a line was quoted as soon as AniList or
+        MangaDex suggested any series for it, and their search is fuzzy. A line is now quoted only when it
+        is nearly the title of a series they suggested (a misspelt or ambiguous title), else given by
+        number."""
         known = {"One Piece", "Naruto", "Bleach"}
+        fuzzy = {"root password hunter2": ["Root", "Password"], "vault token s.abcdef": ["Vault of Stars"],
+                 "Berserkk": ["Berserk", "Berserk: The Prototype"]}
 
-        def lookup(t, strict=False):
+        def lookup(t, unreached=None):
             if t in known:
                 return Series(mangadex_id=f"md-{t}", english=t), []
-            return None, ([Series(anilist_id=99, english="Berserk")] if t == "Berserkk" else [])
-        msg, added = self.sync(b"One Piece\nNaruto\nBleach\nroot password hunter2\nvault token s.abcdef\n"
-                               b"Berserkk\n", lookup)
-        self.assertEqual(msg, "3 fetched, 3 added, 3 review; needs review: line 4 | line 5 | Berserkk (lines AniList "
-                              "and MangaDex found nothing like are given by number)")
-        self.assertNotIn("hunter2", msg)
+            return None, [Series(anilist_id=90 + i, english=c) for i, c in enumerate(fuzzy.get(t, []))]
+        body = b"One Piece\nNaruto\nBleach\nroot password hunter2\nvault token s.abcdef\nBerserkk\n"
+        for suggest in (False, True):           # the secrets without any suggestion, then with fuzzy ones
+            with mock.patch.dict(fuzzy, {} if suggest else {"root password hunter2": [], "vault token s.abcdef": []}):
+                msg, added = self.sync(body, lookup)
+            self.assertEqual(msg, "3 fetched, 3 added, 3 review; needs review: line 4 | line 5 | Berserkk (lines not "
+                                  "close to the title of a series AniList or MangaDex suggested are given by number)")
+            self.assertNotIn("hunter2", msg)
+
+    def test_one_provider_down_is_not_a_verdict(self):
+        """The verifier's repro: with MangaDex unreachable and AniList working, 'One Peice\\nNaruto' failed
+        with 'try again later', and 'Naruto\\nOne Peice' reported line 2 as a line AniList and MangaDex found
+        nothing like, although MangaDex was never asked."""
+        def md_down(q, **kw):
+            raise OSError("network down")
+
+        def anilist(q, **kw):
+            if q == "Naruto":
+                return [Series(anilist_id=1, english="Naruto")]
+            if q == "One Peice":
+                return [Series(anilist_id=2, english="One Piece"), Series(anilist_id=3, english="One Punch-Man")]
+            return [Series(anilist_id=4, english="Wanted!")] if q == "Mystery Webtoon" else []
+        with mock.patch.object(metadata.anilist, "search", anilist), \
+                mock.patch.object(metadata.mangadex, "search", md_down):
+            for body in (b"One Peice\nNaruto\n", b"Naruto\nOne Peice\n"):
+                msg, added = self.sync(body)
+                self.assertEqual((msg, added), ("1 fetched, 1 added, 1 review; needs review: One Peice", ["Naruto"]))
+            # AniList suggests nothing close and MangaDex was not asked: not reviewed, looked up again next time
+            msg, added = self.sync(b"Naruto\nMystery Webtoon\nOne Peice\n")
+            self.assertEqual(msg, "1 fetched, 1 added, 1 review, 1 line(s) not checked (AniList or MangaDex could not "
+                                  "be reached; the next sync tries again); needs review: One Peice")
+            # nothing known in the probe and MangaDex not asked about the lines: no verdict either way
+            msg, added = self.sync(b"Mystery Webtoon\nAnother One\n")
+            self.assertEqual((msg, added), ("error: " + lists.UNREACHABLE, []))
+
+    def test_both_down_after_the_list_is_known(self):
+        """A line neither provider answered for, once the list proved to be one, is counted for the next sync,
+        not reported as a line nothing is like."""
+        calls = []
+
+        def lookup(t, unreached=None):
+            calls.append(t)
+            if t == "Bleach":
+                raise metadata.LookupError_("AniList and MangaDex could not be reached")
+            return Series(anilist_id=len(calls), english=t), []
+        msg, added = self.sync(b"One Piece\nBleach\nNaruto\n", lookup)
+        self.assertEqual(calls, ["One Piece", "Bleach", "Naruto"])
+        self.assertEqual((msg, added), ("2 fetched, 2 added, 1 line(s) not checked (AniList or MangaDex could not be "
+                                        "reached; the next sync tries again)", ["One Piece", "Naruto"]))
 
 
 class LinesTest(unittest.TestCase):
@@ -573,7 +620,7 @@ class LinesTest(unittest.TestCase):
         text = "\n".join(f"Title {i}" for i in range(5000))
         calls = []
 
-        def lookup(t, strict=False):
+        def lookup(t, unreached=None):
             calls.append(t)
             return Series(anilist_id=len(calls), english=t), []
         with mock.patch.object(lists, "_get_text", lambda url, **kw: text), \
@@ -590,7 +637,7 @@ class LinesTest(unittest.TestCase):
         # several series of exactly that title: no confident pick, but a title
         text = "Berserk\nMystery\n"
         twins = [Series(anilist_id=1, english="Berserk"), Series(anilist_id=2, english="Berserk")]
-        lookup = {"Berserk": (None, twins), "Mystery": (None, [Series(anilist_id=3, english="Mystery Man")])}
+        lookup = {"Berserk": (None, twins), "Mystery": (None, [Series(anilist_id=3, english="Mysteria")])}
         with mock.patch.object(lists, "_get_text", lambda url, **kw: text), \
                 mock.patch.object(lists.metadata, "lookup", lambda t, **kw: lookup[t]):
             fetched = lists.fetch_url_text({"url": "http://x"})

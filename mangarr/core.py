@@ -617,6 +617,7 @@ class AdoptItem:
     candidates: list[Series] = field(default_factory=list)
     manga_id: int | None = None
     tracked: bool = False
+    lookup_error: str | None = None     # AniList and MangaDex could not be asked: not identified, scan again
 
     @property
     def key(self) -> str:
@@ -671,12 +672,19 @@ def plan_adopt(client: Client, only: str | None = None, progress: Callable[[str]
     """Inspect every staged series folder and work out what it is. Each one
     costs a metadata lookup (rate limited), so a big staging tree takes a
     while: `progress` hears which folder is being identified, and a cancel
-    raises limits.Cancelled between folders."""
+    raises limits.Cancelled between folders.
+
+    A folder AniList and MangaDex could not be asked about (a network blip)
+    keeps its lookup_error and is not identified; the others are. When not
+    one lookup got an answer, metadata.LookupError_ is raised instead: a
+    list of nothing but unidentified folders would say nothing."""
     dirs = [(src, name, path) for src, name, path in library.staging_dirs()
             if not only or only.lower() in name.lower()]
     entries = suwayomi_downloaded_entries(client, {(src, name) for src, name, _ in dirs}, progress, should_cancel)
     items: list[AdoptItem] = []
     cache: dict[str, tuple[Series | None, list[Series]]] = {}
+    asked = failed = 0
+    error = None
     for i, (src, name, path) in enumerate(dirs, 1):
         if should_cancel and should_cancel():
             raise limits.Cancelled()
@@ -686,12 +694,25 @@ def plan_adopt(client: Client, only: str | None = None, progress: Callable[[str]
         seasons = any(library.parse_season(u) for u in unparsed)
         it = AdoptItem(src, name, path, numbers, unparsed, seasons, manga_id=entries.get((src, name)))
         if name not in cache:
-            cache[name] = metadata.lookup(name)
-        it.series, it.candidates = cache[name]
+            asked += 1
+            try:
+                cache[name] = metadata.lookup(name)
+            except metadata.LookupError_ as e:      # not cached: a later folder of that name asks again
+                failed += 1
+                error = e
+                it.lookup_error = f"not looked up: {e}"
+        if name in cache:
+            it.series, it.candidates = cache[name]
         items.append(it)
-        tag = it.series.ref if it.series else f"REVIEW ({len(it.candidates)} candidates)"
+        tag = it.series.ref if it.series else "NOT LOOKED UP" if it.lookup_error else \
+            f"REVIEW ({len(it.candidates)} candidates)"
         log.info("%-14s %-42s %4d ch%s -> %s", src[:14], name[:42], len(numbers),
                  f" +{len(unparsed)} unparsed" if unparsed else "", tag)
+    if asked and failed == asked:
+        raise error
+    if failed:
+        log.warning("adopt scan: %d of %d folder(s) could not be looked up (%s); scan again to identify them",
+                    failed, asked, error)
     return items
 
 

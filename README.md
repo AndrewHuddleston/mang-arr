@@ -422,10 +422,13 @@ lines that are not titles (`key=value`, markup, URLs, tokens) are skipped:
 they are neither looked up nor shown. A text file only counts as a title
 list once AniList or MangaDex know its lines: the lines are looked up until
 one is a series they know, and when none of the first 20 is, the sync stops
-with an error that quotes nothing. If AniList or MangaDex cannot be reached
-before then, the sync stops with "try again later" instead (the list is
-kept, and the next sync tries again). Up to 20 lines of whatever the URL
-returns are sent to AniList and MangaDex as searches that way. Each list has
+with an error that quotes nothing. If neither AniList nor MangaDex can be
+reached before then, or no line is known and one of them could not be
+asked about some of those lines, the sync stops with "try again later"
+instead (the list is kept, and the next sync tries again). Up to 20 lines
+of whatever the URL returns are sent to AniList and MangaDex as searches
+that way. With one of them down, the lines the other does not know are
+counted as *not checked* and looked up again at the next sync. Each list has
 its own sync interval (default 24 h), a download flag and a monitored flag,
 and can be disabled. Lists are checked every ten minutes and synced when
 due, or by *Sync now*; every series a sync yields that is not tracked yet
@@ -433,9 +436,9 @@ is queued as an ordinary add job (at most 25 per sync; the next sync
 continues), with the list's download / monitored flags. Titles from a text
 list without a single exact database match are reported as *needs review*
 in the list's result, not added - quoted when at least half of the lines
-looked up are series AniList or MangaDex know and they suggested some
-series for that line (a misspelt or ambiguous title), by line number
-otherwise.
+looked up are series AniList or MangaDex know and the line is nearly the
+title of a series they suggested for it (a misspelt or ambiguous title, so
+what is quoted is close to a public title), by line number otherwise.
 **Exclusions** are references a list must never add: tick *exclude from
 import lists* when deleting a series, or add one by reference. Deleting a
 list keeps the series it added.
