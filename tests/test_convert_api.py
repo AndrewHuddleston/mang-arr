@@ -1,10 +1,13 @@
 """The converter's standard-library side, without Pillow: the server can
 list profiles and ask whether conversion is available without Pillow ever
-being imported; options are checked before anything runs; and the archive
+being imported; options are checked before anything runs; the archive
 reader orders pages, caps entries and refuses ComicInfo it should not
-parse."""
+parse; and the engine's own tests are skipped only when Pillow is
+missing."""
+import importlib.util
 import io
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -23,6 +26,12 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(mangarr.__file__)))
 def run(code: str) -> subprocess.CompletedProcess:
     return subprocess.run([sys.executable, "-c", code], cwd=ROOT, capture_output=True, text=True, timeout=60,
                           env={**os.environ, "PYTHONPATH": ROOT})
+
+
+def engine_tests(first: str, name: str = "tests.test_convert_engine") -> subprocess.CompletedProcess:
+    """The engine's tests run by dotted name, as `python -m unittest` does
+    (tests/ is not on sys.path), after the line `first`."""
+    return run(f"import sys, unittest\n{first}\nunittest.main(module=None, argv=['test', '-v', {name!r}])")
 
 
 def cbz(entries) -> zipfile.ZipFile:
@@ -58,6 +67,27 @@ class ImportTests(unittest.TestCase):
         self.assertEqual(lines[0], "(False, \"Pillow is not installed: pip install 'mang-arr[convert]'\")")
         self.assertEqual(lines[1], "True")
         self.assertEqual(lines[2], "refused: Pillow is not installed: pip install 'mang-arr[convert]'")
+
+    def test_the_engine_tests_are_skipped_without_pillow(self):
+        r = engine_tests("sys.modules['PIL'] = None")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        ran = int(re.search(r"Ran (\d+) tests", r.stderr)[1])
+        self.assertGreater(ran, 20)
+        self.assertIn(f"OK (skipped={ran})", r.stderr)
+        self.assertEqual(r.stderr.count("skipped 'Pillow is not installed (the convert extra)'"), ran)
+
+    @unittest.skipIf(importlib.util.find_spec("PIL") is None, "Pillow is not installed (the convert extra)")
+    def test_with_pillow_the_engine_tests_run_or_fail(self):
+        r = engine_tests("", "tests.test_convert_engine.HostileInputTests.test_comicinfo_with_a_doctype_is_ignored")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("Ran 1 test", r.stderr)
+        self.assertNotIn("skipped", r.stderr)
+        # an engine that cannot be imported is an error, not a run of skips
+        r = engine_tests("sys.modules['mangarr.convert.engine'] = None")
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("FAILED (errors=1)", r.stderr)
+        self.assertIn("mangarr.convert.engine", r.stderr)
+        self.assertNotIn("skipped", r.stderr)
 
     def test_available(self):
         with mock.patch("importlib.util.find_spec", return_value=None):

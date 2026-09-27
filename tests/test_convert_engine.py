@@ -4,6 +4,7 @@ metadata that reaches the book, byte-identical output, and hostile pages
 that must fail with the page's name and leave nothing behind. Needs Pillow
 (the convert extra); skipped without it."""
 import hashlib
+import importlib.util
 import io
 import os
 import re
@@ -15,15 +16,21 @@ import zipfile
 from itertools import pairwise
 from unittest import mock
 
-try:
-    import convert_fixtures as fx
+from mangarr.convert import ConvertError, Options, convert_chapter, profiles
+
+# Skipped only when Pillow is missing: with it installed, an import that
+# fails here (a broken engine) fails the run instead of skipping it.
+PILLOW = importlib.util.find_spec("PIL") is not None
+NO_PILLOW = "Pillow is not installed (the convert extra)"
+if PILLOW:
     from PIL import Image, ImageChops, ImageFile, JpegImagePlugin, PngImagePlugin
 
     from mangarr.convert import engine
-except ImportError:             # the convert extra is not installed
-    Image = None
 
-from mangarr.convert import ConvertError, Options, convert_chapter, profiles
+    try:                        # run by discover (-s tests) or as tests.test_convert_engine
+        import convert_fixtures as fx
+    except ImportError:
+        from tests import convert_fixtures as fx
 
 OPF_NS = {"o": "http://www.idpf.org/2007/opf", "dc": "http://purl.org/dc/elements/1.1/"}
 
@@ -46,8 +53,8 @@ def sha(path: str) -> str:
 
 class Base(unittest.TestCase):
     def setUp(self):
-        if Image is None:
-            self.skipTest("Pillow is not installed (the convert extra)")
+        if not PILLOW:
+            self.skipTest(NO_PILLOW)
         patcher = mock.patch.dict(profiles.PROFILES, fx.PROFILES)
         patcher.start()
         self.addCleanup(patcher.stop)
@@ -62,7 +69,7 @@ class Base(unittest.TestCase):
         return convert_chapter(src, os.path.join(self.out, name), Options(**opts), **kw)
 
 
-@unittest.skipIf(Image is None, "Pillow is not installed (the convert extra)")
+@unittest.skipIf(not PILLOW, NO_PILLOW)
 class MangaTests(Base):
     @classmethod
     def setUpClass(cls):
@@ -250,7 +257,7 @@ class MangaTests(Base):
             self.assertIsNone(z.testzip())
 
 
-@unittest.skipIf(Image is None, "Pillow is not installed (the convert extra)")
+@unittest.skipIf(not PILLOW, NO_PILLOW)
 class WebtoonTests(Base):
     @classmethod
     def setUpClass(cls):
@@ -314,7 +321,7 @@ class WebtoonTests(Base):
         self.assertTrue(all(ImageChops.difference(p.convert("L"), Image.new("L", p.size, 255)).getbbox() for p in pages))
 
 
-@unittest.skipIf(Image is None, "Pillow is not installed (the convert extra)")
+@unittest.skipIf(not PILLOW, NO_PILLOW)
 class HostileInputTests(Base):
     def page(self, w=600, h=900, fmt="jpg", **kw):
         return fx.encode(Image.new("L", (w, h), 200), fmt, **kw)
@@ -401,7 +408,7 @@ class HostileInputTests(Base):
         self.assertLess(means[3], 50)                            # the first frame
 
 
-@unittest.skipIf(Image is None, "Pillow is not installed (the convert extra)")
+@unittest.skipIf(not PILLOW, NO_PILLOW)
 class DraftTests(Base):
     def test_large_jpegs_decode_at_a_reduced_scale_with_the_same_result(self):
         rnd = fx.random.Random(5)
