@@ -802,7 +802,7 @@ class LongJobProgressTest(Base):
         said = []
         known = {"One": Series(anilist_id=1, english="One"), "Two": Series(anilist_id=2, english="Two")}
         with mock.patch.object(lists, "_get_text", lambda url, **kw: "One\nTwo"), \
-                mock.patch.object(lists.metadata, "lookup", lambda t: (known.get(t), [])):
+                mock.patch.object(lists.metadata, "lookup", lambda t, **kw: (known.get(t), [])):
             lists.fetch("url_text", {"url": "http://x"}, progress=said.append)
         self.assertEqual(said, ["looking up line 1 of 2", "looking up line 2 of 2"])
 

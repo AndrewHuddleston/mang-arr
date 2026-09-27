@@ -586,6 +586,26 @@ def chapters(con, series_id: int, limit: int | None = None, offset: int = 0):
                        (series_id, limit, offset)).fetchall()
 
 
+def chapter_index(con, series_id: int):
+    """Number, status and name of every chapter row, by number: all the
+    series page groups, counts and pages by (chapters_by_number for the
+    whole rows of the page it shows)."""
+    return con.execute("SELECT number, status, name FROM chapter WHERE series_id=? ORDER BY number",
+                       (series_id,)).fetchall()
+
+
+def chapters_by_number(con, series_id: int, numbers) -> dict:
+    """{number: whole chapter row} for these chapter numbers, in statements
+    of at most 500 (SQLite limits the parameters of one)."""
+    numbers, out = list(numbers), {}
+    for i in range(0, len(numbers), 500):
+        part = numbers[i:i + 500]
+        for r in con.execute(f"SELECT * FROM chapter WHERE series_id=? AND number IN ({','.join('?' * len(part))})",
+                             (series_id, *part)):
+            out[r["number"]] = r
+    return out
+
+
 def chapter_count(con, series_id: int) -> int:
     return con.execute("SELECT COUNT(*) FROM chapter WHERE series_id=?", (series_id,)).fetchone()[0]
 

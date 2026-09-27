@@ -50,24 +50,29 @@ def _pick(cands: list[Series], query: str, author_hint: str | None) -> Series | 
     return None
 
 
-def _safe(fn, query):
-    """A provider failure is logged and treated as 'no candidates from it';
-    the other provider still gets a chance. The query is logged only at
-    DEBUG: it may be a line of an import list URL's answer, and the log is
-    readable on the System page."""
-    provider = fn.__module__.split(".")[-1]
+def _safe(provider: str, fn, query, failed: list[str]):
+    """A provider failure is logged, noted in `failed` and treated as 'no
+    candidates from it'; the other provider still gets a chance. The query
+    is logged only at DEBUG: it may be a line of an import list URL's
+    answer, and the log is readable on the System page."""
     try:
         return fn(query)
     except Exception as e:
         log.warning("%s lookup failed: %s: %s", provider, type(e).__name__, oneline(e, 300))
         log.debug("%s lookup that failed was for %r", provider, query[:200])
+        failed.append(provider)
         return []
 
 
-def lookup(query: str) -> tuple[Series | None, list[Series]]:
+def lookup(query: str, strict: bool = False) -> tuple[Series | None, list[Series]]:
     """(confident pick or None, candidates shown to the user). The query is
     typed, or a line of an import list: anything past MAX_TITLE characters
-    is cut (logged) before it is matched or sent to the providers."""
+    is cut (logged) before it is matched or sent to the providers.
+
+    Raises LookupError_ when no pick was found and no provider answered at
+    all: "no candidates" would be untrue. With strict, also when one of
+    them did not answer: the caller must not take the title for one neither
+    knows (an import list deciding whether its lines are titles)."""
     query = (query or "").strip()
     if len(query) > MAX_TITLE:
         log.info("lookup query cut to %d characters: %s", MAX_TITLE, oneline(query, 80))
@@ -82,21 +87,27 @@ def lookup(query: str) -> tuple[Series | None, list[Series]]:
         queries.append(" ".join(words[:_LONG]))
 
     seen: dict[str, Series] = {}
+    failed: list[str] = []
+    asked = 0
     for q in queries:
-        al = _safe(anilist.search, q)
+        asked += 1
+        al = _safe("AniList", anilist.search, q, failed)
         for s in al:
             seen.setdefault(s.ref, s)
         for target in (query, base):
             pick = _pick(al, target, hint)
             if pick:
                 return pick, list(seen.values())
-        md = _safe(mangadex.search, q)
+        asked += 1
+        md = _safe("MangaDex", mangadex.search, q, failed)
         for s in md:
             seen.setdefault(s.ref, s)
         for target in (query, base):
             pick = _pick(md, target, hint)
             if pick:
                 return pick, list(seen.values())
+    if failed and (strict or len(failed) == asked):
+        raise LookupError_(f"{' and '.join(dict.fromkeys(failed))} could not be reached")
     cands = list(seen.values())
     cands.sort(key=lambda s: (min(query_score(t, base) for t in s.titles) if s.titles else 9,
                               -s.popularity))

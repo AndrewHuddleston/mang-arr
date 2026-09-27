@@ -75,3 +75,31 @@ class LookupTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ProviderFailureTest(unittest.TestCase):
+    """Round 3 (medium): a provider failure was swallowed, so "nobody answered" looked like "nobody knows
+    this title" to the caller."""
+
+    @staticmethod
+    def down(q, limit=8):
+        raise OSError("network down")
+
+    def test_nobody_answering_is_an_error(self):
+        with mock.patch.object(metadata.anilist, "search", self.down), \
+                mock.patch.object(metadata.mangadex, "search", self.down), self.assertLogs("mangarr.metadata"), \
+                self.assertRaises(metadata.LookupError_) as cm:
+            metadata.lookup("One Piece")
+        self.assertEqual(str(cm.exception), "AniList and MangaDex could not be reached")
+
+    def test_one_provider_down(self):
+        md = [S(mangadex_id="u1", english="Berserk of Gluttony")]
+        with mock.patch.object(metadata.anilist, "search", self.down), \
+                mock.patch.object(metadata.mangadex, "search", lambda q, limit=8: list(md)), \
+                self.assertLogs("mangarr.metadata"):
+            self.assertEqual(metadata.lookup("Berserk"), (None, md))          # the Add page still shows these
+            with self.assertRaises(metadata.LookupError_) as cm:
+                metadata.lookup("Berserk", strict=True)                        # ... but AniList was not asked
+            self.assertEqual(str(cm.exception), "AniList could not be reached")
+            self.assertEqual(metadata.lookup("Berserk of Gluttony", strict=True)[0], md[0])  # a pick is a pick
+

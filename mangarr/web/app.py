@@ -641,21 +641,30 @@ def index(request: Request, q: str = ""):
 def series_page(request: Request, series_id: int, page_no: int = Query(1, alias="page")):
     """The series details page. The counts cover every chapter; the chapter
     rows are paged (views.page_groups), so a source listing tens of
-    thousands of chapters cannot make one response huge."""
+    thousands of chapters cannot make one response huge. Grouping and
+    counting need only number, status and name of every row
+    (db.chapter_index); whole rows are read for the page shown only. That
+    still reads those three columns of every row on each view, so the cost
+    grows with the rows stored (100,000: about 1 s and 35 MB, from 2.5 s
+    and 70 MB); keeping per-group counts in the database would be needed
+    to go below that."""
     with db.connect() as con:
         r = db.get_series(con, series_id)
         if not r:
             raise HTTPException(404, "no such series")
         srcs = db.sources(con, series_id)
-        chs = db.chapters(con, series_id)
+        chs = db.chapter_index(con, series_id)
+        groups, paging = views.page_groups(views.group_chapters(chs, r), page_no)
+        whole = db.chapters_by_number(con, series_id, [c["number"] for g in groups for c in g["chapters"]])
         events = con.execute("SELECT * FROM event WHERE series_id=? ORDER BY id DESC LIMIT 15",
                              (series_id,)).fetchall()
         size_fn = getattr(db, "series_size", None)          # lands on main; (bytes, files)
         size_bytes, size_files = size_fn(con, series_id) if size_fn else (0, 0)
+    for g in groups:
+        g["chapters"] = [whole.get(c["number"], c) for c in g["chapters"]]
     by: dict[str, list] = {}
     for c in chs:
         by.setdefault(c["status"], []).append(c["number"])
-    groups, paging = views.page_groups(views.group_chapters(chs, r), page_no)
     if paging["pages"] > 1:
         log.debug("series %d: %d chapter rows, showing page %d of %d", series_id, paging["total"], paging["page"],
                   paging["pages"])

@@ -247,6 +247,25 @@ class SeriesPagingWebTest(WebBase):
         self.assertNotIn('data-number="4100"', last.text)
         self.assertIn('href="?page=2">Newer</a>', last.text)
 
+    def test_series_page_reads_whole_rows_for_the_page_only(self):
+        """Round 3: every view loaded and grouped every whole chapter row, although a page shows at most
+        PAGE_CHAPTERS. Only number, status and name are read for all of them now, and names are parsed for
+        seasons only until one is not season-numbered."""
+        from mangarr import library
+        fetched, parsed = [], []
+        real_fetch, real_parse = db.chapters_by_number, library.parse_season
+        with mock.patch.object(db, "chapters", side_effect=AssertionError("whole rows of every chapter")), \
+                mock.patch.object(db, "chapters_by_number",
+                                  lambda con, sid, numbers: fetched.append(len(numbers)) or real_fetch(con, sid, numbers)), \
+                mock.patch.object(library, "parse_season", lambda name: parsed.append(name) or real_parse(name)):
+            r = self.client.get(f"/series/{self.sid}?page=2")
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(fetched, [views.PAGE_CHAPTERS])
+        self.assertEqual(parsed, ["Chapter 1"])
+        self.assertEqual(r.text.count('<tr class="episode-row'), views.PAGE_CHAPTERS)
+        self.assertIn("waiting", r.text)                               # the rows shown are whole rows
+        self.assertIn("4100 missing", r.text)                          # the counts still cover every chapter
+
     def test_short_series_has_no_paging(self):
         with db.connect() as con:
             con.execute("DELETE FROM chapter WHERE number > 30")

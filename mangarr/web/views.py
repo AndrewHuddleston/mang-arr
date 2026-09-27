@@ -133,23 +133,34 @@ def group_chapters(chapters, series_row=None) -> list[dict]:
     rows = list(chapters)
     if not rows:
         return []
-    named = [c for c in rows if _val(c, "name")]
-    seasons = {id(c): library.parse_season(_val(c, "name")) for c in named}
-    by_season = bool(named) and all(seasons.values())
+    seasons: dict[int, tuple[int, float]] = {}
+    for c in rows:
+        name = _val(c, "name")
+        if name:
+            s = library.parse_season(name)
+            if s is None:                  # one plain name: blocks, and the other names need no parsing
+                seasons = {}
+                break
+            seasons[id(c)] = s
+    by_season = bool(seasons)
     groups: dict = {}                      # sort key -> group; keys sort newest first, 'Unnumbered' last
+    # (a group's dict is made only when its key is new: this runs once per chapter row)
     if by_season:
         for c in rows:
             s = seasons.get(id(c))
             key = (0, -s[0]) if s else (1, 0)
-            g = groups.setdefault(key, {"key": f"season-{s[0]}" if s else "unnumbered",
-                                        "name": f"Season {s[0]}" if s else "Unnumbered", "chapters": []})
-            g["chapters"].append(c)
+            if key not in groups:
+                groups[key] = {"key": f"season-{s[0]}" if s else "unnumbered",
+                               "name": f"Season {s[0]}" if s else "Unnumbered", "chapters": []}
+            groups[key]["chapters"].append(c)
     else:
         for c in rows:
             start = _block_start(float(_val(c, "number") or 0))
-            g = groups.setdefault((0, -start), {"key": f"block-{start}",
-                                               "name": f"Chapters {start}-{start + BLOCK - 1}", "chapters": []})
-            g["chapters"].append(c)
+            key = (0, -start)
+            if key not in groups:
+                groups[key] = {"key": f"block-{start}", "name": f"Chapters {start}-{start + BLOCK - 1}",
+                               "chapters": []}
+            groups[key]["chapters"].append(c)
     out = []
     for key in sorted(groups):
         g = groups[key]

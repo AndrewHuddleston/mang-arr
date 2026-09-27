@@ -13,8 +13,8 @@ Each list kind is a fetch(params) -> Fetched(series, review, skipped, quoted)
 function in FETCHERS; review are lines of a text list that look like titles
 but could not be identified with confidence (the user adds them by hand) -
 the lines themselves, or only "line N" when the list did not prove to be a
-title list (see fetch_url_text) - and skipped counts lines that do not look
-like titles at all.
+title list or nothing like the line is known (see fetch_url_text) - and
+skipped counts lines that do not look like titles at all.
 """
 import functools
 import http.client
@@ -51,7 +51,7 @@ class Fetched(NamedTuple):
     series: list[Series]
     review: list[str]           # look like titles, no confident match: listed for the user
     skipped: int = 0            # text list lines that are not titles: neither looked up nor shown
-    quoted: bool = True         # review holds the lines; False: only "line N" (see fetch_url_text)
+    quoted: bool = True         # the list proved to be one; False: review holds only "line N" (fetch_url_text)
 
 
 # -- AniList: a user's lists ----------------------------------------------------
@@ -134,7 +134,7 @@ MAX_LIST_LINES = 500            # lines looked up per sync
 MAX_LINE = 300                  # characters; longer lines are not titles (same limit as a manual ref)
 FETCH_TIMEOUT = 20              # seconds per network operation ...
 FETCH_DEADLINE = 60             # ... and for the whole download
-PROBE_LINES = 5                 # lines looked up before one must be a series AniList or MangaDex knows
+PROBE_LINES = 20                # lines looked up before one must be a series AniList or MangaDex knows
 MAX_REVIEW_SHOWN = 10           # unidentified lines quoted in last_result ...
 MAX_REVIEW_CHARS = 80           # ... each cut to this many characters
 
@@ -146,6 +146,7 @@ class ListFetchError(ValueError):
 
 
 NOT_A_LIST = "the URL did not return a title list"
+_BY_NUMBER = re.compile(r"line \d+")
 _THIS_NETWORK = ipaddress.ip_network("0.0.0.0/8")
 _LOCAL_NAMES = ("localhost", "localhost.localdomain", "ip6-localhost", "ip6-loopback")
 
@@ -597,16 +598,22 @@ def list_titles(text: str, max_lines: int | None = None) -> tuple[list[Line], in
     return titles, skipped
 
 
+UNREACHABLE = "AniList or MangaDex could not be reached, so the list's titles could not be checked; try again later"
+
+
 def _unknown(looked: int, failed: int) -> ListFetchError:
-    """The error for a list none of whose lines looked up is a series
-    AniList or MangaDex knows. It quotes none of them."""
-    if failed >= looked:
-        log.warning("text list: none of %d line(s) could be looked up (AniList and MangaDex unreachable?)", looked)
-        return ListFetchError("the titles could not be looked up at AniList or MangaDex; try again later")
+    """The error for a list none of whose lines looked up is known to be a
+    series AniList or MangaDex knows: not a title list, or - when a lookup
+    failed - not known yet (the list stays as it is; the next sync tries
+    again). It quotes none of the lines."""
+    if failed:
+        log.warning("text list: %d of %d line(s) could not be looked up (AniList or MangaDex unreachable); "
+                    "nothing more looked up", failed, looked)
+        return ListFetchError(UNREACHABLE)
     log.warning("text list: none of the %d line(s) looked up is a series AniList or MangaDex knows; not taken "
                 "for a title list: nothing more looked up, nothing quoted", looked)
     return ListFetchError(f"{NOT_A_LIST}: none of the {looked} line(s) looked up is a series AniList or MangaDex "
-                          "knows" + (f" ({failed} could not be looked up)" if failed else ""))
+                          "knows")
 
 
 def fetch_url_text(params: dict, should_cancel: Callable[[], bool] | None = None,
@@ -623,13 +630,17 @@ def fetch_url_text(params: dict, should_cancel: Callable[[], bool] | None = None
     so AniList and MangaDex decide. A line is known when it is a confident
     pick or the exact title of some series there. Until one line is known,
     at most PROBE_LINES are looked up; when none is, the sync fails and
-    quotes nothing. Lines without a confident pick are quoted for review
-    only when at least half of the lines looked up are known - the body has
-    then proved to be a title list - and are otherwise given only by line
-    number. Lines are logged by number, never quoted."""
+    quotes nothing. A lookup that fails before then (a provider down or
+    rate-limiting) ends the sync with "try again later" instead: whether
+    the lines are titles is not known. Lines without a confident pick are
+    quoted for review only when at least half of the lines looked up are
+    known - the body has then proved to be a title list - and AniList or
+    MangaDex suggested some series for that line (a misspelt or ambiguous
+    title); the others are given only by line number. Lines are logged by
+    number, never quoted."""
     lines, skipped = list_titles(_get_text(params["url"], should_cancel=should_cancel), MAX_LIST_LINES)
     series: dict[str, Series] = {}
-    unmatched: list[Line] = []
+    unmatched: list[tuple[Line, bool]] = []     # (line, AniList or MangaDex suggested series for it)
     looked = known = failed = 0
     cancelled = False
     for ln in lines:
@@ -637,7 +648,7 @@ def fetch_url_text(params: dict, should_cancel: Callable[[], bool] | None = None
             log.info("text list sync cancelled after %d of %d line(s)", looked, len(lines))
             cancelled = True
             break
-        if not known and looked >= PROBE_LINES:
+        if not known and (failed or looked >= PROBE_LINES):
             raise _unknown(looked, failed)
         if progress:
             progress(f"looking up line {looked + 1} of {len(lines)}")
@@ -648,7 +659,7 @@ def fetch_url_text(params: dict, should_cancel: Callable[[], bool] | None = None
                 s = metadata.by_ref(ln.text)
                 s = s if s and s.title != "?" else None
             else:
-                s, cands = metadata.lookup(ln.text)
+                s, cands = metadata.lookup(ln.text, strict=True)
         except Exception as e:
             failed += 1
             log.warning("list line %d: lookup failed: %s: %s", ln.no, type(e).__name__, oneline(e, 300))
@@ -661,14 +672,14 @@ def fetch_url_text(params: dict, should_cancel: Callable[[], bool] | None = None
         if any(query_score(t, ln.text) == 0 for c in cands for t in c.titles):
             known += 1                  # several series of exactly that title: a title all the same
         log.debug("list line %d: no confident match (%d candidate(s))", ln.no, len(cands))
-        unmatched.append(ln)
+        unmatched.append((ln, bool(cands)))
     if looked and not known and not cancelled:
         raise _unknown(looked, failed)
     quoted = known > 0 and known * 2 >= looked
     if unmatched and not quoted:
         log.warning("text list: only %d of %d line(s) looked up are series AniList or MangaDex knows; the %d "
                     "without a match are reported by line number, not quoted", known, looked, len(unmatched))
-    review = [ln.text if quoted else f"line {ln.no}" for ln in unmatched]
+    review = [ln.text if quoted and like else f"line {ln.no}" for ln, like in unmatched]
     return Fetched(list(series.values()), review, skipped, quoted)
 
 
@@ -917,6 +928,8 @@ def sync(con: sqlite3.Connection, row, submit_add: Callable[[Series, bool, bool]
         msg += "; needs review: " + " | ".join(shown) + (" | ..." if len(review) > MAX_REVIEW_SHOWN else "")
         if not quoted:
             msg += " (not quoted: fewer than half of the lines looked up are series AniList or MangaDex knows)"
+        elif any(_BY_NUMBER.fullmatch(t) for t in review):
+            msg += " (lines AniList and MangaDex found nothing like are given by number)"
     mark_synced(con, row["id"], msg)
     log.info("list %s: %s", name, msg)
     return msg

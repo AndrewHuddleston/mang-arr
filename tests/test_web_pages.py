@@ -315,9 +315,18 @@ class PagesTest(unittest.TestCase):
         with mock.patch("mangarr.web.app.metadata.lookup", boom):
             self._ok("/add?term=x", "lookup failed")
 
+        def down(q, limit=8):                   # round 3: both providers down was "Couldn't find any results"
+            raise OSError("network down")
+        with mock.patch("mangarr.metadata.anilist.search", down), mock.patch("mangarr.metadata.mangadex.search", down):
+            html = self._ok("/add?term=Berserk", "lookup failed", "AniList and MangaDex could not be reached")
+        self.assertNotIn("Couldn&#39;t find any results", html)
+
     def test_other_pages(self):
         self._ok("/import", "Scan Folders", "No scan yet")
-        self._ok("/lists", "Add a list", 'id="addlist"', 'name="sync_hours"', "Exclusions")
+        self._ok("/lists", "Add a list", 'id="addlist"', 'name="sync_hours"', "Exclusions",
+                 # round 3: the help says exactly what is refused (it claimed "not on the machine mang-arr runs on")
+                 "Refused are only loopback (localhost, 127.0.0.1, ::1), link-local, multicast and 0.0.0.0 "
+                 "addresses: the LAN and Docker addresses of the machine mang-arr runs on are allowed.")
         html = self._ok("/wanted", "Alpha Manga", 'action="/wanted/search"', 'id="missing-table"', 'id="select-all"',
                         f'data-select="{self.sid}"', 'data-label-selected="Search Selected"',
                         f'action="/series/{self.sid}/refresh"')
