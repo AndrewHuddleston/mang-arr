@@ -332,7 +332,7 @@ class ZipBombTest(unittest.TestCase):
         small = deflated(b"\0" * (250 << 10))                  # under the per-entry ratio floor
         cases = [(2047, page, "uncompressed"),                  # the evidence: 2 GiB, passed after 14 s
                  (900, page, "expands"),                        # under 1 GiB, but each page expands ~1000x
-                 (4000, small, "byte file")]                    # small pages: the whole file expands ~800x
+                 (4000, small, "from a file that stores")]      # small pages: the whole file expands ~800x
         for pages, entry, why in cases:
             p = build_zip(os.path.join(self.d, f"zeros{pages}.cbz"), [(f"{i:04d}.jpg", *entry) for i in range(pages)])
             t = time.monotonic()
@@ -480,6 +480,54 @@ class ZipBombTest(unittest.TestCase):
             ok, detail = verify_archive(p)
         self.assertFalse(ok)
         self.assertIn("longer than", detail)
+
+
+class SparseArchiveTest(unittest.TestCase):
+    """Round 3, finding #114 still open: the ratio and overlap limits compared against the file's apparent
+    size, and a sparse file (holes that read back as zeros) is far larger than what it stores."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.d = self.tmp.name
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    @staticmethod
+    def sparse_copy(src: str, dst: str) -> None:
+        """dst: src with every all-zero 4 KiB block left as a hole."""
+        with open(src, "rb") as fi, open(dst, "wb") as fo:
+            while block := fi.read(4096):
+                if block.count(0) == len(block):
+                    fo.seek(len(block), os.SEEK_CUR)
+                else:
+                    fo.write(block)
+            fo.truncate()
+
+    def test_sparse_archive_is_refused_before_reading_it(self):
+        zeros = b"\0" * (256 << 10)
+        dense = build_zip(os.path.join(self.d, "dense.cbz"), [(f"{i:03d}.jpg", *stored(zeros)) for i in range(200)])
+        p = os.path.join(self.d, "sparse.cbz")
+        self.sparse_copy(dense, p)
+        st = os.stat(p)
+        if st.st_blocks * 512 * 4 > st.st_size:
+            self.skipTest("this file system does not keep sparse files")
+        with mock.patch.object(zipfile.ZipFile, "open", side_effect=AssertionError("read back")) as opened, \
+                self.assertLogs("mangarr.library", "WARNING"):
+            ok, detail = verify_archive(p)
+        self.assertFalse(ok)
+        self.assertIn("entries overlap or the file is sparse: they claim 52428800 bytes of data from a file that "
+                      f"stores {st.st_blocks * 512} bytes", detail)
+        opened.assert_not_called()
+
+    def test_stored_bytes(self):
+        from types import SimpleNamespace as St
+        self.assertEqual(library._stored_bytes(St(st_size=50_000, st_blocks=8)), 4096)        # sparse
+        self.assertEqual(library._stored_bytes(St(st_size=50_000, st_blocks=200)), 50_000)    # blocks round up
+        self.assertEqual(library._stored_bytes(St(st_size=50_000, st_blocks=0)), 50_000)      # FUSE: no blocks said
+        self.assertEqual(library._stored_bytes(St(st_size=50_000)), 50_000)
+        p = make_cbz(os.path.join(self.d, "real.cbz"), 5)
+        self.assertEqual(verify_archive(p), (True, "5 pages"))
 
 
 class CopyFallbackTest(unittest.TestCase):
@@ -670,6 +718,58 @@ class ImportTest(ImportBase):
         self.assertEqual(rows[1.0]["status"], "failed")
         self.assertIn("not set aside", rows[1.0]["reason"])
         self.assertEqual(rows[2.0]["status"], "have")
+
+
+class Round3ImportTest(ImportBase):
+    """Round 3: running out of time is no verdict on a file, and failures in the staging folder name it."""
+
+    def test_verification_out_of_time_is_try_again_later(self):
+        """The verifier's code path: a chapter whose check ran past VERIFY_SECONDS was quarantined, failed
+        ('will be fetched again') and counted as corrupt against its source, on every pass for a big chapter
+        on slow storage."""
+        p = make_cbz(os.path.join(self.folder, "Chapter 1.cbz"), 3)
+        age(p, 3600)
+        with mock.patch.object(library, "VERIFY_SECONDS", -1):
+            self.assertEqual(verify_archive(p), (None, "checking it took longer than -1s (slow or busy storage)"))
+        with db.connect(self.dbpath) as con:
+            sid = self._series(con)
+            self._wanted(con, sid, 1)
+            with mock.patch.object(library, "VERIFY_SECONDS", -1), self.assertLogs("mangarr", "WARNING") as cm:
+                self.assertEqual(core.import_series(con, sid), 0)
+            row = db.chapters(con, sid)[0]
+            self.assertEqual((row["status"], row["reason"]), ("wanted", None))
+            self.assertEqual(con.execute("SELECT COUNT(*) FROM source_stats").fetchone()[0], 0)   # no penalty
+            self.assertTrue(os.path.exists(p))
+            self.assertFalse(os.path.exists(p + ".corrupt"))
+            self.assertIn("could not be checked", "\n".join(cm.output))
+            self.assertIn("trying again at the next import", "\n".join(cm.output))
+            self.assertEqual(core.import_series(con, sid), 1)                # the next import, in time
+            self.assertEqual(db.chapters(con, sid)[0]["status"], "have")
+
+    @unittest.skipIf(os.geteuid() == 0, "root reads and writes through any mode")
+    def test_staging_failures_name_the_staging_folder(self):
+        """The verifier's repro: reasons for an unreadable staged file, or a bad one that could not be set
+        aside, named only the bare file name since the import works through the open folder."""
+        one, two = os.path.join(self.folder, "Chapter 1.cbz"), os.path.join(self.folder, "Chapter 2.cbz")
+        age(make_cbz(one), 3600)
+        write(two, b"PK" + b"x" * 3000)
+        age(two, 3600)
+        os.chmod(one, 0)
+        os.chmod(self.folder, 0o555)                             # the usual PUID/PGID mistake
+        try:
+            with db.connect(self.dbpath) as con, self.assertLogs("mangarr.core", "ERROR") as cm:
+                sid = self._series(con)
+                self._wanted(con, sid, 1, 2)
+                self.assertEqual(core.import_series(con, sid), 0)
+                rows = {r["number"]: r["reason"] for r in db.chapters(con, sid)}
+        finally:
+            os.chmod(self.folder, 0o755)
+            os.chmod(one, 0o644)
+        self.assertEqual(rows[1.0], f"Src (EN): cannot read Chapter 1.cbz: PermissionError: [Errno 13] "
+                                    f"Permission denied: '{one}'")
+        self.assertEqual(rows[2.0], f"Src (EN): bad file Chapter 2.cbz not set aside: PermissionError: [Errno 13] "
+                                    f"Permission denied: '{two}' -> '{two}.corrupt'")
+        self.assertIn(repr(one), "\n".join(cm.output))
 
 
 class LinkTest(ImportBase):

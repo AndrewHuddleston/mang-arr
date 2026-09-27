@@ -386,7 +386,7 @@ class StagedFile:
         except OSError as e:
             if e.errno == errno.ELOOP:
                 raise NotRegularFile(e.errno, "a symlink, not a regular file", path) from None
-            raise
+            raise _naming(e, path) from e      # opened by plain name: say which staging folder
         try:
             self.st = os.fstat(self.fd)
             if not stat.S_ISREG(self.st.st_mode):
@@ -502,11 +502,12 @@ def link_into_library(src: str | StagedFile, folder: str, number: float, root: s
     return dst
 
 
-def _naming(e: OSError, src: str, dst: str) -> OSError:
+def _naming(e: OSError, src: str, dst: str | None = None) -> OSError:
     """e (same type, so FileNotFoundError still means the file went away),
-    naming the staged file and its library path instead of the names the
-    call was made with, so the reason on the chapter says which folder
-    could not be written (the usual PUID/PGID mistake)."""
+    naming the staged file (and where it was going) by full path instead of
+    the plain names the call was made with, so the reason on the chapter
+    says which folder could not be read or written (the usual PUID/PGID
+    mistake)."""
     if e.errno is None:
         return e
     return type(e)(e.errno, e.strerror, src, None, dst)
@@ -620,11 +621,17 @@ _END64 = struct.Struct("<4sQ2H2L4Q")            # zip64 end of central directory
 _CENTRAL = struct.Struct("<4s4B4HL2L5H2L")      # one central directory header
 
 
-def verify_archive(src: str | StagedFile) -> tuple[bool, str]:
+class _OutOfTime(Exception):
+    """Reading the entries back took longer than VERIFY_SECONDS."""
+
+
+def verify_archive(src: str | StagedFile) -> tuple[bool | None, str]:
     """Is this a readable comic archive with at least one image? Returns
     (ok, detail) and never raises: a truncated, corrupt, encrypted or
     oversized file (or a symlink) must not reach the library, and must not
-    stop the import of the other chapters either. src is an opened
+    stop the import of the other chapters either. ok is None when reading
+    the entries back ran out of time (VERIFY_SECONDS, slow or busy storage):
+    that says nothing about the file, so try again later. src is an opened
     StagedFile or a path (never opened through a symlink). A directory too
     big for a chapter is refused from the end records alone, before zipfile
     reads it; oversized or over-compressed contents are refused from the
@@ -640,7 +647,8 @@ def verify_archive(src: str | StagedFile) -> tuple[bool, str]:
         except Exception as e:
             return False, f"{type(e).__name__}: {e}"[:300]
     try:
-        size = os.fstat(src.fd).st_size
+        st = os.fstat(src.fd)
+        size = st.st_size
         if size < 1024:
             return False, "file is empty"
         snap = _Snapshot(src.fd, size)
@@ -652,18 +660,32 @@ def verify_archive(src: str | StagedFile) -> tuple[bool, str]:
             return _rejected(src.path, problem)
         with zipfile.ZipFile(snap) as z:
             infos = z.infolist()
-            problem = _archive_limits(infos, size)
+            problem = _archive_limits(infos, _stored_bytes(st))
             if problem:
                 return _rejected(src.path, problem)
-            bad = _read_entries(z, infos, src.path)
+            bad = _read_entries(z, infos)
             if bad:
                 return False, bad
         images = [i.filename for i in infos if i.filename.lower().endswith(_IMAGE_EXT)]
         if not images:
             return False, "no images inside"
         return True, f"{len(images)} pages"
+    except _OutOfTime:
+        detail = f"checking it took longer than {VERIFY_SECONDS}s (slow or busy storage)"
+        log.warning("%s not checked: %s; trying again later", src.path, detail)
+        return None, detail
     except Exception as e:      # zlib.error, NotImplementedError, RuntimeError (encrypted), EOFError ...
         return False, f"{type(e).__name__}: {e}"[:300]
+
+
+def _stored_bytes(st: os.stat_result) -> int:
+    """The bytes a file really holds: its size, or the blocks it takes on
+    disk when that is less. A sparse file (holes that read back as zeros)
+    has a size far above what is stored, and would pass the ratio and
+    overlap limits on its size. A file system that reports no blocks at
+    all (some FUSE mounts) gets its size."""
+    blocks = getattr(st, "st_blocks", 0) * 512
+    return min(st.st_size, blocks) if blocks > 0 else st.st_size
 
 
 def _rejected(path: str, problem: str) -> tuple[bool, str]:
@@ -804,7 +826,8 @@ def _directory_limits(snap: _Snapshot, entries: int, cd_size: int, cd_at: int) -
 
 
 def _archive_limits(infos, size: int) -> str | None:
-    """Why an archive's parsed directory is implausible for a chapter, or None."""
+    """Why an archive's parsed directory is implausible for a chapter, or
+    None. size is what the file stores (_stored_bytes), not its length."""
     if len(infos) > MAX_ENTRIES:
         return f"{len(infos)} entries (limit {MAX_ENTRIES})"
     for i in infos:
@@ -812,10 +835,12 @@ def _archive_limits(infos, size: int) -> str | None:
             method = _METHOD_NAMES.get(i.compress_type, f"method {i.compress_type}")
             return f"entry {i.filename[:80]!r} is compressed with {method}; only stored or deflate is accepted"
     # every entry's data takes its own bytes of the file; more than the file
-    # holds means entries overlap, which is how one page is read back 5000 times
+    # holds means entries overlap, which is how one page is read back 5000
+    # times, or that the file is sparse (holes read back as zeros)
     packed = sum(i.compress_size for i in infos)
     if packed > size:
-        return f"entries overlap: they claim {packed} bytes of data from a {size} byte file"
+        return f"entries overlap or the file is sparse: they claim {packed} bytes of data from a file that " \
+               f"stores {size} bytes"
     total = sum(i.file_size for i in infos)
     if total > MAX_UNCOMPRESSED:
         return f"{total} bytes uncompressed (limit {MAX_UNCOMPRESSED})"
@@ -823,25 +848,25 @@ def _archive_limits(infos, size: int) -> str | None:
         if i.file_size > RATIO_MIN_SIZE and i.file_size > MAX_RATIO * max(i.compress_size, 1):
             return f"entry {i.filename[:80]!r} expands {i.file_size // max(i.compress_size, 1)}x (limit {MAX_RATIO}x)"
     if total > RATIO_MIN_SIZE and total > MAX_RATIO * size:
-        return f"{total} bytes uncompressed from a {size} byte file: {total // size}x (limit {MAX_RATIO}x)"
+        return f"{total} bytes uncompressed from a file that stores {size} bytes: {total // size}x " \
+               f"(limit {MAX_RATIO}x)"
     return None
 
 
-def _read_entries(z, infos, path: str) -> str | None:
+def _read_entries(z, infos) -> str | None:
     """zipfile's testzip, bounded: read every entry back (which checks its
-    CRC) in 1 MiB pieces and give up after VERIFY_SECONDS. The limits above
-    already cap how much is read and decompressed (stored and deflate stop
-    at the declared size, overlapping entries are refused); this caps the
-    time on a slow disk. Returns what is wrong, or None."""
+    CRC) in 1 MiB pieces, giving up (_OutOfTime) after VERIFY_SECONDS. The
+    limits above already cap how much is read and decompressed (stored and
+    deflate stop at the declared size, overlapping entries and sparse files
+    are refused); this caps the time on a slow disk. Returns what is wrong,
+    or None."""
     deadline = time.monotonic() + VERIFY_SECONDS
     for i in infos:
         try:
             with z.open(i) as e:
                 while True:
                     if time.monotonic() > deadline:
-                        problem = f"checking it took longer than {VERIFY_SECONDS}s"
-                        log.warning("%s rejected: %s", path, problem)
-                        return problem
+                        raise _OutOfTime()
                     if not e.read(1 << 20):
                         break
         except zipfile.BadZipFile:
@@ -862,15 +887,21 @@ def quarantine(src: str | StagedFile) -> str:
     if isinstance(src, str):
         with open_staged(src) as f:
             return quarantine(f)
-    if not src.is_same(os.stat(src.name, dir_fd=src.dir_fd, follow_symlinks=False)):
-        raise OSError(errno.EAGAIN, "the file was replaced while it was being checked; not set aside", src.path)
     dst = src.name + ".corrupt"
-    os.replace(src.name, dst, src_dir_fd=src.dir_fd, dst_dir_fd=src.dir_fd)
+    moved = os.path.join(os.path.dirname(src.path), dst)
+    try:                                        # by plain names in the open folder: errors say which folder
+        same = src.is_same(os.stat(src.name, dir_fd=src.dir_fd, follow_symlinks=False))
+        if same:
+            os.replace(src.name, dst, src_dir_fd=src.dir_fd, dst_dir_fd=src.dir_fd)
+    except OSError as e:
+        raise _naming(e, src.path, moved) from e
+    if not same:
+        raise OSError(errno.EAGAIN, "the file was replaced while it was being checked; not set aside", src.path)
     try:
         os.utime(src.fd)
     except OSError as e:
-        log.debug("could not touch %s: %s", dst, e)
-    return os.path.join(os.path.dirname(src.path), dst)
+        log.debug("could not touch %s: %s", moved, e)
+    return moved
 
 
 def prune_quarantine(path: str, days: float = QUARANTINE_DAYS, dir_fd: int | None = None) -> int:

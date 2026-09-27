@@ -540,6 +540,10 @@ def _import_file(con, series_id: int, title: str, folder: str, n: float, prev, f
     logged). FileNotFoundError (the file was renamed away meanwhile) is left
     to the caller."""
     ok, detail = library.verify_archive(f)
+    if ok is None:                          # ran out of time: slow or busy storage, nothing wrong with the file
+        log.warning("%s: ch %g from %s could not be checked (%s); trying again at the next import",
+                    title, n, source_name, detail)
+        return None
     if not ok:
         if _still_being_written(f, title, n, source_name, detail):
             return None
