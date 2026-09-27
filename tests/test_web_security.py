@@ -4,6 +4,7 @@ disclosure, short Suwayomi timeouts and the health cache."""
 import asyncio
 import logging
 import os
+import re
 import sqlite3
 import tempfile
 import threading
@@ -664,6 +665,19 @@ class LegacyUrlSettingTest(WebBase):
         r = self.client.put("/api/v1/settings", json={"komga_url": "192.168.1.214:25600"})
         self.assertEqual(r.status_code, 400)
         self.assertEqual(self.settings.all_values()["komga_url"], "192.168.1.213:25600")
+
+    def test_the_hint_is_shown_in_the_warning_colour(self):
+        # round 2: .help-text (defined later, same specificity) turned the hint back into grey help text
+        from mangarr import db
+        with db.connect() as con:
+            con.execute("INSERT INTO setting (key, value) VALUES ('komga_url', '\"192.168.1.213:25600\"')")
+            con.commit()
+            self.settings.refresh(con)
+        self.assertIn('<div class="help-text text-warning">The stored value is not a valid URL',
+                      self.client.get("/settings").text)
+        css = self.client.get("/static/style.css").text
+        rules = {sel.strip(): body for sel, body in re.findall(r"([^{}]+)\{([^{}]*)\}", css)}
+        self.assertIn("color:var(--warning-label)", rules.get(".help-text.text-warning", ""))
 
 
 class FailClosedTest(WebBase):

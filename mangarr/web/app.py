@@ -1101,6 +1101,7 @@ def system_backups_restore(name: str):
 
 # One restore upload at a time: each one holds up to backup.upload_limit() on the data volume while it
 # arrives, so parallel (or stalled) uploads could fill the disk that Suwayomi, Komga and the database share.
+# uploads.receive cuts off one that stalls or crawls, so nobody can keep the slot for long.
 _upload_slot = threading.Lock()
 
 

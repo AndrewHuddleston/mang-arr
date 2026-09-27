@@ -45,6 +45,15 @@ class EnvNumberTest(unittest.TestCase):
             with self.subTest(raw=raw), self.assertLogs("mangarr.config", "WARNING"):
                 self.assertEqual(self.get(raw), want)
 
+    def test_warnings_give_the_exact_numbers(self):
+        # round 2: %g printed the clamped 1048576 as 1.04858e+06
+        with self.assertLogs("mangarr.config", "WARNING") as logs:
+            self.assertEqual(self.get("1e30", default=2048, lo=1, hi=1048576, integer=True), 1048576)
+        self.assertIn("MANGARR_T='1e30' is outside 1..1048576; using 1048576", logs.output[0])
+        with self.assertLogs("mangarr.config", "WARNING") as logs:
+            self.assertEqual(self.get("6h", default=21600.5, lo=0, hi=604800), 21600.5)
+        self.assertIn("using the default 21600.5", logs.output[0])
+
     def test_integers(self):
         self.assertEqual(self.get("7", integer=True, default=7), 7)
         self.assertIsInstance(self.get("7.0", integer=True, default=7), int)

@@ -202,6 +202,7 @@ select.input{padding:6px 12px;cursor:pointer}
 .input-unit{position:absolute;top:0;right:20px;margin-top:7px;width:75px;color:#c6c6c6;text-align:right;pointer-events:none;user-select:none}
 .help-text{margin-top:5px;color:var(--help);line-height:20px}
 .help-text.inline{display:inline;margin:0 0 0 8px}
+.help-text.text-warning{color:var(--warning-label)}
 .content-body > .help-text{margin:0 0 15px}
 .form-actions{margin:20px 0 0;display:flex;gap:10px;flex-wrap:wrap;align-items:center}
 .inline-form{display:flex;gap:10px;margin-top:12px;flex-wrap:wrap}.inline-form .input{width:auto;min-width:220px}

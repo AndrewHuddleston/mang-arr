@@ -21,11 +21,11 @@ def env_number(name: str, default: float, lo: float, hi: float, integer: bool = 
     except ValueError:
         v = math.nan
     if not math.isfinite(v):
-        log.warning("%s=%r is not a number; using the default %g", name, raw, default)
+        log.warning("%s=%r is not a number; using the default %.15g", name, raw, default)
         return default
     out = min(max(v, lo), hi)
-    if out != v:
-        log.warning("%s=%r is outside %g..%g; using %g", name, raw, lo, hi, out)
+    if out != v:           # %.15g: the exact bound (plain %g would print 1048576 as 1.04858e+06)
+        log.warning("%s=%r is outside %.15g..%.15g; using %.15g", name, raw, lo, hi, out)
     if integer:
         if out != int(out):
             log.warning("%s=%r is not a whole number; using %d", name, raw, round(out))

@@ -5,11 +5,13 @@ the container's /tmp (the Docker host's system disk) with no limit on how
 long a client may take. Here the multipart body is parsed as it streams in
 and the one file part goes straight into a backup.UploadSpool, which lives
 in the data volume and stops at the upload limit or before the disk gets
-too full. A client that sends nothing for IDLE_SECS is cut off. The route
-itself (app.py) lets only one upload in at a time.
+too full. A client that sends nothing for IDLE_SECS, or less on average
+than MIN_RATE, is cut off. The route itself (app.py) lets only one upload in
+at a time, so these bound how long anyone can hold it.
 """
 import asyncio
 import logging
+import time
 
 import python_multipart
 from python_multipart.exceptions import FormParserError
@@ -20,7 +22,8 @@ from .. import backup
 
 log = logging.getLogger(__name__)
 
-IDLE_SECS = 30.0         # an upload that sends no bytes for this long is cut off
+IDLE_SECS = 30.0         # an upload that sends no bytes for this long is cut off ...
+MIN_RATE = 128 << 10     # ... and so is one that averages fewer bytes a second than this (about 1 Mbit/s)
 MAX_FIELDS = 8           # form fields besides the file (the form has none) ...
 MAX_FIELD_BYTES = 4096   # ... and their total size, kept only to be skipped
 
@@ -90,8 +93,12 @@ class _Form:
 
 
 async def _body(request):
-    """The request body as it arrives; UploadError when nothing arrives for
-    IDLE_SECS, Disconnected when the client goes away."""
+    """The request body as it arrives. UploadError when nothing arrives for
+    IDLE_SECS, or when the upload falls behind MIN_RATE: it may take
+    IDLE_SECS plus one second for every MIN_RATE bytes received, so a client
+    that drips a byte now and then cannot keep the upload slot and its spool
+    for as long as it likes. Disconnected when the client goes away."""
+    start, received = time.monotonic(), 0
     while True:
         try:
             message = await asyncio.wait_for(request.receive(), IDLE_SECS)
@@ -99,9 +106,16 @@ async def _body(request):
             raise UploadError(f"the upload stalled: nothing arrived for {IDLE_SECS:g} seconds") from None
         if message["type"] == "http.disconnect":
             raise Disconnected()
-        if message.get("body"):
-            yield message["body"]
-        if not message.get("more_body", False):
+        body = message.get("body", b"")
+        received += len(body)
+        more = message.get("more_body", False)
+        took = time.monotonic() - start
+        if more and took > IDLE_SECS + received / MIN_RATE:      # a complete upload is taken, however slow
+            raise UploadError(f"the upload is too slow ({backup.size_text(received)} in {took:.0f} seconds; "
+                              f"it has to average at least {backup.size_text(MIN_RATE)} a second)")
+        if body:
+            yield body
+        if not more:
             return
 
 

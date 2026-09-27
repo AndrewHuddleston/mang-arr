@@ -43,10 +43,10 @@ KEEP = config.env_number("MANGARR_BACKUPS_KEEP", 7, 1, 1000, integer=True)
 INTERVAL_HOURS = config.env_number("MANGARR_BACKUP_HOURS", 24.0, 1.0, 8760.0)
 # Largest backup accepted through the upload form (MB); a bigger live database raises it to twice its size.
 UPLOAD_MAX_MB = config.env_number("MANGARR_BACKUP_UPLOAD_MAX_MB", 512.0, 1.0, 1048576.0)
-# Free space an upload must leave on the data volume while it is written: other
-# services often share that disk, and the restore itself needs room after it.
+# Free space an upload must leave on the data volume while it is written: as much
+# again as the upload (the restore then builds a database of about that size
+# next to it), up to this many MB (other services often share that disk).
 UPLOAD_FREE_MARGIN_MB = 256
-_ROOM_STEP = 8 << 20             # while an upload arrives, free space is checked again every this many bytes
 # Event history kept (Activity/series pages); older events are pruned before each scheduled backup.
 EVENTS_KEEP_DAYS = config.env_number("MANGARR_EVENTS_KEEP_DAYS", 90.0, 1.0, 36500.0)
 EVENTS_KEEP_ROWS = config.env_number("MANGARR_EVENTS_KEEP_ROWS", 100000, 1000, 100_000_000, integer=True)  # see README
@@ -283,14 +283,22 @@ def _free_bytes(path: str) -> int:
     return shutil.disk_usage(path).free
 
 
-def _check_room(folder: str, need: int, what: str = "") -> None:
-    """RestoreError unless `need` more bytes still leave UPLOAD_FREE_MARGIN_MB
-    free in folder (`what` needs them, for the message)."""
+def size_text(n: int) -> str:
+    """A size for the upload messages: '8 KB', '300 MB'."""
+    return f"{n >> 20} MB" if n >= 1 << 20 else f"{(n + 1023) >> 10} KB"
+
+
+def _check_room(folder: str, more: int, total: int) -> None:
+    """RestoreError unless writing `more` bytes, for an upload of `total`
+    bytes, leaves free in folder as much again as the upload, up to
+    UPLOAD_FREE_MARGIN_MB. The floor grows with the upload so that a small
+    backup can still be restored on a nearly full disk, while a big one
+    cannot take the last of it."""
     free = _free_bytes(folder)
-    if free - need < UPLOAD_FREE_MARGIN_MB << 20:
-        needs = f", {what} needs {need >> 20} MB" if what and need >= 1 << 20 else ""
-        msg = f"not enough free disk space in {folder} ({free >> 20} MB free{needs}; {UPLOAD_FREE_MARGIN_MB} MB " \
-              "must stay free)"
+    keep = min(UPLOAD_FREE_MARGIN_MB << 20, total)
+    if free - more < keep:
+        msg = f"not enough free disk space in {folder} ({size_text(free)} free; an upload of {size_text(total)} " \
+              f"must leave {size_text(keep)} free)"
         log.warning("backup upload refused: %s", msg)
         raise RestoreError(msg)
 
@@ -299,9 +307,9 @@ class UploadSpool:
     """A backup file while it is uploaded: written straight to a private
     temporary file in the backups folder (the data volume, not the
     container's /tmp, which sits on the Docker host's system disk), refused
-    once it passes upload_limit() or would leave less than
-    UPLOAD_FREE_MARGIN_MB free there (checked before the first byte, with
-    the size the client announced, and again every _ROOM_STEP bytes).
+    once it passes upload_limit() or the disk gets too full for it (see
+    _check_room: checked before the first byte, with the size the client
+    announced, and again on every write, however slowly the data arrives).
     restore(spool) moves the file into its work folder; discard() removes
     whatever is left, so call it on every path."""
 
@@ -311,11 +319,10 @@ class UploadSpool:
             log.warning("backup upload refused: %d bytes announced, the limit is %d", expected, self.limit)
             raise RestoreError(self._too_big())
         d = backup_dir()
-        _check_room(d, expected, "the upload")
+        _check_room(d, expected, expected)
         fd, self.path = tempfile.mkstemp(prefix=_TMP_PREFIX + "upload-", suffix=".db", dir=d)   # created 0600
         self._f = os.fdopen(fd, "wb")
         self.size = 0
-        self._room_until = 0                      # bytes written before free space is checked again
 
     def _too_big(self) -> str:
         return f"the file is larger than the upload limit ({self.limit // 1048576} MB)"
@@ -325,9 +332,7 @@ class UploadSpool:
         if end > self.limit:
             log.warning("backup upload refused: it passed the limit of %d bytes", self.limit)
             raise RestoreError(self._too_big())
-        if end > self._room_until:
-            _check_room(os.path.dirname(self.path), len(data) + _ROOM_STEP)     # others write to that disk too
-            self._room_until = end + _ROOM_STEP
+        _check_room(os.path.dirname(self.path), len(data), end)     # every time: others write to that disk too
         self._f.write(data)
         self.size = end
 

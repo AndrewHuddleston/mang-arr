@@ -554,11 +554,14 @@ class BackupRoutesTest(_Base):
 
     async def _asgi_upload(self, chunks, stall=False, headers=()):
         """POST /system/backups/upload straight through the ASGI app, one
-        receive() message per chunk; with stall=True the client then stops
-        sending without going away. Returns (status, headers, flash text)."""
+        receive() message per bytes chunk (a float in the list: wait that
+        many seconds first); with stall=True the client then stops sending
+        without going away. Returns (status, headers, flash text)."""
         chunks = list(chunks)
 
         async def receive():
+            while chunks and isinstance(chunks[0], float):
+                await asyncio.sleep(chunks.pop(0))     # a slow client
             if chunks:
                 return {"type": "http.request", "body": chunks.pop(0), "more_body": bool(chunks) or stall}
             await asyncio.sleep(3600)                  # stalled: only the server's idle cut-off ends this
@@ -630,30 +633,108 @@ class BackupRoutesTest(_Base):
         self.assertEqual(seen, [("UploadSpool", backup.backup_dir(), len(data))])
         self.assertEqual(self.backups_dir_extras(), [])
 
+    def test_a_dripping_upload_is_cut_off_and_frees_the_slot(self):
+        # round 2: a client sending a byte now and then (under the idle cut-off) kept the only upload slot and
+        # its spool for as long as it liked, and every real "Restore from file" was refused meanwhile
+        from mangarr.web import uploads
+        p = backup.create("t")
+        with open(p, "rb") as f:
+            data = f.read()
+        drip = [self.HEAD, b"x" * 65536] + [0.1, b"x"] * 50       # 5 s if nothing stops it
+
+        async def scenario():
+            t0 = time.monotonic()
+            first = asyncio.ensure_future(self._asgi_upload(drip))
+            await asyncio.sleep(0.3)
+            busy = await self._asgi_upload([self.HEAD, data, self.TAIL])
+            spooled = self._spooled()
+            return busy, spooled, await first, time.monotonic() - t0
+        with mock.patch.object(uploads, "IDLE_SECS", 0.5), mock.patch.object(uploads, "MIN_RATE", 256 << 10):
+            busy, spooled, first, took = asyncio.run(scenario())
+        self.assertIn("another backup upload is in progress", busy[2])    # it did hold the slot ...
+        self.assertEqual(len(spooled), 1)
+        self.assertEqual(first[0], 303)
+        self.assertIn("the upload is too slow", first[2])                 # ... until it fell behind the rate
+        self.assertIn("at least 256 KB a second", first[2])
+        self.assertLess(took, 2.5)                                        # 0.5 s + 64 KB at 256 KB/s, not 5 s
+        self.assertEqual(self.backups_dir_extras(), [])
+        with db.connect() as con:
+            con.execute("DELETE FROM series")
+        r = self.client.post("/system/backups/upload", files={"file": ("b.db", data)}, follow_redirects=False)
+        self.assertIn("restored", r.headers["location"])                  # the slot is free again
+        self.assertEqual(self.titles(), ["Live"])
+
+    def test_a_steady_upload_with_pauses_is_not_cut_off(self):
+        from mangarr.web import uploads
+        p = backup.create("t")
+        with open(p, "rb") as f:
+            data = f.read()
+        with db.connect() as con:
+            con.execute("DELETE FROM series")
+        steady = [self.HEAD]
+        for i in range(0, len(data), 16384):                    # ~800 KB/s with a pause after every 16 KB
+            steady += [0.02, data[i:i + 16384]]
+        steady += [0.3, self.TAIL]                              # and a pause shorter than the idle cut-off
+        with mock.patch.object(uploads, "IDLE_SECS", 0.5), mock.patch.object(uploads, "MIN_RATE", 256 << 10):
+            status, _, msg = asyncio.run(self._asgi_upload(steady))
+        self.assertEqual(status, 303)
+        self.assertIn("restored", msg)
+        self.assertEqual(self.titles(), ["Live"])
+
+    def test_free_space_floor_grows_with_the_upload(self):
+        # round 2: a flat 256 MB floor refused even a KB-sized backup on a volume with less than that free
+        mb = 1 << 20
+        cases = [(200 * mb, 8192, True),           # a small backup on a nearly full disk
+                 (12288, 8192, False),             # ... but not when it would leave less than its own size
+                 (300 * mb, 150 * mb, True),       # as much again must stay free ...
+                 (299 * mb, 150 * mb, False),
+                 (556 * mb, 300 * mb, True),       # ... up to 256 MB
+                 (555 * mb, 300 * mb, False)]
+        for free, total, ok in cases:
+            with self.subTest(free=free, total=total), mock.patch.object(backup, "_free_bytes", return_value=free):
+                if ok:
+                    backup._check_room(backup.backup_dir(), total, total)
+                else:
+                    with self.assertRaises(backup.RestoreError):
+                        backup._check_room(backup.backup_dir(), total, total)
+
+    def test_small_upload_restores_on_a_nearly_full_disk(self):
+        p = backup.create("t")
+        with open(p, "rb") as f:
+            data = f.read()
+        with db.connect() as con:
+            con.execute("DELETE FROM series")
+        with mock.patch.object(backup, "_free_bytes", return_value=200 << 20):    # below the 256 MB of before
+            r = self.client.post("/system/backups/upload", files={"file": ("b.db", data)}, follow_redirects=False)
+        self.assertIn("restored", r.headers["location"])
+        self.assertEqual(self.titles(), ["Live"])
+
     def test_upload_refused_up_front_when_the_disk_is_nearly_full(self):
-        margin = backup.UPLOAD_FREE_MARGIN_MB << 20
-        with mock.patch.object(backup, "_free_bytes", return_value=margin + 4096) as free:
+        with mock.patch.object(backup, "_free_bytes", return_value=12288) as free:
             r = self.client.post("/system/backups/upload", files={"file": ("b.db", b"x" * 8192)},
                                  follow_redirects=False)
         msg = urllib.parse.unquote(r.headers["location"])
-        self.assertIn(f"not enough free disk space in {backup.backup_dir()}", msg)
+        self.assertIn(f"not enough free disk space in {backup.backup_dir()} (12 KB free; an upload of 9 KB "
+                      "must leave 9 KB free)", msg)
         self.assertEqual(r.headers.get("connection"), "close")
         free.assert_called_once_with(backup.backup_dir())       # before the first byte was stored
         self.assertEqual(self.backups_dir_extras(), [])
         self.assertEqual(self.titles(), ["Live"])
 
     def test_upload_stops_when_the_disk_fills_up_meanwhile(self):
+        # round 2: free space was checked again only every 8 MB, so a slowly dripping upload never was
+        from mangarr.web import uploads
         calls = []
 
         def free(path):                                          # plenty at first, then someone else fills the disk
             calls.append(path)
-            return (1 << 40) if len(calls) <= 2 else (backup.UPLOAD_FREE_MARGIN_MB << 20) + 1000
-        chunks = [self.HEAD] + [b"x" * 65536] * 8 + [self.TAIL]   # chunked: no Content-Length to check first
-        with mock.patch.object(backup, "_free_bytes", free), mock.patch.object(backup, "_ROOM_STEP", 65536):
-            status, _, msg = asyncio.run(self._asgi_upload(chunks))
+            return (1 << 40) if len(calls) <= 2 else 0
+        drip = [self.HEAD, b"x" * 65536] + [0.05, b"x"] * 20     # chunked: no Content-Length to check first
+        with mock.patch.object(backup, "_free_bytes", free), mock.patch.object(uploads, "IDLE_SECS", 0.5):
+            status, _, msg = asyncio.run(self._asgi_upload(drip))
         self.assertEqual(status, 303)
         self.assertIn("not enough free disk space", msg)
-        self.assertEqual(calls, [backup.backup_dir()] * 3)      # before, and while writing, where it is written
+        self.assertEqual(calls, [backup.backup_dir()] * 3)      # before, then with each write: the first drip
         self.assertEqual(self.backups_dir_extras(), [])
         self.assertEqual(self.titles(), ["Live"])
 
