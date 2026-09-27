@@ -2,6 +2,7 @@
 come from scraped sites: names fit the filesystem, symlinks are never
 followed, bad archives are set aside instead of breaking the import, and
 one bad chapter never blocks the rest of the series."""
+import bz2
 import errno
 import logging
 import os
@@ -91,6 +92,25 @@ def build_zip(path: str, entries, zip64: bool = False, count: int | None = None,
         else:
             f.write(struct.pack("<4s4H2LH", b"PK\x05\x06", 0, 0, total, total, cd_size, cd_at, 0))
     return path
+
+
+def hidden_directory(path: str, hidden: int) -> tuple[bytes, bytes]:
+    """The evidence file for the end-record race: one stored page, a directory
+    of `hidden` entries nothing points at, then a one-entry directory and an
+    end record for it. Returns (that end record, one whose directory spans
+    both, still claiming one entry); each is the last 22 bytes of the file."""
+    page, name = os.urandom(3000), b"0.jpg"
+    local = struct.pack("<4s5H3L2H", b"PK\x03\x04", 20, 0, 0, 0, 0x21, zlib.crc32(page), len(page), len(page),
+                        len(name), 0) + name + page
+    central = struct.pack("<4s6H3L5H2L", b"PK\x01\x02", 20, 20, 0, 0, 0, 0x21, zlib.crc32(page), len(page),
+                          len(page), len(name), 0, 0, 0, 0, 0, 0) + name
+    with open(path, "wb") as f:
+        f.write(local + central * hidden + central)
+    small = struct.pack("<4s4H2LH", b"PK\x05\x06", 0, 0, 1, 1, len(central), len(local) + len(central) * hidden, 0)
+    big = struct.pack("<4s4H2LH", b"PK\x05\x06", 0, 0, 1, 1, len(central) * (hidden + 1), len(local), 0)
+    with open(path, "ab") as f:
+        f.write(small)
+    return small, big
 
 
 class NameLengthTest(unittest.TestCase):
@@ -229,7 +249,12 @@ class VerifyArchiveTest(unittest.TestCase):
                 data[cd + 8] |= 1
                 data[6] |= 1
             write(p, bytes(data))
-            ok, detail = verify_archive(p)
+            if tweak == "method":                       # refused from the directory, before zipfile opens it
+                with self.assertLogs("mangarr.library", "WARNING"):
+                    ok, detail = verify_archive(p)
+                self.assertIn("compressed with AES", detail)
+            else:
+                ok, detail = verify_archive(p)
             self.assertFalse(ok, tweak)
 
     def test_caps(self):
@@ -336,6 +361,108 @@ class ZipBombTest(unittest.TestCase):
                       + [("ComicInfo.xml", *deflated(info))], zip64=True)
         self.assertEqual(verify_archive(p), (True, "3 pages"))
 
+    def test_bzip2_and_lzma_are_refused_before_decompressing(self):
+        """The evidence: zipfile inflates a whole bzip2 or LZMA read at once, so
+        a few KB declared as a 1000-byte page expanded to gigabytes in memory,
+        and passed when the CRC matched the first 1000 bytes."""
+        zeros = b"\0" * (16 << 20)                             # 16 MiB here; the evidence used 1-2 GiB
+        lz = zipfile.LZMACompressor()
+        packed = {"bzip2": (bz2.compress(zeros), zipfile.ZIP_BZIP2),
+                  "LZMA": (lz.compress(zeros) + lz.flush(), zipfile.ZIP_LZMA)}
+        for method, (data, code) in packed.items():
+            p = build_zip(os.path.join(self.d, f"{method}.cbz"),
+                          [("000.jpg", *stored(os.urandom(3000))),
+                           ("001.jpg", data, code, zlib.crc32(zeros[:1000]), 1000)])
+            self.assertLess(os.path.getsize(p), 10_000)
+            with mock.patch.object(zipfile.ZipFile, "open", side_effect=AssertionError("decompressed")) as opened, \
+                    self.assertLogs("mangarr.library", "WARNING"):
+                ok, detail = verify_archive(p)
+            self.assertEqual((ok, detail), (False, f"entry '001.jpg' is compressed with {method}; "
+                                                   "only stored or deflate is accepted"))
+            opened.assert_not_called()
+
+    def test_overlapping_entries_are_refused(self):
+        # 300 entries reading back one 3000-byte page behind 1 MiB of empty deflate
+        # blocks: 300 MiB of inflating, which no size or ratio limit sees
+        page = os.urandom(3000)
+        data, method, crc, size = deflated(page)
+        p = build_zip(os.path.join(self.d, "overlap.cbz"),
+                      [("0.jpg", b"\0\0\0\xff\xff" * ((1 << 20) // 5) + data, method, crc, size)], repeat=300)
+        with mock.patch.object(zipfile.ZipFile, "open", side_effect=AssertionError("read back")), \
+                self.assertLogs("mangarr.library", "WARNING"):
+            ok, detail = verify_archive(p)
+        self.assertFalse(ok)
+        self.assertIn("overlap", detail)
+
+    def _spy_limits(self):
+        seen: list = []
+        real = library._archive_limits
+
+        def spy(infos, size):
+            seen.append(len(infos))
+            return real(infos, size)
+        return seen, mock.patch.object(library, "_archive_limits", spy)
+
+    def test_end_record_rewritten_after_the_check(self):
+        """The evidence repro made deterministic: the end record is switched to
+        a hidden 20,001-entry directory right after the directory was checked.
+        zipfile parses the directory that was checked, not the new one."""
+        p = os.path.join(self.d, "flip.cbz")
+        small, big = hidden_directory(p, 20000)
+        real = library._directory_limits
+
+        def check_then_rewrite(snap, *end):
+            res = real(snap, *end)
+            fd = os.open(p, os.O_WRONLY)
+            os.pwrite(fd, big, os.path.getsize(p) - len(big))
+            os.close(fd)
+            return res
+        seen, spy = self._spy_limits()
+        with spy, mock.patch.object(library, "_directory_limits", check_then_rewrite):
+            self.assertEqual(verify_archive(p), (True, "1 pages"))
+        self.assertEqual(seen, [1])                             # was: 20001 entries parsed after the check
+        self.assertEqual(read(p)[-len(big):], big)              # the file really did change
+        with self.assertLogs("mangarr.library", "WARNING"):     # and checked afresh, it is refused
+            self.assertEqual(verify_archive(p), (False, "more than 5000 entries (limit 5000)"))
+
+    def test_end_record_flipped_while_checking(self):
+        """The evidence repro: a thread writes the end record back and forth
+        while verify_archive runs in a loop (it won 70 of 300 attempts)."""
+        p = os.path.join(self.d, "flip.cbz")
+        small, big = hidden_directory(p, 20000)
+        at = os.path.getsize(p) - len(small)
+        stop = threading.Event()
+
+        def flip():
+            fd = os.open(p, os.O_WRONLY)
+            try:
+                while not stop.is_set():
+                    os.pwrite(fd, big, at)
+                    os.pwrite(fd, small, at)
+            finally:
+                os.close(fd)
+        seen, spy = self._spy_limits()
+        results = set()
+        interval = sys.getswitchinterval()
+        t = threading.Thread(target=flip, daemon=True)
+        with spy, mock.patch.object(library.log, "warning"):
+            sys.setswitchinterval(1e-5)
+            t.start()
+            try:
+                deadline = time.monotonic() + 20
+                for _ in range(300):
+                    results.add(verify_archive(p))
+                    if time.monotonic() > deadline:
+                        break
+            finally:
+                stop.set()
+                t.join(10)
+                sys.setswitchinterval(interval)
+        self.assertTrue(seen)
+        self.assertEqual(max(seen), 1, "zipfile parsed a directory that was not checked")
+        self.assertIn((True, "1 pages"), results)
+        self.assertEqual({detail for ok, detail in results if ok}, {"1 pages"})
+
     def test_unusual_zip64_layout_is_refused(self):
         p = build_zip(os.path.join(self.d, "z.cbz"), [("0.jpg", *stored(os.urandom(2000)))], zip64=True)
         data = bytearray(read(p))
@@ -368,15 +495,17 @@ class CopyFallbackTest(unittest.TestCase):
         real = os.link
 
         def fake(src, dst, **kw):
-            if src in (self.src, os.path.basename(self.src)):     # a path, or a name in its open folder
-                raise OSError(err, os.strerror(err))
+            if not src.startswith(".mangarr-"):         # the staged file, by any name; not the final rename
+                raise OSError(err, os.strerror(err), src, None, dst)
             return real(src, dst, **kw)
         return mock.patch.object(library.os, "link", fake)
 
     def test_other_errors_are_not_copied(self):
-        with self._link_fails(errno.ENOSPC), self.assertRaises(OSError):
+        with self._link_fails(errno.ENOSPC), self.assertRaises(OSError) as cm:
             link_into_library(self.src, "T", 1.0, root=self.lib)
         self.assertEqual(os.listdir(os.path.join(self.lib, "T")), [])
+        self.assertEqual((cm.exception.filename, cm.exception.filename2),       # the real paths, not temp names
+                         (self.src, os.path.join(self.lib, "T", "Chapter 001.0.cbz")))
 
     def test_cross_device_copies_atomically(self):
         with self._link_fails(errno.EXDEV), self.assertLogs("mangarr.library", "WARNING"):
@@ -504,6 +633,24 @@ class ImportTest(ImportBase):
             self.assertEqual([f for _, f, _ in core.series_staging_dirs(con, sid)], [folder])
 
 
+    def test_bzip2_page_is_set_aside_not_linked(self):
+        """The evidence end to end: a 4 KB 'Chapter 1.cbz' holding bzip2 of
+        zeros declared as a 1000-byte page was verified and linked."""
+        zeros = b"\0" * (16 << 20)
+        p = build_zip(os.path.join(self.folder, "Chapter 1.cbz"),
+                      [("000.jpg", *stored(os.urandom(3000))),
+                       ("001.jpg", bz2.compress(zeros), zipfile.ZIP_BZIP2, zlib.crc32(zeros[:1000]), 1000)])
+        age(p, 3600)
+        with db.connect(self.dbpath) as con, self.assertLogs("mangarr", "WARNING"):
+            sid = self._series(con)
+            self._wanted(con, sid, 1)
+            self.assertEqual(core.import_series(con, sid), 0)
+            row = db.chapters(con, sid)[0]
+        self.assertEqual(row["status"], "failed")
+        self.assertIn("compressed with bzip2", row["reason"])
+        self.assertTrue(os.path.exists(p + ".corrupt"))
+        self.assertFalse(os.path.exists(os.path.join(self.lib, "Title")) and os.listdir(os.path.join(self.lib, "Title")))
+
     def test_bad_file_that_cannot_be_set_aside_does_not_block_the_rest(self):
         with open(os.path.join(self.folder, "Chapter 1.cbz"), "wb") as f:     # corrupt and old
             f.write(b"PK" + b"x" * 3000)
@@ -523,6 +670,67 @@ class ImportTest(ImportBase):
         self.assertEqual(rows[1.0]["status"], "failed")
         self.assertIn("not set aside", rows[1.0]["reason"])
         self.assertEqual(rows[2.0]["status"], "have")
+
+
+class LinkTest(ImportBase):
+    """What reaches the library is the open file that was checked, on any
+    filesystem, and a failure says which folders were involved."""
+
+    def test_link_does_not_depend_on_inode_numbers(self):
+        """sshfs and other FUSE mounts without use_ino, or CIFS with
+        noserverino, number each path on its own: a new hard link does not
+        show the inode of the open file it was made from."""
+        real = library._lstat_at
+
+        def own_numbers(name, dir_fd):
+            st = real(name, dir_fd)
+            if st is None:
+                return None
+            fields = list(st)
+            fields[1] += 1_000_000                              # st_ino
+            return os.stat_result(fields)
+        staged = os.path.join(self.folder, "Chapter 1.cbz")
+        dst = os.path.join(self.lib, "Title", "Chapter 001.0.cbz")
+        for i, proc in enumerate((library._PROC_FD, os.path.join(self.tmp.name, "no-proc"))):     # Linux, elsewhere
+            with self.subTest(proc=proc):
+                age(make_cbz(staged), 3600)
+                with db.connect(os.path.join(self.tmp.name, f"{i}.db")) as con, \
+                        mock.patch.object(library, "_lstat_at", own_numbers), \
+                        mock.patch.object(library, "_PROC_FD", proc), self.assertLogs("mangarr", "INFO") as cm:
+                    sid = self._series(con)
+                    self._wanted(con, sid, 1)
+                    self.assertEqual(core.import_series(con, sid), 1)      # was: failed, "the staged file was replaced"
+                    self.assertEqual(db.chapters(con, sid)[0]["status"], "have")
+                self.assertEqual(read(dst), read(staged))
+                warned = [r.getMessage() for r in cm.records if r.levelno >= logging.WARNING]
+                if proc == library._PROC_FD:
+                    self.assertTrue(os.path.samefile(staged, dst))       # the open file itself, hard-linked
+                    self.assertEqual(warned, [])
+                else:
+                    self.assertIn("copying the checked file instead", "\n".join(warned))
+                os.remove(dst)
+
+    @unittest.skipIf(os.geteuid() == 0, "root writes through a read-only folder")
+    def test_link_failure_names_the_folders(self):
+        staged = os.path.join(self.folder, "Chapter 4.cbz")
+        age(make_cbz(staged), 3600)
+        lib = os.path.join(self.lib, "Title")
+        os.makedirs(lib)
+        os.chmod(lib, 0o555)                                    # the usual PUID/PGID mistake
+        try:
+            with db.connect(self.dbpath) as con, self.assertLogs("mangarr.core", "ERROR") as cm:
+                sid = self._series(con)
+                self._wanted(con, sid, 4)
+                self.assertEqual(core.import_series(con, sid), 0)
+                row = db.chapters(con, sid)[0]
+        finally:
+            os.chmod(lib, 0o755)
+        where = f"'{staged}' -> '{os.path.join(lib, 'Chapter 004.0.cbz')}'"
+        self.assertEqual(row["status"], "failed")
+        self.assertIn(f"cannot link Chapter 4.cbz: PermissionError: [Errno 13] Permission denied: {where}",
+                      row["reason"])                            # was: 'Chapter 4.cbz' -> '.mangarr-....part'
+        self.assertIn(where, "\n".join(cm.output))
+        self.assertEqual(os.listdir(lib), [])
 
 
 class StagingSwapTest(ImportBase):
@@ -615,25 +823,43 @@ class StagingSwapTest(ImportBase):
         self.assertEqual(self._victim(), self.before)
         self.assertTrue(os.path.islink(os.path.join(self.folder, "Chapter 1.cbz")))     # not set aside either
 
-    def test_file_swapped_after_the_check_is_not_linked(self):
+    def test_file_swapped_after_the_check_links_the_checked_file(self):
         p = os.path.join(self.folder, "Chapter 1.cbz")
-        age(make_cbz(p), 3600)
-        other = make_cbz(os.path.join(self.tmp.name, "other.cbz"))
+        lib = os.path.join(self.lib, "Title")
         real = library.verify_archive
+        runs = 0
+        for keep_old in (True, False):
+            for proc in (library._PROC_FD, os.path.join(self.tmp.name, "no-proc")):      # Linux, and elsewhere
+                with self.subTest(proc=proc, keep_old=keep_old):
+                    age(make_cbz(p), 3600)
+                    checked = read(p)
+                    other = make_cbz(os.path.join(self.tmp.name, "other.cbz"))
 
-        def verify_then_swap(f):
-            res = real(f)
-            os.replace(other, p)                                # a different, unchecked file under the name
-            return res
-        with db.connect(self.dbpath) as con, mock.patch.object(library, "verify_archive", verify_then_swap), \
-                self.assertLogs("mangarr.core", "ERROR"):
-            sid = self._series(con)
-            self._wanted(con, sid, 1)
-            self.assertEqual(core.import_series(con, sid), 0)
-            row = db.chapters(con, sid)[0]
-        self.assertEqual(row["status"], "failed")
-        self.assertIn("replaced", row["reason"])
-        self.assertEqual(os.listdir(os.path.join(self.lib, "Title")), [])      # nothing linked, no temp file left
+                    def verify_then_swap(f, keep_old=keep_old, other=other):
+                        res = real(f)
+                        if keep_old:
+                            os.rename(p, p + ".old")
+                        os.replace(other, p)                    # a different, unchecked file under the name
+                        return res
+                    runs += 1
+                    with db.connect(os.path.join(self.tmp.name, f"{runs}.db")) as con, \
+                            mock.patch.object(library, "verify_archive", verify_then_swap), \
+                            mock.patch.object(library, "_PROC_FD", proc), self.assertLogs("mangarr", "INFO") as cm:
+                        sid = self._series(con)
+                        self._wanted(con, sid, 1)
+                        linked = core.import_series(con, sid)
+                        status = db.chapters(con, sid)[0]["status"]
+                    self.assertEqual([r.getMessage() for r in cm.records if r.levelno >= logging.ERROR], [])
+                    if linked:
+                        self.assertEqual(status, "have")
+                        self.assertEqual(os.listdir(lib), ["Chapter 001.0.cbz"])        # no temp file left
+                        self.assertEqual(read(os.path.join(lib, "Chapter 001.0.cbz")), checked)
+                        os.remove(os.path.join(lib, "Chapter 001.0.cbz"))
+                    else:
+                        # the checked file was deleted by the swap: through /proc it cannot be
+                        # linked any more, so the chapter waits for the next import
+                        self.assertEqual((keep_old, proc, status), (False, library._PROC_FD, "wanted"))
+                        self.assertEqual(os.listdir(lib), [])
 
     def test_file_renamed_away_mid_import_skips_that_chapter(self):
         self._bad_staged("Chapter 1.cbz")

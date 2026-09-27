@@ -10,9 +10,11 @@ title never share one), regardless of how many sources the chapters came from.
 Everything under staging is written by Suwayomi and its extensions, so it is
 treated as untrusted: symlinks and special files are skipped, import works
 on each series folder through one open directory (StagingFolder) so a folder
-swapped for a symlink mid-import changes nothing, archives are checked with
-hard caps before zipfile parses or decompresses them, and every name
-mang-arr creates fits the filesystem's 255-byte limit.
+swapped for a symlink mid-import changes nothing, the file linked is the
+open file that was checked, archives are checked with hard caps before
+zipfile parses or decompresses them (and zipfile parses the very bytes that
+were checked), and every name mang-arr creates fits the filesystem's
+255-byte limit.
 """
 import errno
 import hashlib
@@ -459,10 +461,11 @@ def link_into_library(src: str | StagedFile, folder: str, number: float, root: s
     library path, or None when a different file already sits there and
     `replace` is False - the library never overwrites what it did not make.
     src is an opened StagedFile (import passes the file it verified) or a
-    path, which must be a regular file, never a symlink. The link or copy is
-    made under a hidden temporary name, checked to be the very file that
-    was opened, and only then given its real name, so the library never
-    shows a half-written copy or a file swapped in after the check."""
+    path, which must be a regular file, never a symlink. What is linked or
+    copied is that open file, whatever its name points at by now; it goes
+    to a hidden temporary name first and only then gets its real name, so
+    the library never shows a half-written copy. An OSError names the
+    staged file and the library path."""
     global COPIED
     if isinstance(src, str):
         try:
@@ -488,6 +491,9 @@ def link_into_library(src: str | StagedFile, folder: str, number: float, root: s
         try:
             copied = _link_or_copy(src, dir_fd, tmp, dst)
             _publish(dir_fd, tmp, name, dst, replace)
+        except OSError as e:
+            # the calls above use plain and temporary names; say which files it was
+            raise _naming(e, src.path, dst) from e
         finally:
             _unlink_at(tmp, dir_fd)
     finally:
@@ -496,14 +502,31 @@ def link_into_library(src: str | StagedFile, folder: str, number: float, root: s
     return dst
 
 
+def _naming(e: OSError, src: str, dst: str) -> OSError:
+    """e (same type, so FileNotFoundError still means the file went away),
+    naming the staged file and its library path instead of the names the
+    call was made with, so the reason on the chapter says which folder
+    could not be written (the usual PUID/PGID mistake)."""
+    if e.errno is None:
+        return e
+    return type(e)(e.errno, e.strerror, src, None, dst)
+
+
+# Where Linux shows each open file as a link to it. Hard-linking that entry
+# (linkat with AT_SYMLINK_FOLLOW) links the open file itself, so no second
+# lookup by name is needed and nothing depends on inode numbers, which some
+# mounts (FUSE without use_ino, e.g. sshfs; CIFS with noserverino) do not
+# keep the same between two names of one file.
+_PROC_FD = "/proc/self/fd"
+
+
 def _link_or_copy(src: StagedFile, dir_fd: int, tmp: str, dst: str) -> bool:
     """Put the opened staged file at `tmp` in the library folder dir_fd: a
     hard link when possible, else a copy read from the open file. Returns
-    whether it was copied. A hard link can only be made by name, so it is
-    checked to be the file that was opened (the name may have been swapped)."""
+    whether it was copied."""
     global _copy_warned
     try:
-        os.link(src.name, tmp, src_dir_fd=src.dir_fd, dst_dir_fd=dir_fd, follow_symlinks=False)
+        linked = _link_open_file(src, dir_fd, tmp)
     except OSError as e:
         if e.errno not in _COPY_ERRNOS:
             raise
@@ -511,10 +534,27 @@ def _link_or_copy(src: StagedFile, dir_fd: int, tmp: str, dst: str) -> bool:
             log.warning("cannot hard-link %s -> %s (%s); copying instead. Staging and library are on "
                         "different filesystems or mounts, so every chapter is stored twice", src.path, dst, e)
             _copy_warned = True
+        linked = False
+    if not linked:
         _copy_into(src, dir_fd, tmp)
+    return not linked
+
+
+def _link_open_file(src: StagedFile, dir_fd: int, tmp: str) -> bool:
+    """Hard-link the open staged file as `tmp` in dir_fd. False when that
+    cannot be done safely and the caller should copy from the open file
+    instead. Without /proc the link can only be made by name, and the name
+    may have been swapped since the file was checked; when the new link is
+    not (as far as inode numbers tell) the open file it is removed."""
+    if os.path.isdir(_PROC_FD):
+        os.link(f"{_PROC_FD}/{src.fd}", tmp, dst_dir_fd=dir_fd, follow_symlinks=True)
         return True
-    if not src.is_same(_lstat_at(tmp, dir_fd)):
-        raise OSError(errno.EAGAIN, "the staged file was replaced while it was being imported", src.path)
+    os.link(src.name, tmp, src_dir_fd=src.dir_fd, dst_dir_fd=dir_fd, follow_symlinks=False)
+    if src.is_same(_lstat_at(tmp, dir_fd)):
+        return True
+    os.unlink(tmp, dir_fd=dir_fd)
+    log.warning("%s is no longer the file that was checked (replaced meanwhile, or this filesystem does not "
+                "keep inode numbers); copying the checked file instead", src.path)
     return False
 
 
@@ -567,6 +607,12 @@ MAX_UNCOMPRESSED = 1 << 30          # 1 GiB, declared total
 MAX_RATIO = 20                      # uncompressed / compressed, per entry and for the whole file ...
 RATIO_MIN_SIZE = 256 << 10          # ... once over 256 KiB (a small ComicInfo.xml compresses well)
 VERIFY_SECONDS = 120                # reading every entry back to check its CRC
+# Stored and deflate are all Suwayomi (and any comic tool) writes, and the
+# only methods zipfile decompresses a piece at a time: it inflates a whole
+# bzip2 or LZMA read at once whatever size the directory declares, so a few
+# KB of bzip2 could take gigabytes of memory before any limit here applies.
+_METHODS = (zipfile.ZIP_STORED, zipfile.ZIP_DEFLATED)
+_METHOD_NAMES = {zipfile.ZIP_BZIP2: "bzip2", zipfile.ZIP_LZMA: "LZMA", 9: "deflate64", 93: "zstandard", 99: "AES"}
 
 _END = struct.Struct("<4s4H2LH")                # end of central directory record
 _END64_LOCATOR = struct.Struct("<4sLQL")        # zip64 end of central directory locator
@@ -582,7 +628,9 @@ def verify_archive(src: str | StagedFile) -> tuple[bool, str]:
     StagedFile or a path (never opened through a symlink). A directory too
     big for a chapter is refused from the end records alone, before zipfile
     reads it; oversized or over-compressed contents are refused from the
-    directory, before anything is decompressed."""
+    directory, before anything is decompressed. zipfile is handed the end
+    records and directory that were checked (_Snapshot), not the live file,
+    which the staging writer could rewrite in between."""
     if isinstance(src, str):
         try:
             with open_staged(src) as f:
@@ -592,25 +640,24 @@ def verify_archive(src: str | StagedFile) -> tuple[bool, str]:
         except Exception as e:
             return False, f"{type(e).__name__}: {e}"[:300]
     try:
-        size = src.st.st_size
+        size = os.fstat(src.fd).st_size
         if size < 1024:
             return False, "file is empty"
-        with src.reader() as f:
-            end = _end_records(f, size)
-            if end is None:
-                return False, "not a zip archive"
-            problem = _directory_limits(f, *end)
+        snap = _Snapshot(src.fd, size)
+        end = _end_records(snap)
+        if end is None:
+            return False, "not a zip archive"
+        problem = _directory_limits(snap, *end)
+        if problem:
+            return _rejected(src.path, problem)
+        with zipfile.ZipFile(snap) as z:
+            infos = z.infolist()
+            problem = _archive_limits(infos, size)
             if problem:
                 return _rejected(src.path, problem)
-            f.seek(0)
-            with zipfile.ZipFile(f) as z:
-                infos = z.infolist()
-                problem = _archive_limits(infos, size)
-                if problem:
-                    return _rejected(src.path, problem)
-                bad = _read_entries(z, infos, src.path)
-                if bad:
-                    return False, bad
+            bad = _read_entries(z, infos, src.path)
+            if bad:
+                return False, bad
         images = [i.filename for i in infos if i.filename.lower().endswith(_IMAGE_EXT)]
         if not images:
             return False, "no images inside"
@@ -624,14 +671,82 @@ def _rejected(path: str, problem: str) -> tuple[bool, str]:
     return False, problem
 
 
-def _end_records(f, size: int) -> tuple[int, int, int] | None:
+def _pread(fd: int, n: int, at: int) -> bytes:
+    """Up to n bytes at offset `at` (fewer only at the end of the file)."""
+    parts = []
+    while n > 0:
+        b = os.pread(fd, min(n, 1 << 20), at)
+        if not b:
+            break
+        parts.append(b)
+        n -= len(b)
+        at += len(b)
+    return b"".join(parts)
+
+
+class _Snapshot:
+    """A read-only file object over an open archive, for zipfile, that keeps
+    it to what was checked. Its size is fixed, and every byte from `start`
+    to the end (the central directory, the end records and the comment) is
+    held in memory from the moment it was first read; only entry data before
+    `start` comes from the file. Everything zipfile reads to find and parse
+    the directory is therefore what the limits were checked on, even if the
+    staging writer rewrites the end record meanwhile."""
+
+    def __init__(self, fd: int, size: int):
+        self.fd, self.size, self.pos = fd, size, 0
+        self.start, self.held = size, b""
+        self.hold_from(max(size - (1 << 16) - _END.size, 0))      # where zipfile looks for the end record
+
+    def hold_from(self, at: int) -> None:
+        """Hold every byte from `at` to the end in memory as well."""
+        at = max(at, 0)
+        if at < self.start:
+            more = _pread(self.fd, self.start - at, at)
+            if len(more) != self.start - at:
+                raise zipfile.BadZipFile("the file got shorter while it was being checked")
+            self.held, self.start = more + self.held, at
+
+    def seekable(self) -> bool:
+        return True
+
+    def tell(self) -> int:
+        return self.pos
+
+    def seek(self, offset: int, whence: int = os.SEEK_SET) -> int:
+        pos = offset + (0, self.pos, self.size)[whence]
+        if pos < 0:
+            raise OSError(errno.EINVAL, "negative seek position")
+        self.pos = pos
+        return pos
+
+    def read(self, n: int | None = -1) -> bytes:
+        end = self.size if n is None or n < 0 else min(self.pos + n, self.size)
+        if end <= self.pos:
+            return b""
+        out = b""
+        if self.pos < self.start:
+            want = min(end, self.start) - self.pos
+            out = _pread(self.fd, want, self.pos)
+            if len(out) < want:                         # the file got shorter: it ends here
+                self.pos += len(out)
+                return out
+        if end > self.start:
+            out += self.held[max(self.pos, self.start) - self.start:end - self.start]
+        self.pos = end
+        return out
+
+
+def _end_records(snap: _Snapshot) -> tuple[int, int, int] | None:
     """(entries, directory size, directory start) from the end of a zip, or
     None when it has no end record. The records are found the way zipfile
     finds them (the last 22 bytes, else the last signature in the final
-    64 KiB, then a zip64 locator right before it), reading only the tail."""
+    64 KiB, then a zip64 locator right before it), and held in the snapshot
+    before they are read."""
+    size = snap.size
     tail_at = max(size - (1 << 16) - _END.size, 0)
-    f.seek(tail_at)
-    tail = f.read()
+    snap.seek(tail_at)
+    tail = snap.read()
     if len(tail) >= _END.size and tail[-_END.size:][:4] == b"PK\x05\x06" and tail[-2:] == b"\0\0":
         pos = len(tail) - _END.size
     else:
@@ -640,16 +755,18 @@ def _end_records(f, size: int) -> tuple[int, int, int] | None:
             return None
     _, disk, cd_disk, _, entries, cd_size, _, _ = _END.unpack_from(tail, pos)
     at = tail_at + pos                          # the directory ends where the end records start
+    # zipfile looks for a zip64 locator and record right before the end record
+    snap.hold_from(at - _END64_LOCATOR.size - _END64.size)
     if at >= _END64_LOCATOR.size:
-        f.seek(at - _END64_LOCATOR.size)
-        sig, loc_disk, rec_at, disks = _END64_LOCATOR.unpack(f.read(_END64_LOCATOR.size))
+        snap.seek(at - _END64_LOCATOR.size)
+        sig, loc_disk, rec_at, disks = _END64_LOCATOR.unpack(snap.read(_END64_LOCATOR.size))
         if sig == b"PK\x06\x07":
             # only the plain layout, the record right before its locator: zipfile
             # versions differ on the others, and no chapter archive needs them
             if loc_disk or disks > 1 or rec_at != at - _END64_LOCATOR.size - _END64.size:
                 raise zipfile.BadZipFile("unsupported zip64 end records")
-            f.seek(rec_at)
-            sig, _, _, _, disk, cd_disk, _, entries, cd_size, _ = _END64.unpack(f.read(_END64.size))
+            snap.seek(rec_at)
+            sig, _, _, _, disk, cd_disk, _, entries, cd_size, _ = _END64.unpack(snap.read(_END64.size))
             if sig != b"PK\x06\x06":
                 raise zipfile.BadZipFile("zip64 end of central directory record not found")
             at = rec_at
@@ -658,19 +775,20 @@ def _end_records(f, size: int) -> tuple[int, int, int] | None:
     return entries, cd_size, at - cd_size
 
 
-def _directory_limits(f, entries: int, cd_size: int, cd_at: int) -> str | None:
+def _directory_limits(snap: _Snapshot, entries: int, cd_size: int, cd_at: int) -> str | None:
     """Why an archive's directory is too big for a chapter, or None. The
-    declared count and size come first; then the directory is walked header
-    by header without building anything, because the count in the end record
-    can understate what zipfile would parse."""
+    declared count and size come first; then the directory is held in the
+    snapshot and walked header by header without building anything, because
+    the count in the end record can understate what zipfile would parse."""
     if entries > MAX_ENTRIES:
         return f"{entries} entries (limit {MAX_ENTRIES})"
     if cd_size > MAX_DIRECTORY:
         return f"{cd_size} bytes of directory (limit {MAX_DIRECTORY})"
     if cd_at < 0:
         raise zipfile.BadZipFile("bad offset for central directory")
-    f.seek(cd_at)
-    cd = f.read(cd_size)
+    snap.hold_from(cd_at)
+    snap.seek(cd_at)
+    cd = snap.read(cd_size)
     count = pos = 0
     while pos < cd_size:
         count += 1
@@ -689,14 +807,21 @@ def _archive_limits(infos, size: int) -> str | None:
     """Why an archive's parsed directory is implausible for a chapter, or None."""
     if len(infos) > MAX_ENTRIES:
         return f"{len(infos)} entries (limit {MAX_ENTRIES})"
+    for i in infos:
+        if i.compress_type not in _METHODS:
+            method = _METHOD_NAMES.get(i.compress_type, f"method {i.compress_type}")
+            return f"entry {i.filename[:80]!r} is compressed with {method}; only stored or deflate is accepted"
+    # every entry's data takes its own bytes of the file; more than the file
+    # holds means entries overlap, which is how one page is read back 5000 times
+    packed = sum(i.compress_size for i in infos)
+    if packed > size:
+        return f"entries overlap: they claim {packed} bytes of data from a {size} byte file"
     total = sum(i.file_size for i in infos)
     if total > MAX_UNCOMPRESSED:
         return f"{total} bytes uncompressed (limit {MAX_UNCOMPRESSED})"
     for i in infos:
         if i.file_size > RATIO_MIN_SIZE and i.file_size > MAX_RATIO * max(i.compress_size, 1):
             return f"entry {i.filename[:80]!r} expands {i.file_size // max(i.compress_size, 1)}x (limit {MAX_RATIO}x)"
-    # entries can share compressed bytes (overlapping entries), so the file's
-    # own size is what the archive as a whole can honestly expand from
     if total > RATIO_MIN_SIZE and total > MAX_RATIO * size:
         return f"{total} bytes uncompressed from a {size} byte file: {total // size}x (limit {MAX_RATIO}x)"
     return None
@@ -705,17 +830,20 @@ def _archive_limits(infos, size: int) -> str | None:
 def _read_entries(z, infos, path: str) -> str | None:
     """zipfile's testzip, bounded: read every entry back (which checks its
     CRC) in 1 MiB pieces and give up after VERIFY_SECONDS. The limits above
-    already cap how much can be decompressed; this caps the time on a slow
-    disk. Returns what is wrong, or None."""
+    already cap how much is read and decompressed (stored and deflate stop
+    at the declared size, overlapping entries are refused); this caps the
+    time on a slow disk. Returns what is wrong, or None."""
     deadline = time.monotonic() + VERIFY_SECONDS
     for i in infos:
         try:
             with z.open(i) as e:
-                while e.read(1 << 20):
+                while True:
                     if time.monotonic() > deadline:
                         problem = f"checking it took longer than {VERIFY_SECONDS}s"
                         log.warning("%s rejected: %s", path, problem)
                         return problem
+                    if not e.read(1 << 20):
+                        break
         except zipfile.BadZipFile:
             return f"corrupt entry {i.filename}"
     return None
