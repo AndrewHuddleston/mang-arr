@@ -223,11 +223,17 @@ def _backfill_folders(con) -> None:
 
 
 def valid_folder(folder) -> bool:
-    """Is this a series folder name mang-arr could have made: one plain path
-    component (no separator, not absolute, not '.' or '..')? Folders are
-    joined onto LIBRARY_ROOT, so anything else would point outside it."""
-    return (isinstance(folder, str) and folder not in ("", ".", "..")
-            and library.safe_title(folder) == folder)
+    """Is this a usable series folder name: one plain path component (no
+    separator, no NUL, not absolute, not '', '.' or '..')? Folders are joined
+    onto LIBRARY_ROOT, so anything else would point outside it. This is a
+    structural check only (library.safe_title is not idempotent, e.g.
+    'Foo ...' -> 'Foo ', so "safe_title(folder) == folder" would reject
+    folders mang-arr made itself); callers that delete files also check
+    library.is_within on the resolved folder, which catches symlinks."""
+    if not isinstance(folder, str) or folder in ("", ".", "..") or "\0" in folder:
+        return False
+    # '\\' too: safe_title never makes it, and it is a separator on SMB/Windows shares
+    return not any(sep in folder for sep in ("/", "\\", os.sep, os.altsep or "/")) and not os.path.isabs(folder)
 
 
 def restrict_permissions(path: str) -> None:
@@ -287,20 +293,39 @@ def event(con, kind: str, message: str, series_id: int | None = None) -> None:
                 (now(), series_id, kind, message))
 
 
+# Per-pass summaries written for every series on every refresh ("Sources
+# resolved", "Needs a decision"). On a large library they are most of the
+# table, so the row cap removes these first and the chapter history
+# (downloaded, imported, failed, ...) keeps its full keep_days.
+ROUTINE_EVENT_KINDS = ("resolved", "review")
+
+
 def prune_events(con, keep_days: float, keep_rows: int) -> int:
-    """Delete events older than keep_days, and all but the newest keep_rows.
-    Returns how many were deleted. The history is for the UI; without this
-    the table (and every backup) grows forever."""
+    """Delete events older than keep_days; then, if more than keep_rows are
+    left, the oldest routine events and only after those the oldest of any
+    kind. Returns how many were deleted. The history is for the UI; without
+    this the table (and every backup) grows forever."""
     cutoff = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(time.time() - keep_days * 86400))
-    n = con.execute("DELETE FROM event WHERE at < ?", (cutoff,)).rowcount
-    top = con.execute("SELECT id FROM event ORDER BY id DESC LIMIT 1 OFFSET ?", (max(keep_rows, 0),)).fetchone()
-    if top:
-        n += con.execute("DELETE FROM event WHERE id <= ?", (top[0],)).rowcount
+    aged = con.execute("DELETE FROM event WHERE at < ?", (cutoff,)).rowcount
+    excess = con.execute("SELECT COUNT(*) FROM event").fetchone()[0] - max(keep_rows, 0)
+    routine = other = 0
+    if excess > 0:
+        marks = ",".join("?" for _ in ROUTINE_EVENT_KINDS)
+        routine = con.execute(f"DELETE FROM event WHERE id IN (SELECT id FROM event WHERE kind IN ({marks})"
+                              " ORDER BY id LIMIT ?)", (*ROUTINE_EVENT_KINDS, excess)).rowcount
+        excess -= routine
+    if excess > 0:
+        other = con.execute("DELETE FROM event WHERE id IN (SELECT id FROM event ORDER BY id LIMIT ?)",
+                            (excess,)).rowcount
     con.commit()
-    if n:
-        log.info("event history pruned: %d event(s) older than %g days or beyond the newest %d removed",
-                 n, keep_days, keep_rows)
-    return n
+    if aged:
+        log.info("event history pruned: %d event(s) older than %g days removed", aged, keep_days)
+    if routine or other:
+        log.info("event history over %d events: removed the %d oldest routine (resolved/review) event(s)"
+                 "%s", keep_rows, routine,
+                 f" and, as that was not enough, the {other} oldest other event(s): raise "
+                 f"MANGARR_EVENTS_KEEP_ROWS to keep {keep_days:g} days" if other else "")
+    return aged + routine + other
 
 
 # -- series -----------------------------------------------------------------

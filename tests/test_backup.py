@@ -374,6 +374,47 @@ class BackupTest(_Base):
         self.assertTrue(any("outside the series' library folder" in m for m in logs.output))
         self.assertTrue(any("is not a folder inside" in m for m in logs.output))
 
+    def test_series_whose_folder_ends_in_a_space_is_deleted_and_restored_as_is(self):
+        # 'Foo ...' gets the folder 'Foo ' (safe_title strips, then drops the dots): still its own folder
+        with db.connect() as con:
+            sid = db.upsert_series(con, Series(anilist_id=7, english="Foo ..."))
+            folder = con.execute("SELECT folder FROM series WHERE id=?", (sid,)).fetchone()[0]
+        self.assertEqual(folder, "Foo ")
+        p = backup.create("t")
+        msg = backup.restore(p)
+        self.assertNotIn("folder name(s) replaced", msg)
+        own = os.path.join(self.library, folder, "Chapter 001.0.cbz")
+        os.makedirs(os.path.dirname(own))
+        open(own, "w").close()
+        with db.connect() as con:
+            self.assertEqual(con.execute("SELECT folder FROM series WHERE id=?", (sid,)).fetchone()[0], "Foo ")
+            db.set_have(con, sid, 1.0, None, own)
+            core.delete_series(con, mock.Mock(), sid, delete_library=True)
+        self.assertFalse(os.path.exists(own))
+        self.assertFalse(os.path.exists(os.path.dirname(own)))
+
+    def test_restore_keeps_the_id_counters(self):
+        # a deleted series' id must not be handed out again: its events keep that series_id
+        with db.connect() as con:
+            for i in (1, 2, 3):
+                db.upsert_series(con, Series(anilist_id=i, english=f"S{i}"))
+            db.event(con, "downloaded", "chapter 1 of the old series 3", 3)
+            db.delete_series(con, 3)
+        p = backup.create("t")
+        backup.restore(p)
+        with db.connect() as con:
+            sid = db.upsert_series(con, Series(anilist_id=9, english="New"))
+        self.assertEqual(sid, 4)
+
+    def test_restore_ignores_an_implausible_id_counter(self):
+        p = self.crafted(sql="INSERT INTO series (id, ref, title, added_at, folder) VALUES (1, 'manual:A', 'A', '2020', 'A');"
+                             "UPDATE sqlite_sequence SET seq = 9223372036854775807 WHERE name = 'series';")
+        with self.assertLogs("mangarr.backup", "WARNING") as logs:
+            backup.restore(p)
+        self.assertTrue(any("id counter for series" in m for m in logs.output))
+        with db.connect() as con:
+            self.assertEqual(db.upsert_series(con, Series(anilist_id=9, english="New")), 2)
+
     # -- uploads (file objects)
 
     def test_restore_from_an_upload_stream_with_limit(self):
@@ -413,6 +454,25 @@ class BackupTest(_Base):
         with db.connect() as con:
             self.assertEqual([r[0] for r in con.execute("SELECT message FROM event ORDER BY id")],
                              [f"e{i}" for i in range(10, 30)])
+
+    def test_prune_history_drops_routine_events_before_chapter_history(self):
+        with db.connect() as con:
+            for i in range(10):
+                db.event(con, "downloaded", f"d{i}", 1)
+                db.event(con, "resolved", f"r{i}", 1)
+        with self.assertLogs("mangarr.db", "INFO") as logs:
+            self.assertEqual(backup.prune_history(keep_days=90, keep_rows=12), 8)
+        with db.connect() as con:
+            left = [r[0] for r in con.execute("SELECT message FROM event ORDER BY id")]
+        self.assertEqual(left, [f"d{i}" for i in range(9)] + ["r8", "d9", "r9"])
+        self.assertFalse(any("oldest other" in m for m in logs.output))
+        # when routine events alone cannot get under the cap, the oldest of any kind go, and the log says so
+        with self.assertLogs("mangarr.db", "INFO") as logs:
+            self.assertEqual(backup.prune_history(keep_days=90, keep_rows=5), 7)
+        with db.connect() as con:
+            left = [r[0] for r in con.execute("SELECT message FROM event ORDER BY id")]
+        self.assertEqual(left, ["d5", "d6", "d7", "d8", "d9"])
+        self.assertTrue(any("MANGARR_EVENTS_KEEP_ROWS" in m for m in logs.output))
 
 
 @unittest.skipIf(TestClient is None, "web extras not installed")

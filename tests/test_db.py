@@ -7,7 +7,7 @@ import threading
 import unittest
 from unittest import mock
 
-from mangarr import db
+from mangarr import db, library
 from mangarr.model import Series
 from mangarr.resolver import Plan, SourceMatch
 from mangarr.suwayomi import Chapter, Source
@@ -215,8 +215,14 @@ class PathSafetyTest(unittest.TestCase):
     def test_valid_folder(self):
         for ok in ("Wind Breaker", "Wind Breaker (anilist_2)", "untitled"):
             self.assertTrue(db.valid_folder(ok), ok)
-        for bad in ("", ".", "..", "/etc", "../x", "a/b", "a\\b", None, 3):
+        for bad in ("", ".", "..", "/etc", "../x", "a/b", "a\\b", "a\0b", None, 3):
             self.assertFalse(db.valid_folder(bad), bad)
+
+    def test_valid_folder_accepts_every_folder_mang_arr_makes(self):
+        # safe_title is not idempotent ('Foo ...' -> 'Foo '): its output must still count as valid
+        for title in ("Foo ...", "Why Me .", " x ", "a:b", "..", "...", "/", "Wind Breaker"):
+            folder = library.unique_folder(title, set(), "anilist:1")
+            self.assertTrue(db.valid_folder(folder), (title, folder))
 
 
 if __name__ == "__main__":

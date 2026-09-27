@@ -44,7 +44,7 @@ INTERVAL_HOURS = float(os.environ.get("MANGARR_BACKUP_HOURS", "24"))
 UPLOAD_MAX_MB = float(os.environ.get("MANGARR_BACKUP_UPLOAD_MAX_MB", "512"))
 # Event history kept (Activity/series pages); older events are pruned before each scheduled backup.
 EVENTS_KEEP_DAYS = float(os.environ.get("MANGARR_EVENTS_KEEP_DAYS", "90"))
-EVENTS_KEEP_ROWS = int(os.environ.get("MANGARR_EVENTS_KEEP_ROWS", "20000"))
+EVENTS_KEEP_ROWS = int(os.environ.get("MANGARR_EVENTS_KEEP_ROWS", "100000"))   # a size ceiling, see README
 
 # Security settings a restore keeps from the CURRENT database instead of the
 # backup's (a key the current database does not have is removed from the
@@ -339,6 +339,7 @@ def _rebuild(src_path: str, dst_path: str, page_size: int) -> tuple[int, list[st
                 raise RestoreError(f"table {t} lacks column(s) {', '.join(missing)} that schema {version} has")
             names = ", ".join(_q(c) for c in cols)
             con.execute(f"INSERT INTO main.{_q(t)} ({names}) SELECT {names} FROM src.{_q(t)}")
+        _copy_sequences(con, want, "sqlite_sequence" in found)
         con.commit()
         con.execute("DETACH DATABASE src")
         orphans = 0
@@ -356,6 +357,31 @@ def _rebuild(src_path: str, dst_path: str, page_size: int) -> tuple[int, list[st
         raise RestoreError(f"the backup cannot be used: {type(e).__name__}: {e}") from e
     finally:
         con.close()
+
+
+SEQUENCE_MAX = 2 ** 53      # a larger AUTOINCREMENT high-water mark in a backup is ignored (it would soon exhaust ids)
+
+
+def _copy_sequences(con, tables: list[str], src_has_sequence: bool) -> None:
+    """Carry the backup's AUTOINCREMENT high-water marks over. The copied rows
+    alone only set them to max(id), so the id of a series deleted before the
+    backup would be handed out again and its leftover events (which keep
+    their series_id) would show up on the new series' page."""
+    if not src_has_sequence:
+        return
+    for name, seq in con.execute("SELECT name, seq FROM src.sqlite_sequence").fetchall():
+        if name not in tables:
+            continue
+        if not isinstance(seq, int) or not 0 <= seq <= SEQUENCE_MAX:
+            log.warning("restore: ignoring the backup's id counter for %s (%r): not a plausible value", name, seq)
+            continue
+        if not con.execute("UPDATE main.sqlite_sequence SET seq = MAX(seq, ?) WHERE name = ?",
+                           (seq, name)).rowcount:
+            # no row yet: the table was empty in the backup; only AUTOINCREMENT tables get one
+            sql = con.execute("SELECT sql FROM main.sqlite_master WHERE type='table' AND name=?",
+                              (name,)).fetchone()
+            if sql and "AUTOINCREMENT" in (sql[0] or "").upper():
+                con.execute("INSERT INTO main.sqlite_sequence (name, seq) VALUES (?, ?)", (name, seq))
 
 
 def _sanitise_paths(con) -> list[str]:

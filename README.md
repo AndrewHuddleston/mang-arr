@@ -194,7 +194,7 @@ with an asterisk to the container mounts (`/config`, `/data/staging`,
 | `MANGARR_BACKUPS_KEEP` | `7` | How many backups to keep in `$MANGARR_DATA/backups`; the oldest are pruned after every backup. |
 | `MANGARR_BACKUP_UPLOAD_MAX_MB` | `512` | Largest backup file accepted by *Restore from file* (raised to twice the current database when that is larger). |
 | `MANGARR_EVENTS_KEEP_DAYS` | `90` | Days of event history (Activity, series pages) kept; older events are pruned before each scheduled backup. |
-| `MANGARR_EVENTS_KEEP_ROWS` | `20000` | At most this many events are kept. |
+| `MANGARR_EVENTS_KEEP_ROWS` | `100000` | Size ceiling for the event history. Above it the oldest routine *Sources resolved* / *Needs a decision* events go first, so chapter history (downloaded, imported, failed) keeps its full `MANGARR_EVENTS_KEEP_DAYS`; only if that is not enough are older events of any kind removed (logged). A library refreshed often with many hundreds of series may need more. |
 | `MANGARR_PUSHOVER_TOKEN` | unset | Default Pushover application token. Notifications are sent only when both Pushover values are set. |
 | `MANGARR_PUSHOVER_USER` | unset | Default Pushover user key. |
 | `MANGARR_WEBHOOK_URL` | unset | Default URL to POST `{"title", "message", "kind"}` JSON to on every notification. |
@@ -435,8 +435,12 @@ name and appears only once it is complete and passes an integrity check.
 The database, its backups and the backups folder are readable by the owner
 only (0600 / 0700): they hold the login password, API key and notifier
 tokens. Before each scheduled backup the event history is trimmed to the
-last `MANGARR_EVENTS_KEEP_DAYS` days (default 90) and at most
-`MANGARR_EVENTS_KEEP_ROWS` events (default 20000).
+last `MANGARR_EVENTS_KEEP_DAYS` days (default 90). `MANGARR_EVENTS_KEEP_ROWS`
+(default 100000) is a size ceiling on top of that: when the history is larger,
+the oldest routine per-refresh events (*Sources resolved*, *Needs a decision*)
+are removed first and chapter history keeps its full 90 days; only if that is
+still not enough are the oldest events of any kind removed, with a log line
+saying so.
 
 Restore, from a kept backup or an uploaded file (at most
 `MANGARR_BACKUP_UPLOAD_MAX_MB`, default 512, or twice the current database
