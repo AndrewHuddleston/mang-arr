@@ -90,7 +90,7 @@ def show_plan(plan: Plan) -> None:
     wanted = plan.wanted()
     out()
     out(f"  chapters listed: {len(plan.chapters)}  on disk: {len(plan.have())}"
-        f"  wanted: {len(wanted)}  gaps nobody has: {ranges(plan.gaps()) if plan.gaps() else 'none'}")
+        f"  wanted: {len(wanted)}  gaps nobody has: {plan.gap_text() or 'none'}")
     if plan.series.chapters and plan.series.status == "FINISHED":
         top = max(plan.chapters)
         if top < plan.series.chapters - 0.5:

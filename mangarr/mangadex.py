@@ -12,6 +12,7 @@ import urllib.parse
 import urllib.request
 
 from . import config
+from .anilist import retry_after
 from .matching import query_score
 from .model import Series
 
@@ -35,8 +36,9 @@ def _get(path: str, params: list[tuple[str, str]], retries: int = 3) -> dict:
             return d
         except urllib.error.HTTPError as e:
             if e.code == 429:
-                wait = int(e.headers.get("Retry-After", "5"))
-                log.debug("mangadex rate limited, waiting %ds", wait)
+                wait = retry_after(e.headers, 5)
+                log.debug("mangadex rate limited, waiting %gs", wait)
+                last = e
                 time.sleep(wait)
                 continue
             if e.code == 404:

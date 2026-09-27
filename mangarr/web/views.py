@@ -66,19 +66,23 @@ def nav_current(path: str) -> str:
     return "/"
 
 
-_TAG = re.compile(r"<[^>]+>")
+# a tag cannot contain '<': "<[^>]+>" rescans from every '<' of a long run
+_TAG = re.compile(r"<[^<>]+>")
 _BR = re.compile(r"<br\s*/?>|</p>|</div>", re.I)
+MAX_DESCRIPTION = 10_000        # chars rendered; real descriptions are a few thousand at most
 
 
 def plain_description(text: str | None) -> str:
     """AniList descriptions carry <br> and <i>; make them plain text with
-    real line breaks, at most one blank line in a row."""
+    real line breaks, at most one blank line in a row. The text comes from
+    the metadata providers, so it is capped and only linear patterns run on
+    it (trailing blanks are stripped per line, not by a regex)."""
     if not text:
         return ""
-    t = _BR.sub("\n", text)
+    t = _BR.sub("\n", text[:MAX_DESCRIPTION])
     t = _TAG.sub("", t)
     t = html.unescape(t)
-    t = re.sub(r"[ \t]+\n", "\n", t)
+    t = "\n".join(line.rstrip(" \t") for line in t.split("\n"))
     t = re.sub(r"\n{3,}", "\n\n", t)
     return t.strip()
 
