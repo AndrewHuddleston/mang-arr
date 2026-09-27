@@ -32,11 +32,15 @@ class Job:
     progress: str = ""
     message: str = ""
     cancel: bool = False
+    # a multi-series job (refresh pass) lists every series it covers:
+    # {series_id, title, state: queued|running|done|nomatch|failed|error|cancelled, result}
+    items: list = field(default_factory=list)
 
     def as_dict(self) -> dict:
         return {"id": self.id, "kind": self.kind, "title": self.title, "seriesId": self.series_id,
                 "status": self.status, "queuedAt": self.queued_at, "startedAt": self.started_at,
-                "finishedAt": self.finished_at, "progress": self.progress, "message": self.message}
+                "finishedAt": self.finished_at, "progress": self.progress, "message": self.message,
+                "items": self.items}
 
 
 class Runner:

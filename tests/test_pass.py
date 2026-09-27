@@ -35,5 +35,32 @@ class PassTest(unittest.TestCase):
         self.assertEqual(skipped, 0)
 
 
+@unittest.skipIf(web is None, "web extras not installed")
+class RunPassTest(unittest.TestCase):
+    def test_items_track_each_series(self):
+        from mangarr import core, jobs
+        rows = [{"id": 1, "title": "A"}, {"id": 2, "title": "B"}, {"id": 3, "title": "C"}]
+
+        class Result:
+            downloaded = imported = 0
+
+        def fake_refresh(con, client, sid, **kw):
+            if sid == 2:
+                raise RuntimeError("Suwayomi unreachable")
+            kw["progress"]("downloading")
+            return Result()
+        outcomes = {1: ("done", "complete: nothing missing"), 3: ("nomatch", "no match: rejected titles: X")}
+        job = jobs.Job(1, "refresh-all", "all")
+        with mock.patch.object(core, "refresh_series", fake_refresh), \
+             mock.patch.object(core, "describe_outcome", lambda con, sid, o: outcomes[sid]), \
+             mock.patch.object(web, "_record_error", lambda sid, e: None), \
+             mock.patch.object(web.db, "connect", mock.MagicMock()):
+            done, dl, imp, errors = web._run_pass(job, rows, "test")
+        self.assertEqual([i["state"] for i in job.items], ["done", "error", "nomatch"])
+        self.assertIn("unreachable", job.items[1]["result"])
+        self.assertEqual(job.items[2]["result"], "no match: rejected titles: X")
+        self.assertEqual((done, errors), (3, 1))          # done = processed, errors included
+
+
 if __name__ == "__main__":
     unittest.main()

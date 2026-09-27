@@ -165,31 +165,50 @@ def plan_pass(rows) -> tuple[list, int]:
     return keep, skipped
 
 
+def _run_pass(job: jobs.Job, rows, label: str) -> tuple[int, int, int, int]:
+    """Refresh every series in rows, one at a time, keeping job.items current
+    so the Activity page shows the whole pass: what is queued, what is running
+    and what happened to each. Returns (done, downloaded, imported, errors)."""
+    job.items = [{"series_id": r["id"], "title": r["title"], "state": "queued", "result": ""} for r in rows]
+    done = downloaded = imported = errors = 0
+    for i, (r, item) in enumerate(zip(rows, job.items, strict=True), 1):
+        if job.cancel:
+            job.progress = f"cancelled after {done} of {len(rows)}"
+            for it in job.items[i - 1:]:
+                it["state"], it["result"] = "cancelled", "pass cancelled"
+            break
+        head = f"{i}/{len(rows)}: {r['title']}"
+        job.progress = head
+        item["state"], item["result"] = "running", "checking sources"
+
+        def prog(m, head=head, item=item):
+            job.progress = f"{head} - {m}"
+            item["result"] = m
+        try:
+            with db.connect() as con:
+                o = core.refresh_series(con, client, r["id"], download=True, should_cancel=lambda: job.cancel,
+                                        progress=prog)
+                item["state"], item["result"] = core.describe_outcome(con, r["id"], o)
+            downloaded += o.downloaded
+            imported += o.imported
+        except core.Gone:
+            item["state"], item["result"] = "cancelled", "series was deleted"
+            continue
+        except Exception as e:
+            errors += 1
+            item["state"], item["result"] = "error", f"{type(e).__name__}: {e}"[:300]
+            log.error("%s: %s: %s: %s", label, r["title"], type(e).__name__, e)
+            _record_error(r["id"], e)
+        done += 1
+    return done, downloaded, imported, errors
+
+
 def _job_refresh_all(job: jobs.Job):
     with db.connect() as con:
         rows, skipped = plan_pass(db.series_rows(con))
     log.info("refresh pass: %d series (%d with missing chapters first), %d finished series skipped until due",
              len(rows), sum(1 for r in rows if r["wanted"]), skipped)
-    done = downloaded = imported = errors = 0
-    for i, r in enumerate(rows, 1):
-        if job.cancel:
-            job.progress = f"cancelled after {done} of {len(rows)}"
-            break
-        head = f"{i}/{len(rows)}: {r['title']}"
-        job.progress = head
-        try:
-            with db.connect() as con:
-                o = core.refresh_series(con, client, r["id"], download=True, should_cancel=lambda: job.cancel,
-                                        progress=lambda m, head=head: setattr(job, "progress", f"{head} - {m}"))
-            downloaded += o.downloaded
-            imported += o.imported
-        except core.Gone:
-            continue
-        except Exception as e:
-            errors += 1
-            log.error("refresh-all: %s: %s: %s", r["title"], type(e).__name__, e)
-            _record_error(r["id"], e)
-        done += 1
+    done, downloaded, imported, errors = _run_pass(job, rows, "refresh-all")
     msg = f"{done} series, {downloaded} downloaded, {imported} imported, {errors} errors" + \
         (f", {skipped} complete finished series skipped" if skipped else "")
     if imported:
@@ -222,23 +241,8 @@ def _job_search_wanted(job: jobs.Job):
     """Download-only pass over every series with wanted chapters."""
     with db.connect() as con:
         rows = db.wanted_all(con)
-    got = 0
-    for i, r in enumerate(rows, 1):
-        if job.cancel:
-            break
-        head = f"{i}/{len(rows)}: {r['title']}"
-        job.progress = head
-        try:
-            with db.connect() as con:
-                o = core.refresh_series(con, client, r["id"], download=True, should_cancel=lambda: job.cancel,
-                                        progress=lambda m, head=head: setattr(job, "progress", f"{head} - {m}"))
-            got += o.downloaded
-        except core.Gone:
-            continue
-        except Exception as e:
-            log.error("search wanted: %s: %s: %s", r["title"], type(e).__name__, e)
-            _record_error(r["id"], e)
-    return f"{len(rows)} series searched, {got} chapters downloaded"
+    done, downloaded, imported, errors = _run_pass(job, rows, "search wanted")
+    return f"{len(rows)} series searched, {downloaded} chapters downloaded, {errors} errors"
 
 
 # -- middleware / errors -------------------------------------------------------
@@ -661,7 +665,10 @@ def wanted_search():
 @app.get("/activity")
 def activity_page(request: Request):
     jobs_, squeue = runner.jobs()[:50], _suwayomi_queue()
-    return page(request, "activity.html", jobs=jobs_, squeue=squeue, queue=views.queue_rows(jobs_, squeue))
+    passes = [j for j in jobs_ if j.items]
+    current = next((j for j in passes if j.status == "running"), passes[0] if passes else None)
+    return page(request, "activity.html", jobs=jobs_, squeue=squeue, queue=views.queue_rows(jobs_, squeue),
+                pass_job=current)
 
 
 @app.get("/activity/history")

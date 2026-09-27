@@ -112,6 +112,39 @@ def refresh_metadata(con, series_id: int) -> str:
     return f"{fresh.title}: {fresh.status or '?'}, {len(fresh.genres)} genre(s), year {fresh.year or '?'}"
 
 
+def describe_outcome(con, series_id: int, o: Outcome) -> tuple[str, str]:
+    """(state, text) for the Activity page: what happened to this series in a
+    pass, in words a user can act on."""
+    plan = o.plan
+    if not primary(plan):
+        return "nomatch", "no match: " + _review_summary(plan)
+    rows = db.chapters(con, series_id)
+    now_ = db.now()
+    later = [r for r in rows if r["status"] == "failed" and r["next_try"] and r["next_try"] > now_]
+    unavailable = sum(1 for r in rows if r["status"] == "unavailable")
+    parts = []
+    state = "done"
+    if o.results:
+        parts.append(f"{o.downloaded} downloaded")
+        if o.failed:
+            state = "failed" if not o.downloaded else "done"
+            failed_rows = [r for r in rows if r["status"] == "failed" and r["reason"]]
+            why = failed_rows[0]["reason"] if failed_rows else "download failed"
+            parts.append(f"{o.failed} failed ({why})")
+    else:
+        wanted_now = sum(1 for r in rows if r["status"] == "wanted")
+        if not wanted_now and not later:
+            parts.append("complete: nothing missing")
+    if later:
+        nxt = min(r["next_try"] for r in later)[:16]
+        parts.append(f"{len(later)} failed chapter(s) waiting for retry (next {nxt})")
+    if unavailable:
+        parts.append(f"{unavailable} chapter(s) no source lists")
+    if plan.unreachable:
+        parts.append("unreachable: " + ", ".join(src.name for src, _ in plan.unreachable))
+    return state, "; ".join(parts) or "nothing to do"
+
+
 def _resolve_summary(plan: Plan) -> str:
     used = sorted({m.source.name for m in plan.assignment.values()})
     s = f"{len(plan.chapters)} chapters listed from {', '.join(used) or 'no source'}; {len(plan.wanted())} wanted"

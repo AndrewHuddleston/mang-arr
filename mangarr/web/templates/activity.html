@@ -44,6 +44,32 @@
 </tr>
 {% endfor %}
 </tbody></table></div>
+{% if pass_job %}
+{% set items = pass_job.items %}
+{% set n_done = items|selectattr('state', 'in', ['done', 'nomatch', 'failed', 'error'])|list|length %}
+<h2 class="section-title" id="pass">{{ 'Current' if pass_job.status == 'running' else 'Last' }} {{ pass_job.kind }} pass: {{ n_done }} of {{ items|length }} series
+  <span class="muted small">
+    {{ items|selectattr('state', 'equalto', 'queued')|list|length }} queued ·
+    {{ items|selectattr('state', 'equalto', 'done')|list|length }} ok ·
+    {{ items|selectattr('state', 'equalto', 'nomatch')|list|length }} no match ·
+    {{ items|selectattr('state', 'in', ['failed', 'error'])|list|length }} failed
+  </span></h2>
+<div class="table-container"><table class="table queue pass">
+<thead><tr><th class="col-icon"></th><th class="num">#</th><th>Series</th><th>Status</th><th>What happened / what it is doing</th></tr></thead>
+<tbody>
+{% for it in items %}
+{% set lk = {'running': 'info', 'done': 'success', 'nomatch': 'warning', 'failed': 'danger', 'error': 'danger', 'cancelled': 'default'}.get(it.state, 'default') %}
+{% set lt = {'running': 'working', 'done': 'done', 'nomatch': 'no match', 'failed': 'failed', 'error': 'error', 'cancelled': 'cancelled', 'queued': 'queued'}.get(it.state, it.state) %}
+<tr class="queue-row pass-{{ it.state }}" data-status="{{ 'active' if it.state in ['queued', 'running'] else ('failed' if it.state in ['failed', 'error', 'nomatch'] else 'done') }}">
+  <td class="col-icon">{% if it.state == 'running' %}{{ m.icon('spinner', 'sm spin') }}{% elif it.state == 'queued' %}{{ m.icon('clock', 'sm') }}{% elif it.state in ['failed', 'error', 'nomatch'] %}{{ m.icon('warning', 'sm') }}{% elif it.state == 'cancelled' %}{{ m.icon('ignore', 'sm') }}{% else %}{{ m.icon('check-circle', 'sm') }}{% endif %}</td>
+  <td class="num muted">{{ loop.index }}</td>
+  <td><a href="/series/{{ it.series_id }}">{{ it.title }}</a></td>
+  <td>{{ m.label(lt, lk) }}</td>
+  <td class="small message">{{ it.result }}</td>
+</tr>
+{% endfor %}
+</tbody></table></div>
+{% endif %}
 <div class="help-text">Suwayomi's own download queue is {{ squeue.state|lower }} ({{ squeue.count }} item{{ 's' if squeue.count != 1 }}). This page refreshes every 10 s while something runs.</div>
 {% endif %}
 {% endblock %}
