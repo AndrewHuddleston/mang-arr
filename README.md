@@ -87,11 +87,17 @@ curl -fsSL https://raw.githubusercontent.com/AndrewHuddleston/mang-arr/main/inst
 bash install.sh
 ```
 
+(`curl ... | bash` works as well; questions are read from the terminal.)
 It writes a Compose file for the three services, starts them, configures
 Suwayomi (CBZ, extension repository, a default set of sources), creates the
-Komga admin, library and API key, and stores the Komga connection in
-mang-arr. [docs/INSTALL.md](docs/INSTALL.md) explains every step for doing
-it by hand, and what to do with an existing Suwayomi library.
+Komga admin, library and API key, turns on mang-arr's login (the generated
+password is shown once, at the end) and stores the Komga connection in
+mang-arr. Suwayomi and Komga are published on `127.0.0.1` only, since
+mang-arr reaches them over the compose network; Suwayomi has no login and
+runs extension code, so keep it that way. Re-running the installer is safe.
+[docs/INSTALL.md](docs/INSTALL.md) lists its settings, explains how to
+reach Suwayomi and Komga from other machines, every step for doing it by
+hand, and what to do with an existing Suwayomi library.
 
 ### Docker Compose (mang-arr only, existing Suwayomi and Komga)
 
@@ -131,13 +137,17 @@ override with `user: "PUID:PGID"` in compose). `chown` the config folder and
 the library folder to that user and make the download tree readable by it.
 The simplest arrangement is to run Suwayomi as the same user.
 
-The Docker `HEALTHCHECK` calls `/api/v1/system/status`, which only says the
-process is up. That is deliberate: `/api/v1/health` answers 503 when
-Suwayomi is down or a path is missing, and a restart would not fix either.
+The Docker `HEALTHCHECK` calls `/api/v1/ping`, which only says the process
+is up and does no other work. That is deliberate: `/api/v1/health` answers
+503 when Suwayomi is down or a path is missing, and a restart would not fix
+either. The example compose file caps each container's Docker log at
+3 × 10 MB; keep that `logging:` block if you write your own.
 
-Authentication is optional and off until you set a username and password
-under Settings → Security (a login page by default, or the browser's basic
-auth prompt). Scripts use the API key shown on the same page instead.
+Authentication is off until you set a username and password under
+Settings → Security (a login page by default, or the browser's basic auth
+prompt); the installer sets one for you. Set it before you store any API
+key or token in mang-arr. Scripts use the API key shown on the same page
+instead.
 `/api/v1/health`, `/api/v1/system/status` and `/metrics` stay open so
 health checks and scrapers work without credentials.
 
