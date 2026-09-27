@@ -149,6 +149,48 @@ class OutboundTest(unittest.TestCase):
                 stop()
 
 
+    def test_connect_that_outlasts_the_deadline_is_not_used(self):
+        # a slow DNS answer or a dead first address: the socket appears only after the deadline, and the
+        # server then trickles; the per-read timeout alone would let this run for ever
+        url, stop = _trickle_server(b"HTTP/1.1 200 OK\r\nContent-Length: 100000\r\n\r\n")
+        real = socket.create_connection
+
+        def slow_connect(*a, **kw):
+            time.sleep(1.5)
+            return real(*a, **kw)
+        result = []
+
+        def call():
+            try:
+                outbound.fetch(url, timeout=1.0)
+                result.append("returned")
+            except Exception as e:
+                result.append(e)
+        try:
+            with mock.patch.object(outbound.http.client.socket, "create_connection", slow_connect):
+                t = threading.Thread(target=call, daemon=True)
+                t.start()
+                t.join(5)
+            self.assertFalse(t.is_alive(), "fetch ran on past its deadline")
+            self.assertIsInstance(result[0], TimeoutError)
+        finally:
+            stop()
+
+    def test_watchdog_catches_a_socket_created_after_the_deadline(self):
+        a, b = socket.socketpair()
+        self.addCleanup(a.close)
+        self.addCleanup(b.close)
+        box = []
+        wd = outbound.Watchdog(time.monotonic() + 0.1, lambda: box[0] if box else None).start()
+        self.addCleanup(wd.cancel)
+        time.sleep(0.3)                           # the deadline passed with no socket
+        box.append(a)
+        a.settimeout(3)
+        t0 = time.monotonic()
+        self.assertEqual(a.recv(10), b"")         # shut down, not left to block
+        self.assertLess(time.monotonic() - t0, 1.0)
+
+
 class NotifyChannelTest(unittest.TestCase):
     """The real notify._post against local servers."""
 

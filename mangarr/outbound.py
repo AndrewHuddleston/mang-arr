@@ -16,7 +16,8 @@ and to GitHub for the update check, with the guard rails plain urllib lacks:
 - A hard wall-clock deadline for the whole request. The socket timeout
   alone applies to each read, so a server that trickles one byte at a time
   could hold a thread for ever. A watchdog shuts the socket down once the
-  deadline passes; the caller gets TimeoutError.
+  deadline passes (or the moment it appears, if connecting took longer);
+  the caller gets TimeoutError.
 - Response bodies are capped (max_bytes).
 """
 import http.client
@@ -47,30 +48,46 @@ def check_url(url: str, what: str = "URL") -> str:
 class Watchdog:
     """Shut a socket down once a monotonic deadline passes, which makes any
     blocked send/recv on it return at once. get_sock is called at expiry, so
-    it can follow a socket that was replaced (TLS wrap, STARTTLS)."""
+    it can follow a socket that was replaced (TLS wrap, STARTTLS).
+
+    If there is no socket yet at the deadline (a slow DNS lookup or a
+    multi-address connect is still running) the watchdog keeps looking
+    until cancelled and shuts the socket down as soon as it appears, so a
+    connection that completes late cannot then run on under the per-read
+    timeout alone."""
+    POLL = 0.05     # seconds between looks for a socket that appears after the deadline
 
     def __init__(self, deadline: float, get_sock):
         self.deadline = deadline
         self._get_sock = get_sock
-        self._timer = threading.Timer(max(0.0, deadline - time.monotonic()), self._expire)
-        self._timer.daemon = True
+        self._cancelled = threading.Event()
+        self._thread = threading.Thread(target=self._run, name="mangarr-watchdog", daemon=True)
 
     def start(self) -> "Watchdog":
-        self._timer.start()
+        self._thread.start()
         return self
 
     def cancel(self) -> None:
-        self._timer.cancel()
+        self._cancelled.set()
 
-    def _expire(self) -> None:
+    def _run(self) -> None:
+        if self._cancelled.wait(max(0.0, self.deadline - time.monotonic())):
+            return
+        while not self._expire():
+            if self._cancelled.wait(self.POLL):
+                return
+
+    def _expire(self) -> bool:
+        """Shut the socket down; False when there is no socket (yet)."""
         sock = self._get_sock()
         if sock is None:
-            return
+            return False
         try:
             # the plain-socket method, so an SSL socket's state is not touched from this thread
             socket.socket.shutdown(sock, socket.SHUT_RDWR)
         except OSError:
             pass
+        return True
 
 
 class _DeadlineMixin:
@@ -88,6 +105,11 @@ class _DeadlineMixin:
         self._watchdog = Watchdog(self.deadline, lambda: self._wd_sock or self.sock).start()
         super().connect()
         self._wd_sock = self.sock   # urllib drops self.sock before the body is read; keep our own reference
+        if time.monotonic() >= self.deadline:
+            # DNS or the TCP connect itself used up the time (e.g. a dead IPv6
+            # address tried first): give up now rather than start the request
+            self.close()
+            raise TimeoutError("deadline passed while connecting")
 
     def disarm(self) -> None:
         if self._watchdog:

@@ -55,7 +55,12 @@ EVENTS = {                      # kind -> setting that enables it
 PRIORITY = {"failed": 1, "error": 1, "health": 1}   # louder on services that support it
 
 DEADLINE = 30.0          # seconds for one message, all channels together
-REQUEST_TIMEOUT = 10.0   # per socket operation (connect, each read) inside that
+# Per socket operation (connect, each read) inside that deadline; the values
+# urllib/smtplib calls used before the deadline existed, so a slow but working
+# endpoint (an Apprise server fanning out, an SMTP greeting delay) still gets
+# its answer in.
+REQUEST_TIMEOUT = 20.0
+SMTP_TIMEOUT = 30.0
 QUEUE_MAX = 100          # messages waiting for the background sender; the oldest is dropped beyond this
 MAX_TITLE = 250
 MAX_MESSAGE = 4000
@@ -204,13 +209,15 @@ def _email(v, title, message, kind):
     port = int(v["smtp_port"] or (465 if security == "ssl" else 587))
     ctx = ssl.create_default_context()
     deadline = _deadline()
-    timeout = max(0.1, min(REQUEST_TIMEOUT, deadline - time.monotonic()))
+    timeout = max(0.1, min(SMTP_TIMEOUT, deadline - time.monotonic()))
     server = smtplib.SMTP_SSL(timeout=timeout, context=ctx) if security == "ssl" else smtplib.SMTP(timeout=timeout)
     server._host = host      # smtplib only sets this (the TLS server name) when given a host in the constructor
     watchdog = outbound.Watchdog(deadline, lambda: server.sock).start()   # a hard stop for the whole exchange
     try:
-        server.connect(host, port)
+        code, reply = server.connect(host, port)
         with server:
+            if code != 220:     # what smtplib.SMTP(host, port) checks: the server refused us in its greeting
+                raise smtplib.SMTPConnectError(code, reply)
             if security == "starttls":
                 server.starttls(context=ctx)
             if v["smtp_user"]:
@@ -394,11 +401,19 @@ def _sender_loop() -> None:
             log.exception("notification %r could not be sent", item[0])
 
 
-def flush(timeout: float = DEADLINE) -> bool:
-    """Wait up to `timeout` seconds for queued messages to go out. True when
-    the queue is empty. Called at exit so a one-shot run still notifies."""
-    end = time.monotonic() + timeout
+def flush(timeout: float | None = None) -> bool:
+    """Wait up to `timeout` seconds for queued messages to go out (default:
+    long enough for every queued message to reach its DEADLINE). True when
+    the queue is empty.
+
+    A one-shot command that sends notifications must call this before it
+    returns (daemon.run does). The atexit hook below is only a fallback:
+    since Python 3.12 no thread can be started once the interpreter is
+    shutting down, and delivery needs threads, so at exit it may fail."""
     with _cond:
+        if timeout is None:
+            timeout = DEADLINE * (len(_queue) + int(_busy)) + 1.0
+        end = time.monotonic() + timeout
         while _queue or _busy:
             left = end - time.monotonic()
             if left <= 0:

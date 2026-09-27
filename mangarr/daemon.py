@@ -78,4 +78,8 @@ def run(interval_hours: float = config.REFRESH_HOURS, once: bool = False) -> Non
             if _stop:
                 break
             time.sleep(1)
+    # Deliver what the last cycle queued while threads can still be started
+    # (Python 3.12+ refuses new threads during interpreter shutdown, when the
+    # atexit fallback would run), so `daemon --once` still notifies.
+    notify.flush()
     log.info("worker stopped")

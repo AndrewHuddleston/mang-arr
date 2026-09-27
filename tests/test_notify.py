@@ -3,12 +3,14 @@ sending never blocks the caller; text is cleaned and escaped; SMTP security fail
 are damped. No real network: _post and smtplib are replaced."""
 import base64
 import email.header
+import signal
+import smtplib
 import threading
 import time
 import unittest
 from unittest import mock
 
-from mangarr import health, notify, settings
+from mangarr import daemon, health, notify, settings
 
 
 def values(**kw):
@@ -160,6 +162,35 @@ class DeliveryTest(unittest.TestCase):
             self.assertTrue(notify.flush(5))
         self.assertEqual(sent, ["first", "m2", "m3", "m4"])
 
+    def test_daemon_once_delivers_before_returning(self):
+        # `mangarr daemon --once` must not leave delivery to atexit: from Python 3.12 no thread can be
+        # started at interpreter shutdown, and the sender needs threads.
+        v = values(webhook_url="http://hook")
+        got = []
+
+        def slow_post(url, payload=None, headers=None, data=None, timeout=20):
+            time.sleep(0.3)
+            got.append(payload["title"])
+            return 200
+        for sig in (signal.SIGTERM, signal.SIGINT):                    # daemon.run installs its own handlers
+            self.addCleanup(signal.signal, sig, signal.getsignal(sig))
+        p1, p2 = self.patches(v, slow_post)
+        with p1, p2, mock.patch.object(daemon, "Client"), \
+             mock.patch.object(daemon, "cycle", lambda c: notify.send("mang-arr: new chapters", "X (+1)", "new")):
+            daemon.run(once=True)
+            self.assertEqual(got, ["mang-arr: new chapters"])
+
+    def test_per_operation_timeouts_leave_room_for_slow_endpoints(self):
+        seen = {}
+
+        def fetch(url, data=None, headers=None, method=None, timeout=0, deadline=None, **kw):
+            seen["timeout"] = timeout
+            return 200, b""
+        with mock.patch.object(notify.settings, "all_values", lambda: values(webhook_url="http://hook")), \
+             mock.patch.object(notify.outbound, "fetch", fetch):
+            self.assertIs(notify.send_detailed("T", "B", "test", force=True)["webhook"], True)
+        self.assertGreaterEqual(seen["timeout"], 20)              # an Apprise fan-out may take a while to answer
+
 
 class TextTest(unittest.TestCase):
     """Titles are one line, messages capped, markup from untrusted text neutralised."""
@@ -216,6 +247,7 @@ class TextTest(unittest.TestCase):
 
 class FakeSMTP:
     instances: list = []
+    greeting = 220
 
     def __init__(self, *a, **kw):
         self.log = [("init", a, kw)]
@@ -224,6 +256,7 @@ class FakeSMTP:
 
     def connect(self, host, port):
         self.log.append(("connect", host, port))
+        return self.greeting, b"mail.example ESMTP"
 
     def starttls(self, context=None):
         self.log.append(("starttls",))
@@ -244,6 +277,7 @@ class FakeSMTP:
 class EmailTest(unittest.TestCase):
     def setUp(self):
         FakeSMTP.instances = []
+        FakeSMTP.greeting = 220
 
     def send(self, security, title="T"):
         v = values(smtp_host="mail.example", smtp_to="a@b", smtp_user="me", smtp_password="pw", smtp_security=security)
@@ -268,6 +302,20 @@ class EmailTest(unittest.TestCase):
         with self.assertLogs("mangarr.notify", "WARNING") as logs:       # 'none' works, but says so
             self.assertIs(self.send("none")["email"], True)
         self.assertTrue(any("without encryption" in line for line in logs.output))
+
+    def test_rejecting_greeting_is_a_connect_error(self):
+        FakeSMTP.greeting = 554
+        with self.assertLogs("mangarr.notify", "ERROR"):
+            res = self.send("starttls")
+        self.assertIn("SMTPConnectError", res["email"])
+        self.assertIn("554", res["email"])
+        steps = [s[0] for s in FakeSMTP.instances[-1].log]
+        self.assertEqual(steps, ["init", "connect", "quit"])            # no STARTTLS, no login, nothing sent
+
+    def test_smtp_timeout_allows_a_greeting_delay(self):
+        self.assertIs(self.send("starttls")["email"], True)
+        self.assertGreater(FakeSMTP.instances[-1].log[0][2]["timeout"], 20)
+        self.assertTrue(issubclass(smtplib.SMTPConnectError, smtplib.SMTPException))
 
     def test_subject_one_line(self):
         self.assertIs(self.send("starttls", "Added: Foo\r\nBcc: x@evil\x0bBar ポケモン")["email"], True)
@@ -331,6 +379,37 @@ class HealthAlertTest(unittest.TestCase):
             paged += self.run_at(t)
         paged += self.run_at(later, down) + self.run_at(later + 130, down)
         self.assertEqual(paged, ["Komga", "Komga"])
+
+    def test_outage_starting_in_cooldown_pages_when_cooldown_ends(self):
+        down = ("Suwayomi", "unreachable at http://suwayomi: timed out")
+        paged = []
+        for t in (0, 60, 120):
+            paged += [(t, n) for n in self.run_at(t, down)]
+        for t in range(180, 180 + health.CLEAR_SECS + 120, 60):   # recovered
+            self.run_at(t)
+        with self.assertLogs("mangarr.health", "INFO") as logs:     # a new outage, inside the cooldown: held
+            for t in range(3600, 3600 + 3 * 86400, 600):           # and it lasts three days
+                paged += [(t, n) for n in self.run_at(t, down)]
+        self.assertTrue(any("holding the notification" in line for line in logs.output))
+        self.assertEqual([n for _, n in paged], ["Suwayomi", "Suwayomi"])
+        self.assertEqual(paged[0][0], 120)
+        self.assertGreaterEqual(paged[1][0], 120 + health.COOLDOWN_SECS)
+        self.assertLess(paged[1][0], 120 + health.COOLDOWN_SECS + 600)     # at the first run after the cooldown
+
+    def test_held_outage_that_ends_in_cooldown_never_pages(self):
+        down = ("Komga", "http://komga: HTTP 500")
+        paged = []
+        for t in (0, 130):
+            paged += self.run_at(t, down)
+        for t in range(200, 200 + health.CLEAR_SECS + 120, 60):
+            paged += self.run_at(t)
+        for t in range(2000, 2400, 60):                           # held
+            paged += self.run_at(t, down)
+        for t in range(2400, 2400 + health.CLEAR_SECS + 120, 60):   # and over before the cooldown ends
+            paged += self.run_at(t)
+        for t in range(health.COOLDOWN_SECS, health.COOLDOWN_SECS + 3600, 60):
+            paged += self.run_at(t)
+        self.assertEqual(paged, ["Komga"])
 
 
 if __name__ == "__main__":

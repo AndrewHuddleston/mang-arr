@@ -145,12 +145,14 @@ def problems(client: Client) -> list[str]:
 #   - a problem pages once it has lasted CONFIRM_SECS with no clean run in
 #     between (a single slow answer does not page), and once per incident;
 #   - it counts as recovered only after CLEAR_SECS of clean runs (flap damping);
-#   - a check never pages more than once per COOLDOWN_SECS.
+#   - a check never pages more than once per COOLDOWN_SECS: an incident that
+#     starts inside the cooldown is held, and pages when the cooldown ends if
+#     it is still failing then (a long outage is never silenced).
 CONFIRM_SECS = 120
 CLEAR_SECS = 600
 COOLDOWN_SECS = 6 * 3600
 
-_alerts: dict[str, dict] = {}     # check name -> failing_since, clean_since, active, notified_at (monotonic)
+_alerts: dict[str, dict] = {}     # check name -> failing_since, clean_since, active, paged, notified_at (monotonic)
 _alert_lock = threading.Lock()
 
 
@@ -163,19 +165,24 @@ def _alert(out: list[Check], now: float | None = None) -> list[str]:
     with _alert_lock:
         for name in sorted(failing | set(_alerts)):
             a = _alerts.setdefault(name, {"failing_since": None, "clean_since": None, "active": False,
-                                          "notified_at": None})
+                                          "paged": False, "notified_at": None})
             if name in failing:
                 a["clean_since"] = None
                 if a["failing_since"] is None:
                     a["failing_since"] = now
-                if a["active"] or now - a["failing_since"] < CONFIRM_SECS:
-                    continue                          # already paged for this incident, or not confirmed yet
-                a["active"] = True
+                if not a["active"]:
+                    if now - a["failing_since"] < CONFIRM_SECS:
+                        continue                      # not confirmed yet
+                    a["active"], a["paged"] = True, False     # a new incident
+                    if a["notified_at"] is not None and now - a["notified_at"] < COOLDOWN_SECS:
+                        log.info("health: %s is failing again; holding the notification for %.0f min (%.0f h "
+                                 "after the last one) and sending it then if still failing", name,
+                                 (a["notified_at"] + COOLDOWN_SECS - now) / 60, COOLDOWN_SECS / 3600)
+                if a["paged"]:
+                    continue                          # already paged for this incident
                 if a["notified_at"] is not None and now - a["notified_at"] < COOLDOWN_SECS:
-                    log.info("health: %s is failing again; not notifying again within %.0f h of the last "
-                             "notification", name, COOLDOWN_SECS / 3600)
-                    continue
-                a["notified_at"] = now
+                    continue                          # held: inside the cooldown
+                a["paged"], a["notified_at"] = True, now
                 due.append(name)
             else:
                 a["failing_since"] = None
@@ -183,7 +190,8 @@ def _alert(out: list[Check], now: float | None = None) -> list[str]:
                     a["clean_since"] = now
                 if a["active"] and now - a["clean_since"] >= CLEAR_SECS:
                     a["active"] = False
-                    log.info("health: %s recovered", name)
+                    log.info("health: %s recovered%s", name,
+                             "" if a["paged"] else " (not notified: it began and ended within the cooldown)")
                 if not a["active"] and (a["notified_at"] is None or now - a["notified_at"] >= COOLDOWN_SECS):
                     del _alerts[name]                 # nothing left to remember
     if due:
