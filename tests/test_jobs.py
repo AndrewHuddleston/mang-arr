@@ -808,7 +808,8 @@ class SourcesStampTest(unittest.TestCase):
             def search(self, src, q):
                 searched.append(src.name)
                 return []
-        resolver.resolve(Search(), Series(english="T"), sources=list(got.values()))
+        with mock.patch.object(resolver, "SEARCHES", limits.Spacer(pause=lambda s, c=None: False)):
+            resolver.resolve(Search(), Series(english="T"), sources=list(got.values()))
         self.assertNotIn("MangaFire (ALL)", searched)       # disabled: not searched, page by page or not
         with mock.patch("mangarr.settings.all_values",
                         lambda con=None: {"unusable_sources": [], "throttled_sources": [], "page_warm_sources": 8.0}):
@@ -851,6 +852,9 @@ class ResolverErrorsTest(unittest.TestCase):          # finding 94
     def setUp(self):
         resolver._unreachable.clear()
         self.addCleanup(resolver._unreachable.clear)
+        p = mock.patch.object(resolver, "SEARCHES", limits.Spacer(pause=lambda s, c=None: False))
+        p.start()
+        self.addCleanup(p.stop)
 
     def _search(self, exc):
         client = mock.Mock()

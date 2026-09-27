@@ -165,6 +165,9 @@ class Base(unittest.TestCase):
             self.addCleanup(p.stop)
         suwayomi._down.clear()
         self.addCleanup(suwayomi._down.clear)
+        p = mock.patch.object(resolver, "SEARCHES", limits.Spacer(pause=lambda s, c=None: False))   # searches not spaced
+        p.start()
+        self.addCleanup(p.stop)
         downloader._unsaved = downloader._SAVED
         self.addCleanup(setattr, downloader, "_unsaved", downloader._SAVED)
         settings._cache.clear()

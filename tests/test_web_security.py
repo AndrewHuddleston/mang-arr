@@ -50,6 +50,8 @@ def no_network_patches(calls: list) -> list:
 
 
 class _FakeSource:
+    page_warm, tier = False, 0
+
     def __init__(self, name):
         self.id, self.name, self.lang, self.unusable, self.throttled = "1", name, "en", False, False
 

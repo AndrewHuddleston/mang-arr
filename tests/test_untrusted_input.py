@@ -10,7 +10,7 @@ import time
 import unittest
 from unittest import mock
 
-from mangarr import anilist, db, model, resolver
+from mangarr import anilist, db, limits, model, resolver
 from mangarr.model import Series
 from mangarr.resolver import SourceMatch, resolve
 from mangarr.suwayomi import Chapter, Source
@@ -112,9 +112,10 @@ class ByIdClient:
 class PlanCapTest(unittest.TestCase):
     def setUp(self):
         resolver._unreachable.clear()
-        p = mock.patch("mangarr.settings.get", lambda k: 3)
-        p.start()
-        self.addCleanup(p.stop)
+        for p in (mock.patch("mangarr.settings.get", lambda k: 3),
+                  mock.patch.object(resolver, "SEARCHES", limits.Spacer(pause=lambda s, c=None: False))):
+            p.start()
+            self.addCleanup(p.stop)
 
     def test_sources_adding_up_past_any_real_series(self):
         # the review repro: two sources of 10,000 chapters each (1-10000 and

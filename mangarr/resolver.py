@@ -15,7 +15,7 @@ import statistics
 from collections.abc import Callable
 from dataclasses import dataclass, field
 
-from . import config
+from . import config, limits
 from .limits import Cancelled
 from .matching import ACCEPTED, AUTHOR_DIFFER, MAX_TITLE, author_level, match_level, oneline
 from .model import Series
@@ -37,6 +37,15 @@ PLAIN_DENSITY = 1.5          # numbers per unit of a source's top number in a pl
 MAX_SEARCH_TITLES = 8
 MAX_GAP_SPANS = 40
 MAX_CHAPTER_NAME = 500
+
+# Searches on one source start at least this far apart, across every
+# resolve in the process (a burst of titles got Weeb Central to about three
+# searches a second), and further apart on a page-by-page source, whose
+# site refuses bursts; such a source is also searched with fewer titles.
+SEARCH_GAP_SECS = 1.0
+GENTLE_SEARCH_GAP_SECS = 3.0
+GENTLE_SEARCH_TITLES = 3
+SEARCHES = limits.Spacer()
 
 
 @dataclass
@@ -66,10 +75,11 @@ class SourceMatch:
         return not self.note
 
     def rank(self) -> tuple:
-        """Lower is better: health, then trust in the match, then how reliably
-        the source has delivered before (in steps of 10 %, so a few outcomes do
-        not reorder sources), then coverage."""
-        return (self.source.throttled, self.author_ok, self.match, -round(self.reliability, 1), -len(self.chapters))
+        """Lower is better: health (normal, rate-limited, page by page: see
+        Source.tier), then trust in the match, then how reliably the source
+        has delivered before (in steps of 10 %, so a few outcomes do not
+        reorder sources), then coverage."""
+        return (self.source.tier, self.author_ok, self.match, -round(self.reliability, 1), -len(self.chapters))
 
 
 @dataclass
@@ -161,7 +171,8 @@ def resolve(client: Client, series: Series, sources: list[Source] | None = None,
         if cancel():
             raise Cancelled()
         report(f"searching {src.name} ({i} of {len(searched)} sources)")
-        found = _search_source(client, src, series, titles, rejected)
+        found = _search_source(client, src, series, gentle_titles(series, titles) if src.page_warm else titles,
+                               rejected, cancel)
         if isinstance(found, str):
             unreachable.append((src, found))
             log.warning("%s unreachable: %s", src.name, found)
@@ -201,6 +212,19 @@ def capped_search_titles(series: Series) -> list[str]:
     return [t[:MAX_TITLE] for t in titles]
 
 
+def gentle_titles(series: Series, titles: list[str]) -> list[str]:
+    """At most GENTLE_SEARCH_TITLES of `titles` for a page-by-page source,
+    whose site refuses bursts: the first ones, and the native title always
+    (last, as in capped_search_titles)."""
+    if len(titles) <= GENTLE_SEARCH_TITLES:
+        return titles
+    native = series.native[:MAX_TITLE] if series.native else None
+    if native not in titles:
+        native = None
+    kept = [t for t in titles if t != native][:GENTLE_SEARCH_TITLES - (1 if native else 0)]
+    return kept + ([native] if native else [])
+
+
 _unreachable: dict[str, tuple[float, str]] = {}   # source id -> (when, why); skip it for a while
 UNREACHABLE_TTL = 900
 # What a source's own DNS or connection failure looks like when Suwayomi
@@ -217,19 +241,22 @@ def _is_connectivity(msg: str) -> bool:
     return any(k in m for k in _CONNECTIVITY)
 
 
-def _search_source(client, src, series, titles, rejected):
+def _search_source(client, src, series, titles, rejected, should_cancel: Callable[[], bool] | None = None):
     """Best accepted hit on one source, trying each title until one lands.
     Returns SourceMatch, None (no acceptable hit) or str (could not search it
     this time). A source whose site cannot be reached at all (DNS/connection)
     is not asked again for UNREACHABLE_TTL. When Suwayomi itself does not
     answer, SuwayomiUnreachable is raised: that is no verdict on any source,
-    so the caller keeps the plan it has."""
+    so the caller keeps the plan it has. Searches on one source are spaced
+    (SEARCHES); a cancel during that wait raises Cancelled."""
     import time
     seen_ids: set[int] = set()
     known = _unreachable.get(src.id)
     if known and time.monotonic() - known[0] < UNREACHABLE_TTL:
         return known[1] + " (skipped: unreachable earlier)"
     for q in titles:
+        if SEARCHES.wait(src.id, GENTLE_SEARCH_GAP_SECS if src.page_warm else SEARCH_GAP_SECS, should_cancel):
+            raise Cancelled()
         try:
             hits = client.search(src, q)
         except SuwayomiUnreachable:
@@ -416,11 +443,12 @@ def _prune_junk(client: Client, plan: Plan, progress: Callable[[str], None] | No
 
 def primary(plan: Plan) -> SourceMatch | None:
     """The one source entry to keep in Suwayomi's library for new-chapter
-    updates: the best-ranked usable source that reaches the furthest."""
+    updates: the best-ranked usable source that reaches the furthest, a
+    rate-limited or page-by-page one only when nothing healthier is usable."""
     usable = plan.usable
     if not usable:
         return None
-    return sorted(usable, key=lambda m: (m.source.throttled, -m.max, m.rank()))[0]
+    return sorted(usable, key=lambda m: (m.source.tier, -m.max, m.rank()))[0]
 
 
 def ranges(nums) -> str:
