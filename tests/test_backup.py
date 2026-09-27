@@ -474,6 +474,18 @@ class BackupTest(_Base):
         self.assertEqual(self.titles(), ["Uploaded"])
         self.assertEqual(self.backups_dir_extras(), [])
 
+    def test_upload_spool_is_on_disk_as_it_arrives(self):
+        # Python 3.14: the spool's 128 KB file buffer held the first chunks back from the disk (and from the
+        # free-space check on the next write)
+        spool = backup.UploadSpool()
+        try:
+            for n in (70000, 10, 200000):
+                spool.write(b"x" * n)
+                self.assertEqual(os.path.getsize(spool.path), spool.size)
+        finally:
+            spool.discard()
+        self.assertEqual(self.backups_dir_extras(), [])
+
     def test_restore_refused_while_a_download_run_holds_the_lock(self):
         import fcntl
         with db.connect() as con:
@@ -817,22 +829,28 @@ class BackupRoutesTest(_Base):
             con.execute("DELETE FROM series")
 
         async def scenario():
-            t0 = time.monotonic()
             first = asyncio.ensure_future(self._asgi_upload([self.HEAD, data, self.TAIL] + [0.1, b"y"] * 100))
+            ended = []
+            first.add_done_callback(lambda _: ended.append(time.monotonic()))
             for _ in range(500):                                 # restored while the junk still drips
-                if self.titles() == ["Live"] and not self.web._restore_guard():
+                # the slot too: the route frees it only once it is back from the restore's thread, which can be
+                # a moment after the restore job itself has finished
+                if self.titles() == ["Live"] and not self.web._restore_guard() and not self.web._upload_slot.locked():
                     break
                 await asyncio.sleep(0.01)
+            restored = time.monotonic()
             with db.connect() as con:
                 con.execute("DELETE FROM series")
             second = await self._asgi_upload([self.HEAD, data, self.TAIL])
-            return second, await first, time.monotonic() - t0
+            return second, await first, ended[0] - restored
         with mock.patch.object(uploads, "IDLE_SECS", 0.5), mock.patch.object(uploads, "MIN_RATE", 256 << 10):
-            second, first, took = asyncio.run(scenario())
+            second, first, dripped = asyncio.run(scenario())
         self.assertIn("restored", second[2])                     # not "another backup upload is in progress"
         self.assertEqual((first[0], first[1].get("connection")), (303, "close"))
         self.assertIn("restored", first[2])
-        self.assertLess(took, 5)                                 # the drip is cut off, not read for 10 s
+        # the drip is cut off, not read for its 10 s (timed from the restore: two restores on a busy machine
+        # took more than 5 s by themselves)
+        self.assertLess(dripped, 5)
         self.assertEqual(self.titles(), ["Live"])
         self.assertEqual(self.backups_dir_extras(), [])
 

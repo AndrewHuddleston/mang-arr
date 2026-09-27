@@ -62,6 +62,7 @@ class GroupChaptersTest(unittest.TestCase):
     def test_sqlite_rows_work_too(self):
         import sqlite3
         con = sqlite3.connect(":memory:")
+        self.addCleanup(con.close)
         con.row_factory = sqlite3.Row
         con.execute("CREATE TABLE chapter (number REAL, status TEXT, name TEXT)")
         con.executemany("INSERT INTO chapter VALUES (?,?,?)", [(1, "have", None), (25, "wanted", "Ch. 25")])

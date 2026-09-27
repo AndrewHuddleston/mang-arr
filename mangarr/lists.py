@@ -452,6 +452,8 @@ def _get_text(url: str, max_bytes: int = MAX_LIST_BYTES, deadline: float = FETCH
         except ListFetchError:
             raise
         except Exception as e:
+            if isinstance(e, urllib.error.HTTPError):
+                e.close()           # the answer's connection; only the status is reported
             if not wd.reason:
                 log.debug("list %s: %s: %s", oneline(url, 120), type(e).__name__, oneline(e, 200))
                 raise ListFetchError(_fetch_error(e)) from e

@@ -137,6 +137,7 @@ def _send(query: str, variables: dict, retries: int = 3) -> dict:
             log.debug("anilist %s -> ok in %.1fs", variables, time.monotonic() - t0)
             return d
         except urllib.error.HTTPError as e:
+            e.close()                    # the answer's connection: only its status and headers are used
             if e.code == 429:            # 30 requests/minute
                 wait = retry_after(e.headers, 10)
                 log.debug("anilist rate limited, waiting %gs", wait)

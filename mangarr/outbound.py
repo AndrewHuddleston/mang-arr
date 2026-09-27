@@ -209,7 +209,10 @@ def fetch(url: str, data: bytes | None = None, headers: dict | None = None, meth
         with _OPENER.open(req, timeout=min(timeout, left)) as r:
             status = r.status
             body = r.read(max_bytes + 1)
-    except (urllib.error.HTTPError, ValueError):
+    except urllib.error.HTTPError as e:
+        e.close()                 # the answer's connection: callers use only its status, reason and headers
+        raise
+    except ValueError:
         raise
     except Exception as e:
         if time.monotonic() >= deadline:

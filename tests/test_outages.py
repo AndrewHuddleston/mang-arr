@@ -708,8 +708,9 @@ class AniListBreakerTest(Base):
             raise urllib.error.HTTPError("https://graphql.anilist.co", 400, "Bad Request", {}, None)
         with mock.patch.object(anilist, "_send", bad):
             for _ in range(anilist.BREAKER_AFTER + 1):
-                with self.assertRaises(urllib.error.HTTPError):
+                with self.assertRaises(urllib.error.HTTPError) as cm:
                     anilist.by_id(1)
+                cm.exception.close()                         # as _send closes a real one
         self.assertEqual(anilist._failures, 0)
 
     def test_refresh_falls_back_to_the_stored_record(self):

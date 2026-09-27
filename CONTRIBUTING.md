@@ -54,9 +54,9 @@ target Python 3.10, rule sets E, F, W, I, B and UP. `ruff check --fix` is
 fine for import order and unused imports. There is no formatter step; match
 the surrounding style rather than reformatting whole files.
 
-CI (`.github/workflows/ci.yml`) runs ruff, the tests on Python 3.10 and 3.12,
-a wheel build, and a Docker build on every push and pull request. Pushes to
-`main` and `v*` tags also publish the image to
+CI (`.github/workflows/ci.yml`) runs ruff, the tests on Python 3.10, 3.12
+and 3.14, a wheel build, and a Docker build on every push and pull request.
+Pushes to `main` and `v*` tags also publish the image to
 `ghcr.io/andrewhuddleston/mang-arr`.
 
 ## Commit style
