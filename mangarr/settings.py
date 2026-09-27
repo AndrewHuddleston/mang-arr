@@ -168,7 +168,26 @@ def set_many(con: sqlite3.Connection, values: dict[str, object]) -> None:
     refresh(con)
 
 
+# Settings holding a URL that mang-arr sends requests to: http(s) only (urllib
+# would also open file:, ftp: and data: URLs). outbound.fetch checks again at
+# use time, for values that arrive from the environment or a restored backup.
+URL_KEYS = {"komga_url", "webhook_url", "apprise_url", "discord_webhook", "slack_webhook", "ntfy_url", "gotify_url"}
+
+
 def _coerce(key: str, v):
+    if key == "smtp_security":           # fail closed: an unknown mode used to mean a plaintext login
+        v = str(v).strip().lower() or "starttls"
+        if v not in ("starttls", "ssl", "none"):
+            log.warning("rejected smtp_security %r: must be starttls, ssl or none", v)
+            raise ValueError("smtp_security must be starttls, ssl or none")
+        return v
+    if key in URL_KEYS and str(v).strip():
+        from .outbound import check_url
+        try:
+            return check_url(str(v).strip(), key)
+        except ValueError:
+            log.warning("rejected %s: not an http:// or https:// URL", key)   # value not logged: may be secret
+            raise
     d = DEFAULTS[key]
     if isinstance(d, bool):
         return str(v).lower() in ("1", "true", "on", "yes")

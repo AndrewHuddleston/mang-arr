@@ -7,9 +7,8 @@ import logging
 import re
 import threading
 import time
-import urllib.request
 
-from . import __version__, config
+from . import __version__, config, outbound
 
 log = logging.getLogger(__name__)
 
@@ -42,15 +41,19 @@ def check(force: bool = False) -> dict:
             return status()
         _state["checked_at"] = time.time()
     try:
-        req = urllib.request.Request(RELEASES_URL, headers={"User-Agent": config.USER_AGENT,
-                                                            "Accept": "application/vnd.github+json"})
-        with urllib.request.urlopen(req, timeout=15) as r:
-            d = json.load(r)
-        tag = str(d.get("tag_name") or "").lstrip("v")
+        headers = {"User-Agent": config.USER_AGENT, "Accept": "application/vnd.github+json"}
+        # GitHub answers a renamed repository with a redirect, so this one follows them (http(s) only,
+        # no credentials to forward); 15 s in total and a 1 MB cap keep a slow or odd answer harmless
+        _, body = outbound.fetch(RELEASES_URL, headers=headers, timeout=15, follow_redirects=True, max_bytes=1 << 20)
+        d = json.loads(body)
+        tag = str(d.get("tag_name") or "").lstrip("v")[:40]
+        url = d.get("html_url")
+        if not (isinstance(url, str) and url.startswith("https://")):     # shown as a link in the UI banner
+            url = None
         with _lock:
-            _state.update(latest=tag or None, url=d.get("html_url"), error=None)
+            _state.update(latest=tag or None, url=url, error=None)
         if newer_available():
-            log.info("update available: %s (running %s) %s", tag, __version__, d.get("html_url"))
+            log.info("update available: %s (running %s) %s", tag, __version__, url)
         else:
             log.debug("update check: latest %s, running %s", tag, __version__)
     except Exception as e:

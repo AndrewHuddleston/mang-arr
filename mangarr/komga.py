@@ -4,9 +4,8 @@ komga_api_key in Settings (Komga: account menu -> API keys)."""
 import json
 import logging
 import urllib.error
-import urllib.request
 
-from . import settings
+from . import outbound, settings
 
 log = logging.getLogger(__name__)
 
@@ -16,14 +15,20 @@ def configured() -> bool:
     return bool(v["komga_url"] and v["komga_api_key"])
 
 
+MAX_BYTES = 8 << 20      # a library list is a few KB; never read an endless answer into memory
+
+
 def _call(method: str, path: str, timeout: int = 20):
+    """(status, parsed JSON). Only http(s) komga_url values are used, the
+    request is capped at `timeout` seconds in total, and a redirect is not
+    followed (it would carry the API key to another host, and turn the scan
+    POST into a GET): it is reported as an HTTP error naming the new URL."""
     v = settings.all_values()
     url = v["komga_url"].rstrip("/") + path
-    req = urllib.request.Request(url, method=method, headers={"X-API-Key": v["komga_api_key"],
-                                                              "Accept": "application/json"})
-    with urllib.request.urlopen(req, timeout=timeout) as r:
-        body = r.read()
-        return r.status, (json.loads(body) if body else None)
+    status, body = outbound.fetch(url, method=method, headers={"X-API-Key": v["komga_api_key"],
+                                                               "Accept": "application/json"},
+                                  timeout=timeout, max_bytes=MAX_BYTES, what="the Komga URL")
+    return status, (json.loads(body) if body else None)
 
 
 def libraries() -> list[dict]:

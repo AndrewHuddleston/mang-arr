@@ -118,15 +118,10 @@ def run(client: Client, force: bool = False) -> list[Check]:
 
     with _lock:
         _cache.update(at=time.monotonic(), checks=list(out))
-        errors = {f"{c.name}: {c.detail.split(':')[0]}" for c in out if c.level == "error"}
-        new = errors - _cache.get("errors", set())
-        _cache["errors"] = errors
     for c in out:
         if c.level == "error":
             log.warning("health: %s: %s", c.name, c.detail)
-    if new:
-        notify.send("mang-arr: health problem", "\n".join(f"{c.name}: {c.detail}" for c in out
-                                                           if c.level == "error"), "health")
+    _alert(out)
     return out
 
 
@@ -139,3 +134,60 @@ def summary(client: Client) -> dict:
 
 def problems(client: Client) -> list[str]:
     return [f"{c.name}: {c.detail}" for c in run(client) if c.level == "error"]
+
+
+# -- health notifications ------------------------------------------------------
+# Alert state is kept apart from the probe results and keyed on the check name
+# only (details such as "1 GB free" change from run to run). Every rule is
+# about elapsed time, not about how many runs happened, so how often run() is
+# called (page views, the nav poller, anyone polling /api/v1/health) does not
+# change how often anyone is paged:
+#   - a problem pages once it has lasted CONFIRM_SECS with no clean run in
+#     between (a single slow answer does not page), and once per incident;
+#   - it counts as recovered only after CLEAR_SECS of clean runs (flap damping);
+#   - a check never pages more than once per COOLDOWN_SECS.
+CONFIRM_SECS = 120
+CLEAR_SECS = 600
+COOLDOWN_SECS = 6 * 3600
+
+_alerts: dict[str, dict] = {}     # check name -> failing_since, clean_since, active, notified_at (monotonic)
+_alert_lock = threading.Lock()
+
+
+def _alert(out: list[Check], now: float | None = None) -> list[str]:
+    """Update the alert state from one run and send a notification for
+    problems that just became due. Returns the names paged (for tests)."""
+    now = time.monotonic() if now is None else now
+    failing = {c.name for c in out if c.level == "error"}
+    due: list[str] = []
+    with _alert_lock:
+        for name in sorted(failing | set(_alerts)):
+            a = _alerts.setdefault(name, {"failing_since": None, "clean_since": None, "active": False,
+                                          "notified_at": None})
+            if name in failing:
+                a["clean_since"] = None
+                if a["failing_since"] is None:
+                    a["failing_since"] = now
+                if a["active"] or now - a["failing_since"] < CONFIRM_SECS:
+                    continue                          # already paged for this incident, or not confirmed yet
+                a["active"] = True
+                if a["notified_at"] is not None and now - a["notified_at"] < COOLDOWN_SECS:
+                    log.info("health: %s is failing again; not notifying again within %.0f h of the last "
+                             "notification", name, COOLDOWN_SECS / 3600)
+                    continue
+                a["notified_at"] = now
+                due.append(name)
+            else:
+                a["failing_since"] = None
+                if a["clean_since"] is None:
+                    a["clean_since"] = now
+                if a["active"] and now - a["clean_since"] >= CLEAR_SECS:
+                    a["active"] = False
+                    log.info("health: %s recovered", name)
+                if not a["active"] and (a["notified_at"] is None or now - a["notified_at"] >= COOLDOWN_SECS):
+                    del _alerts[name]                 # nothing left to remember
+    if due:
+        log.info("health: notifying about %s", ", ".join(due))
+        notify.send("mang-arr: health problem", "\n".join(f"{c.name}: {c.detail}" for c in out
+                                                           if c.level == "error"), "health")
+    return due
