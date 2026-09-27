@@ -81,9 +81,7 @@ def add_series(con, client: Client, series: Series, download: bool = True, do_im
     if download and p:
         out.results = download_wanted(con, client, series_id, plan, should_cancel, progress)
         if do_import:
-            if not db.get_series(con, series_id):      # deleted while it downloaded: link nothing
-                raise Gone(f"{series.title} was deleted during the download")
-            out.imported += import_series(con, series_id, lookups)
+            finish_download(con, lookups, out)          # deleted while it downloaded: links nothing, raises Gone
     return out
 
 
@@ -217,12 +215,9 @@ def _set_library_entries(client: Client, plan: Plan, primary_manga_id: int, stal
 _JOB_OWNED = ("wanted", "failed", "unavailable")
 
 
-def download_wanted(con, client: Client, series_id: int, plan: Plan,
-                    should_cancel: Callable[[], bool] | None = None,
-                    progress: Callable[[str], None] | None = None) -> dict:
-    """Download the plan's wanted chapters. No write transaction is open while
-    the downloader runs (it can take hours); the outcome is written after, and
-    never over a status the user set in the meantime (e.g. 'ignored')."""
+def _due(con, series_id: int, plan: Plan) -> list[float]:
+    """The plan's wanted chapters that are due now: not on disk, not ignored,
+    and not a failed one waiting for its next attempt."""
     rows = {r["number"]: r for r in db.chapters(con, series_id)}
     have_on_disk = {n for n, r in rows.items() if r["status"] == "have"}
     ignored = {n for n, r in rows.items() if r["status"] == "ignored"}
@@ -234,21 +229,34 @@ def download_wanted(con, client: Client, series_id: int, plan: Plan,
         log.info("%s: %d ignored chapter(s) not downloaded", plan.series.title, len(ignored & set(plan.wanted())))
     if not wanted:
         log.info("%s: nothing to download", plan.series.title)
-        return {}
-    if con.in_transaction:                          # never hold a write across the downloads
-        con.commit()
-    wanted_set = set(wanted)
+    return wanted
 
-    def dropped() -> set:
-        """Chapters ignored (or linked) since the list was made: asked before each chunk."""
-        return {r["number"] for r in con.execute(
-            "SELECT number, status FROM chapter WHERE series_id=? AND status IN ('ignored','have')", (series_id,))
-            if r["number"] in wanted_set}
-    reasons: dict = {}
-    seen_throttle: set = set()
-    results = downloader.download(client, plan, only=wanted_set, should_cancel=should_cancel, reasons=reasons,
-                                  progress=progress, throttled=seen_throttle, dropped=dropped)
-    for name in seen_throttle:
+
+def downloads_due(con, out: Outcome) -> list[float]:
+    """After a refresh without download: the chapters to fetch for it now
+    ([] when no source matched). Commits first, so no write is held across
+    the downloads that follow."""
+    if not primary(out.plan):
+        return []
+    if con.in_transaction:
+        con.commit()
+    return _due(con, out.series_id, out.plan)
+
+
+def dropped_chapters(con, series_id: int, wanted: set) -> set:
+    """Chapters of `wanted` ignored (or linked) since the list was made:
+    asked before each chunk."""
+    return {r["number"] for r in con.execute(
+        "SELECT number, status FROM chapter WHERE series_id=? AND status IN ('ignored','have')", (series_id,))
+        if r["number"] in wanted}
+
+
+def record_downloads(con, series_id: int, plan: Plan, wanted: list[float], results: dict, reasons: dict,
+                     throttled: set) -> None:
+    """Write what a download run did: sources that rate-limited us, source
+    results, failed chapters and the ones not reached (never over a status
+    the user set meanwhile), and the event. Committed."""
+    for name in throttled:
         db.record_throttle(con, name)
         log.info("%s rate-limited us; it is paced automatically from now on", name)
     for n, r in results.items():
@@ -273,6 +281,35 @@ def download_wanted(con, client: Client, series_id: int, plan: Plan,
                           "not attempted: the download pass was cancelled or interrupted before this chapter",
                           only_from=_JOB_OWNED)
     con.commit()
+
+
+def finish_download(con, client: Client, out: Outcome) -> Outcome:
+    """Link what a download run fetched into the library; Gone when the
+    series was deleted while it downloaded (nothing is linked then)."""
+    if not db.get_series(con, out.series_id):
+        raise Gone(f"{out.plan.series.title} was deleted during the download")
+    out.imported += import_series(con, out.series_id, client)
+    return out
+
+
+def download_wanted(con, client: Client, series_id: int, plan: Plan,
+                    should_cancel: Callable[[], bool] | None = None,
+                    progress: Callable[[str], None] | None = None) -> dict:
+    """Download the plan's wanted chapters. No write transaction is open while
+    the downloader runs (it can take hours); the outcome is written after, and
+    never over a status the user set in the meantime (e.g. 'ignored')."""
+    wanted = _due(con, series_id, plan)
+    if not wanted:
+        return {}
+    if con.in_transaction:                          # never hold a write across the downloads
+        con.commit()
+    wanted_set = set(wanted)
+    reasons: dict = {}
+    seen_throttle: set = set()
+    results = downloader.download(client, plan, only=wanted_set, should_cancel=should_cancel, reasons=reasons,
+                                  progress=progress, throttled=seen_throttle,
+                                  dropped=lambda: dropped_chapters(con, series_id, wanted_set))
+    record_downloads(con, series_id, plan, wanted, results, reasons, seen_throttle)
     return results
 
 

@@ -501,6 +501,99 @@ class CoreTest(TmpData):
 
 # -- Suwayomi outages -------------------------------------------------------------------------
 
+class CoreSplitTest(TmpData):
+    """download_wanted in parts, so a pass can resolve a series, hand its
+    chapters to a download lane, and write the outcome later."""
+
+    def seed_mixed(self):
+        sid = self.seed({1: "have", 2: "ignored", 3: "failed", 4: "failed", 5: "wanted"})
+        with db.connect() as con:
+            con.execute("UPDATE chapter SET next_try='2999-01-01 00:00:00' WHERE series_id=? AND number=3", (sid,))
+            con.execute("UPDATE chapter SET next_try='2000-01-01 00:00:00' WHERE series_id=? AND number=4", (sid,))
+        return sid, _plan([_match("A", 1, [1, 2, 3, 4, 5, 6])])
+
+    def test_downloads_due_filters_like_download_wanted(self):
+        sid, plan = self.seed_mixed()
+        asked = {}
+
+        def fake_download(client, plan, only=None, **kw):
+            asked["only"] = only
+            return {}
+        with db.connect() as con:
+            con.execute("UPDATE series SET monitored=1 WHERE id=?", (sid,))      # a write left open
+            with self.assertLogs("mangarr.core", "INFO") as cm:
+                due = core.downloads_due(con, core.Outcome(sid, plan))
+            self.assertFalse(con.in_transaction)
+            with mock.patch.object(downloader, "download", fake_download):
+                core.download_wanted(con, FakeClient(), sid, plan)
+        self.assertEqual(due, [4.0, 5.0, 6.0])              # not on disk, not ignored, not failed until later
+        self.assertEqual(asked["only"], set(due))
+        self.assertIn("1 failed chapter(s) not due", "\n".join(cm.output))
+
+    def test_nothing_due_without_a_usable_source(self):
+        sid = self.seed({1: "wanted"})
+        m = _match("A", 1, [1])
+        m.note = "author differs"
+        with db.connect() as con:
+            self.assertEqual(core.downloads_due(con, core.Outcome(sid, _plan([m]))), [])
+
+    def test_record_downloads(self):
+        sid = self.seed({1: "wanted", 2: "wanted", 3: "wanted", 4: "wanted", 5: "wanted"})
+        plan = _plan([_match("A", 1, [1, 2, 3, 4, 5])])
+        with db.connect() as con:
+            con.execute("UPDATE chapter SET status='ignored' WHERE series_id=? AND number=4", (sid,))  # the user, meanwhile
+            con.commit()
+            core.record_downloads(con, sid, plan, [1.0, 2.0, 3.0, 4.0, 5.0], {1.0: "ok", 2.0: "failed", 4.0: "failed"},
+                                  {2.0: "broken", 3.0: "waiting for chapter 2: in order"}, {"A"})
+            self.assertFalse(con.in_transaction)
+            rows = {r["number"]: (r["status"], r["reason"]) for r in db.chapters(con, sid)}
+            event = db.events(con, 1)[0]
+            stats = db.source_stats(con)["A"]
+        self.assertEqual(rows[2.0][0], "failed")
+        self.assertTrue(rows[2.0][1].startswith("broken"), rows[2.0])
+        self.assertEqual(rows[3.0], ("wanted", "waiting for chapter 2: in order"))
+        self.assertEqual(rows[4.0][0], "ignored")                                   # kept
+        self.assertIn("cancelled or interrupted", rows[5.0][1])
+        self.assertEqual((event["kind"], event["message"]), ("downloaded", "1 chapter(s) downloaded, 2 failed: "
+                                                                           "ch 2: broken; ch 4: ?"))
+        self.assertEqual((stats["ok"], stats["failed"], stats["throttled"]), (1, 2, 1))
+        self.assertIsNotNone(stats["last_throttled"])
+
+    def test_download_wanted_still_records_throttling(self):
+        sid = self.seed({1: "wanted"})
+
+        def fake_download(client, plan, throttled=None, **kw):
+            throttled.add("A")
+            return {1.0: "ok"}
+        with db.connect() as con, mock.patch.object(downloader, "download", fake_download):
+            self.assertEqual(core.download_wanted(con, FakeClient(), sid, _plan([_match("A", 1, [1])])), {1.0: "ok"})
+            self.assertEqual(db.auto_throttled(con), {"a"})
+
+    def test_finish_download(self):
+        sid = self.seed({1: "wanted"})
+        plan = _plan([_match("A", 1, [1])])
+        with db.connect() as con, mock.patch.object(core, "import_series", lambda con, sid, client=None: 2):
+            out = core.finish_download(con, FakeClient(), core.Outcome(sid, plan, imported=1))
+            self.assertEqual(out.imported, 3)
+            db.delete_series(con, sid)
+            con.commit()
+            with self.assertRaises(core.Gone):
+                core.finish_download(con, FakeClient(), core.Outcome(sid, plan))
+
+    def test_import_failure_is_committed_at_once(self):
+        sid = self.seed({1: "wanted"})
+        with db.connect() as con, self.assertLogs("mangarr.core", "ERROR"):
+            core._import_failed(con, sid, "T", 1.0, "A: cannot read Chapter 1.cbz", OSError("boom"))
+            self.assertFalse(con.in_transaction)
+            other = sqlite3.connect(self.tmp.name + "/t.db", timeout=0.2)     # a web request meanwhile
+            try:
+                other.execute("UPDATE series SET monitored=0")
+                other.commit()
+            finally:
+                other.close()
+        self.assertEqual(self.status(sid)[1], "failed")
+
+
 class ImportWriteLockTest(TmpData):                    # findings 21, 33
     """import_series commits every write at once, so another connection can
     write while it checks each archive, links each file and asks Suwayomi,
