@@ -17,8 +17,9 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from fake_suwayomi import PassBase, chapter_id, entry, number_of, resolver_for  # noqa: E402
 
-from mangarr import core, db, downloader, jobs, settings  # noqa: E402
+from mangarr import core, db, downloader, jobs, lanes, settings  # noqa: E402
 from mangarr.model import Series  # noqa: E402
+from mangarr.suwayomi import SuwayomiUnreachable  # noqa: E402
 
 try:
     from mangarr.web import app as web
@@ -37,12 +38,13 @@ class PipelineBase(PassBase):
             by_title = {r["title"]: dict(r) for r in db.series_rows(con)}
         return [by_title[t] for t in titles]
 
-    def run_pass(self, fake, plans, rows, job=None, in_order=True):
+    def run_pass(self, fake, plans, rows, job=None, in_order=True, resolve=None):
         job = job or jobs.Job(1, "refresh-all", "all")
         with db.connect() as con:
             settings.set_many(con, {"download_in_order": in_order})
         settings._cache.clear()
-        with mock.patch.object(web, "client", fake), mock.patch.object(core, "resolve", resolver_for(fake, plans)):
+        with mock.patch.object(web, "client", fake), \
+             mock.patch.object(core, "resolve", resolve or resolver_for(fake, plans)):
             t0 = time.perf_counter()
             out = web._run_pass(job, rows, "test")
             self.took = time.perf_counter() - t0
@@ -290,6 +292,119 @@ class StopTest(PipelineBase):
         self.assertEqual(set(self.statuses(rows[1]).values()), {"have"})
         self.assertEqual(set(self.statuses(rows[2]).values()), {"have"})
         self.assertEqual(fake.items, [])                    # taken back out
+
+
+class EndTest(PipelineBase):
+    """However a pass ends, it ends only once every lane has: nothing of it
+    writes afterwards, and the download lock is held until then."""
+
+    def test_a_pass_the_resolve_step_stopped_waits_for_a_lane_still_importing(self):
+        fake = self.fake()
+        plans = {"S1": [entry(fake, X, 1, "S1", [1])]}
+        rows = self.seed("S1", "S2", "S3")
+        importing, go, seen = threading.Event(), threading.Event(), []
+        real_import, found = core.import_series, resolver_for(fake, plans)
+
+        def release():                                  # a slow import on NAS storage, then done
+            seen.append((self.lock_free(), [t.name for t in threading.enumerate()
+                                            if t.name.startswith("mangarr-lane-")]))
+            go.set()
+
+        def slow_import(con, sid, client=None):
+            if threading.current_thread().name.startswith("mangarr-lane-") and not importing.is_set():
+                importing.set()
+                threading.Timer(1.0, release).start()
+                go.wait(10)
+            return real_import(con, sid, client)
+
+        def resolve(client, series, **kw):
+            if series.title == "S1":
+                return found(client, series, **kw)
+            importing.wait(10)                          # Suwayomi goes away while S1's lane imports
+            raise SuwayomiUnreachable("Suwayomi at http://fake unreachable: connection refused")
+        job = jobs.Job(1, "refresh-all", "all")
+        with mock.patch.object(core, "import_series", slow_import), mock.patch.object(lanes, "SHUTDOWN_JOIN_SECS", 0.1), \
+             self.assertLogs(level="WARNING") as cm, self.assertRaises(web.PassStopped) as stop:
+            self.run_pass(fake, plans, rows, job=job, resolve=resolve)
+        self.assertEqual([t.name for t in threading.enumerate() if t.name.startswith("mangarr-lane-")], [])
+        self.assertEqual(len(seen), 1)
+        self.assertFalse(seen[0][0])                    # the lock was still the pass's while the lane imported
+        self.assertTrue(seen[0][1])
+        self.assertRegex("\n".join(cm.output), r"mangarr-lane-\d is still busy 0 s after the pass ended \(an import "
+                                                r"is not cut short\); waiting for it")
+        self.assertEqual((job.items[0]["state"], job.items[0]["result"]), ("done", "1 downloaded"))
+        self.assertEqual(self.statuses(rows[0]), {1.0: "have"})
+        self.assertEqual(stop.exception.counts, (3, 1, 1, 2))   # S1's chapter is in the pass totals
+        self.assertTrue(str(stop.exception).startswith("pass stopped after 3 of 3 series: Suwayomi is not "
+                                                       "answering (Suwayomi at http://fake unreachable"),
+                        str(stop.exception))
+        self.assertEqual((job.lanes, job.active_series_ids), ([], frozenset()))
+        self.assertTrue(self.lock_free())
+
+    def test_lanes_stopping_after_every_series_was_checked(self):
+        with db.connect() as con:
+            settings.set_many(con, {"download_lanes": 1})
+        fake = self.fake(secs=0.05)
+        plans = {f"S{k}": [entry(fake, f"Site {k}", k, f"S{k}", [1, 2, 3])] for k in range(1, 7)}
+        rows = self.seed(*plans)
+        job = jobs.Job(1, "refresh-all", "all")
+        seen = []
+
+        def on_finish(f, cid):                          # down for good, once the resolve step is done
+            seen.append(cid)
+            if len(seen) == 2:
+                deadline = time.perf_counter() + 10
+                while any(i["state"] == "queued" or i["result"] == "checking sources" for i in job.items) \
+                        and time.perf_counter() < deadline:
+                    threading.Event().wait(0.002)
+                f.set_down()
+        fake.on_finish = on_finish
+        with self.assertLogs(level="WARNING"), self.assertRaises(web.PassStopped) as cm:
+            self.run_pass(fake, plans, rows, job=job)
+        cut = [i for i in job.items if i["state"] == "cancelled"]
+        self.assertGreaterEqual(len(cut), 3)
+        for it in cut:
+            self.assertEqual(it["result"], "pass stopped: Suwayomi is not answering")
+        self.assertTrue(str(cm.exception).startswith(f"pass stopped after 6 of 6 series, {len(cut)} not "
+                                                     "downloaded: Suwayomi is not answering ("), str(cm.exception))
+
+
+class StartTest(PipelineBase):
+    def refused(self, which):
+        real = threading.Thread.start
+
+        def start(t):
+            if which(t.name):
+                raise RuntimeError("can't start new thread")
+            return real(t)
+        fake = self.fake()
+        plans = {"S1": [entry(fake, X, 1, "S1", [1, 2])], "S2": [entry(fake, Y, 2, "S2", [1, 2])]}
+        rows = self.seed(*plans)
+        job, out = jobs.Job(1, "refresh-all", "all"), []
+        with mock.patch.object(threading.Thread, "start", start), self.assertLogs(level="WARNING") as cm:
+            th = threading.Thread(target=lambda: out.append(self.run_pass(fake, plans, rows, job=job)[1]),
+                                  daemon=True)
+            th.start()
+            th.join(20)
+            if th.is_alive():                           # do not leave it running
+                job.cancel = True
+                th.join(10)
+                self.fail("the pass did not end")
+        self.assertTrue(self.lock_free())
+        return fake, rows, job, out[0], "\n".join(cm.output)
+
+    def test_the_pass_goes_on_with_the_lanes_it_got(self):
+        fake, rows, job, out, logs = self.refused(lambda name: name == "mangarr-lane-2")
+        self.assertIn("could start only 1 of 3 download lane(s)", logs)
+        self.assertEqual(out, (2, 4, 4, 0))
+        self.assertEqual([i["state"] for i in job.items], ["done", "done"])
+
+    def test_no_lane_at_all(self):
+        fake, rows, job, out, logs = self.refused(lambda name: name.startswith("mangarr-lane-"))
+        self.assertEqual(out, (2, 0, 0, 2))
+        self.assertEqual([(i["state"], i["result"]) for i in job.items],
+                         [("error", "RuntimeError: can't start new thread")] * 2)
+        self.assertEqual(fake.kinds("enqueue"), [])
 
 
 class LockTest(PipelineBase):

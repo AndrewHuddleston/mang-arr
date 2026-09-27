@@ -861,7 +861,10 @@ lane count is *Download lanes*, but never more than Suwayomi's own *max
 sources in parallel*, which a pass reads and never changes. Download in
 order, fallbacks and every reason work as for a single series; what arrived
 is written and linked as soon as a series is finished. The download lock is
-held from the first series handed over to the end of the pass. A batch that
+held from the first series handed over to the end of the pass, and a pass
+that stops (a cancel, Suwayomi not answering) ends only once every lane has
+finished its step, so what arrived is written and linked first. A lane that
+fails unexpectedly loses only its series; the others go on. A batch that
 Suwayomi never started (its queue busy with other downloads) does not count
 as stalled: after 30 minutes it is taken back out and the series waits for
 the next pass, and the source is not marked as rate-limited.

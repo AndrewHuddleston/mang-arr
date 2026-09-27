@@ -241,7 +241,6 @@ def _run_pass(job: jobs.Job, rows, label: str) -> tuple[int, int, int, int]:
     pool: lanes.LanePool | None = None
     downloaded = imported = errors = 0
     reached = 0                                    # series whose resolve was started
-    stop_msg: str | None = None
     busy: downloader.LockBusy | None = None
 
     def cancel() -> bool:
@@ -269,12 +268,8 @@ def _run_pass(job: jobs.Job, rows, label: str) -> tuple[int, int, int, int]:
                 not_checked(job.items[i - 1:], "pass cancelled")
                 break
             if outages.stopped or (pool is not None and pool.cancelled()):
-                rest = job.items[i - 1:]
-                not_checked(rest, "pass stopped: " + ("Suwayomi is not answering" if outages.stopped
-                                                      else pool.stop_why))
-                if outages.stopped:
-                    stop_msg = (f"pass stopped after {i - 1} of {len(rows)} series, {len(rest)} not checked: "
-                                f"Suwayomi is not answering ({outages.why})")
+                not_checked(job.items[i - 1:], "pass stopped: " + ("Suwayomi is not answering" if outages.stopped
+                                                                  else pool.stop_why))
                 break
             reached = i
             say(head)
@@ -297,9 +292,10 @@ def _run_pass(job: jobs.Job, rows, label: str) -> tuple[int, int, int, int]:
                 if due:
                     if pool is None:
                         n, cap = lanes.effective_lanes(with_cancel(client, cancel))
-                        pool = lanes.LanePool(client, job, n, label, outages, cap=cap,
-                                              on_error=lambda sid, e: _record_error(sid, e))
-                        pool.start()
+                        fresh = lanes.LanePool(client, job, n, label, outages, cap=cap,
+                                               on_error=lambda sid, e: _record_error(sid, e))
+                        fresh.start()              # not one lane could be started: this series fails, the next tries
+                        pool = fresh
                     pool.submit(i, r["id"], r["title"], item, o.plan, due, progress=prog)
             except core.Gone:
                 item["state"], item["result"] = "cancelled", "series was deleted"
@@ -327,38 +323,47 @@ def _run_pass(job: jobs.Job, rows, label: str) -> tuple[int, int, int, int]:
                                 type(rec).__name__, rec)
                 if isinstance(e, SuwayomiUnreachable):
                     if outages.report(e) == "stop":
-                        rest = job.items[i:]
-                        not_checked(rest, "pass stopped: Suwayomi is not answering")
+                        not_checked(job.items[i:], "pass stopped: Suwayomi is not answering")
                         if pool is not None:
                             pool.stop("Suwayomi is not answering")
-                        stop_msg = f"pass stopped after {i} of {len(rows)} series, {len(rest)} not checked: {e}"
                         break
                     say(f"{head} - Suwayomi is not answering; waiting {BREAKER_SECS} s before going on")
                     log.warning("%s: Suwayomi is not answering; waiting %d s, the pass stops if it still is",
                                 label, BREAKER_SECS)
             finally:
                 job.active_series_id = None
-        if pool is not None and stop_msg is None and busy is None:
+        if pool is not None and not outages.stopped and busy is None:
             pool.close()
             pool.join()
-            if pool.stopped_for_outage:
-                stop_msg = (f"pass stopped after {reached} of {len(rows)} series, {len(rows) - reached} not "
-                            f"checked: Suwayomi is not answering ({outages.why})")
     finally:
         if pool is not None:
-            pool.shutdown()
+            pool.shutdown()                        # waits for every lane: nothing of the pass writes after it
     if pool is not None:
         d, im, er = pool.counts()
         downloaded, imported, errors = downloaded + d, imported + im, errors + er
     done = sum(1 for it in job.items if it["state"] in lanes.FINISHED)
     if busy is not None:
         raise busy
-    if stop_msg is not None:
+    if outages.stopped:                            # by the resolve step or by the lanes
         left = sum(1 for it in job.items if it["state"] == "cancelled")
         log.error("%s: Suwayomi is not answering; stopping the pass after %d of %d series (%d left)",
                   label, reached, len(rows), left)
-        raise PassStopped(stop_msg, (done, downloaded, imported, errors))
+        raise PassStopped(_pass_stopped_text(job.items, reached, outages.why), (done, downloaded, imported, errors))
     return done, downloaded, imported, errors
+
+
+def _pass_stopped_text(items: list, reached: int, why: str) -> str:
+    """The message of a pass Suwayomi stopped: how far the resolve got, the
+    series it never checked, and the checked ones that were stopped before
+    their chapters were downloaded (the download lanes stop with it)."""
+    parts = []
+    if len(items) > reached:
+        parts.append(f"{len(items) - reached} not checked")
+    cut = sum(1 for it in items[:reached] if it["state"] == "cancelled")
+    if cut:
+        parts.append(f"{cut} not downloaded")
+    return (f"pass stopped after {reached} of {len(items)} series" + "".join(f", {p}" for p in parts)
+            + f": Suwayomi is not answering ({why})")
 
 
 def _job_refresh_all(job: jobs.Job):

@@ -274,29 +274,135 @@ class PoolTest(PoolBase):
         self.assertEqual(self.statuses(series[1][0]), {"have"})
         self.assertEqual(self.pool_.counts(), (2, 2, 1))
 
-    def test_a_dead_lane_does_not_hang_the_pass(self):
+    def test_every_lane_dying_does_not_hang_the_pass(self):
         fake = self.fake()
-        plans = {"A": [entry(fake, X, 1, "A", [1])], "B": [entry(fake, Y, 2, "B", [1])]}
+        plans = {"A": [entry(fake, X, 1, "A", [1])], "B": [entry(fake, Y, 2, "B", [1])],
+                 "C": [entry(fake, Z, 3, "C", [1])]}
         seed = self.seed(fake, plans)
         items = self.items(seed)
         pool = self.pool(fake, 2)
-        with mock.patch.object(pool, "_pick", side_effect=RuntimeError("bug")), \
-             self.assertLogs("mangarr.lanes", "ERROR") as cm:
+
+        def pick():                                         # both lanes die once A and B wait for them
+            if len(pool._waiting) < 2:
+                return None, None, 0.0
+            raise RuntimeError("bug")
+        with mock.patch.object(pool, "_pick", pick), self.assertLogs("mangarr.lanes", "ERROR") as cm:
             pool.start()
+            for i, (sid, title, plan, due) in enumerate(seed[:2]):
+                pool.submit(i + 1, sid, title, items[i], plan, due)
             for t in pool._threads:
                 t.join(2)
-            for i, (sid, title, plan, due) in enumerate(seed):
-                pool.submit(i + 1, sid, title, items[i], plan, due)
+            with self.assertRaises(lanes.PoolStopped):     # no lane left: the resolve step stops too
+                pool.submit(3, *seed[2][:2], items[2], *seed[2][2:])
             pool.close()
             t0 = time.perf_counter()
             pool.join()
             self.assertLess(time.perf_counter() - t0, 2)
             pool.shutdown()
         self.assertIn("download lane 1 stopped unexpectedly", "\n".join(cm.output))
-        self.assertEqual([(i["state"], i["result"]) for i in items], [("error", lanes.LANE_DIED)] * 2)
+        self.assertEqual(pool.stop_why, lanes.LANE_DIED)
+        self.assertEqual([(i["state"], i["result"]) for i in items[:2]], [("error", lanes.LANE_DIED)] * 2)
         self.assertEqual(pool.counts(), (0, 0, 2))
         self.assertEqual(fake.kinds("enqueue"), [])
         self.assertTrue(self.lock_free())
+
+    def test_one_dead_lane_leaves_the_work_to_the_others(self):
+        fake = self.fake(lanes=2)
+        plans = {f"S{k}": [entry(fake, f"Site {k}", k, f"S{k}", [1, 2, 3])] for k in range(1, 7)}
+        real, died = lanes.LanePool._pick, []
+
+        def pick(pool):
+            if threading.current_thread().name == "mangarr-lane-1" and not died:
+                died.append(1)
+                raise RuntimeError("bug")
+            return real(pool)
+        with mock.patch.object(lanes.LanePool, "_pick", pick), self.assertLogs("mangarr.lanes", "ERROR") as cm:
+            series = self.run_all(fake, plans, n_lanes=2)
+        self.assertIn("download lane 1 stopped unexpectedly", "\n".join(cm.output))
+        for sid, *_ in series:
+            self.assertEqual(self.statuses(sid), {"have"})
+        self.assertEqual({i["state"] for i in self.job.items}, {"done"})
+        self.assertEqual(self.pool_.counts(), (18, 18, 0))
+        self.assertEqual(fake.violations, [])
+
+    def test_a_lane_dying_mid_step_gives_its_site_back(self):
+        fake = self.fake()
+        plans = {"A": [entry(fake, X, 1, "A", [1])], "B": [entry(fake, X, 2, "B", [1])],
+                 "C": [entry(fake, Y, 3, "C", [1])]}
+        real, died = lanes.LanePool._release, []
+
+        def release(pool, lane, task, *a):
+            if task.title == "A" and not died:
+                died.append(lane)
+                raise RuntimeError("bug")
+            return real(pool, lane, task, *a)
+        with mock.patch.object(lanes.LanePool, "_release", release), self.assertLogs("mangarr.lanes", "ERROR"):
+            series = self.run_all(fake, plans)
+        items = self.job.items
+        self.assertEqual((items[0]["state"], items[0]["result"]), ("error", f"RuntimeError: {lanes.LANE_DIED}"))
+        self.assertEqual(self.statuses(series[0][0]), {"have"})         # what it downloaded is still written
+        self.assertEqual([sid for sid, _ in self.errors], [series[0][0]])
+        self.assertEqual([i["state"] for i in items[1:]], ["done", "done"])
+        self.assertEqual(self.statuses(series[1][0]), {"have"})         # B still got Site X
+        self.assertEqual(self.pool_.counts(), (3, 3, 1))
+
+    def test_waiting_texts_follow_the_sites(self):
+        # C waits for Site X while A has it; once A moves on to Site Z, X is free and C
+        # waits only for a lane (all three are busy), which its text must say
+        fake = self.fake(secs=0.15, max_parallel=4)
+        fake.hold_until_other(X, "nowhere", timeout=0.5)
+        plans = {"A": [entry(fake, X, 1, "A", [1]), entry(fake, Z, 2, "A", range(2, 11))],
+                 "B": [entry(fake, Y, 3, "B", range(1, 16))],
+                 "C": [entry(fake, X, 4, "C", [1])],
+                 "D": [entry(fake, "Site W", 5, "D", range(1, 16))]}
+        seed = self.seed(fake, plans)
+        items = self.items(seed)
+        pool = self.pool(fake, 3)
+        pool.start()
+
+        def until(cond, what):
+            deadline = time.perf_counter() + 10
+            while time.perf_counter() < deadline:
+                with pool._cv:
+                    if cond():
+                        return
+                threading.Event().wait(0.002)
+            self.fail(f"never saw {what}: {items[2]['result']!r}, busy {sorted(pool._busy)}")
+        for i in range(3):
+            pool.submit(i + 1, *seed[i][:2], items[i], *seed[i][2:])
+        until(lambda: items[2]["result"] == f"waiting for {X}: busy with A", "C waiting for A")
+        pool.submit(4, *seed[3][:2], items[3], *seed[3][2:])
+        until(lambda: set(pool._busy) == {"site y", "site w", "site z"}, "A on Site Z")
+        with pool._cv:
+            self.assertEqual((items[2]["state"], items[2]["result"]),
+                             ("waiting", "resolved: 1 chapter(s) due; waiting for a download lane"))
+        self.job.cancel = True
+        pool.close()
+        pool.join()
+        pool.shutdown()
+
+    def test_the_system_refusing_a_lane_thread(self):
+        fake = self.fake()
+        plans = {"A": [entry(fake, X, 1, "A", [1])], "B": [entry(fake, Y, 2, "B", [1])]}
+        real = threading.Thread.start
+
+        def start(t):
+            if t.name == "mangarr-lane-2":
+                raise RuntimeError("can't start new thread")
+            return real(t)
+        with mock.patch.object(threading.Thread, "start", start), \
+             self.assertLogs("mangarr.lanes", "WARNING") as cm:
+            series = self.run_all(fake, plans)
+        self.assertIn("could start only 1 of 3 download lane(s)", "\n".join(cm.output))
+        self.assertEqual(self.pool_.lanes, 1)
+        for sid, *_ in series:
+            self.assertEqual(self.statuses(sid), {"have"})
+        self.assertTrue(self.lock_free())
+        pool = self.pool(fake, 2)
+        with mock.patch.object(threading.Thread, "start", side_effect=RuntimeError("can't start new thread")), \
+             self.assertRaises(RuntimeError):
+            pool.start()
+        self.assertEqual(pool._running, 0)
 
     def test_submit_waits_while_too_many_series_wait_and_a_cancel_frees_it(self):
         fake = self.fake()

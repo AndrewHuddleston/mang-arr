@@ -20,7 +20,8 @@ to download never asks Suwayomi for it.
 The download lock is taken when the first series is handed over and held
 until the pass ends (shutdown), across the lane threads: still one download
 run per process and across processes, and a restore still cannot run
-meanwhile.
+meanwhile. The pass only ends once every lane has ended, however it ended,
+so nothing of it writes after that.
 
 Suwayomi not answering is counted per outage, not per failure (Outages):
 when several lanes and the resolve step run into one outage at once, the
@@ -45,7 +46,9 @@ log = logging.getLogger(__name__)
 HOLD_SECS = BREAKER_SECS
 # series resolved and waiting for a lane at most; the resolve step waits beyond that
 PIPELINE_MAX_WAITING = 50
-# how long the end of a pass waits for the lanes to finish their step
+# The end of a pass waits for every lane to finish its step, however long
+# that takes (a download step is cut short, writing and importing what
+# arrived is not); after this long it says in the log what it waits for.
 SHUTDOWN_JOIN_SECS = 100
 LANE_DIED = "download worker stopped unexpectedly"
 # job.lanes entry of a lane between steps
@@ -153,7 +156,9 @@ class LanePool:
     step calls submit() for each series with chapters due, then close() and
     join(); shutdown() ends it however the pass ended. One condition (_cv)
     guards all the state below; nothing does I/O, sleeps or calls back while
-    holding it."""
+    holding it. A lane that dies loses only the series it held (written at
+    the end with LANE_DIED); the others go on, and only when no lane is left
+    does the pool stop."""
 
     def __init__(self, client, job, lanes: int, label: str, outages: Outages,
                  on_error: Callable[[int, Exception], None] | None = None, cap: int | None = None,
@@ -164,15 +169,17 @@ class LanePool:
         self._cv = threading.Condition()
         self._waiting: list[SeriesTask] = []        # by index
         self._busy: dict[str, SeriesTask] = {}      # site -> the series a lane runs on it
-        self._claimed: dict[int, SeriesTask] = {}   # lane -> the series it runs
+        self._claimed: dict[int, SeriesTask] = {}   # lane -> the series it runs a step of
+        self._finishing: dict[int, SeriesTask] = {}     # lane -> the series it writes
+        self._lost: list[SeriesTask] = []           # held by a lane that died: written at the end
         self._ready_at: dict[str, float] = {}       # site -> when it may serve the next series (pacing)
-        self._in_flight = 0                         # series a lane runs or writes right now
-        self._finishing: set[int] = set()           # series a lane writes right now
-        self._closed = self._stopping = self._crashed = False
+        self._closed = self._stopping = False
+        self._crashed = False                       # every lane died with work left
+        self._dead = 0                              # lanes that died
         self._stop_why = ""
-        self.stopped_for_outage = False
         self._lane_state: dict[int, dict] = {}      # lane -> {source, series_id, title, text, since}
         self._resolving = ""
+        self._ending = ""                           # what the end of the pass waits for
         self.downloaded = self.imported = self.errors = 0
         self._threads: list[threading.Thread] = []
         self._running = 0                           # lanes started and not ended
@@ -185,13 +192,31 @@ class LanePool:
     def stop_why(self) -> str:
         return self._stop_why
 
+    def _in_flight(self) -> int:
+        """Under _cv: series a lane runs a step of or writes right now."""
+        return len(self._claimed) + len(self._finishing)
+
     def start(self) -> None:
+        """Start the lanes. When the system refuses a thread (a thread or
+        process limit), the pass goes on with the lanes it got; RuntimeError
+        when it got none."""
+        with self._cv:
+            self._running = self.lanes              # all at once: a lane that dies at once is not the last
         for k in range(1, self.lanes + 1):
             t = threading.Thread(target=self._worker, args=(k,), name=f"mangarr-lane-{k}", daemon=True)
+            try:
+                t.start()
+            except RuntimeError as e:
+                with self._cv:
+                    self._running -= self.lanes - k + 1     # they never ran: join() must not wait for them
+                    if k == 1:
+                        raise
+                    log.warning("%s: could start only %d of %d download lane(s) (%s); going on with those",
+                                self.label, k - 1, self.lanes, e)
+                    self.lanes = k - 1
+                    self._all_died()
+                break
             self._threads.append(t)
-            with self._cv:
-                self._running += 1
-            t.start()
         log.info("%s: %d download lane(s), Suwayomi allows %s source(s) in parallel", self.label, self.lanes,
                  "?" if self.cap is None else self.cap)
 
@@ -208,7 +233,7 @@ class LanePool:
             self._fd = downloader.acquire_download_lock(should_cancel=self.cancelled, progress=progress)
             downloader.clear_leftovers(self.client, self.cancelled)
         with self._cv:
-            while len(self._waiting) >= PIPELINE_MAX_WAITING and not self.cancelled():
+            while len(self._waiting) >= PIPELINE_MAX_WAITING and not self.cancelled() and self._running:
                 self._resolving = f"waiting: {len(self._waiting)} series queued for download lanes"
                 self._render()
                 self._cv.wait(1.0)
@@ -262,14 +287,12 @@ class LanePool:
 
     def join(self) -> None:
         """After close(): wait until every lane has ended (every series is
-        finished, or the lanes stopped). A cancel of the job stops them; so
-        does a lane that died, and join never waits for one that did."""
+        finished, or the lanes stopped). A cancel of the job stops them. A
+        lane that died has ended; the others finish the work."""
         with self._cv:
-            while self._running > 0:
+            while self._running > 0 and any(t.is_alive() for t in self._threads):
                 if not self._stopping and self.job.cancel:
                     self._stop_locked("cancelled")
-                elif not self._stopping and self._crashed:
-                    self._stop_locked(LANE_DIED)
                 self._cv.wait(1.0)
 
     def counts(self) -> tuple[int, int, int]:
@@ -278,29 +301,32 @@ class LanePool:
             return self.downloaded, self.imported, self.errors
 
     def shutdown(self) -> None:
-        """End of the pass, however it ended: stop the lanes and wait for them
-        (SHUTDOWN_JOIN_SECS in all), write the series still waiting that had
-        started, mark the others, give the download lock back and clear the
-        lanes from the Activity page. Never raises."""
+        """End of the pass, however it ended: stop the lanes and wait until
+        every one has ended (a step is cut short by the stop; writing and
+        importing what arrived is not, and is waited for however long it
+        takes, so nothing of the pass writes once it is over and the lock
+        is free), write the series still waiting that had started and those
+        of lanes that died, mark the others, give the download lock back
+        and clear the lanes from the Activity page. Never raises."""
         try:
             with self._cv:
                 if self._running or self._waiting:     # the pass did not get to the end of join()
                     self._stop_locked("cancelled" if self.job.cancel else "the pass ended early")
                 self._stopping = True
-            deadline = time.monotonic() + SHUTDOWN_JOIN_SECS
+                if any(t.is_alive() for t in self._threads):
+                    self._ending = "ending: waiting for the download lanes to finish their step"
+                    self._render()
+            t0 = time.monotonic()
             for t in self._threads:
-                t.join(max(0.0, deadline - time.monotonic()))
+                t.join(max(0.0, t0 + SHUTDOWN_JOIN_SECS - time.monotonic()))
                 if t.is_alive():
-                    log.warning("%s: %s is still busy %d s after the pass ended; leaving it", self.label, t.name,
-                                SHUTDOWN_JOIN_SECS)
+                    log.warning("%s: %s is still busy %d s after the pass ended (an import is not cut short); "
+                                "waiting for it", self.label, t.name, SHUTDOWN_JOIN_SECS)
+                    t.join()
             with self._cv:
-                left = list(self._waiting)
+                left = list(self._waiting) + self._lost
                 self._waiting.clear()
-                for lane, task in list(self._claimed.items()):
-                    if not self._threads[lane - 1].is_alive():     # lost with a lane that died
-                        del self._claimed[lane]
-                        self._in_flight -= 1
-                        left.append(task)
+                self._lost = []
             for task in left:
                 self._settle(task)
         except Exception:
@@ -314,13 +340,15 @@ class LanePool:
                 self._fd = None
             with self._cv:
                 self._lane_state.clear()
+                self._ending = ""
                 self.job.lanes = []
                 self.job.active_series_ids = frozenset()
             metrics.record_lanes(0, 0, 0)
 
     def _settle(self, task: SeriesTask) -> None:
-        """A series still waiting when the pass ended: written when a step of
-        it ran (what arrived is kept), otherwise only marked."""
+        """A series still waiting when the pass ended, or held by a lane that
+        died: written when a step of it ran (what arrived is kept),
+        otherwise only marked."""
         item = task.item
         if self._crashed and task.error is None:
             task.error = RuntimeError(LANE_DIED)
@@ -349,11 +377,12 @@ class LanePool:
                     while True:
                         if self._stopping:
                             return
-                        if self._closed and not self._waiting and not self._in_flight:
+                        if self._closed and not self._waiting and not self._in_flight():
                             return
                         task, key, wait = self._pick()
                         if task is not None:
                             break
+                        self._retext()                  # countdowns go on while no lane is busy
                         self._cv.wait(min(wait, 1.0) if wait > 0 else 1.0)
                     self._claim(lane, task, key)
                 finished, rest = True, 0.0
@@ -374,45 +403,90 @@ class LanePool:
                             self.errors += 1
                     finally:
                         with self._cv:
-                            self._finishing.discard(task.series_id)
-                            self._in_flight -= 1
+                            self._finishing.pop(lane, None)
                             self._cv.notify_all()
                             self._render()
         except BaseException:
             log.exception("%s: download lane %d stopped unexpectedly", self.label, lane)
             with self._cv:
-                self._crashed = True
+                self._lane_died(lane)
         finally:
             with self._cv:
                 self._running -= 1
+                self._all_died()
                 self._cv.notify_all()
+
+    def _all_died(self) -> None:
+        """Under _cv: when no lane is left and one died with work left (or
+        more series to come), the pool stops: nothing would run them."""
+        if not self._running and self._dead and not self._stopping and (self._waiting or not self._closed):
+            self._crashed = True
+            self._stop_locked(LANE_DIED)
+
+    def _lane_died(self, lane: int) -> None:
+        """Under _cv: lane `lane` died. The series it held gives its site
+        back, so the other lanes can serve that site, and is written at the
+        end of the pass with LANE_DIED; the other lanes go on."""
+        self._dead += 1
+        self._lane_state.pop(lane, None)
+        lost = self._claimed.pop(lane, None) or self._finishing.pop(lane, None)
+        if lost is not None:
+            for key in [k for k, t in self._busy.items() if t is lost]:
+                del self._busy[key]
+            if lost.error is None:
+                lost.error = RuntimeError(LANE_DIED)
+            self._lost.append(lost)
+        self._cv.notify_all()
 
     def _pick(self) -> tuple[SeriesTask | None, str | None, float]:
         """Under _cv: the first waiting series (pass order) with a site that
         is free and rested, as (task, site, 0); otherwise (None, None, seconds
-        until that may change, 0 when unknown). The texts of the series it
-        passes over say what they wait for."""
+        until that may change, 0 when unknown)."""
         left = self.outages.hold_left()
         if left > 0:
-            for task in self._waiting:
-                self._say(task, f"waiting: Suwayomi is not answering, trying again in {left:.0f} s")
             return None, None, left
         self.outages.served()                   # a hold that just ended: the next outage is a new one
         now, soonest = self.clock(), 0.0
         for task in self._waiting:
             for key in task.want:
-                name = task.names.get(key, key)
-                other = self._busy.get(key)
-                if other is not None:
-                    self._say(task, f"waiting for {name}: busy with {other.title}")
+                if key in self._busy:
                     continue
                 at = self._ready_at.get(key, 0.0)
                 if at > now:
-                    self._say(task, f"waiting for {name}: paced, next chapter in {at - now:.0f} s")
                     soonest = at - now if not soonest else min(soonest, at - now)
                     continue
                 return task, key, 0.0
         return None, None, soonest
+
+    def _retext(self) -> None:
+        """Under _cv: every waiting series says what it waits for now. Run on
+        every change (_render) and by idle lanes, so a text never names a
+        site that is free again, nor shows the download line of a step that
+        is over."""
+        left, now = self.outages.hold_left(), self.clock()
+        for task in self._waiting:
+            self._say(task, self._wait_text(task, left, now))
+
+    def _wait_text(self, task: SeriesTask, left: float, now: float) -> str:
+        """What `task` waits for: Suwayomi, a lane (one of its sites is free),
+        or else its first site (busy with another series, or resting)."""
+        if left > 0:
+            return f"waiting: Suwayomi is not answering, trying again in {left:.0f} s"
+        first = ""
+        for key in task.want:
+            name = task.names.get(key, key)
+            other = self._busy.get(key)
+            at = self._ready_at.get(key, 0.0)
+            if other is not None:
+                why = f"waiting for {name}: busy with {other.title}"
+            elif at > now:
+                why = f"waiting for {name}: paced, next chapter in {at - now:.0f} s"
+            elif task.ran:
+                return "waiting for a download lane"
+            else:
+                return f"resolved: {len(task.wanted)} chapter(s) due; waiting for a download lane"
+            first = first or why
+        return first or "waiting for a download lane"
 
     @staticmethod
     def _say(task: SeriesTask, text: str) -> None:
@@ -424,7 +498,6 @@ class LanePool:
         self._waiting.remove(task)
         self._busy[key] = task
         self._claimed[lane] = task
-        self._in_flight += 1
         task.item["state"] = "running"
         self._lane_state[lane] = {"source": task.names.get(key, key), "series_id": task.series_id,
                                   "title": task.title, "text": "", "since": time.time()}
@@ -441,11 +514,10 @@ class LanePool:
             if rest > 0:
                 self._ready_at[key] = max(self._ready_at.get(key, 0.0), self.clock() + rest)
             if finished:
-                self._finishing.add(task.series_id)     # still the pass's until it is written
+                self._finishing[lane] = task            # still the pass's until it is written
             else:
                 task.item["state"] = "waiting"
                 bisect.insort(self._waiting, task, key=lambda t: t.index)
-                self._in_flight -= 1
             self._cv.notify_all()
             self._render()
 
@@ -486,7 +558,6 @@ class LanePool:
                 task.error = e
                 log.warning("%s: %s: Suwayomi is not answering: %s", self.label, task.title, e)
                 if self.outages.report(e) == "stop":
-                    self.stopped_for_outage = True
                     self.stop("Suwayomi is not answering")
                 return True, 0.0
             finally:
@@ -562,10 +633,14 @@ class LanePool:
         line, the series being downloaded) and the lane gauges. Replaced,
         never changed in place, so a page render never sees half of it."""
         job = self.job
+        self._retext()
         job.lanes = [{"lane": k, **self._lane_state.get(k, _IDLE)} for k in range(1, self.lanes + 1)]
-        job.active_series_ids = frozenset([t.series_id for t in self._busy.values()] + list(self._finishing))
+        job.active_series_ids = frozenset([t.series_id for t in self._busy.values()] +
+                                          [t.series_id for t in self._finishing.values()])
         done = sum(1 for it in job.items if it.get("state") in FINISHED)
         parts = [f"{done}/{len(job.items)} done"]
+        if self._ending:
+            parts.append(self._ending)
         if self._resolving:
             parts.append(f"resolving {self._resolving}")
         busy = [f"{s['title']}: {s['text']}" if s["text"] else f"{s['source']} - {s['title']}"
