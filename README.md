@@ -280,7 +280,7 @@ published.
 | Page | One line |
 |---|---|
 | **Series** (`/`) | Every tracked series as posters or a table; search, sort, filter, monitored toggle, status and have/listed progress. |
-| **Series detail** (`/series/{id}`) | Cover, description, a details panel, per-status counts, chapters in groups with a reason and actions per chapter, the sources that matched, recent history. |
+| **Series detail** (`/series/{id}`) | Cover, description, a details panel, per-status counts, chapters in groups with a reason and actions per chapter (2000 per page, newest first, when a series lists more), the sources that matched, recent history. |
 | **Add New** (`/add`) | Type a title; pick an AniList / MangaDex candidate or add by exact title with aliases. |
 | **Library Import** (`/import`) | Scan Suwayomi's download tree and adopt what is already there. |
 | **Lists** (`/lists`) | Import lists (AniList user list, AniList chart, text file at a URL) and the exclusion list. |
@@ -879,7 +879,7 @@ curl -H "X-Api-Key: $KEY" http://localhost:6789/api/v1/wanted
 | `GET /api/v1/system/backup` | the kept backups: `[{"name", "size", "mtime"}]` |
 | `POST /api/v1/system/backup` | take a backup now; returns `{"name", "size"}` |
 | `GET /api/v1/series` | every tracked series with counts |
-| `GET /api/v1/series/{id}` | one series with its sources and chapters (each chapter with `status`, `reason`, `name`, `uploaded`, `source_name`, paths) |
+| `GET /api/v1/series/{id}?limit=5000&offset=0` | one series with its sources and chapters by number (each chapter with `status`, `reason`, `name`, `uploaded`, `source_name`, paths), at most 5000 chapters per call; `chapterTotal`, `limit` and `offset` in the answer say where the page is (next page: `offset=offset+limit`) |
 | `POST /api/v1/series` | add. Body: `{"ref": "anilist:123", "download": true}` or `{"ref": "mangadex:<uuid>"}` or `{"ref": "manual", "title": "...", "aliases": ["..."]}`; `download` defaults to true. Returns the job. 400 on a bad reference, 409 when the series is already tracked or already queued. |
 | `POST /api/v1/series/{id}/refresh?download=true` | queue a refresh; returns the job; 409 if one is already queued for the series |
 | `DELETE /api/v1/series/{id}?files=false` | stop tracking, optionally delete the library folder; 409 while a job for the series runs |

@@ -3,7 +3,8 @@
     series (AniList/MangaDex/manual) -> search every source with every title
                                      -> accept only exact title matches
                                      -> drop implausible chapter numbers
-                                     -> distrust sources whose length is off
+                                     -> distrust sources whose length is off,
+                                        or that add up to more than any series
                                      -> union the chapter numbers
                                      -> drop fractional "chapters" with no pages
                                      -> pick a source for each chapter
@@ -29,6 +30,7 @@ OUTLIER_FACTOR = 10          # a top number this many times the next one ...
 OUTLIER_MIN_JUMP = 1000      # ... and this far above it is a typo or a date, not a chapter,
 OUTLIER_MIN_BELOW = 5        # ... judged only with this many chapters below it (not [1, 1500])
 MAX_CHAPTERS_PER_SOURCE = 10_000
+MAX_PLAN_CHAPTERS = 10_000   # the same bound for the union of the trusted sources
 MAX_SEARCH_TITLES = 8
 MAX_GAP_SPANS = 40
 MAX_CHAPTER_NAME = 500
@@ -312,7 +314,8 @@ def plausible_chapters(source_name: str, chapters: list[Chapter]) -> list[Chapte
 
 
 def _trust(series: Series, matches: list[SourceMatch]) -> None:
-    """Flag sources whose length says they merged in another series."""
+    """Flag sources whose length says they merged in another series, then
+    those that would take the plan past MAX_PLAN_CHAPTERS."""
     good = [m for m in matches if m.usable and m.max]
     if not good:
         return
@@ -321,12 +324,32 @@ def _trust(series: Series, matches: list[SourceMatch]) -> None:
         expected = float(series.chapters)
     elif len(good) >= 3:
         expected = statistics.median(m.max for m in good)
-    if not expected:
-        return
-    for m in good:
-        if m.max > expected * config.DISAGREE:
-            m.note = f"too long: max {m.max:g} vs expected ~{expected:g}"
+    if expected:
+        for m in good:
+            if m.max > expected * config.DISAGREE:
+                m.note = f"too long: max {m.max:g} vs expected ~{expected:g}"
+                log.warning("%s: %s - not trusted", m.source.name, m.note)
+    _cap_union(matches)
+
+
+def _cap_union(matches: list[SourceMatch]) -> None:
+    """Each source is capped (MAX_CHAPTERS_PER_SOURCE), but two or three
+    sources listing different numbers can still add up to a plan no real
+    series has - and every number becomes a wanted chapter row. Without a
+    known length to judge by (an ongoing series on fewer than three
+    sources), the most plausible set is kept: sources that reach least far
+    first (a merged-in series or padding only ever adds numbers), best-ranked
+    among equals, as long as their union stays within MAX_PLAN_CHAPTERS. The
+    others are not trusted."""
+    union: set[float] = set()
+    for m in sorted((m for m in matches if m.usable), key=lambda m: (m.max, m.rank())):
+        numbers = m.numbers
+        total = len(union) + len(numbers - union)
+        if total > MAX_PLAN_CHAPTERS:
+            m.note = f"would make the plan {total} chapters, more than any real series ({MAX_PLAN_CHAPTERS})"
             log.warning("%s: %s - not trusted", m.source.name, m.note)
+            continue
+        union |= numbers
 
 
 def _assign(matches: list[SourceMatch]) -> dict[float, list[SourceMatch]]:

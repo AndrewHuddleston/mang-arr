@@ -15,7 +15,7 @@ import urllib.parse
 from collections import deque
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, Form, HTTPException, Request
+from fastapi import FastAPI, Form, HTTPException, Query, Request
 from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
@@ -40,7 +40,6 @@ from .. import (
     settings,
     updates,
 )
-from ..resolver import ranges
 from ..suwayomi import BREAKER_SECS, Client, SuwayomiError, SuwayomiUnreachable
 from . import lists_routes, security, views
 
@@ -110,7 +109,6 @@ def _startup_security() -> None:
 app = FastAPI(title="mang-arr", version=__version__, docs_url="/api/docs", redoc_url=None, lifespan=lifespan)
 app.mount("/static", StaticFiles(directory=os.path.join(HERE, "static")), name="static")
 templates = Jinja2Templates(directory=os.path.join(HERE, "templates"))
-templates.env.filters["ranges"] = ranges
 templates.env.filters["ago"] = lambda ts: _ago(ts)
 views.install(templates.env)
 app.include_router(lists_routes.router)
@@ -585,7 +583,10 @@ def index(request: Request, q: str = ""):
 
 
 @app.get("/series/{series_id}")
-def series_page(request: Request, series_id: int):
+def series_page(request: Request, series_id: int, page_no: int = Query(1, alias="page")):
+    """The series details page. The counts cover every chapter; the chapter
+    rows are paged (views.page_groups), so a source listing tens of
+    thousands of chapters cannot make one response huge."""
     with db.connect() as con:
         r = db.get_series(con, series_id)
         if not r:
@@ -599,9 +600,13 @@ def series_page(request: Request, series_id: int):
     by: dict[str, list] = {}
     for c in chs:
         by.setdefault(c["status"], []).append(c["number"])
-    return page(request, "series.html", s=r, series=db.series_to_model(r), sources=srcs, chapters=chs,
+    groups, paging = views.page_groups(views.group_chapters(chs, r), page_no)
+    if paging["pages"] > 1:
+        log.debug("series %d: %d chapter rows, showing page %d of %d", series_id, paging["total"], paging["page"],
+                  paging["pages"])
+    return page(request, "series.html", s=r, series=db.series_to_model(r), sources=srcs,
                 by=by, events=events, busy=runner.pending_for(series_id),
-                groups=views.group_chapters(chs, r), counts=views.counts(chs),
+                groups=groups, paging=paging, counts=views.counts(chs),
                 description=views.plain_description(r["description"]),
                 library_path=library.library_dir(r["folder"] or ""), size_bytes=size_bytes, size_files=size_files,
                 size_human=views.human_size(size_bytes), ref_url=views.ref_url(r))
@@ -1311,14 +1316,22 @@ def api_series():
         return [dict(r) for r in db.series_rows(con)]
 
 
+API_CHAPTERS = 5000        # chapters per GET /api/v1/series/{id} (default and maximum); real series fit in one
+
+
 @app.get("/api/v1/series/{series_id}")
-def api_series_one(series_id: int):
+def api_series_one(series_id: int, limit: int = API_CHAPTERS, offset: int = 0):
+    """One series with its sources and chapters (by number). The chapters
+    come in pages of at most API_CHAPTERS; chapterTotal, limit and offset
+    say where this page is, so a client pages on with offset=offset+limit."""
+    limit, offset = max(1, min(limit, API_CHAPTERS)), max(0, offset)
     with db.connect() as con:
         r = db.get_series(con, series_id)
         if not r:
             raise HTTPException(404)
         return {"series": dict(r), "sources": [dict(s) for s in db.sources(con, series_id)],
-                "chapters": [dict(c) for c in db.chapters(con, series_id)]}
+                "chapters": [dict(c) for c in db.chapters(con, series_id, limit=limit, offset=offset)],
+                "chapterTotal": db.chapter_count(con, series_id), "limit": limit, "offset": offset}
 
 
 @app.post("/api/v1/series")

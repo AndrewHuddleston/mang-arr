@@ -109,6 +109,16 @@
   </details>
 
   {# -- Chapter groups (Sonarr SeriesDetailsSeason) ------------------------ #}
+  {# a long chapter list is paged (views.page_groups); the counts above cover all of it #}
+  {% macro paging_nav(where) %}
+  <div class="alert info compact chapter-paging" id="chapter-pages-{{ where }}">
+    {{ paging.total }} chapters are listed, more than one page shows: rows {{ paging.first }}-{{ paging.last }}, newest first (page {{ paging.page }} of {{ paging.pages }}).
+    {% if paging.page > 1 %}<a href="?page=1">Newest</a> · <a href="?page={{ paging.page - 1 }}">Newer</a>{% endif %}
+    {% if paging.page > 1 and paging.page < paging.pages %} · {% endif %}
+    {% if paging.page < paging.pages %}<a href="?page={{ paging.page + 1 }}">Older</a> · <a href="?page={{ paging.pages }}">Oldest</a>{% endif %}
+  </div>
+  {% endmacro %}
+  {% if paging.pages > 1 %}{{ paging_nav('top') }}{% endif %}
   {% for g in groups %}
   {% set gkind = progress_kind(s.status, s.monitored, g.pct) if g.total else 'default' %}
   <div class="season" data-group="{{ g.key }}">
@@ -116,11 +126,11 @@
       <div class="season-left">
         <span class="season-number">{{ g.name }}</span>
         {{ m.label(g.have ~ ' / ' ~ g.total, gkind, 'large', title=(g.total ~ ' chapters listed, ' ~ g.have ~ ' on disk' ~ (', ' ~ g.wanted ~ ' wanted' if g.wanted else ''))) }}
-        <span class="season-count">{{ g.chapters|length }} chapter{{ 's' if g.chapters|length != 1 }}</span>
+        <span class="season-count">{% if g.part %}{{ g.chapters|length }} of {{ g.size }} chapters on this page{% else %}{{ g.chapters|length }} chapter{{ 's' if g.chapters|length != 1 }}{% endif %}</span>
       </div>
       <button type="button" class="season-expand grouphead" aria-expanded="{{ 'true' if g.open else 'false' }}" aria-controls="group-{{ g.key }}" title="{{ 'Hide chapters' if g.open else 'Show chapters' }}">{{ m.icon('collapse' if g.open else 'expand') }}</button>
       <div class="season-actions">
-        <button type="button" class="iconbtn" data-group-search="{{ g.key }}" title="Search for the wanted chapters in this group" {% if not g.wanted or busy %}disabled{% endif %}>{{ m.icon('search') }}</button>
+        <button type="button" class="iconbtn" data-group-search="{{ g.key }}" title="{{ 'Search for the wanted chapters of this group shown on this page' if g.part else 'Search for the wanted chapters in this group' }}" {% if not g.wanted or busy %}disabled{% endif %}>{{ m.icon('search') }}</button>
         <a class="iconbtn" href="#history" title="History">{{ m.icon('history') }}</a>
       </div>
     </div>
@@ -154,6 +164,7 @@
     </div>
   </div>
   {% endfor %}
+  {% if paging.pages > 1 %}{{ paging_nav('bottom') }}{% endif %}
   {% if not groups %}<div class="alert warning">No chapters listed yet. Run <b>Search Missing</b> to resolve the sources.</div>{% endif %}
 
   {# -- Sources ---------------------------------------------------------- #}

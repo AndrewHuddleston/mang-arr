@@ -10,8 +10,16 @@ import secrets
 import urllib.parse
 
 from .. import library, model
+from ..resolver import ranges
 
 BLOCK = 20                       # chapters per group when a series has no seasons
+# A source can list any number of chapters, and each row is about 2 KB of
+# HTML: one series page renders at most PAGE_CHAPTERS rows in at most
+# PAGE_GROUPS groups (one chapter per block of 20 is possible), the rest on
+# further pages. Real series have up to about 4000 chapters.
+PAGE_CHAPTERS = 2000
+PAGE_GROUPS = 200
+MAX_RANGE_SPANS = 40             # spans in a '1-3, 5, 7-9' tooltip
 
 STATUS_LABELS = {"RELEASING": "Continuing", "FINISHED": "Ended", "HIATUS": "Hiatus", "CANCELLED": "Cancelled"}
 CHAPTER_STATUSES = ("have", "wanted", "failed", "junk", "unavailable", "ignored")
@@ -152,6 +160,48 @@ def group_chapters(chapters, series_row=None) -> list[dict]:
     newest = next((g for g in out if g["key"] != "unnumbered"), out[0])
     newest["open"] = True
     return out
+
+
+def page_groups(groups: list[dict], page: int = 1, rows: int = PAGE_CHAPTERS,
+                max_groups: int = PAGE_GROUPS) -> tuple[list[dict], dict]:
+    """One page of group_chapters()' groups: at most `rows` chapter rows in
+    at most `max_groups` groups, in the same order (newest first). A group
+    that does not fit is split across pages: the part keeps the whole
+    group's header numbers, with `part` set and `size` its full length.
+    A page past the last one shows the last. Returns (groups, info) with
+    info = {page, pages, total, first, last}: first/last are row positions
+    (from 1) of the page's rows among all `total` rows."""
+    page = max(page, 1)
+    total = sum(len(g["chapters"]) for g in groups)
+    at, used, n_groups, row = 1, 0, 0, 0         # page being filled, its rows and groups, rows before it
+    out: list[dict] = []
+    first = last = 0
+    for g in groups:
+        chs = g["chapters"]
+        start = 0
+        while start < len(chs):
+            if used >= rows or n_groups >= max_groups:
+                at, used, n_groups = at + 1, 0, 0
+            take = min(len(chs) - start, rows - used)
+            if at == page:
+                first = first or row + 1
+                last = row + take
+                out.append(dict(g, chapters=chs[start:start + take], part=take < len(chs), size=len(chs)))
+            used, n_groups, row, start = used + take, n_groups + 1, row + take, start + take
+    if not out and page > at:
+        return page_groups(groups, at, rows, max_groups)
+    if out and not any(g["open"] for g in out):
+        out[0]["open"] = True                    # a later page opens its first group
+    return out, {"page": page, "pages": at, "total": total, "first": first, "last": last}
+
+
+def short_ranges(numbers, limit: int = MAX_RANGE_SPANS) -> str:
+    """resolver.ranges() cut to `limit` spans ('1-3, 5, ... (12 more)'): a
+    tooltip over thousands of scattered chapter numbers stays short."""
+    spans = ranges(numbers).split(", ")
+    if len(spans) <= limit:
+        return ", ".join(spans)
+    return ", ".join(spans[:limit]) + f", ... ({len(spans) - limit} more)"
 
 
 def counts(chapters) -> dict[str, int]:
@@ -311,6 +361,7 @@ def install(env) -> None:
                        progress_kind=progress_kind, chapter_status=chapter_status, event_icon=event_icon,
                        provider=provider, network_line=network_line, index_stats=index_stats, human_size=human_size,
                        row_kind=row_kind, row_language=row_language)
+    env.filters["ranges"] = short_ranges
     env.filters["status_label"] = status_label
     env.filters["status_class"] = status_class
     env.filters["plain"] = plain_description
