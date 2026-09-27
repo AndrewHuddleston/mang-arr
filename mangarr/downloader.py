@@ -28,7 +28,6 @@ chapter at a time: its pages are first requested through Suwayomi one by one
 import fcntl
 import logging
 import os
-import re
 import socket
 import threading
 import time
@@ -39,7 +38,7 @@ from dataclasses import dataclass, field
 from . import config, limits, metrics, pagewarm
 from .limits import Cancelled
 from .resolver import Plan, SourceMatch, ranges
-from .suwayomi import BREAKER_SECS, CircuitOpen, Client, SuwayomiError, SuwayomiUnreachable, with_cancel
+from .suwayomi import BREAKER_SECS, CircuitOpen, Client, SuwayomiError, SuwayomiUnreachable, site_key, with_cancel
 
 log = logging.getLogger(__name__)
 
@@ -256,9 +255,9 @@ class RunMemo:
 
 
 def lanes_key(name: str) -> str:
-    """The site a source name stands for: the EN and ALL variants of one
-    extension ('Comick (Unoriginal) (EN)' and '... (ALL)') are one site."""
-    return re.sub(r"\s*\((en|all)\)\s*$", "", name.lower().strip())
+    """The lane a source downloads through: its site (suwayomi.site_key),
+    so the EN and ALL variants of one extension share one."""
+    return site_key(name)
 
 
 @dataclass

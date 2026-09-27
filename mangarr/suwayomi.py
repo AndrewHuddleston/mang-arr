@@ -76,6 +76,13 @@ _PAGE_BUSY = {429, 500, 502, 503, 504}
 _PAGE_GONE = {404, 410}
 
 
+def site_key(name: str) -> str:
+    """The site a source name stands for: the EN and ALL variants of one
+    extension ('Comick (Unoriginal) (EN)' and '... (ALL)') are one site,
+    with one image server."""
+    return re.sub(r"\s*\((en|all)\)\s*$", "", name.lower().strip())
+
+
 @dataclass(frozen=True)
 class PageFetch:
     status: str             # ok | busy | gone | error | timeout

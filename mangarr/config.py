@@ -103,6 +103,8 @@ BATCH_DEFAULT = 4
 BATCH_THROTTLED = 1
 BACKOFF_MAX = 300
 BACKOFF_MAX_WITH_FALLBACK = 60
-# In order, consecutive chapters from one source are fetched in one run of at
-# most this many, so the next source (and the next series) gets its turn.
+# In order, consecutive chapters from one source are fetched in runs of at
+# most this many. That only splits a long run into steps: in a pass the series
+# keeps its place in the pass order, so it gets its site straight back (an
+# earlier series always goes first, see lanes.py).
 RUN_MAX_CHAPTERS = 20

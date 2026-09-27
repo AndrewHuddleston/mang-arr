@@ -232,6 +232,14 @@ class SearchPacingTest(unittest.TestCase):
         resolve(self.client, series, sources=[Source("2", "Comick", "en", page_warm=True)])
         self.assertEqual(self.gaps("Comick"), [3.0, 3.0])       # and only 3 titles
 
+    def test_the_en_and_all_variants_of_one_site_share_the_spacing(self):
+        series = Series(anilist_id=1, english="A", romaji="B", synonyms=["C"])
+        resolve(self.client, series, sources=[Source("111", "Comick (Unoriginal) (ALL)", "all", page_warm=True),
+                                              Source("222", "Comick (Unoriginal) (EN)", "en", page_warm=True)])
+        times = sorted(t for _, t in self.starts)
+        self.assertEqual(len(times), 6)
+        self.assertEqual([round(b - a, 6) for a, b in zip(times, times[1:], strict=False)], [3.0] * 5)
+
     def test_other_sources_do_not_wait(self):
         series = Series(anilist_id=1, english="A")
         resolve(self.client, series, sources=[Source(str(i), f"S{i}", "en") for i in range(1, 5)])

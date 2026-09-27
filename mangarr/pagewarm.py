@@ -23,7 +23,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 
 from . import limits, metrics
-from .suwayomi import PAGE_PATH, SuwayomiError, SuwayomiUnreachable
+from .suwayomi import PAGE_PATH, SuwayomiError, SuwayomiUnreachable, site_key
 
 log = logging.getLogger(__name__)
 
@@ -130,8 +130,7 @@ class PagePacer:
 def pacer(name: str) -> PagePacer:
     """The pacer of source `name`'s site: the EN and ALL variants of one
     extension share an image server, so they share one."""
-    from .downloader import lanes_key  # here, not at the top: downloader imports this module
-    key = lanes_key(name)
+    key = site_key(name)
     with _pacers_lock:
         p = _pacers.get(key)
         if p is None:

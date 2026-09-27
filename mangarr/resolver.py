@@ -19,7 +19,7 @@ from . import config, limits
 from .limits import Cancelled
 from .matching import ACCEPTED, AUTHOR_DIFFER, MAX_TITLE, author_level, match_level, oneline
 from .model import Series
-from .suwayomi import Chapter, Client, Source, SuwayomiError, SuwayomiUnreachable, with_cancel
+from .suwayomi import Chapter, Client, Source, SuwayomiError, SuwayomiUnreachable, site_key, with_cancel
 
 log = logging.getLogger(__name__)
 
@@ -38,10 +38,11 @@ MAX_SEARCH_TITLES = 8
 MAX_GAP_SPANS = 40
 MAX_CHAPTER_NAME = 500
 
-# Searches on one source start at least this far apart, across every
-# resolve in the process (a burst of titles got Weeb Central to about three
-# searches a second), and further apart on a page-by-page source, whose
-# site refuses bursts; such a source is also searched with fewer titles.
+# Searches on one site start at least this far apart, across every resolve
+# in the process (a burst of titles got Weeb Central to about three searches
+# a second), and further apart on a page-by-page source, whose site refuses
+# bursts; such a source is also searched with fewer titles. The EN and ALL
+# variants of one extension are one site (suwayomi.site_key).
 SEARCH_GAP_SECS = 1.0
 GENTLE_SEARCH_GAP_SECS = 3.0
 GENTLE_SEARCH_TITLES = 3
@@ -247,15 +248,17 @@ def _search_source(client, src, series, titles, rejected, should_cancel: Callabl
     this time). A source whose site cannot be reached at all (DNS/connection)
     is not asked again for UNREACHABLE_TTL. When Suwayomi itself does not
     answer, SuwayomiUnreachable is raised: that is no verdict on any source,
-    so the caller keeps the plan it has. Searches on one source are spaced
-    (SEARCHES); a cancel during that wait raises Cancelled."""
+    so the caller keeps the plan it has. Searches on one site are spaced
+    (SEARCHES; the EN and ALL variants of an extension are one site, like
+    their download lane); a cancel during that wait raises Cancelled."""
     import time
     seen_ids: set[int] = set()
     known = _unreachable.get(src.id)
     if known and time.monotonic() - known[0] < UNREACHABLE_TTL:
         return known[1] + " (skipped: unreachable earlier)"
     for q in titles:
-        if SEARCHES.wait(src.id, GENTLE_SEARCH_GAP_SECS if src.page_warm else SEARCH_GAP_SECS, should_cancel):
+        if SEARCHES.wait(site_key(src.name), GENTLE_SEARCH_GAP_SECS if src.page_warm else SEARCH_GAP_SECS,
+                         should_cancel):
             raise Cancelled()
         try:
             hits = client.search(src, q)
