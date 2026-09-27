@@ -7,7 +7,11 @@ series (in pass order) that wants a site no other lane is busy with, runs
 one step of it (one source entry: downloader.SeriesSteps.take, then
 downloader._download_source) and gives the site back. So a site serves one
 series at a time and keeps its pacing, and a slow or rate-limited site holds
-up only the series that need it. What to fetch next for a series, fallbacks,
+up only the series that need it. When no waiting series can have the site it
+wants next, a free lane takes the first one that can get the same chapters
+from another free site of no worse a tier (SeriesSteps.alternatives), rather
+than stay idle while the series waits; the site it skipped is still tried
+if that one fails. What to fetch next for a series, fallbacks,
 download in order and every reason are the same SeriesSteps a single-series
 download uses; what came of a series is written once it is finished
 (core.record_downloads, then core.finish_download imports it).
@@ -53,6 +57,10 @@ SHUTDOWN_JOIN_SECS = 100
 LANE_DIED = "download worker stopped unexpectedly"
 # job.lanes entry of a lane between steps
 _IDLE = {"source": None, "series_id": None, "title": None, "text": "", "since": None}
+# A series whose next site is busy or resting may take its chapters from
+# another free site that lists them (see the module docstring); tests turn it
+# off to compare.
+TAKE_FREE_SITE = True
 # item states of a series the pass is done with ("skipped": complete and finished, not checked this time)
 FINISHED = ("done", "nomatch", "failed", "error", "skipped")
 
@@ -144,6 +152,7 @@ class SeriesTask:
     seen: set = field(default_factory=set)      # sources that rate-limited it (recorded when it is written)
     told: set = field(default_factory=set)      # chapters already logged as no longer wanted
     want: list = field(default_factory=list)    # the sites it could download from next
+    alts: list = field(default_factory=list)    # ... or else, while those are busy (SeriesSteps.alternatives)
     names: dict = field(default_factory=dict)   # site -> a source name, for the texts
     ran: bool = False                   # a step started: something may have to be written
     cut: bool = False                   # stopped by a cancel or a stopped pass before it was done
@@ -244,7 +253,7 @@ class LanePool:
             task.names.setdefault(downloader.lanes_key(m.source.name), m.source.name)
         with db.connect() as con:
             gone = self._gone(con, task)
-            task.want = task.steps.wants(gone())
+            self._next(task, gone())
         if not task.want:                           # nothing any source can be asked for: written at once
             self._finalize(task)
             with self._cv:
@@ -436,24 +445,34 @@ class LanePool:
             self._lost.append(lost)
         self._cv.notify_all()
 
+    @staticmethod
+    def _next(task: SeriesTask, skip: set) -> None:
+        """What `task` can download from next (want), and instead (alts)."""
+        task.want = task.steps.wants(skip)
+        task.alts = task.steps.alternatives(skip) if TAKE_FREE_SITE and task.want else []
+
     def _pick(self) -> tuple[SeriesTask | None, str | None, float]:
-        """Under _cv: the first waiting series (pass order) with a site that
-        is free and rested, as (task, site, 0); otherwise (None, None, seconds
-        until that may change, 0 when unknown)."""
+        """Under _cv: the first waiting series (pass order) with a site it
+        wants that is free and rested, as (task, site, 0); else the first
+        one with such a site among its alternatives; otherwise (None, None,
+        seconds until that may change, 0 when unknown). Wants go first, so a
+        series never takes as its alternative the site a later series needs
+        and could have now."""
         left = self.outages.hold_left()
         if left > 0:
             return None, None, left
         self.outages.served()                   # a hold that just ended: the next outage is a new one
         now, soonest = self.clock(), 0.0
-        for task in self._waiting:
-            for key in task.want:
-                if key in self._busy:
-                    continue
-                at = self._ready_at.get(key, 0.0)
-                if at > now:
-                    soonest = at - now if not soonest else min(soonest, at - now)
-                    continue
-                return task, key, 0.0
+        for alts in (False, True):
+            for task in self._waiting:
+                for key in task.alts if alts else task.want:
+                    if key in self._busy:
+                        continue
+                    at = self._ready_at.get(key, 0.0)
+                    if at > now:
+                        soonest = at - now if not soonest else min(soonest, at - now)
+                        continue
+                    return task, key, 0.0
         return None, None, soonest
 
     def _retext(self) -> None:
@@ -471,7 +490,7 @@ class LanePool:
         if left > 0:
             return f"waiting: Suwayomi is not answering, trying again in {left:.0f} s"
         first = ""
-        for key in task.want:
+        for key in task.want + task.alts:       # the text names a site it wants; a free alternative: a lane
             name = task.names.get(key, key)
             other = self._busy.get(key)
             at = self._ready_at.get(key, 0.0)
@@ -543,7 +562,7 @@ class LanePool:
             gone = self._gone(con, task)
             run = task.steps.take(key, gone())
             if run is None:                     # its chapters there were ignored meanwhile
-                task.want = task.steps.wants(gone())
+                self._next(task, gone())
                 return not task.want, 0.0
             memo = downloader.RunMemo(throttle=task.seen, shared=self.shared)
             task.ran = True
@@ -575,9 +594,9 @@ class LanePool:
             rest = limits.setting("throttled_delay_seconds") if src.throttled or self.shared.seen(src.name) else 0.0
             if src.name in memo.gave_up:
                 rest += config.BACKOFF_MAX_WITH_FALLBACK
-            task.want = task.steps.wants(gone())
+            self._next(task, gone())
             if task.want and self.cancelled():
-                task.cut, task.want = True, []
+                task.cut, task.want, task.alts = True, [], []
             return not task.want, rest
 
     def _reporter(self, task: SeriesTask, lane: int) -> Callable[[str], None]:

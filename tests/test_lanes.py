@@ -227,6 +227,52 @@ class PoolTest(PoolBase):
         self.assertEqual(b, [1.0, 2.0, 3.0])
         self.assertEqual(self.statuses(seed[1][0]), {"have"})
 
+    def test_a_series_takes_a_free_site_instead_of_waiting_for_a_busy_one(self):
+        # B's next chapters are on X (busy with A) and on Y as well: a second lane takes them from Y,
+        # unless switching is off; a page-by-page copy (C's) is never taken instead of a normal one
+        for switch in (True, False):
+            with self.subTest(switch=switch), mock.patch.object(lanes, "TAKE_FREE_SITE", switch):
+                fake = self.fake(page_warm={"Comick"})
+                fake.hold_until_other(X, "nowhere", timeout=0.4)   # A keeps Site X busy a while
+                base = 10 if switch else 20
+                plans = {f"A{base}": [entry(fake, X, base + 1, f"A{base}", [1])],
+                         f"B{base}": [entry(fake, X, base + 2, f"B{base}", [1, 2]),
+                                      entry(fake, Y, base + 3, f"B{base}", [1, 2])],
+                         f"C{base}": [entry(fake, X, base + 4, f"C{base}", [1]),
+                                      entry(fake, "Comick", base + 5, f"C{base}", [1])]}
+                self.run_all(fake, plans)
+                self.assertEqual(fake.violations, [])
+                a_done = [e[0] for e in fake.kinds("finish") if e[3] == base + 1][0]
+                b = [(e[0], e[3]) for e in fake.kinds("enqueue") if e[3] in (base + 2, base + 3)]
+                if switch:
+                    self.assertEqual({mid for _, mid in b}, {base + 3})     # all from Y
+                    self.assertLess(b[0][0], a_done)                        # while A still had X
+                else:
+                    self.assertEqual({mid for _, mid in b}, {base + 2})     # waited for X, as before
+                    self.assertGreater(b[0][0], a_done)
+                self.assertEqual(fake.kinds("enqueue", "Comick"), [])
+                self.assertEqual({i["state"] for i in self.job.items}, {"done"})
+
+    def test_a_site_a_later_series_needs_is_not_taken_as_an_alternative(self):
+        # A holds X; B could use Y instead of X, but C needs Y and can have it now: C gets it
+        fake = self.fake()
+        fake.hold_until_other(X, "nowhere", timeout=0.4)
+        plans = {"A": [entry(fake, X, 1, "A", [1])],
+                 "B": [entry(fake, X, 2, "B", [1]), entry(fake, Y, 3, "B", [1])],
+                 "C": [entry(fake, Y, 4, "C", [1, 2, 3])]}
+        seed = self.seed(fake, plans)
+        items = self.items(seed)
+        pool = self.pool(fake, 2)
+        for i, (sid, title, plan, due) in enumerate(seed):     # all waiting before any lane looks
+            pool.submit(i + 1, sid, title, items[i], plan, due)
+        pool.start()
+        pool.close()
+        pool.join()
+        on_y = [e[3] for e in fake.kinds("enqueue", Y)]
+        self.assertEqual(on_y[0], 4)
+        self.assertEqual(fake.violations, [])
+        self.assertEqual({i["state"] for i in items}, {"done"})
+
     def test_an_earlier_series_goes_first(self):
         fake = self.fake()
         fake.hold_until_other(X, "nowhere", timeout=0.3)

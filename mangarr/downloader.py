@@ -311,7 +311,13 @@ class SeriesSteps:
     Otherwise chapters are grouped per source in rounds; the ones that fail
     go to their next source in the next round. A chapter Suwayomi did not
     start goes on to its next source the same way (not_started), but with
-    no source left it is not attempted this time instead of failed."""
+    no source left it is not attempted this time instead of failed.
+
+    Each chapter's sources are tried best first (plan.candidates), every one
+    of them before the chapter fails. When the sites wants() names are busy
+    with other series, a caller may take the same chapters from another
+    source that lists them (alternatives: no worse a tier, on another site);
+    the source skipped that way is still tried if that one fails."""
 
     def __init__(self, plan: Plan, wanted: set[float], in_order: bool, label: str, reasons: dict):
         self.plan, self.in_order, self.label, self.reasons = plan, in_order, label, reasons
@@ -325,17 +331,54 @@ class SeriesSteps:
             self.results[n] = "failed"
             reasons[n] = "no enabled source lists this chapter"
             log.warning("%s: ch %g has no usable source", label, n)
-        self.attempt: dict[float, int] = dict.fromkeys(pending, 0)   # index into plan.candidates[n]
+        self.used: dict[float, set[int]] = {n: set() for n in pending}   # entries (manga ids) tried per chapter
         self.order = sorted(pending)                       # in order
         self.idx = 0
         self.pending = pending                             # batch: the chapters for the next round
         self.round: list[_Group] = []
 
+    def _open(self, n: float) -> list[SourceMatch]:
+        """Chapter n's entries not tried yet for it (nor dead), best first."""
+        used, dead = self.used[n], self.dead
+        return [c for c in self.plan.candidates[n] if c.manga_id not in used and c.manga_id not in dead]
+
     def _next_source(self, n: float):
-        cands = self.plan.candidates[n]
-        while self.attempt[n] < len(cands) and cands[self.attempt[n]].manga_id in self.dead:
-            self.attempt[n] += 1
-        return cands[self.attempt[n]] if self.attempt[n] < len(cands) else None
+        return next(iter(self._open(n)), None)
+
+    def _others(self, n: float, m: SourceMatch) -> bool:
+        """Whether chapter n has an entry left to try besides m."""
+        return any(c.manga_id != m.manga_id for c in self._open(n))
+
+    def _instead(self, n: float) -> list[SourceMatch]:
+        """The entries chapter n could come from now instead of its next
+        source: not tried yet, on other sites (one each, the best), and no
+        worse a tier (normal, rate-limited, page by page: Source.tier)."""
+        left = self._open(n)
+        if not left:
+            return []
+        first, out = left[0], []
+        seen = {lanes_key(first.source.name)}
+        for c in left[1:]:
+            k = lanes_key(c.source.name)
+            if k not in seen and c.source.tier <= first.source.tier:
+                seen.add(k)
+                out.append(c)
+        return out
+
+    def alternatives(self, skip: set) -> list[str]:
+        """Sites (lanes_key) this series could download from instead when
+        every site of wants() is busy or resting: in order, another entry of
+        the next chapter; otherwise another entry of a chapter of the round.
+        Best first; [] when there are none, or it is done."""
+        keys = self.wants(skip)
+        if not keys:
+            return []
+        if self.in_order:
+            nums = [self.order[self.idx]]
+        else:
+            nums = [n for g in self.round for n in g.nums if n not in skip]
+        out = [lanes_key(c.source.name) for n in nums for c in self._instead(n)]
+        return [k for k in dict.fromkeys(out) if k not in keys]
 
     def wants(self, skip: set) -> list[str]:
         """The sites (lanes_key) this series could download from next,
@@ -412,44 +455,87 @@ class SeriesSteps:
         self.round = list(groups.values())
 
     def take(self, key: str, skip: set) -> Run | None:
-        """The next run on site `key`, or None when this series has nothing
-        for that site (any more)."""
-        if key not in self.wants(skip):
+        """The next run on site `key` (one of wants(), or of alternatives()),
+        or None when this series has nothing for that site (any more)."""
+        keys = self.wants(skip)
+        if key not in keys and key not in self.alternatives(skip):
             return None
-        plan = self.plan
         if self.in_order:
-            order = self.order
-            n = order[self.idx]
-            m = self._next_source(n)
-            run, j = [n], self.idx + 1
-            while j < len(order) and len(run) < config.RUN_MAX_CHAPTERS:
-                x = order[j]
-                if self.results.get(x) != "ok" and x not in skip:
-                    nx = self._next_source(x)
-                    if nx is None or nx.manga_id != m.manga_id:
-                        break
-                    run.append(x)
-                j += 1
-            chapters = {c.number: c for c in m.chapters}
-            todo = [chapters[x] for x in run if x in chapters]
-            patient = all(self.attempt[x] + 1 >= len(plan.candidates[x]) for x in run)
-            log.info("%s: downloading %d chapter(s) of %r from %s in order [%s]%s", self.label, len(todo), m.title,
-                     m.source.name, ranges(run), "" if patient else " (fallbacks available)")
-            # one at a time: a failure never lets a later chapter in
-            return Run(key, m, todo, 1, patient, True, end=j)
-        g = next(g for g in self.round if g.key == key and any(n not in skip for n in g.nums))
-        self.round.remove(g)
-        nums = [n for n in g.nums if n not in skip]
-        m = next(c for c in plan.candidates[nums[0]] if c.manga_id == g.manga_id)
+            return self._take_in_order(key, skip)
+        g = next((g for g in self.round if g.key == key and any(n not in skip for n in g.nums)), None)
+        if g is not None:
+            self.round.remove(g)
+            nums = [n for n in g.nums if n not in skip]
+            m = next(c for c in self.plan.candidates[nums[0]] if c.manga_id == g.manga_id)
+            instead = ""
+        else:
+            m, nums = self._take_instead(key, skip)
+            instead = " instead of their busy source(s)"
         chapters = {c.number: c for c in m.chapters}
         todo = [chapters[n] for n in nums if n in chapters]
         # a page-by-page source fetches one chapter at a time
         batch = 1 if m.source.page_warm else config.BATCH_THROTTLED if m.source.throttled else config.BATCH_DEFAULT
-        patient = all(self.attempt[n] + 1 >= len(plan.candidates[n]) for n in nums)
-        log.info("%s: downloading %d chapter(s) of %r from %s [%s]%s", self.label, len(todo),
-                 m.title, m.source.name, ranges([c.number for c in todo]),
+        patient = not any(self._others(n, m) for n in nums)
+        log.info("%s: downloading %d chapter(s) of %r from %s%s [%s]%s", self.label, len(todo),
+                 m.title, m.source.name, instead, ranges([c.number for c in todo]),
                  "" if patient else " (fallbacks available)")
         return Run(key, m, todo, batch, patient, False)
+
+    def _take_in_order(self, key: str, skip: set) -> Run:
+        """In order: the next chapter and the ones after it that come from
+        the same entry. On site `key` that is its next source, or else the
+        entry there that lists it too (alternatives), which then also takes
+        the chapters after it whose next source is on the same busy site."""
+        order = self.order
+        n = order[self.idx]
+        first = self._next_source(n)
+        m, busy_site = first, None
+        if lanes_key(first.source.name) != key:
+            m = next(c for c in self._instead(n) if lanes_key(c.source.name) == key)
+            busy_site = lanes_key(first.source.name)
+            log.info("%s: %s is busy; ch %g comes from %s instead", self.label, first.source.name, n, m.source.name)
+
+        def fits(x: float, nx: SourceMatch) -> bool:
+            if nx.manga_id == m.manga_id:
+                return True
+            return busy_site is not None and lanes_key(nx.source.name) == busy_site and \
+                any(c.manga_id == m.manga_id for c in self._instead(x))
+        run, j = [n], self.idx + 1
+        while j < len(order) and len(run) < config.RUN_MAX_CHAPTERS:
+            x = order[j]
+            if self.results.get(x) != "ok" and x not in skip:
+                nx = self._next_source(x)
+                if nx is None or not fits(x, nx):
+                    break
+                run.append(x)
+            j += 1
+        chapters = {c.number: c for c in m.chapters}
+        todo = [chapters[x] for x in run if x in chapters]
+        patient = not any(self._others(x, m) for x in run)
+        log.info("%s: downloading %d chapter(s) of %r from %s in order [%s]%s", self.label, len(todo), m.title,
+                 m.source.name, ranges(run), "" if patient else " (fallbacks available)")
+        # one at a time: a failure never lets a later chapter in
+        return Run(key, m, todo, 1, patient, True, end=j)
+
+    def _take_instead(self, key: str, skip: set) -> tuple[SourceMatch, list[float]]:
+        """Out of order, when every site of the round is busy: the chapters of
+        the round an entry on site `key` lists too (alternatives), taken out
+        of their groups; of several entries there, the one that lists most."""
+        picks: dict[int, list[float]] = {}
+        entry: dict[int, SourceMatch] = {}
+        for g in self.round:
+            for n in g.nums:
+                c = None if n in skip else next((c for c in self._instead(n) if lanes_key(c.source.name) == key),
+                                                None)
+                if c is not None:
+                    picks.setdefault(c.manga_id, []).append(n)
+                    entry[c.manga_id] = c
+        mid = max(picks, key=lambda i: len(picks[i]))
+        taken = set(picks[mid])
+        for g in self.round:
+            g.nums = [n for n in g.nums if n not in taken]
+        self.round = [g for g in self.round if g.nums]
+        return entry[mid], sorted(taken)
 
     def record(self, run: Run, ok: list, failed: list, why: dict) -> None:
         """What came of a run: delivered chapters are done, failed ones move
@@ -468,7 +554,7 @@ class SeriesSteps:
                 self.dead.add(m.manga_id)
                 log.warning("%s: %s delivered nothing this run; not retrying it", self.label, m.source.name)
             for x in failed:
-                self.attempt[x] += 1
+                self.used[x].add(m.manga_id)
                 self.tried.setdefault(x, []).append(f"{m.source.name}: {why.get(x, 'failed')}")
                 self.held.pop(x, None)
             self.idx = self.order.index(min(failed))    # resume at the first chapter that did not arrive
@@ -479,12 +565,12 @@ class SeriesSteps:
             self.dead.add(m.manga_id)
             log.warning("%s: %s delivered nothing this run; not retrying it", self.label, m.source.name)
         for n in failed:
-            self.attempt[n] += 1
+            self.used[n].add(m.manga_id)
             self.tried.setdefault(n, []).append(f"{m.source.name}: {why.get(n, 'failed')}")
             self.held.pop(n, None)
-            if self.attempt[n] < len(plan.candidates[n]):
-                nxt = plan.candidates[n][self.attempt[n]].source.name
-                log.info("%s: ch %g failed on %s, will try %s", self.label, n, m.source.name, nxt)
+            nxt = next((c for c in plan.candidates[n] if c.manga_id not in self.used[n]), None)
+            if nxt is not None:
+                log.info("%s: ch %g failed on %s, will try %s", self.label, n, m.source.name, nxt.source.name)
                 self.pending.add(n)
             else:
                 self.results[n] = "failed"
@@ -504,7 +590,7 @@ class SeriesSteps:
         name = run.match.source.name
         tried, reason = (UNSTARTED_TRIED, UNSTARTED_REASON) if queued else (BUSY_TRIED, busy_reason(name))
         for n in nums:
-            self.attempt[n] += 1
+            self.used[n].add(run.match.manga_id)
             self.tried.setdefault(n, []).append(f"{name}: {tried}")
             self.held[n] = reason
         if self.in_order:

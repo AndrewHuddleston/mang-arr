@@ -268,6 +268,70 @@ class SeriesStepsTest(unittest.TestCase):
         run = steps.take("comick (unoriginal)", set())
         self.assertEqual((run.batch, len(run.todo)), (1, 3))
 
+    def test_in_order_alternatives_are_other_sites_of_no_worse_tier(self):
+        a, b, d = match("A (EN)", 1, [1, 2, 3]), match("B", 2, [1, 2]), match("A (ALL)", 4, [1, 2, 3])
+        c = match("C", 3, [1, 2])
+        c.source = Source("3", "C", "en", page_warm=True)
+        steps, reasons = steps_for([a, d, b, c], [1, 2, 3])
+        self.assertEqual(steps.wants(set()), ["a"])
+        self.assertEqual(steps.alternatives(set()), ["b"])   # not A (ALL): the same site; not C: page by page
+        self.assertIsNone(steps.take("c", set()))
+        run = steps.take("b", set())                        # A is busy: B lists ch 1 and 2 as well
+        self.assertEqual((run.match.source.name, [x.number for x in run.todo], run.patient), ("B", [1.0, 2.0], False))
+        steps.record(run, [1.0], [2.0], {2.0: "broken"})
+        self.assertEqual((steps.wants(set()), steps.alternatives(set())), (["a"], []))
+        run = steps.take("a", set())
+        self.assertEqual((run.match.source.name, [x.number for x in run.todo]), ("A (EN)", [2.0, 3.0]))
+        steps.record(run, [2.0, 3.0], [], {})
+        self.assertEqual(steps.wants(set()), [])
+        self.assertEqual(steps.results, {1.0: "ok", 2.0: "ok", 3.0: "ok"})
+
+    def test_every_source_is_tried_before_a_chapter_fails(self):
+        for in_order in (True, False):
+            with self.subTest(in_order=in_order):
+                steps, reasons = steps_for([match("A", 1, [1]), match("B", 2, [1]), match("C", 3, [1])], [1],
+                                           in_order)
+                seen = []
+                while keys := steps.wants(set()):
+                    alts = steps.alternatives(set())
+                    run = steps.take(alts[0] if alts else keys[0], set())   # A stays busy while there is another
+                    seen.append(run.match.source.name)
+                    steps.record(run, [], [1.0], {1.0: "broken"})
+                self.assertEqual(seen, ["B", "C", "A"])
+                self.assertEqual(steps.results, {1.0: "failed"})
+                self.assertIn("B: broken; C: broken; A: broken", reasons[1.0])
+
+    def test_out_of_order_a_free_site_takes_chapters_of_a_busy_one(self):
+        a, b = match("A", 1, [1, 2, 3, 4]), match("B", 2, [3, 4, 5, 6])
+        steps, _ = steps_for([a, b], [1, 2, 3, 4, 5, 6], in_order=False)
+        self.assertEqual((steps.wants(set()), steps.alternatives(set())), (["a", "b"], []))
+        run_b = steps.take("b", set())
+        self.assertEqual([x.number for x in run_b.todo], [5.0, 6.0])
+        self.assertEqual((steps.wants(set()), steps.alternatives(set())), (["a"], ["b"]))
+        steps.record(run_b, [5.0, 6.0], [], {})
+        run = steps.take("b", set())                        # A is busy: B takes the chapters it lists too
+        self.assertEqual(([x.number for x in run.todo], run.batch, run.patient), ([3.0, 4.0], 4, False))
+        steps.record(run, [3.0], [4.0], {4.0: "broken"})    # 4 still gets its turn on A
+        run = steps.take("a", set())
+        self.assertEqual([x.number for x in run.todo], [1.0, 2.0])
+        steps.record(run, [1.0, 2.0], [], {})
+        run = steps.take("a", set())
+        self.assertEqual([x.number for x in run.todo], [4.0])
+        steps.record(run, [4.0], [], {})
+        self.assertEqual(steps.wants(set()), [])
+        self.assertEqual(set(steps.results.values()), {"ok"})
+
+    def test_a_worse_tier_is_never_an_alternative(self):
+        for flag in ("throttled", "page_warm"):
+            for in_order in (True, False):
+                a, c = match("A", 1, [1]), match("C", 2, [1])
+                c.source = Source("2", "C", "en", **{flag: True})
+                steps, _ = steps_for([a, c], [1], in_order)
+                self.assertEqual((steps.wants(set()), steps.alternatives(set())), (["a"], []), (flag, in_order))
+        a, c = match("A", 1, [1]), match("C", 2, [1])
+        a.source, c.source = Source("1", "A", "en", throttled=True), Source("2", "C", "en", throttled=True)
+        self.assertEqual(steps_for([a, c], [1])[0].alternatives(set()), ["c"])      # the same tier is fine
+
     def test_en_and_all_variants_are_one_site(self):
         self.assertEqual(downloader.lanes_key("Comick (Unoriginal) (EN)"), downloader.lanes_key("Comick (Unoriginal) (ALL)"))
         self.assertEqual(downloader.lanes_key(" Weeb Central "), "weeb central")
