@@ -744,21 +744,26 @@ def plan_adopt(client: Client, only: str | None = None, progress: Callable[[str]
 def apply_adopt(con, items: list[AdoptItem]) -> tuple[list[int], int]:
     """Register the identified folders. Folders of the same series (one per
     source) merge into one tracked series, and a folder of a series tracked
-    under its other reference (duplicates.py) into that one. Returns
-    (series ids, chapters)."""
-    by_ref: dict[str, list[AdoptItem]] = {}
+    under its other reference (duplicates.py) into that one. Folders of one
+    new series found under both references merge too, as the AniList one.
+    A tracked series keeps its primary source. Returns (series ids,
+    chapters)."""
+    groups: dict[str, list[AdoptItem]] = {}
     for it in items:
         if it.series:
             row = duplicates.tracked_as(con, it.series)
             if row is not None and row["ref"] != it.series.ref:
                 it = replace(it, series=db.series_to_model(row))
-            by_ref.setdefault(it.series.ref, []).append(it)
+            groups.setdefault(row["ref"] if row is not None else duplicates.identity(it.series), []).append(it)
     n_chapters = 0
     ids = []
-    for group in by_ref.values():
-        series = group[0].series
+    for group in groups.values():
+        series = next((it.series for it in group if it.series.anilist_id is not None), group[0].series)
         series_id = db.upsert_series(con, series)
         ids.append(series_id)
+        primary = {r[0] for r in con.execute("SELECT manga_id FROM series_source WHERE series_id=? AND is_primary=1",
+                                             (series_id,))}
+        first = next((it for it in group if it.manga_id is not None), None)
         for it in group:
             if it.manga_id is not None:
                 con.execute(
@@ -767,7 +772,7 @@ def apply_adopt(con, items: list[AdoptItem]) -> tuple[list[int], int]:
                     " is_primary, folder, seen_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
                     (series_id, it.manga_id, it.source, it.folder_name, None, 0, 1,
                      len(it.numbers), max(it.numbers) if it.numbers else 0, None,
-                     int(it is group[0]), it.path, db.now()))
+                     int(it.manga_id in primary if primary else it is first), it.path, db.now()))
             for n, path in it.numbers.items():
                 db.set_have(con, series_id, n, path, None, it.source)
                 n_chapters += 1

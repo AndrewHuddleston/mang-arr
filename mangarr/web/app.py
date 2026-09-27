@@ -175,8 +175,11 @@ def _job_refresh(series_id: int, download: bool):
 def _job_add(series: model.Series, download: bool, monitored: bool = True):
     def run(job: jobs.Job):
         with db.connect() as con:
-            o = core.add_series(con, client, series, download=download and monitored,
-                                should_cancel=lambda: job.cancel, progress=lambda m: setattr(job, "progress", m))
+            try:
+                o = core.add_series(con, client, series, download=download and monitored,
+                                    should_cancel=lambda: job.cancel, progress=lambda m: setattr(job, "progress", m))
+            except duplicates.AlreadyTracked as e:     # added under its other reference since this was queued
+                return str(e)
             if not monitored:
                 db.set_monitored(con, o.series_id, False)
         job.series_id = o.series_id
@@ -292,6 +295,7 @@ def _run_pass(job: jobs.Job, rows, label: str) -> tuple[int, int, int, int]:
 
 def _job_refresh_all(job: jobs.Job):
     with db.connect() as con:
+        duplicates.read_links(con)                 # the AniList links of MangaDex series, skipped ones too
         rows, skipped = plan_pass(db.series_rows(con))
     log.info("refresh pass: %d series (%d with missing chapters first), %d finished series skipped until due",
              len(rows), sum(1 for r in rows if r["wanted"]), skipped)
@@ -864,10 +868,11 @@ def _queue_add(series: model.Series, download: bool, monitored: bool = True) -> 
         why = duplicates.refusal(con, series)
         if why:
             return why
+    key = duplicates.add_key(series)          # one add per series, under either reference
     for j in runner.jobs():
-        if j.kind == "add" and j.title == series.title and j.status in ("queued", "running"):
+        if j.kind == "add" and (j.title == series.title or j.key == key) and j.status in ("queued", "running"):
             return f"already queued as job #{j.id}"
-    return runner.submit("add", series.title, _job_add(series, download, monitored))
+    return runner.submit("add", series.title, _job_add(series, download, monitored), key=key)
 
 
 @app.post("/add")

@@ -7,16 +7,18 @@ MangaDex series when Library Import looked up its folder "It’s Mine", so
 the same 159 chapters were tracked, downloaded and linked twice.
 
 A MangaDex record names its AniList entry (attributes.links.al); the series
-keeps that id as anilist_link, read again with every metadata refresh. Two
-series with the same AniList id, their own or a linked one, are the same
-series. Add (page and API), import lists and Library Import ask
+keeps that id as anilist_link, read again with every metadata refresh, and
+every refresh pass reads it for the MangaDex series that have none yet
+(read_links: those tracked before links were kept, and the ones a pass
+skips). Two series with the same AniList id, their own or a linked one, are
+the same series. Add (page and API), import lists and Library Import ask
 tracked_as() before a series is added, and the health check names the
 pairs tracked before this check existed, so the extra one can be deleted.
 """
 import logging
 import sqlite3
 
-from . import db
+from . import db, mangadex
 from .matching import oneline
 from .model import Series
 
@@ -32,6 +34,20 @@ class AlreadyTracked(ValueError):
 def anilist_of(s: Series) -> int | None:
     """The AniList id the series has, or its MangaDex record links to."""
     return s.anilist_id if s.anilist_id is not None else s.anilist_link
+
+
+def identity(s: Series) -> str:
+    """One key for a series under either reference: anilist:<id> when it has
+    an AniList id or its MangaDex record links to one, else its reference."""
+    aid = anilist_of(s)
+    return f"anilist:{aid}" if aid is not None else s.ref
+
+
+def add_key(s: Series) -> str:
+    """The key of the job that adds `s` (jobs.Runner.submit): one queued add
+    per series, whichever reference it came under (two import lists due
+    together, or one list naming both references)."""
+    return f"add {identity(s)}"
 
 
 def tracked_as(con, s: Series) -> sqlite3.Row | None:
@@ -78,7 +94,10 @@ def tracked_ids(con, candidates) -> dict[str, int]:
 def mark_tracked(con, items) -> None:
     """Library Import: flag the scanned folders (core.AdoptItem) whose series
     is tracked already. One tracked under another reference is proposed as
-    that series, so its folder is never adopted as a second series."""
+    that series, so its folder is never adopted as a second series. Folders
+    this scan found under both references of one new series are proposed as
+    one series, the AniList one (core.apply_adopt merges them all the same)."""
+    first: dict[str, Series] = {}          # identity -> the series proposed for it
     for it in items:
         row = tracked_as(con, it.series) if it.series else None
         it.tracked = row is not None
@@ -86,6 +105,46 @@ def mark_tracked(con, items) -> None:
             log.info("adopt: %s is %s, already tracked as %s (%s)", oneline(it.folder_name, 80), it.series.ref,
                      oneline(row["title"], 80), row["ref"])
             it.series = db.series_to_model(row)
+        elif row is None and it.series:
+            one = first.get(identity(it.series))
+            if one is None or (one.anilist_id is None and it.series.anilist_id is not None):
+                first[identity(it.series)] = it.series
+    for it in items:
+        one = first.get(identity(it.series)) if it.series and not it.tracked else None
+        if one is not None and one.ref != it.series.ref:
+            log.info("adopt: %s is %s, the same series as %s (%s) in this scan", oneline(it.folder_name, 80),
+                     it.series.ref, oneline(one.title, 80), one.ref)
+            it.series = one
+
+
+def read_links(con) -> int:
+    """Read the AniList link of every tracked MangaDex series that has none:
+    those tracked before links were kept (migration 13 leaves them empty),
+    and records that had none when last read. A refresh pass does this
+    first, so series the pass skips (unmonitored, finished) are read too:
+    one MangaDex request per 100 series. Returns how many links were found;
+    an error is logged, never raised, and the next pass tries again."""
+    try:
+        rows = con.execute("SELECT id, title, mangadex_id FROM series WHERE ref LIKE 'mangadex:%'"
+                           " AND mangadex_id IS NOT NULL AND anilist_link IS NULL").fetchall()
+        if not rows:
+            return 0
+        links = mangadex.anilist_links([r["mangadex_id"] for r in rows])
+        found = 0
+        for r in rows:
+            aid = links.get(r["mangadex_id"])
+            if aid is not None:
+                con.execute("UPDATE series SET anilist_link=? WHERE id=? AND anilist_link IS NULL", (aid, r["id"]))
+                found += 1
+                log.info("%s (mangadex:%s): MangaDex links it to anilist:%d", oneline(r["title"], 80),
+                         r["mangadex_id"], aid)
+        con.commit()
+    except Exception as e:                 # never ends the pass that asked
+        log.warning("could not read the AniList links of MangaDex series (the next refresh pass tries again):"
+                    " %s: %s", type(e).__name__, e)
+        return 0
+    log.debug("AniList links read for %d MangaDex series: %d found", len(rows), found)
+    return found
 
 
 def pairs(con) -> list[tuple[sqlite3.Row, sqlite3.Row]]:

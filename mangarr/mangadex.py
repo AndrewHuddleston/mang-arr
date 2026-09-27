@@ -121,3 +121,23 @@ def by_id(uuid: str) -> Series | None:
                                  ("includes[]", "cover_art")])
     m = d.get("data")
     return _to_series(m) if m else None
+
+
+IDS_PER_REQUEST = 100    # MangaDex's cap on ids[] (and limit) per /manga request
+
+
+def anilist_links(uuids: list[str]) -> dict[str, int | None]:
+    """{uuid: the AniList id its record links to, or None} for these records,
+    IDS_PER_REQUEST per request, whatever their content rating. A record
+    MangaDex no longer has is left out. Raises RuntimeError when MangaDex
+    cannot be reached."""
+    out: dict[str, int | None] = {}
+    for i in range(0, len(uuids), IDS_PER_REQUEST):
+        batch = uuids[i:i + IDS_PER_REQUEST]
+        params = [("ids[]", u) for u in batch] + [("limit", str(len(batch)))] + \
+            [("contentRating[]", r) for r in ("safe", "suggestive", "erotica", "pornographic")]
+        for m in _get("/manga", params).get("data") or []:
+            a = m.get("attributes") if isinstance(m, dict) and m.get("id") in batch else None
+            if isinstance(a, dict):
+                out[m["id"]] = _anilist_link(a)
+    return out
