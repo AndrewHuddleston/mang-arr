@@ -2,6 +2,7 @@
 awareness, clamped settings, short write transactions, user state kept,
 Suwayomi outages and the circuit breaker, adopt paging, import keys.
 Nothing here talks to a network or sleeps for real."""
+import errno
 import fcntl
 import math
 import os
@@ -10,6 +11,7 @@ import tempfile
 import time
 import unittest
 import urllib.error
+import zipfile
 from unittest import mock
 
 from mangarr import config, core, db, downloader, jobs, limits, resolver, suwayomi
@@ -498,6 +500,123 @@ class CoreTest(TmpData):
 
 
 # -- Suwayomi outages -------------------------------------------------------------------------
+
+class ImportWriteLockTest(TmpData):                    # findings 21, 33
+    """import_series commits every write at once, so another connection can
+    write while it checks each archive, links each file and asks Suwayomi,
+    whatever happened to the files before (a link failed, a bad file could
+    not be set aside, a file vanished)."""
+
+    def setUp(self):
+        super().setUp()
+        self.probes: list = []
+        self.con = None
+        self.patches.append(mock.patch.object(core.komga, "scan", lambda: False))
+        self.patches[-1].start()
+
+    def stage(self, source, name, data=None):
+        d = os.path.join(self.tmp.name, "staging", source, "T")
+        os.makedirs(d, exist_ok=True)
+        p = os.path.join(d, name)
+        if data is None:
+            with zipfile.ZipFile(p, "w") as z:
+                z.writestr("001.jpg", os.urandom(2000))
+        else:
+            with open(p, "wb") as f:
+                f.write(data)
+        t = time.time() - 3600                              # settled, not still being written
+        os.utime(p, (t, t))
+        return p
+
+    def probe(self, what):
+        """What a web request writing right now gets, with a short busy timeout."""
+        c = sqlite3.connect(self.tmp.name + "/t.db", timeout=0.5)
+        try:
+            c.execute("UPDATE series SET monitored=monitored")
+            c.commit()
+            res = "ok"
+        except sqlite3.OperationalError as e:
+            res = str(e)
+        finally:
+            c.close()
+        self.probes.append((what, self.con.in_transaction, res))
+
+    def run_import(self, sid, client=None, fail_link=(), refuse_quarantine=()):
+        verify, link, quarantine = core.library.verify_archive, core.library.link_into_library, core.library.quarantine
+
+        def probed_verify(f):
+            self.probe(f"verify {f.name}")
+            return verify(f)
+
+        def probed_link(f, *a, **kw):
+            self.probe(f"link {f.name}")
+            if f.name in fail_link:
+                raise OSError(errno.ENOSPC, "No space left on device")
+            return link(f, *a, **kw)
+
+        def maybe_quarantine(f):
+            if f.name in refuse_quarantine:
+                raise PermissionError(errno.EACCES, "Permission denied", f.path)
+            return quarantine(f)
+        with db.connect() as con, mock.patch.object(core.library, "verify_archive", probed_verify), \
+                mock.patch.object(core.library, "link_into_library", probed_link), \
+                mock.patch.object(core.library, "quarantine", maybe_quarantine), self.assertLogs("mangarr", "INFO"):
+            self.con = con
+            return core.import_series(con, sid, client)
+
+    def assert_never_locked(self):
+        self.assertTrue(self.probes)
+        self.assertEqual([p for p in self.probes if p[1] or p[2] != "ok"], [])
+
+    @unittest.skipIf(os.geteuid() == 0, "root writes through a read-only folder")
+    def test_unwritable_library(self):                  # the evidence repro: the usual PUID/PGID mistake
+        sid = self.seed({1: "wanted", 2: "wanted", 3: "wanted"})
+        for n in (1, 2, 3):
+            self.stage("A", f"Chapter {n}.cbz")
+        lib = os.path.join(self.tmp.name, "library")
+        os.makedirs(lib)
+        os.chmod(lib, 0o555)
+        try:
+            self.assertEqual(self.run_import(sid), 0)
+        finally:
+            os.chmod(lib, 0o755)
+        self.assertEqual([w for w, _, _ in self.probes], ["verify Chapter 1.cbz", "link Chapter 1.cbz",
+                                                          "verify Chapter 2.cbz", "link Chapter 2.cbz",
+                                                          "verify Chapter 3.cbz", "link Chapter 3.cbz"])
+        self.assert_never_locked()
+        self.assertEqual(self.status(sid), {1.0: "failed", 2.0: "failed", 3.0: "failed"})
+
+    def test_every_write_is_committed_before_the_next_slow_step(self):
+        sid = self.seed({n: "wanted" for n in range(1, 8)}, sources=(("A", 1), ("B", 2)))
+        self.stage("A", "Chapter 1.cbz", b"PK" + b"x" * 3000)     # bad, and cannot be set aside
+        self.stage("A", "Chapter 2.cbz")                            # the link fails (disk full)
+        self.stage("A", "Chapter 3.cbz", b"PK" + b"x" * 3000)     # bad, set aside
+        gone = self.stage("A", "Chapter 4.cbz")                     # vanishes after the folder is listed
+        self.stage("A", "Chapter 5.cbz")
+        self.stage("B", "Official_Special.cbz")                     # no number: Suwayomi is asked
+        real_scan = core.library.StagingFolder.scan
+
+        def scan_then_vanish(sf):
+            found = real_scan(sf)
+            if os.path.exists(gone):
+                os.remove(gone)
+            return found
+
+        class Client:
+            def chapters(client, manga_id):
+                self.probe(f"chapters {manga_id}")
+                return [Chapter(27, 7.0, "Special", "Official", True)]
+        with mock.patch.object(core.library.StagingFolder, "scan", scan_then_vanish):
+            linked = self.run_import(sid, Client(), fail_link={"Chapter 2.cbz"}, refuse_quarantine={"Chapter 1.cbz"})
+        self.assertEqual(linked, 2)
+        self.assertEqual([w for w, _, _ in self.probes],
+                         ["verify Chapter 1.cbz", "verify Chapter 2.cbz", "link Chapter 2.cbz", "verify Chapter 3.cbz",
+                          "verify Chapter 5.cbz", "link Chapter 5.cbz", "chapters 2", "verify Official_Special.cbz",
+                          "link Official_Special.cbz"])
+        self.assert_never_locked()
+        self.assertEqual(self.status(sid), {1.0: "failed", 2.0: "failed", 3.0: "failed", 4.0: "wanted",
+                                            5.0: "have", 6.0: "wanted", 7.0: "have"})
+
 
 class BreakerTest(unittest.TestCase):                 # finding 78
     def setUp(self):

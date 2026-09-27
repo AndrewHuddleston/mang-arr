@@ -446,67 +446,24 @@ def import_series(con, series_id: int, client: Client | None = None) -> int:
     One bad file never stops the others: a failure is recorded on that
     chapter and the import goes on. A file that fails verification while it
     is still fresh (Suwayomi may be writing it) is left for the next import
-    instead of being quarantined; old quarantined files are pruned."""
+    instead of being quarantined; old quarantined files are pruned.
+    Each staging folder is opened once and its files are listed, checked,
+    set aside and linked through that open folder (library.StagingFolder),
+    so a folder swapped for a symlink mid-import cannot point any of it at
+    other files. Every write is committed at once, so no database write is
+    held across a Suwayomi call or an archive check."""
     row = db.get_series(con, series_id)
     title, folder = row["title"], row["folder"]
     known = {r["number"]: dict(r) for r in db.chapters(con, series_id)}
     linked = 0
     for source_name, staging, manga_id in series_staging_dirs(con, series_id):
-        library.prune_quarantine(staging)
-        found, unparsed = library.scan_series_dir(staging)
-        if unparsed and client is not None and manga_id is not None:
-            try:
-                names = library.suwayomi_name_map(client.chapters(manga_id))
-            except SuwayomiError as e:
-                names = {}
-                log.warning("%s: cannot list chapters of %s entry to match %d unnamed file(s): %s",
-                            title, source_name, len(unparsed), e)
-            matched = 0
-            for path in unparsed:
-                n = library.match_unparsed(path, names)
-                if n is not None and n not in found:
-                    found[n] = path
-                    matched += 1
-                else:
-                    log.debug("%s: no chapter matches file %s", title, os.path.basename(path))
-            log.info("%s: %d of %d unnumbered file(s) in %s matched through Suwayomi's chapter list",
-                     title, matched, len(unparsed), staging)
-        elif unparsed:
-            log.debug("%s: %d file(s) in %s without a chapter number", title, len(unparsed), staging)
-        for n, path in found.items():
-            prev = known.get(n)
-            if prev and prev["status"] == "junk":
-                continue
-            if prev and prev["library_path"] and os.path.exists(prev["library_path"]):
-                continue
-            ok, detail = library.verify_archive(path)
-            if not ok:
-                if _still_being_written(path, title, n, source_name, detail):
-                    continue
-                moved = _quarantine(con, series_id, title, n, source_name, path)
-                if moved is None:
-                    continue
-                db.set_status(con, series_id, n, "failed", f"{source_name}: bad file ({detail}); set aside as "
-                              f"{os.path.basename(moved)}, will be fetched again")
-                db.record_source_result(con, source_name, "corrupt")
-                log.warning("%s: ch %g from %s is unusable (%s); quarantined %s", title, n, source_name, detail, moved)
-                con.commit()                        # never hold a write across the next file check
-                continue
-            label = prev["name"] if prev and "name" in prev.keys() else None
-            expected = os.path.join(library.library_dir(folder), library.chapter_filename(n, label))
-            ours = bool(prev and prev["library_path"] == expected)
-            try:
-                dst = library.link_into_library(path, folder, n, replace=ours, label=label)
-            except OSError as e:
-                _import_failed(con, series_id, title, n, f"{source_name}: cannot link {os.path.basename(path)}", e)
-                continue
-            if dst is None:
-                continue
-            db.set_have(con, series_id, n, path, dst, source_name)
-            con.commit()                            # never hold a write across the next file check
-            known[n] = {"number": n, "status": "have", "library_path": dst}
-            log.debug("%s: linked ch %g <- %s", title, n, path)
-            linked += 1
+        try:
+            sf = library.StagingFolder(staging)
+        except OSError as e:            # swapped for a symlink or removed since it was listed
+            log.warning("%s: skipping staging folder %s: %s", title, oneline(staging, 300), e)
+            continue
+        with sf:
+            linked += _import_folder(con, client, series_id, title, folder, known, sf, source_name, manga_id)
     if linked:
         db.event(con, "imported", f"{linked} chapter(s) linked into the library", series_id)
         log.info("%s: imported %d chapter(s) into %s", title, linked, library.library_dir(folder))
@@ -516,12 +473,101 @@ def import_series(con, series_id: int, client: Client | None = None) -> int:
     return linked
 
 
-def _still_being_written(path: str, title: str, n: float, source_name: str, detail: str) -> bool:
+def _import_folder(con, client: Client | None, series_id: int, title: str, folder: str, known: dict,
+                   sf: library.StagingFolder, source_name: str, manga_id: int | None) -> int:
+    """import_series for one opened staging folder. Returns how many
+    chapters were newly linked."""
+    sf.prune_quarantine()
+    found, unparsed = sf.scan()
+    if unparsed and client is not None and manga_id is not None:
+        try:
+            names = library.suwayomi_name_map(client.chapters(manga_id))
+        except SuwayomiError as e:
+            names = {}
+            log.warning("%s: cannot list chapters of %s entry to match %d unnamed file(s): %s",
+                        title, source_name, len(unparsed), e)
+        matched = 0
+        for name in unparsed:
+            n = library.match_unparsed(name, names)
+            if n is not None and n not in found:
+                found[n] = name
+                matched += 1
+            else:
+                log.debug("%s: no chapter matches file %s", title, name)
+        log.info("%s: %d of %d unnumbered file(s) in %s matched through Suwayomi's chapter list",
+                 title, matched, len(unparsed), sf.path)
+    elif unparsed:
+        log.debug("%s: %d file(s) in %s without a chapter number", title, len(unparsed), sf.path)
+    linked = 0
+    for n, name in found.items():
+        prev = known.get(n)
+        if prev and prev["status"] == "junk":
+            continue
+        if prev and prev["library_path"] and os.path.exists(prev["library_path"]):
+            continue
+        try:
+            with sf.open(name) as f:
+                dst = _import_file(con, series_id, title, folder, n, prev, f, source_name)
+        except FileNotFoundError:       # renamed or deleted since the folder was listed
+            log.warning("%s: ch %g: %s disappeared while it was being imported; skipped",
+                        title, n, os.path.join(sf.path, name))
+            continue
+        except OSError as e:            # swapped for a symlink or special file, unreadable ...
+            _import_failed(con, series_id, title, n, f"{source_name}: cannot read {name}", e)
+            continue
+        if dst:
+            known[n] = {"number": n, "status": "have", "library_path": dst}
+            linked += 1
+    return linked
+
+
+def _import_file(con, series_id: int, title: str, folder: str, n: float, prev, f: library.StagedFile,
+                 source_name: str) -> str | None:
+    """Check one opened staged file and link it into the library. Returns the
+    library path, or None when it was not linked (why is recorded and
+    logged). FileNotFoundError (the file was renamed away meanwhile) is left
+    to the caller."""
+    ok, detail = library.verify_archive(f)
+    if not ok:
+        if _still_being_written(f, title, n, source_name, detail):
+            return None
+        try:
+            moved = library.quarantine(f)
+        except FileNotFoundError:
+            raise
+        except OSError as e:
+            _import_failed(con, series_id, title, n, f"{source_name}: bad file {f.name} not set aside", e)
+            return None
+        db.set_status(con, series_id, n, "failed", f"{source_name}: bad file ({detail}); set aside as "
+                      f"{os.path.basename(moved)}, will be fetched again")
+        db.record_source_result(con, source_name, "corrupt")
+        con.commit()                        # never hold a write across the next file check
+        log.warning("%s: ch %g from %s is unusable (%s); quarantined %s", title, n, source_name, detail, moved)
+        return None
+    label = prev["name"] if prev and "name" in prev.keys() else None
+    expected = os.path.join(library.library_dir(folder), library.chapter_filename(n, label))
+    ours = bool(prev and prev["library_path"] == expected)
+    try:
+        dst = library.link_into_library(f, folder, n, replace=ours, label=label)
+    except FileNotFoundError:
+        raise
+    except OSError as e:
+        _import_failed(con, series_id, title, n, f"{source_name}: cannot link {f.name}", e)
+        return None
+    if dst is None:
+        return None
+    db.set_have(con, series_id, n, f.path, dst, source_name)
+    con.commit()                            # never hold a write across the next file check
+    log.debug("%s: linked ch %g <- %s", title, n, f.path)
+    return dst
+
+
+def _still_being_written(f: library.StagedFile, title: str, n: float, source_name: str, detail: str) -> bool:
     """True when a file that failed verification was written less than
     SETTLE_SECONDS ago: Suwayomi is probably still writing it, so it is left
     for the next import instead of being quarantined (logged)."""
     try:
-        age = time.time() - os.lstat(path).st_mtime
+        age = time.time() - os.fstat(f.fd).st_mtime
     except OSError:
         return False
     if age >= SETTLE_SECONDS:
@@ -533,20 +579,12 @@ def _still_being_written(path: str, title: str, n: float, source_name: str, deta
 
 def _import_failed(con, series_id: int, title: str, n: float, what: str, e: OSError) -> None:
     """One file could not be handled: recorded on its chapter and logged; the
-    import goes on with the other files."""
+    import goes on with the other files. Committed at once, so the write is
+    not held across the checks and Suwayomi calls still to come."""
     why = f"{what}: {type(e).__name__}: {e}"
     log.error("%s: ch %g: %s", title, n, why)
     db.set_status(con, series_id, n, "failed", why[:500])
-
-
-def _quarantine(con, series_id: int, title: str, n: float, source_name: str, path: str) -> str | None:
-    """library.quarantine, or None (recorded on the chapter) when the bad file
-    cannot be moved aside, e.g. it was swapped for a symlink."""
-    try:
-        return library.quarantine(path)
-    except OSError as e:
-        _import_failed(con, series_id, title, n, f"{source_name}: bad file {os.path.basename(path)} not set aside", e)
-        return None
+    con.commit()
 
 
 # -- adopt -------------------------------------------------------------------
