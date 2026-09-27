@@ -109,7 +109,12 @@ def resolve(client: Client, series: Series, sources: list[Source] | None = None,
     unreachable: list[tuple[Source, str]] = []
     titles = series.search_titles
 
+    skipped = [s.name for s in sources if s.unusable]
+    if skipped:
+        log.debug("not searching disabled source(s): %s", ", ".join(skipped))
     for src in sources:
+        if src.unusable:                      # disabled in Settings: not searched, not downloaded from
+            continue
         found = _search_source(client, src, series, titles, rejected)
         if isinstance(found, str):
             unreachable.append((src, found))

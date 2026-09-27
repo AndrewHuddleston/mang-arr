@@ -32,9 +32,8 @@ WEBHOOK_URL = os.environ.get("MANGARR_WEBHOOK_URL")
 
 # Sources that list chapters but cannot deliver images from this network, or
 # that rate-limit so hard under bulk load that they are worthless for a
-# backfill. They are still searched, so a series that exists only there is
-# reported as "exists, unreachable" rather than "not found", but no chapter is
-# ever assigned to them. Names are Suwayomi display names, lower-cased.
+# backfill. They are neither searched nor downloaded from (Settings -> Sources).
+# Names are Suwayomi display names, lower-cased.
 UNUSABLE_SOURCES = {
     s.strip().lower() for s in os.environ.get(
         "MANGARR_UNUSABLE_SOURCES",

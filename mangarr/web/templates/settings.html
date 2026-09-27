@@ -22,7 +22,7 @@
 
 <fieldset class="fieldset" id="sources">
   <legend class="legend">Sources</legend>
-  <div class="help-text">The sources installed in Suwayomi. Untick one to stop downloading from it (it is still searched, so a series that exists only there is reported). Rate limiting is detected automatically: a source that starts refusing requests is paced (one chapter at a time, a pause between chapters) and loses close calls to other sources for {{ auto_days }} days.</div>
+  <div class="help-text">The sources installed in Suwayomi. Untick one to stop using it: it is neither searched nor downloaded from. Rate limiting is detected automatically: a source that starts refusing requests is paced (one chapter at a time, a pause between chapters) and loses close calls to other sources for {{ auto_days }} days.</div>
   <input type="hidden" name="sources_listed" value="{{ '1' if sources else '0' }}">
   <div class="table-container"><table class="table">
   <thead><tr><th class="col-check">Enabled</th><th>Source</th><th>Language</th><th>Reliability</th><th>Rate limiting</th></tr></thead>

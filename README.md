@@ -194,7 +194,7 @@ with an asterisk to the container mounts (`/config`, `/data/staging`,
 | `MANGARR_PUSHOVER_TOKEN` | unset | Default Pushover application token. Notifications are sent only when both Pushover values are set. |
 | `MANGARR_PUSHOVER_USER` | unset | Default Pushover user key. |
 | `MANGARR_WEBHOOK_URL` | unset | Default URL to POST `{"title", "message", "kind"}` JSON to on every notification. |
-| `MANGARR_UNUSABLE_SOURCES` | `comick (unoriginal) (en),mangakakalot (en),readcomiconline (en)` | Default set of disabled sources: comma-separated Suwayomi source names (case-insensitive) that are searched but never assigned chapters, because they list series but cannot deliver images, or rate-limit into uselessness. |
+| `MANGARR_UNUSABLE_SOURCES` | `comick (unoriginal) (en),mangakakalot (en),readcomiconline (en)` | Default set of disabled sources: comma-separated Suwayomi source names (case-insensitive) that are neither searched nor downloaded from, because they cannot deliver images, or rate-limit into uselessness. Change it in Settings -> Sources. |
 | `MANGARR_THROTTLED_SOURCES` | `manganato (en)` | Default set of throttled sources: they work but throttle, so they lose every close call and get single-chapter batches; chapters nobody else has are still taken from them. |
 
 Source names are Suwayomi's display names as shown on the System page, e.g.
