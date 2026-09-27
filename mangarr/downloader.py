@@ -5,8 +5,13 @@ updates and with the user's own queueing, so this module only ever touches
 its own chapter ids: it enqueues them, watches them, and dequeues them if it
 gives up. It never clears the queue. Ids it could not dequeue because
 Suwayomi was not answering are remembered and taken out later (see
-clear_leftovers). Only one mang-arr download run may exist at a time (a file
-lock guards it, across the worker and the CLI).
+clear_leftovers). Only one mang-arr download run may exist at a time, per
+process and across the worker and the CLI (a file lock guards it). What to
+fetch next for a series, and what came of it, is kept apart from the loop
+that fetches it (SeriesSteps), so a caller can interleave several series,
+one per site. A chapter Suwayomi has not started yet (its queue is busy)
+does not count as stalled; after QUEUED_CAP_SECS its series is left for the
+next pass, with no verdict on the source.
 
 Within a source the batch size adapts: it shrinks to 1 and backs off when
 the source errors, and grows back when downloads succeed. A chapter that
@@ -18,15 +23,17 @@ chapters no source could deliver end up 'failed'.
 import fcntl
 import logging
 import os
+import re
 import socket
 import threading
 import time
 from collections.abc import Callable
 from contextlib import contextmanager
+from dataclasses import dataclass, field
 
-from . import config, limits
+from . import config, limits, metrics
 from .limits import Cancelled
-from .resolver import Plan, ranges
+from .resolver import Plan, SourceMatch, ranges
 from .suwayomi import BREAKER_SECS, CircuitOpen, Client, SuwayomiError, SuwayomiUnreachable, with_cancel
 
 log = logging.getLogger(__name__)
@@ -39,6 +46,12 @@ STALL_SECS = 600
 CHUNK_CAP_SECS = 3 * 3600
 # every try errored out faster than this: a dead chapter, not rate limiting
 INSTANT_FAIL_SECS = 45
+# How long our chapters may wait in Suwayomi's queue without being started
+# (its queue busy with its own updates or the user's downloads) before the
+# series is left for the next pass. Not rate limiting: the source never saw them.
+QUEUED_CAP_SECS = 1800
+UNSTARTED_REASON = (f"not attempted: Suwayomi did not start this chapter within {QUEUED_CAP_SECS // 60} min "
+                    "(its download queue was busy with other downloads)")
 # How long a run waits for another process (the CLI) to finish its download
 # before giving up with an error (a bad value: see config.env_number), and
 # how often it checks meanwhile.
@@ -79,13 +92,14 @@ class LockBusy(RuntimeError):
     """Another download run held the lock for longer than LOCK_WAIT_SECS."""
 
 
-@contextmanager
-def download_lock(path: str | None = None, should_cancel: Callable[[], bool] | None = None,
-                  progress: Callable[[str], None] | None = None, wait_secs: float | None = None):
-    """Only one download run at a time, across the web worker and the CLI.
-    While another process holds it, poll (never block): a cancel raises
-    Cancelled, and after wait_secs (LOCK_WAIT_SECS) LockBusy is raised. The
-    holder writes its pid and host into the file so the waiter can say who."""
+def acquire_download_lock(path: str | None = None, should_cancel: Callable[[], bool] | None = None,
+                          progress: Callable[[str], None] | None = None, wait_secs: float | None = None) -> int:
+    """Take the download lock and return its file descriptor (give it back
+    with release_download_lock). While another process holds it, poll (never
+    block): a cancel raises Cancelled, and after wait_secs (LOCK_WAIT_SECS)
+    LockBusy is raised. The holder writes its pid and host into the file so
+    the waiter can say who. Split from download_lock so a refresh pass can
+    hold it across threads."""
     path = path or config.LOCK_PATH
     wait_secs = LOCK_WAIT_SECS if wait_secs is None else wait_secs
     cancel = should_cancel or (lambda: False)
@@ -114,17 +128,35 @@ def download_lock(path: str | None = None, should_cancel: Callable[[], bool] | N
             if limits.pause(LOCK_POLL_SECS, cancel):
                 raise Cancelled()
             waited += LOCK_POLL_SECS
-        try:
-            os.ftruncate(fd, 0)
-            os.pwrite(fd, f"pid {os.getpid()} on {socket.gethostname()}\n".encode(), 0)
-        except OSError as e:
-            log.debug("could not record lock holder in %s: %s", path, e)
-        try:
-            yield
-        finally:
-            fcntl.flock(fd, fcntl.LOCK_UN)
+    except BaseException:
+        os.close(fd)
+        raise
+    try:
+        os.ftruncate(fd, 0)
+        os.pwrite(fd, f"pid {os.getpid()} on {socket.gethostname()}\n".encode(), 0)
+    except OSError as e:
+        log.debug("could not record lock holder in %s: %s", path, e)
+    return fd
+
+
+def release_download_lock(fd: int) -> None:
+    """Give back a lock taken with acquire_download_lock (any thread may)."""
+    try:
+        fcntl.flock(fd, fcntl.LOCK_UN)
     finally:
         os.close(fd)
+
+
+@contextmanager
+def download_lock(path: str | None = None, should_cancel: Callable[[], bool] | None = None,
+                  progress: Callable[[str], None] | None = None, wait_secs: float | None = None):
+    """Only one download run at a time, across the web worker and the CLI
+    (see acquire_download_lock)."""
+    fd = acquire_download_lock(path, should_cancel, progress, wait_secs)
+    try:
+        yield
+    finally:
+        release_download_lock(fd)
 
 
 def _lock_holder(fd: int) -> str:
@@ -132,6 +164,254 @@ def _lock_holder(fd: int) -> str:
         return os.pread(fd, 200, 0).decode(errors="replace").strip() or "unknown process"
     except OSError:
         return "unknown process"
+
+
+class PassShared:
+    """Sources seen rate-limiting us during one refresh pass, shared by the
+    series that download at the same time, so the second one does not have
+    to learn it again."""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._names: set[str] = set()
+
+    def seen(self, name: str) -> bool:
+        with self._lock:
+            return name in self._names
+
+    def add(self, name: str) -> None:
+        with self._lock:
+            self._names.add(name)
+
+
+@dataclass
+class RunMemo:
+    """What one series' download run has learned so far, handed to every
+    _download_source call of that run."""
+    throttle: set[str] = field(default_factory=set)   # sources that rate-limited us (the caller records them)
+    shared: PassShared | None = None                   # the same, pass-wide
+    gave_up: set[str] = field(default_factory=set)     # sources backed off until we gave up on them
+    rewarmed: set[int] = field(default_factory=set)    # chapter ids whose pages were fetched a second time
+    stop: str | None = None                            # set: stop this series, with this reason for the rest
+
+    def paced(self, name: str) -> bool:
+        return name in self.throttle or (self.shared is not None and self.shared.seen(name))
+
+    def note_throttle(self, name: str) -> None:
+        self.throttle.add(name)
+        if self.shared is not None:
+            self.shared.add(name)
+
+
+def lanes_key(name: str) -> str:
+    """The site a source name stands for: the EN and ALL variants of one
+    extension ('Comick (Unoriginal) (EN)' and '... (ALL)') are one site."""
+    return re.sub(r"\s*\((en|all)\)\s*$", "", name.lower().strip())
+
+
+@dataclass
+class Run:
+    """One call of _download_source: chapters of one series from one source entry."""
+    key: str                    # lanes_key of the source
+    match: SourceMatch
+    todo: list                  # suwayomi.Chapter, in order
+    batch: int
+    patient: bool               # no chapter here has another source left to fall back on
+    in_order: bool
+    end: int = 0                # in order: where the next run starts when this one delivers everything
+
+
+@dataclass
+class _Group:
+    manga_id: int
+    key: str
+    nums: list[float]
+
+
+class SeriesSteps:
+    """The bookkeeping of one series' download, apart from the loop that runs
+    it: which source to ask next for which chapters (wants/take), what came
+    of it (record), fallbacks to the next source, sources that delivered
+    nothing, and the reason for every chapter that did not arrive. No I/O.
+
+    In order, chapters go strictly one after the other, consecutive ones
+    from the same source fetched together; a chapter that fails is retried
+    on its other sources at once, and one no source can deliver stops the
+    series there (the later chapters wait for it, and their reason says so).
+    Otherwise chapters are grouped per source in rounds; the ones that fail
+    go to their next source in the next round."""
+
+    def __init__(self, plan: Plan, wanted: set[float], in_order: bool, label: str, reasons: dict):
+        self.plan, self.in_order, self.label, self.reasons = plan, in_order, label, reasons
+        self.results: dict[float, str] = {}
+        self.tried: dict[float, list[str]] = {}            # what happened on each source, per chapter
+        self.dead: set[int] = set()                        # manga ids that failed everything
+        self.finished = False
+        pending = {n for n in wanted if plan.candidates.get(n)}
+        for n in wanted - pending:
+            self.results[n] = "failed"
+            reasons[n] = "no enabled source lists this chapter"
+            log.warning("%s: ch %g has no usable source", label, n)
+        self.attempt: dict[float, int] = dict.fromkeys(pending, 0)   # index into plan.candidates[n]
+        self.order = sorted(pending)                       # in order
+        self.idx = 0
+        self.pending = pending                             # batch: the chapters for the next round
+        self.round: list[_Group] = []
+
+    def _next_source(self, n: float):
+        cands = self.plan.candidates[n]
+        while self.attempt[n] < len(cands) and cands[self.attempt[n]].manga_id in self.dead:
+            self.attempt[n] += 1
+        return cands[self.attempt[n]] if self.attempt[n] < len(cands) else None
+
+    def wants(self, skip: set) -> list[str]:
+        """The sites (lanes_key) this series could download from next,
+        chapters in `skip` (no longer wanted) left out. [] when it is done."""
+        if self.finished:
+            return []
+        if self.in_order:
+            return self._wants_in_order(skip)
+        while True:
+            self.round = [g for g in self.round if any(n not in skip for n in g.nums)]
+            if self.round:
+                return list(dict.fromkeys(g.key for g in self.round))
+            if not self.pending:
+                self.finished = True
+                return []
+            self._next_round(skip)
+
+    def _wants_in_order(self, skip: set) -> list[str]:
+        order, results = self.order, self.results
+        while self.idx < len(order) and (results.get(order[self.idx]) == "ok" or order[self.idx] in skip):
+            self.idx += 1                           # done, or ignored meanwhile: never blocks the rest
+        if self.idx >= len(order):
+            self.finished = True
+            return []
+        n = order[self.idx]
+        m = self._next_source(n)
+        if m is None:
+            cands = self.plan.candidates[n]
+            results[n] = "failed"
+            only_one = len(cands) == 1
+            self.reasons[n] = "; ".join(self.tried.get(n) or [c.source.name for c in cands]) + \
+                (" (no other source has this chapter)" if only_one else "")
+            waiting = [x for x in order[self.idx + 1:] if results.get(x) != "ok" and x not in skip]
+            for x in waiting:
+                self.reasons[x] = (f"waiting for chapter {n:g}: chapters download in order and {n:g} failed on "
+                                   "every source (it is retried on schedule; turn off 'download in order' to skip "
+                                   "ahead)")
+            log.warning("%s: ch %g failed on every source; stopping here, %d later chapter(s) wait for it",
+                        self.label, n, len(waiting))
+            self.finished = True
+            return []
+        return [lanes_key(m.source.name)]
+
+    def _next_round(self, skip: set) -> None:
+        """Group the pending chapters by their next source; fail the ones no
+        source is left for."""
+        plan = self.plan
+        self.pending -= skip
+        groups: dict[int, _Group] = {}
+        for n in sorted(self.pending):
+            m = self._next_source(n)
+            if m is None:
+                cands = plan.candidates[n]
+                self.results[n] = "failed"
+                self.reasons[n] = "failed on every source: " + "; ".join(self.tried.get(n) or
+                                                                         [c.source.name for c in cands])
+                log.warning("%s: ch %g %s", self.label, n, self.reasons[n])
+                continue
+            g = groups.get(m.manga_id)
+            if g is None:
+                g = groups[m.manga_id] = _Group(m.manga_id, lanes_key(m.source.name), [])
+            g.nums.append(n)
+        self.pending = set()
+        self.round = list(groups.values())
+
+    def take(self, key: str, skip: set) -> Run | None:
+        """The next run on site `key`, or None when this series has nothing
+        for that site (any more)."""
+        if key not in self.wants(skip):
+            return None
+        plan = self.plan
+        if self.in_order:
+            order = self.order
+            n = order[self.idx]
+            m = self._next_source(n)
+            run, j = [n], self.idx + 1
+            while j < len(order) and len(run) < config.RUN_MAX_CHAPTERS:
+                x = order[j]
+                if self.results.get(x) != "ok" and x not in skip:
+                    nx = self._next_source(x)
+                    if nx is None or nx.manga_id != m.manga_id:
+                        break
+                    run.append(x)
+                j += 1
+            chapters = {c.number: c for c in m.chapters}
+            todo = [chapters[x] for x in run if x in chapters]
+            patient = all(self.attempt[x] + 1 >= len(plan.candidates[x]) for x in run)
+            log.info("%s: downloading %d chapter(s) of %r from %s in order [%s]%s", self.label, len(todo), m.title,
+                     m.source.name, ranges(run), "" if patient else " (fallbacks available)")
+            # one at a time: a failure never lets a later chapter in
+            return Run(key, m, todo, 1, patient, True, end=j)
+        g = next(g for g in self.round if g.key == key and any(n not in skip for n in g.nums))
+        self.round.remove(g)
+        nums = [n for n in g.nums if n not in skip]
+        m = next(c for c in plan.candidates[nums[0]] if c.manga_id == g.manga_id)
+        chapters = {c.number: c for c in m.chapters}
+        todo = [chapters[n] for n in nums if n in chapters]
+        batch = config.BATCH_THROTTLED if m.source.throttled else config.BATCH_DEFAULT
+        patient = all(self.attempt[n] + 1 >= len(plan.candidates[n]) for n in nums)
+        log.info("%s: downloading %d chapter(s) of %r from %s [%s]%s", self.label, len(todo),
+                 m.title, m.source.name, ranges([c.number for c in todo]),
+                 "" if patient else " (fallbacks available)")
+        return Run(key, m, todo, batch, patient, False)
+
+    def record(self, run: Run, ok: list, failed: list, why: dict) -> None:
+        """What came of a run: delivered chapters are done, failed ones move
+        on to their next source (or fail for good)."""
+        m, plan = run.match, self.plan
+        for n in ok:
+            self.results[n] = "ok"
+        if run.in_order:
+            if not failed:
+                self.idx = run.end
+                return
+            if not ok:
+                self.dead.add(m.manga_id)
+                log.warning("%s: %s delivered nothing this run; not retrying it", self.label, m.source.name)
+            for x in failed:
+                self.attempt[x] += 1
+                self.tried.setdefault(x, []).append(f"{m.source.name}: {why.get(x, 'failed')}")
+            self.idx = self.order.index(min(failed))    # resume at the first chapter that did not arrive
+            return
+        if not failed:
+            return
+        if not ok:
+            self.dead.add(m.manga_id)
+            log.warning("%s: %s delivered nothing this run; not retrying it", self.label, m.source.name)
+        for n in failed:
+            self.attempt[n] += 1
+            self.tried.setdefault(n, []).append(f"{m.source.name}: {why.get(n, 'failed')}")
+            if self.attempt[n] < len(plan.candidates[n]):
+                nxt = plan.candidates[n][self.attempt[n]].source.name
+                log.info("%s: ch %g failed on %s, will try %s", self.label, n, m.source.name, nxt)
+                self.pending.add(n)
+            else:
+                self.results[n] = "failed"
+                only_one = len(plan.candidates[n]) == 1
+                self.reasons[n] = ("; ".join(self.tried[n]) +
+                                   (" (no other source has this chapter)" if only_one else ""))
+                log.warning("%s: ch %g failed: %s", self.label, n, self.reasons[n])
+
+    def stop(self, reason: str) -> None:
+        """Nothing more for this series: every wanted chapter not tried to the
+        end gets `reason`."""
+        for n in self.order:
+            if n not in self.results:
+                self.reasons[n] = reason
+        self.finished = True
+        self.round, self.pending = [], set()
 
 
 def download(client: Client, plan: Plan, only: set[float] | None = None,
@@ -145,99 +425,48 @@ def download(client: Client, plan: Plan, only: set[float] | None = None,
     no longer wanted (ignored by the user meanwhile); those are skipped and
     left out of the result."""
     reasons = reasons if reasons is not None else {}
-    tried: dict[float, list[str]] = {}          # what happened on each source, per chapter
     wanted = set(plan.wanted()) if only is None else set(only)
     label = plan.series.title
-    results: dict[float, str] = {}
-    pending = {n for n in wanted if plan.candidates.get(n)}
-    for n in wanted - pending:
-        results[n] = "failed"
-        reasons[n] = "no enabled source lists this chapter"
-        log.warning("%s: ch %g has no usable source", label, n)
-    attempt: dict[float, int] = dict.fromkeys(pending, 0)   # index into plan.candidates[n]
-    dead: set[int] = set()                                     # manga ids that failed everything
     cancel = should_cancel or (lambda: False)
     report = progress or (lambda m: None)
-    seen_throttle = throttled if throttled is not None else set()
     gone = _dropper(dropped, label)
     from . import settings
     if in_order is None:
         in_order = bool(settings.get("download_in_order"))
-    if in_order:
-        try:
-            with download_lock(should_cancel=cancel, progress=report):
-                clear_leftovers(client, cancel)
-                _download_in_order(client, plan, sorted(pending), attempt, dead, tried, results, reasons,
-                                   cancel, report, seen_throttle, label, gone)
-        except Cancelled:
-            log.warning("%s: download cancelled; %d done", label, sum(1 for r in results.values() if r == "ok"))
-        return results
+    memo = RunMemo(throttle=throttled if throttled is not None else set())
+    steps = SeriesSteps(plan, wanted, in_order, label, reasons)
     try:
         with download_lock(should_cancel=cancel, progress=report):
             clear_leftovers(client, cancel)
-            while pending:
-                pending -= gone()
-                by_source: dict[int, list[float]] = {}
-                for n in sorted(pending):
-                    cands = plan.candidates[n]
-                    while attempt[n] < len(cands) and cands[attempt[n]].manga_id in dead:
-                        attempt[n] += 1
-                    if attempt[n] >= len(cands):
-                        results[n] = "failed"
-                        reasons[n] = "failed on every source: " + "; ".join(tried.get(n) or
-                                                                              [c.source.name for c in cands])
-                        log.warning("%s: ch %g %s", label, n, reasons[n])
-                        continue
-                    by_source.setdefault(cands[attempt[n]].manga_id, []).append(n)
-                pending = set()
-                for manga_id, nums in by_source.items():
-                    if cancel():
-                        raise Cancelled()
-                    nums = [n for n in nums if n not in gone()]
-                    if not nums:
-                        continue
-                    m = next(c for c in plan.candidates[nums[0]] if c.manga_id == manga_id)
-                    chapters = {c.number: c for c in m.chapters}
-                    todo = [chapters[n] for n in nums if n in chapters]
-                    batch = config.BATCH_THROTTLED if m.source.throttled else config.BATCH_DEFAULT
-                    patient = all(attempt[n] + 1 >= len(plan.candidates[n]) for n in nums)
-                    log.info("%s: downloading %d chapter(s) of %r from %s [%s]%s", label, len(todo),
-                             m.title, m.source.name, ranges([c.number for c in todo]),
-                             "" if patient else " (fallbacks available)")
-                    ok, failed, why = _download_source(client, manga_id, todo, batch, label, m.source.name,
-                                                       patient, cancel, report, seen_throttle,
-                                                       throttled=m.source.throttled, gone=gone)
-                    for n in ok:
-                        results[n] = "ok"
-                    if failed:
-                        if not ok:
-                            dead.add(manga_id)
-                            log.warning("%s: %s delivered nothing this run; not retrying it", label,
-                                        m.source.name)
-                        for n in failed:
-                            attempt[n] += 1
-                            tried.setdefault(n, []).append(f"{m.source.name}: {why.get(n, 'failed')}")
-                            if attempt[n] < len(plan.candidates[n]):
-                                nxt = plan.candidates[n][attempt[n]].source.name
-                                log.info("%s: ch %g failed on %s, will try %s", label, n, m.source.name, nxt)
-                                pending.add(n)
-                            else:
-                                results[n] = "failed"
-                                only_one = len(plan.candidates[n]) == 1
-                                reasons[n] = ("; ".join(tried[n]) +
-                                              (" (no other source has this chapter)" if only_one else ""))
-                                log.warning("%s: ch %g failed: %s", label, n, reasons[n])
+            while True:
+                if cancel():
+                    raise Cancelled()
+                skip = gone()
+                keys = steps.wants(skip)
+                if not keys:
+                    break
+                run = steps.take(keys[0], skip)
+                if run is None:
+                    continue
+                ok, failed, why = _download_source(client, run.match.manga_id, run.todo, run.batch, label,
+                                                   run.match.source.name, run.patient, cancel, report, memo,
+                                                   stop_on_fail=run.in_order, throttled=run.match.source.throttled,
+                                                   gone=gone)
+                steps.record(run, ok, failed, why)
+                if memo.stop:
+                    steps.stop(memo.stop)
     except Cancelled:
-        log.warning("%s: download cancelled; %d done", label, sum(1 for r in results.values() if r == "ok"))
-    return results
+        log.warning("%s: download cancelled; %d done", label, sum(1 for r in steps.results.values() if r == "ok"))
+    return steps.results
 
 
-def _dropper(dropped: Callable[[], set] | None, label: str) -> Callable[[], set]:
+def _dropper(dropped: Callable[[], set] | None, label: str, told: set | None = None) -> Callable[[], set]:
     """Wrap dropped() so a failing check never stops a download, and log
-    each chapter the first time it is dropped."""
+    each chapter the first time it is dropped (`told` keeps that across
+    calls when the caller needs it to)."""
     if dropped is None:
         return set
-    told: set = set()
+    told = told if told is not None else set()
 
     def gone() -> set:
         try:
@@ -252,73 +481,6 @@ def _dropper(dropped: Callable[[], set] | None, label: str) -> Callable[[], set]
     return gone
 
 
-def _download_in_order(client, plan, order, attempt, dead, tried, results, reasons, cancel, report,
-                       seen_throttle, label, gone=set) -> None:
-    """Strictly in chapter order. Consecutive chapters that come from the same
-    source are fetched together; a chapter that fails is retried on its other
-    sources at once; a chapter no source can deliver stops the series there,
-    and the later chapters wait for it (their reason says so)."""
-    def next_source(n):
-        cands = plan.candidates[n]
-        while attempt[n] < len(cands) and cands[attempt[n]].manga_id in dead:
-            attempt[n] += 1
-        return cands[attempt[n]] if attempt[n] < len(cands) else None
-
-    idx = 0
-    while idx < len(order):
-        if cancel():
-            raise Cancelled()
-        skip = gone()
-        n = order[idx]
-        if results.get(n) == "ok" or n in skip:       # done, or ignored meanwhile: never blocks the rest
-            idx += 1
-            continue
-        m = next_source(n)
-        if m is None:
-            cands = plan.candidates[n]
-            results[n] = "failed"
-            only_one = len(cands) == 1
-            reasons[n] = "; ".join(tried.get(n) or [c.source.name for c in cands]) + \
-                (" (no other source has this chapter)" if only_one else "")
-            waiting = [x for x in order[idx + 1:] if results.get(x) != "ok" and x not in skip]
-            for x in waiting:
-                reasons[x] = (f"waiting for chapter {n:g}: chapters download in order and {n:g} failed on every "
-                              "source (it is retried on schedule; turn off 'download in order' to skip ahead)")
-            log.warning("%s: ch %g failed on every source; stopping here, %d later chapter(s) wait for it",
-                        label, n, len(waiting))
-            return
-        batch = 1                                # one at a time: a failure never lets a later chapter in
-        run, j = [n], idx + 1
-        while j < len(order) and len(run) < 20:
-            x = order[j]
-            if results.get(x) != "ok" and x not in skip:
-                nx = next_source(x)
-                if nx is None or nx.manga_id != m.manga_id:
-                    break
-                run.append(x)
-            j += 1
-        chapters = {c.number: c for c in m.chapters}
-        todo = [chapters[x] for x in run if x in chapters]
-        patient = all(attempt[x] + 1 >= len(plan.candidates[x]) for x in run)
-        log.info("%s: downloading %d chapter(s) of %r from %s in order [%s]%s", label, len(todo), m.title,
-                 m.source.name, ranges(run), "" if patient else " (fallbacks available)")
-        ok, failed, why = _download_source(client, m.manga_id, todo, batch, label, m.source.name, patient, cancel,
-                                           report, seen_throttle, stop_on_fail=True, throttled=m.source.throttled,
-                                           gone=gone)
-        for x in ok:
-            results[x] = "ok"
-        if not failed:
-            idx = j
-            continue
-        if not ok:
-            dead.add(m.manga_id)
-            log.warning("%s: %s delivered nothing this run; not retrying it", label, m.source.name)
-        for x in failed:
-            attempt[x] += 1
-            tried.setdefault(x, []).append(f"{m.source.name}: {why.get(x, 'failed')}")
-        idx = order.index(min(failed))          # resume at the first chapter that did not arrive
-
-
 def download_one(client: Client, manga_id: int, chapter, label: str, source_name: str,
                  should_cancel: Callable[[], bool] | None = None,
                  progress: Callable[[str], None] | None = None) -> tuple[bool, list, dict]:
@@ -326,24 +488,30 @@ def download_one(client: Client, manga_id: int, chapter, label: str, source_name
     (ok, failed numbers, {number: why}). Raises Cancelled when cancelled."""
     cancel = should_cancel or (lambda: False)
     report = progress or (lambda m: None)
+    memo = RunMemo()
     with download_lock(should_cancel=cancel, progress=report):
         clear_leftovers(client, cancel)
         ok, failed, why = _download_source(client, manga_id, [chapter], 1, label, source_name, False,
-                                           cancel, report, set())
+                                           cancel, report, memo)
     if not ok and not failed and cancel():         # stopped by the cancel, not a failure of the source
         raise Cancelled()
+    if memo.stop and not ok:                        # Suwayomi never got to it
+        return False, [chapter.number], {chapter.number: memo.stop}
     return bool(ok), failed, why
 
 
-def _download_source(client, manga_id, todo, batch, label, source_name, patient, cancel, report, seen_throttle,
-                     stop_on_fail: bool = False, throttled: bool = False, gone=set):
+def _download_source(client, manga_id, todo, batch, label, source_name, patient, cancel, report, memo: RunMemo,
+                     stop_on_fail: bool = False, throttled: bool = False, warm: bool = False, gone=set):
     """Returns (ok numbers, failed numbers, {number: why it failed}). `report`
     receives one-line progress messages for the Activity page. The pause
     between chapters applies only to a rate-limited source (`throttled`, or
-    one seen rate-limiting us during this run), not to every batch of one.
-    Chapters in gone() (no longer wanted) are skipped and appear in neither list.
-    A cancel cuts every Suwayomi call short, also a hung one; the chunk's ids
-    are then taken back out (_dequeue) and what arrived so far is returned."""
+    one seen rate-limiting us during this run: memo), not to every batch of
+    one. Chapters in gone() (no longer wanted) are skipped and appear in
+    neither list. A cancel cuts every Suwayomi call short, also a hung one;
+    the chunk's ids are then taken back out (_dequeue) and what arrived so
+    far is returned. A chunk Suwayomi never started (its queue busy with
+    other downloads) sets memo.stop and ends the call: that is no verdict
+    on the source."""
     ok, failed, why = [], [], {}
     ops = with_cancel(client, cancel)
     i, size, backoff = 0, batch, 0
@@ -356,7 +524,7 @@ def _download_source(client, manga_id, todo, batch, label, source_name, patient,
             i += 1
         if i >= len(todo):
             break
-        paced = throttled or source_name in seen_throttle
+        paced = throttled or memo.paced(source_name)
         span = min(size, len(todo) - i)             # how far this chunk moves us along todo
         chunk = [c for c in todo[i:i + span] if c.number not in skip]
         ids = [c.id for c in chunk]
@@ -380,8 +548,14 @@ def _download_source(client, manga_id, todo, batch, label, source_name, patient,
         except Cancelled:
             outcome = "cancelled"
         finally:
-            if outcome not in ("done", "not sent"):     # stalled, timeout, cancelled, or an exception
+            if outcome not in ("done", "not sent"):     # stalled, timeout, unstarted, cancelled, or an exception
                 _dequeue(client, ids, label, outcome, cancel, unsure)
+        if outcome == "unstarted":
+            memo.stop = UNSTARTED_REASON
+            metrics.record_unstarted(source_name)
+            log.warning("%s: %s did not start ch %s within %d min (Suwayomi's queue is busy); stopping this series "
+                        "for now", label, source_name, ranges([c.number for c in chunk]), QUEUED_CAP_SECS // 60)
+            break
         instant = outcome == "stalled" and time.monotonic() - t_start < INSTANT_FAIL_SECS
         if outcome == "cancelled":
             break                                   # keep what arrived; the caller sees the cancel and stops
@@ -404,7 +578,7 @@ def _download_source(client, manga_id, todo, batch, label, source_name, patient,
                 break
             continue
         if outcome in ("stalled", "timeout") and not got:
-            seen_throttle.add(source_name)          # refused after trying for a while: rate limiting
+            memo.note_throttle(source_name)         # refused after trying for a while: rate limiting
             size = 1
             backoff = min(max_backoff, (backoff or 30) * 2)
             log.warning("%s: %s %s on ch %g - backing off %ds", label, source_name,
@@ -418,6 +592,7 @@ def _download_source(client, manga_id, todo, batch, label, source_name, patient,
                 rest = [c for c in todo[i:] if c.number not in skip]
                 log.error("%s: giving up on %s at ch %g (%d done, %d left)", label, source_name,
                           chunk[0].number, len(ok), len(rest))
+                memo.gave_up.add(source_name)
                 failed.extend(c.number for c in rest)
                 what = ("Suwayomi reported an error on every try" if outcome == "stalled"
                         else "download made no progress")
@@ -670,14 +845,20 @@ def _queue_unreadable(again: bool, e: Exception, extra: str = "") -> None:
 def _wait(client, ids: list[int], cancel, every: int = 5, moved: Callable[[float], None] | None = None) -> str:
     """Watch our chapter ids until they leave the queue.
     Returns 'done', 'stalled' (every remaining one errored out), 'timeout'
-    (no progress for STALL_SECS or CHUNK_CAP_SECS overall) or 'cancelled'.
-    moved(share done, 0..1) hears about every change Suwayomi reports."""
+    (no progress for STALL_SECS or CHUNK_CAP_SECS overall), 'unstarted'
+    (still waiting in the queue, never tried, after QUEUED_CAP_SECS) or
+    'cancelled'. While Suwayomi has not started any of them (its queue is
+    busy with other downloads, or it downloads from fewer sources at once
+    than we queue on) that is not a stall: the stall clock starts once one
+    of them moves. moved(share done, 0..1) hears about every change
+    Suwayomi reports."""
     ours = set(ids)
     # reading the queue is safe to abandon, so a cancel cuts a hung read short
     reader = with_cancel(client, cancel)
     started = last_change = time.monotonic()
     last_seen: dict[int, tuple] = {}
     down_since: float | None = None
+    unstarted_since: float | None = None
     failing = False                  # the queue could not be read last time: warn once per streak, not per poll
     while True:
         time.sleep(every)
@@ -714,6 +895,16 @@ def _wait(client, ids: list[int], cancel, every: int = 5, moved: Callable[[float
                 if moved:
                     moved((len(ours) - len(items) + sum(min(max(x["progress"], 0.0), 1.0) for x in items))
                           / len(ours))
+            if all(x["state"] == "QUEUED" and x["tries"] == 0 and not x["progress"] for x in items):
+                if unstarted_since is None:
+                    unstarted_since = now
+                last_change = now                   # waiting for Suwayomi to get to them, not stalled
+                if now - unstarted_since > QUEUED_CAP_SECS:
+                    log.warning("our chapter(s) %s were not started by Suwayomi for %d s (its queue is busy)",
+                                ids, QUEUED_CAP_SECS)
+                    return "unstarted"
+            else:
+                unstarted_since = None
         if now - last_change > STALL_SECS:
             log.warning("no download progress for %d s", STALL_SECS)
             return "timeout"

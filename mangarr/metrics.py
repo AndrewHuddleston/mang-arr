@@ -6,6 +6,8 @@
     mangarr_jobs_total{kind,status}
     mangarr_suwayomi_up                  1 when the API answers
     mangarr_last_refresh_timestamp       unix time of the last completed refresh-all
+    mangarr_download_unstarted_total{source}
+                                         chunks Suwayomi did not start within 30 min (its queue busy)
 """
 import logging
 
@@ -24,11 +26,18 @@ if AVAILABLE:
     JOBS = Counter("mangarr_jobs_total", "jobs by outcome", ["kind", "status"])
     SUWAYOMI_UP = Gauge("mangarr_suwayomi_up", "Suwayomi API reachable")
     LAST_REFRESH = Gauge("mangarr_last_refresh_timestamp", "last completed refresh-all")
+    UNSTARTED = Counter("mangarr_download_unstarted_total", "download chunks Suwayomi did not start in time",
+                        ["source"])
 
 
 def record_download(source: str, result: str) -> None:
     if AVAILABLE:
         DOWNLOADS.labels(source=source, result=result).inc()
+
+
+def record_unstarted(source: str) -> None:
+    if AVAILABLE:
+        UNSTARTED.labels(source=source).inc()
 
 
 def record_job(kind: str, status: str) -> None:
