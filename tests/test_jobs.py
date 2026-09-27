@@ -499,6 +499,53 @@ class CoreTest(TmpData):
         self.assertEqual((seen["retries"], seen["variables"]), (1, {"first": 500, "offset": 0}))
 
 
+class DownloadChapterWarmTest(TmpData):
+    """A single chapter (the Download button) from a source Settings has
+    fetched page by page: its pages are requested one by one before it is
+    queued. The plan-less path reads the setting itself."""
+    COMICK = "Comick (Unoriginal) (EN)"
+
+    class PageClient(FakeClient):
+        def __init__(self, chapters):
+            super().__init__()
+            self.calls: list[str] = []
+            self._chapters = chapters
+
+        def chapters(self, manga_id):
+            return self._chapters
+
+        def page_urls(self, chapter_id):
+            self.calls.append("page_urls")
+            return [f"/api/v1/manga/1/chapter/5/page/{p}" for p in range(3)]
+
+        def fetch_page(self, path, timeout=60):
+            self.calls.append("fetch_page")
+            return suwayomi.PageFetch("ok", 200, 10, 0.0)
+
+        def enqueue(self, ids):
+            self.calls.append("enqueue")
+            super().enqueue(ids)
+
+    def download(self, warm_sources):
+        from mangarr import pagewarm, settings
+        sid = self.seed({5: "failed"}, sources=((self.COMICK, 1),))
+        client = self.PageClient(_match(self.COMICK, 1, [5]).chapters)
+        with db.connect() as con:
+            settings.set_many(con, {"page_warm_sources": warm_sources})
+        settings._cache.clear()
+        with db.connect() as con, mock.patch.object(core, "import_series", lambda *a, **k: 0), \
+             mock.patch.dict(pagewarm._pacers, clear=True), self.assertLogs("mangarr", "INFO"):
+            msg = core.download_chapter(con, client, sid, 5.0)
+        self.assertIn(f"downloaded from {self.COMICK}", msg)
+        return client.calls
+
+    def test_pages_are_fetched_before_the_chapter_is_queued(self):
+        self.assertEqual(self.download([self.COMICK]), ["page_urls"] + ["fetch_page"] * 3 + ["enqueue"])
+
+    def test_not_listed_downloads_the_normal_way(self):
+        self.assertEqual(self.download(["weeb central"]), ["enqueue"])
+
+
 # -- Suwayomi outages -------------------------------------------------------------------------
 
 class CoreSplitTest(TmpData):

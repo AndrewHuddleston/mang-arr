@@ -19,6 +19,10 @@ fails on its first source is retried on the next source that lists it (the
 plan keeps every usable source per chapter, best first). A source that
 fails everything it was asked for is dropped for the rest of the run. Only
 chapters no source could deliver end up 'failed'.
+
+A source whose image server refuses bursts (Settings: page by page) goes one
+chapter at a time: its pages are first requested through Suwayomi one by one
+(pagewarm), then Suwayomi builds the chapter from its cache.
 """
 import fcntl
 import logging
@@ -31,7 +35,7 @@ from collections.abc import Callable
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 
-from . import config, limits, metrics
+from . import config, limits, metrics, pagewarm
 from .limits import Cancelled
 from .resolver import Plan, SourceMatch, ranges
 from .suwayomi import BREAKER_SECS, CircuitOpen, Client, SuwayomiError, SuwayomiUnreachable, with_cancel
@@ -52,6 +56,11 @@ INSTANT_FAIL_SECS = 45
 QUEUED_CAP_SECS = 1800
 UNSTARTED_REASON = (f"not attempted: Suwayomi did not start this chapter within {QUEUED_CAP_SECS // 60} min "
                     "(its download queue was busy with other downloads)")
+# A page-by-page source whose image server refuses even paced page requests is
+# backed off like a rate limit, but at most this long: its lane waits meanwhile.
+WARM_BACKOFF_MAX = 120
+WARM_BUILD_FAILED = ("its pages were fetched one by one, but Suwayomi still could not build the chapter "
+                     "(page cache cleared, or a page kept failing)")
 # How long a run waits for another process (the CLI) to finish its download
 # before giving up with an error (a bad value: see config.env_number), and
 # how often it checks meanwhile.
@@ -490,15 +499,28 @@ def download_one(client: Client, manga_id: int, chapter, label: str, source_name
     cancel = should_cancel or (lambda: False)
     report = progress or (lambda m: None)
     memo = RunMemo()
+    warm = _page_warm_name(source_name)
     with download_lock(should_cancel=cancel, progress=report):
         clear_leftovers(client, cancel)
         ok, failed, why = _download_source(client, manga_id, [chapter], 1, label, source_name, False,
-                                           cancel, report, memo)
+                                           cancel, report, memo, warm=warm)
     if not ok and not failed and cancel():         # stopped by the cancel, not a failure of the source
         raise Cancelled()
     if memo.stop and not ok:                        # Suwayomi never got to it
         return False, [chapter.number], {chapter.number: memo.stop}
     return bool(ok), failed, why
+
+
+def _page_warm_name(name: str) -> bool:
+    """Whether Settings has source `name` fetched page by page (a download
+    with no resolved plan: one chapter). Anything unreadable means no."""
+    try:
+        from . import settings
+        v = settings.get("page_warm_sources")
+        return isinstance(v, list) and name.lower().strip() in v
+    except Exception as e:
+        log.debug("could not read page_warm_sources: %s: %s", type(e).__name__, e)
+        return False
 
 
 def _download_source(client, manga_id, todo, batch, label, source_name, patient, cancel, report, memo: RunMemo,
@@ -512,11 +534,18 @@ def _download_source(client, manga_id, todo, batch, label, source_name, patient,
     the chunk's ids are then taken back out (_dequeue) and what arrived so
     far is returned. A chunk Suwayomi never started (its queue busy with
     other downloads) sets memo.stop and ends the call: that is no verdict
-    on the source."""
+    on the source. On a page-by-page source (`warm`) each chapter's pages
+    are fetched one by one before it is queued; one whose pages the image
+    server keeps refusing is backed off like a rate limit without ever
+    being queued, and one Suwayomi does not build from its cache gets its
+    pages fetched once more (memo.rewarmed)."""
     ok, failed, why = [], [], {}
     ops = with_cancel(client, cancel)
     i, size, backoff = 0, batch, 0
     max_backoff = config.BACKOFF_MAX if patient else config.BACKOFF_MAX_WITH_FALLBACK
+    if warm:
+        size = batch = 1                            # one chapter at a time, its pages first
+        max_backoff = min(max_backoff, WARM_BACKOFF_MAX)
     while i < len(todo):
         if cancel():
             raise Cancelled()
@@ -532,60 +561,99 @@ def _download_source(client, manga_id, todo, batch, label, source_name, patient,
         status = (f"{source_name}: chapter {ranges([c.number for c in chunk])} ({len(ok)} of {len(todo)} done"
                   + (", rate-limited source: one at a time" if paced and size == 1 else ""))
         report(status + ")")
-        t_start = time.monotonic()
-        outcome, unsure = "error", False
-        try:
+        warmed = None
+        if warm:
+            n0 = chunk[0].number
+            warmed = pagewarm.warm_chapter(ops, chunk[0], source_name, cancel, report,
+                                           suffix=f" ({len(ok)} of {len(todo)} done)")
+            metrics.record_warm(source_name, warmed.state)
+            if warmed.state == "cancelled":
+                break                               # nothing of ours was queued: nothing to take back
+            if warmed.state == "no_pages":
+                log.info("%s: %s ch %g: %s; falling back to a normal download", label, source_name, n0, warmed.why)
+            elif warmed.usable:
+                report(f"{source_name}: chapter {n0:g} - {warmed.fetched} of {warmed.pages} pages cached; "
+                       f"Suwayomi is building the chapter ({len(ok)} of {len(todo)} done)")
+        if warmed is not None and warmed.state in ("refused", "deadline"):
+            outcome, got = warmed.state, []         # never queued: straight to the backoff below
+        else:
+            t_start = time.monotonic()
+            outcome, unsure = "error", False
             try:
-                ops.enqueue(ids)
-            except CircuitOpen:
-                outcome = "not sent"                # refused before anything reached Suwayomi: nothing to take back
-                raise
+                try:
+                    ops.enqueue(ids)
+                except CircuitOpen:
+                    outcome = "not sent"            # refused before anything reached Suwayomi: nothing to take back
+                    raise
+                except Cancelled:
+                    unsure = True                   # cut short in flight: it may still land after the dequeue
+                    raise
+                ops.start()
+                outcome = _wait(client, ids, cancel, every=2 if len(ids) == 1 else 5,
+                                moved=lambda share, status=status: report(f"{status}, this batch {share:.0%})"))
             except Cancelled:
-                unsure = True                       # cut short in flight: it may still land after the dequeue
-                raise
-            ops.start()
-            outcome = _wait(client, ids, cancel, every=2 if len(ids) == 1 else 5,
-                            moved=lambda share, status=status: report(f"{status}, this batch {share:.0%})"))
-        except Cancelled:
-            outcome = "cancelled"
-        finally:
-            if outcome not in ("done", "not sent"):     # stalled, timeout, unstarted, cancelled, or an exception
-                _dequeue(client, ids, label, outcome, cancel, unsure)
-        if outcome == "unstarted":
-            memo.stop = UNSTARTED_REASON
-            metrics.record_unstarted(source_name)
-            log.warning("%s: %s did not start ch %s within %d min (Suwayomi's queue is busy); stopping this series "
-                        "for now", label, source_name, ranges([c.number for c in chunk]), QUEUED_CAP_SECS // 60)
-            break
-        instant = outcome == "stalled" and time.monotonic() - t_start < INSTANT_FAIL_SECS
-        if outcome == "cancelled":
-            break                                   # keep what arrived; the caller sees the cancel and stops
-        try:
-            have = ops.downloaded_ids(manga_id)
-        except Cancelled:
-            break                                   # the same; the next import links what did arrive
-        got = [c for c in chunk if c.id in have]
-        if instant and not got:
-            # Suwayomi gave up on every try within seconds: the source has no
-            # working pages for these chapters ("All CDN attempts failed"),
-            # which no amount of waiting fixes. Do not back off; fail them.
-            for c in chunk:
-                failed.append(c.number)
-                why[c.number] = "the source has no working pages for this chapter (failed instantly on every try)"
-            log.warning("%s: %s has no working pages for ch %s - not retrying this run", label, source_name,
-                        ranges([c.number for c in chunk]))
-            i += span
-            if stop_on_fail or limits.pause(2, cancel):
+                outcome = "cancelled"
+            finally:
+                if outcome not in ("done", "not sent"):     # stalled, timeout, unstarted, cancelled, or an exception
+                    _dequeue(client, ids, label, outcome, cancel, unsure)
+            if outcome == "unstarted":
+                memo.stop = UNSTARTED_REASON
+                metrics.record_unstarted(source_name)
+                log.warning("%s: %s did not start ch %s within %d min (Suwayomi's queue is busy); stopping this "
+                            "series for now", label, source_name, ranges([c.number for c in chunk]),
+                            QUEUED_CAP_SECS // 60)
                 break
-            continue
-        if outcome in ("stalled", "timeout") and not got:
+            instant = outcome == "stalled" and time.monotonic() - t_start < INSTANT_FAIL_SECS
+            if outcome == "cancelled":
+                break                               # keep what arrived; the caller sees the cancel and stops
+            try:
+                have = ops.downloaded_ids(manga_id)
+            except Cancelled:
+                break                               # the same; the next import links what did arrive
+            got = [c for c in chunk if c.id in have]
+            if warmed is not None and warmed.usable:
+                if got:
+                    metrics.record_warm_download(source_name, "ok")
+                elif chunk[0].id not in memo.rewarmed:
+                    # Suwayomi went to the source for the pages after all: its
+                    # cache was cleared meanwhile. Fetch them again, once.
+                    memo.rewarmed.add(chunk[0].id)
+                    metrics.record_warm_download(source_name, "rewarm")
+                    log.warning("%s: Suwayomi did not build ch %g from its page cache (cleared meanwhile?); "
+                                "fetching its pages again", label, chunk[0].number)
+                    continue
+                else:
+                    metrics.record_warm_download(source_name, "failed_after_warm")
+                    failed.append(chunk[0].number)
+                    why[chunk[0].number] = WARM_BUILD_FAILED
+                    log.warning("%s: %s ch %g: %s", label, source_name, chunk[0].number, WARM_BUILD_FAILED)
+                    i += span
+                    if stop_on_fail or limits.pause(2, cancel):
+                        break
+                    continue
+            if instant and not got:
+                # Suwayomi gave up on every try within seconds: the source has no
+                # working pages for these chapters ("All CDN attempts failed"),
+                # which no amount of waiting fixes. Do not back off; fail them.
+                for c in chunk:
+                    failed.append(c.number)
+                    why[c.number] = "the source has no working pages for this chapter (failed instantly on every try)"
+                log.warning("%s: %s has no working pages for ch %s - not retrying this run", label, source_name,
+                            ranges([c.number for c in chunk]))
+                i += span
+                if stop_on_fail or limits.pause(2, cancel):
+                    break
+                continue
+        if outcome in ("stalled", "timeout", "refused", "deadline") and not got:
             memo.note_throttle(source_name)         # refused after trying for a while: rate limiting
             size = 1
             backoff = min(max_backoff, (backoff or 30) * 2)
-            log.warning("%s: %s %s on ch %g - backing off %ds", label, source_name,
-                        "made no progress" if outcome == "timeout" else "errored", chunk[0].number, backoff)
-            report(f"{source_name} {'made no progress' if outcome == 'timeout' else 'refused the request'}"
-                   f" (rate limiting): waiting {backoff} s before retrying chapter "
+            did = {"timeout": "made no progress", "stalled": "errored",
+                   "refused": "refused even paced page requests",
+                   "deadline": "was too slow even page by page"}[outcome]
+            log.warning("%s: %s %s on ch %g - backing off %ds", label, source_name, did, chunk[0].number, backoff)
+            said = "refused the request" if outcome == "stalled" else did
+            report(f"{source_name} {said} (rate limiting): waiting {backoff} s before retrying chapter "
                    f"{chunk[0].number:g} ({len(ok)} of {len(todo)} done)")
             if limits.pause(backoff, cancel):
                 break                               # cancelled: these chapters were simply not reached
@@ -595,8 +663,15 @@ def _download_source(client, manga_id, todo, batch, label, source_name, patient,
                           chunk[0].number, len(ok), len(rest))
                 memo.gave_up.add(source_name)
                 failed.extend(c.number for c in rest)
-                what = ("Suwayomi reported an error on every try" if outcome == "stalled"
-                        else "download made no progress")
+                if outcome == "refused":
+                    what = (f"the image server refused even paced page requests ({warmed.fetched} of "
+                            f"{warmed.pages} pages)")
+                elif outcome == "deadline":
+                    what = (f"fetching pages one at a time took over {warmed.limit / 60:.0f} min "
+                            f"({warmed.fetched} of {warmed.pages} pages)")
+                else:
+                    what = ("Suwayomi reported an error on every try" if outcome == "stalled"
+                            else "download made no progress")
                 for c in rest:
                     why[c.number] = f"{what}, gave up after {backoff}s of backoff"
                 break

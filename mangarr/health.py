@@ -166,6 +166,15 @@ def _compute(client: Client) -> list[Check]:
                              f"{', '.join(slow)}: the site limits requests, so chapters only it has download one at "
                              f"a time with pauses and retries (Settings: delay between chapters). Other sources "
                              f"are preferred whenever they list the chapter."))
+        gentle = [s.name for s in sources if s.page_warm and not s.unusable]
+        off = [s.name for s in sources if s.page_warm and s.unusable]
+        if gentle or off:
+            said = [f"{', '.join(gentle)}: the image server refuses bursts, so chapters only it has are fetched "
+                    f"page by page (about 2-4 min a chapter; Settings: Page Delay). Other sources are preferred "
+                    f"whenever they list the chapter."] if gentle else []
+            said += [f"{name} is set to page by page but disabled in Settings -> Sources; tick it to use it for "
+                     f"chapters no other source has." for name in off]
+            out.append(Check("ok", "Page-by-page sources", " ".join(said)))
     except SuwayomiError as e:
         out.append(Check("error", "Suwayomi", f"unreachable at {config.SUWAYOMI_URL}: {e}"))
 

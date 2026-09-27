@@ -1,17 +1,23 @@
 """Page-by-page fetching for sources whose image server refuses bursts:
-the client's page GET (Client.fetch_page over outbound.drain) and the
-spacing between requests to one source (limits.Spacer). Only 127.0.0.1
-servers; nothing reaches a real Suwayomi."""
+the client's page GET (Client.fetch_page over outbound.drain), the spacing
+between requests to one source (limits.Spacer, pagewarm.PagePacer), a
+chapter's warm-up (pagewarm.warm_chapter) and how the downloader queues a
+chapter only after it, on a fake clock. Only 127.0.0.1 servers and fakes;
+nothing reaches a real Suwayomi."""
+import logging
 import socket
+import tempfile
 import threading
 import time
 import unittest
 import urllib.error
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from itertools import pairwise
 from unittest import mock
 
-from mangarr import limits, outbound, suwayomi
-from mangarr.suwayomi import CircuitOpen, Client, SuwayomiUnreachable
+from mangarr import downloader, health, limits, outbound, pagewarm, settings, suwayomi
+from mangarr.resolver import SourceMatch
+from mangarr.suwayomi import Chapter, CircuitOpen, Client, PageFetch, Source, SuwayomiError, SuwayomiUnreachable
 
 PAGE = "/api/v1/manga/1/chapter/2/page/{}"
 
@@ -265,6 +271,496 @@ class SpacerTest(unittest.TestCase):
         self.spacer.wait("new", 1.0)
         self.spacer.prune(3600)
         self.assertEqual(set(self.spacer._next), {"new"})
+
+
+# -- the warm-up ---------------------------------------------------------------------------------
+
+COMICK = "Comick (Unoriginal) (EN)"
+
+
+def page_path(chapter_id, p):
+    return f"/api/v1/manga/{chapter_id // 1000}/chapter/{chapter_id % 1000}/page/{p}"
+
+
+def comick(numbers, name=COMICK, manga_id=1):
+    src = Source(str(manga_id), name, "en", page_warm=True)
+    chapters = [Chapter(manga_id * 1000 + int(n * 10), float(n), f"Chapter {n}", None, False) for n in numbers]
+    return SourceMatch(src, manga_id, name, None, 0, name, 1, chapters)
+
+
+class FakePageClient:
+    """Suwayomi in front of an image server that refuses bursts: a queued
+    chapter is built only from its cache, i.e. when every page (all but
+    `builds_missing`) was fetched one by one since the last evict();
+    otherwise every try fails (ERROR, tries 3). `busy` maps a page path to
+    how many busy answers it gives first (-1: always), `answers` to a fixed
+    status ('gone', 'error'); `urls` replaces a chapter's page list. Each
+    page request takes `fetch_secs` on the clock."""
+
+    def __init__(self, clock, pages=4, busy=None, answers=None, urls=None, fetch_secs=0.5, builds_missing=0):
+        self.clock, self.pages, self.fetch_secs, self.builds_missing = clock, pages, fetch_secs, builds_missing
+        self.busy, self.answers, self.urls = dict(busy or {}), dict(answers or {}), dict(urls or {})
+        self.events: list[tuple] = []       # (clock time, kind, what)
+        self.cached: set[str] = set()
+        self.queued: list[int] = []
+        self.have: set[int] = set()
+        self.on_start = None
+        self.on_page = None
+        self.down = False
+
+    def kinds(self):
+        return [e[1] for e in self.events]
+
+    def page_urls(self, chapter_id):
+        self.events.append((self.clock.now(), "urls", chapter_id))
+        if chapter_id in self.urls:
+            return list(self.urls[chapter_id])
+        return [page_path(chapter_id, p) for p in range(self.pages)]
+
+    def fetch_page(self, path, timeout=60):
+        if self.down:
+            raise SuwayomiUnreachable("Suwayomi at x unreachable")
+        self.events.append((self.clock.now(), "page", path))
+        self.clock.advance(self.fetch_secs)
+        if self.on_page:
+            self.on_page(self, path)
+        fixed = self.answers.get(path)
+        if fixed:
+            return PageFetch(fixed, 404 if fixed == "gone" else 403, 0, self.fetch_secs)
+        left = self.busy.get(path, 0)
+        if left:
+            self.busy[path] = left - 1 if left > 0 else left
+            return PageFetch("busy", 429, 0, self.fetch_secs)
+        self.cached.add(path)
+        return PageFetch("ok", 200, 1000, self.fetch_secs)
+
+    def evict(self):
+        self.cached.clear()
+
+    def enqueue(self, ids):
+        self.events.append((self.clock.now(), "enqueue", list(ids)))
+        self.queued += [i for i in ids if i not in self.queued]
+
+    def dequeue(self, ids, timeout=30):
+        self.queued = [c for c in self.queued if c not in ids]
+
+    def start(self):
+        if self.on_start:
+            self.on_start(self)
+        for cid in list(self.queued):
+            missing = [p for p in range(self.pages) if page_path(cid, p) not in self.cached]
+            if len(missing) <= self.builds_missing:
+                self.have.add(cid)
+                self.queued.remove(cid)
+
+    def queue(self):
+        return [{"id": cid, "state": "ERROR", "tries": 3, "progress": 0.0} for cid in self.queued]
+
+    def downloaded_ids(self, manga_id):
+        return {cid for cid in self.have if cid // 1000 == manga_id}
+
+
+class WarmBase(unittest.TestCase):
+    """A fake clock for pagewarm (its _now and _pause) and for the
+    downloader's pauses, settings from self.values, fresh pacers."""
+
+    def setUp(self):
+        self.clock = FakeClock()
+        self.page_waits: list[float] = []           # pagewarm's pauses (pacing and retry waits)
+        self.dl_waits: list[float] = []             # the downloader's (backoff, between chapters)
+        self.cancelled = False
+        self.values = {"page_delay_seconds": 2.5, "throttled_delay_seconds": 0.0,
+                       "page_warm_sources": [COMICK.lower()], downloader.LEFTOVER_KEY: []}
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        for p in (mock.patch.object(pagewarm, "_now", self.clock.now),
+                  mock.patch.object(pagewarm, "_pause", self.page_pause),
+                  mock.patch.object(downloader.limits, "pause", self.dl_pause),
+                  mock.patch("mangarr.downloader.time.sleep", lambda s: None),
+                  mock.patch("mangarr.settings.get", lambda k: self.values.get(k, settings.DEFAULTS[k])),
+                  mock.patch("mangarr.config.DB_PATH", tmp.name + "/t.db"),
+                  mock.patch("mangarr.config.LOCK_PATH", tmp.name + "/lock"),
+                  mock.patch.dict(pagewarm._pacers, clear=True),
+                  mock.patch.object(pagewarm, "_bad_url_logged", False)):
+            p.start()
+            self.addCleanup(p.stop)
+        limits._warned.clear()
+
+    def page_pause(self, secs, should_cancel=None):
+        self.page_waits.append(round(secs, 6))
+        if should_cancel and should_cancel():
+            return True
+        self.clock.advance(max(secs, 0.0))
+        return bool(should_cancel and should_cancel())
+
+    def dl_pause(self, secs, should_cancel=None, step=1.0):
+        self.dl_waits.append(secs)
+        self.clock.advance(max(secs, 0.0))
+        return bool(should_cancel and should_cancel())
+
+    def cancel(self):
+        return self.cancelled
+
+    def run_source(self, client, numbers=(1,), warm=True, patient=True, memo=None, stop_on_fail=False):
+        m = comick(numbers)
+        self.memo = memo or downloader.RunMemo()
+        self.said: list[str] = []
+        return downloader._download_source(client, 1, m.chapters, 1, "T", COMICK, patient, self.cancel,
+                                           self.said.append, self.memo, stop_on_fail=stop_on_fail, warm=warm)
+
+    def warm(self, client, number=1):
+        self.said = []
+        return pagewarm.warm_chapter(client, comick([number]).chapters[0], COMICK, self.cancel, self.said.append)
+
+    def starts(self, client, path=None):
+        return [t for t, kind, what in client.events if kind == "page" and (path is None or what == path)]
+
+
+class WarmUpTest(WarmBase):
+    def test_pages_one_at_a_time_then_the_chapter_is_queued(self):
+        client = FakePageClient(self.clock, pages=4)
+        with self.assertLogs("mangarr.pagewarm", "INFO") as cm:
+            ok, failed, why = self.run_source(client)
+        self.assertEqual((ok, failed, why), ([1.0], [], {}))
+        self.assertEqual(client.kinds(), ["urls", "page", "page", "page", "page", "enqueue"])
+        self.assertEqual(client.events[-1][2], [1010])
+        starts = self.starts(client)
+        for a, b in pairwise(starts):
+            self.assertGreaterEqual(b - a - client.fetch_secs, 2.5 - 1e-9)     # end of one to the next start
+        self.assertIn("4/4 pages fetched one by one", "\n".join(cm.output))
+
+    def test_the_spacing_follows_the_setting(self):
+        self.values["page_delay_seconds"] = 6.0
+        client = FakePageClient(self.clock, pages=3, fetch_secs=0.0)
+        self.warm(client)
+        starts = self.starts(client)
+        self.assertEqual([round(b - a, 6) for a, b in pairwise(starts)], [6.0, 6.0])
+        self.values["page_delay_seconds"] = 1e9                           # clamped to 60 at the point of use
+        with self.assertLogs("mangarr.limits", "WARNING"):
+            self.warm(client, 2)
+        self.assertEqual(max(self.page_waits), 60.0)
+
+    def test_a_busy_page_is_retried_after_5_then_10_s(self):
+        self.values["page_delay_seconds"] = 0.5
+        p = page_path(1010, 1)
+        client = FakePageClient(self.clock, pages=4, busy={p: 2})
+        with self.assertLogs("mangarr.pagewarm", "INFO"):
+            r = self.warm(client)
+        self.assertEqual((r.state, r.fetched, r.busy, r.recovered, r.failed), ("ok", 4, 2, 1, 0))
+        tries = self.starts(client, p)
+        self.assertEqual([round(b - a - client.fetch_secs, 6) for a, b in pairwise(tries)], [5.0, 10.0])
+        self.assertIn(f"{COMICK}: chapter 1 - page 2 of 4: image server busy, retry 1 of 5 in 5 s", self.said)
+        self.assertIn(f"{COMICK}: chapter 1 - page 2 of 4: image server busy, retry 2 of 5 in 10 s", self.said)
+
+    def test_a_page_busy_on_every_try_is_left_out(self):
+        p = page_path(1010, 2)
+        client = FakePageClient(self.clock, pages=4, busy={p: -1}, builds_missing=1)
+        with self.assertLogs("mangarr.pagewarm", "WARNING") as cm:
+            ok, failed, why = self.run_source(client)
+        self.assertEqual((ok, failed), ([1.0], []))                     # Suwayomi fetched that page itself
+        self.assertEqual(len(self.starts(client, p)), pagewarm.PAGE_TRIES)
+        self.assertEqual(client.kinds().count("enqueue"), 1)
+        self.assertIn("page 3 of 4 was still busy after 6 tries", "\n".join(cm.output))
+        client = FakePageClient(self.clock, pages=4, busy={page_path(1020, 2): -1})
+        with self.assertLogs("mangarr.pagewarm", "WARNING"):
+            r = self.warm(client, 2)
+        self.assertEqual((r.state, r.fetched, r.failed, r.usable), ("partial", 3, 1, True))
+
+    def test_an_image_server_that_refuses_even_paced_requests(self):
+        busy = {page_path(1010, p): -1 for p in range(3)}              # 3 of 20 pages always busy
+        client = FakePageClient(self.clock, pages=20, busy=busy)
+        with self.assertLogs("mangarr", "WARNING") as cm:
+            ok, failed, why = self.run_source(client)                   # no fallback: backs off 60, then 120
+        self.assertEqual(client.kinds().count("enqueue"), 0)            # never queued
+        self.assertEqual((ok, failed), ([], [1.0]))
+        self.assertEqual(why[1.0], "the image server refused even paced page requests (0 of 20 pages), gave up "
+                                   "after 120s of backoff")
+        self.assertEqual([s for s in self.dl_waits if s >= 60], [60, 120])
+        self.assertEqual((self.memo.throttle, self.memo.gave_up), ({COMICK}, {COMICK}))
+        self.assertIn("refused even paced page requests on ch 1 - backing off 60s", "\n".join(cm.output))
+        self.assertIn("the image server answered busy 15 times in 10 min (stopped at page 3 of 20)",
+                      "\n".join(cm.output))
+        self.assertLess(self.clock.now() - 100.0, 2 * 900 + 180)       # two warm-ups of at most ~15 min each
+        self.assertTrue(any("(rate limiting): waiting 60 s before retrying chapter 1" in m for m in self.said))
+
+    def test_refused_once_more_pages_than_allowed_failed(self):
+        busy = {page_path(1010, p): -1 for p in (0, 1, 2)}
+        client = FakePageClient(self.clock, pages=10, busy=busy)
+        with mock.patch.object(pagewarm, "DEADLINE_MIN", 7200), self.assertLogs("mangarr.pagewarm", "WARNING"):
+            r = self.warm(client)
+        self.assertEqual((r.state, r.failed, r.fetched), ("refused", 3, 0))     # max(2, 10% of 10) = 2 allowed
+        self.assertEqual(r.why, "3 pages stayed busy after 6 tries each")
+        self.assertEqual(len(self.starts(client)), 18)                  # nothing after the third
+
+    def test_a_chapter_that_takes_too_long(self):
+        client = FakePageClient(self.clock, pages=20, fetch_secs=50.0)  # pages arrive, but slowly
+        with self.assertLogs("mangarr", "WARNING"):
+            ok, failed, why = self.run_source(client, patient=False)   # with a fallback: one backoff of 60
+        self.assertEqual(client.kinds().count("enqueue"), 0)
+        self.assertEqual(failed, [1.0])
+        self.assertRegex(why[1.0], r"^fetching pages one at a time took over 10 min \(1[12] of 20 pages\), gave up "
+                                   r"after 60s of backoff$")
+        self.assertEqual([s for s in self.dl_waits if s >= 60], [60])
+        client = FakePageClient(self.clock, pages=20, fetch_secs=50.0)
+        with self.assertLogs("mangarr.pagewarm", "WARNING") as cm:
+            r = self.warm(client)
+        self.assertEqual((r.state, r.why, r.limit), ("deadline", "stopped at page 13 of 20 after 10 min", 600))
+        self.assertIn("12/20 pages fetched in 6", cm.output[0])
+
+    def test_a_cancel_between_pages(self):
+        client = FakePageClient(self.clock, pages=6)
+        client.on_page = lambda c, path: setattr(self, "cancelled", len(self.starts(c)) >= 2)
+        ok, failed, why = self.run_source(client)
+        self.assertEqual((ok, failed, why), ([], [], {}))
+        self.assertEqual(len(self.starts(client)), 2)
+        self.assertNotIn("enqueue", client.kinds())
+        a = comick([1])
+        with self.assertRaises(downloader.Cancelled):
+            downloader.download_one(FakePageClient(self.clock), 1, a.chapters[0], "T", COMICK, should_cancel=lambda: True)
+
+    def test_a_cancel_during_a_retry_wait(self):
+        p = page_path(1010, 1)
+        client = FakePageClient(self.clock, pages=4, busy={p: -1})
+        real = self.page_pause
+
+        def pause(secs, should_cancel=None):
+            if secs >= pagewarm.RETRY_FIRST_SECS:
+                self.cancelled = True
+            return real(secs, should_cancel)
+        with mock.patch.object(pagewarm, "_pause", pause):
+            ok, failed, why = self.run_source(client)
+        self.assertEqual((ok, failed, why), ([], [], {}))               # nothing failed: it was not reached
+        self.assertEqual(len(self.starts(client, p)), 1)
+        self.assertNotIn("enqueue", client.kinds())
+        self.assertEqual(self.memo.throttle, set())
+
+    def test_an_unexpected_page_url_is_never_requested(self):
+        evil = ["http://elsewhere.test/1.jpg", page_path(1010, 1) + "\n", "/api/graphql", None]
+        for i, bad in enumerate(evil):
+            client = FakePageClient(self.clock, urls={1010: [page_path(1010, 0), bad]}, builds_missing=4)
+            with self.assertLogs("mangarr", "INFO") as cm:
+                ok, failed, why = self.run_source(client)
+            self.assertEqual(ok, [1.0], repr(bad))                       # downloaded the normal way
+            self.assertEqual(client.kinds(), ["urls", "enqueue"], repr(bad))
+            errors = [r for r in cm.records if r.levelno >= logging.ERROR]
+            self.assertEqual(len(errors), 1 if i == 0 else 0, repr(bad))   # an error once per process
+            self.assertIn("falling back to a normal download", "\n".join(cm.output))
+
+    def test_no_page_list_or_a_gone_page_falls_back(self):
+        client = FakePageClient(self.clock, pages=4, answers={page_path(1010, 1): "gone"})
+        with self.assertLogs("mangarr.downloader", "INFO") as cm:
+            self.run_source(client)
+        self.assertEqual(client.kinds(), ["urls", "page", "page", "enqueue"])
+        self.assertIn("page 2 answered HTTP 404; falling back to a normal download", "\n".join(cm.output))
+        for answer in ([], [page_path(1010, 0)] * (pagewarm.MAX_PAGES + 1), SuwayomiError("no pages")):
+            client = FakePageClient(self.clock, builds_missing=4)
+            if isinstance(answer, Exception):
+                client.page_urls = mock.Mock(side_effect=answer)
+            else:
+                client.urls = {1010: answer}
+            with self.assertLogs("mangarr.downloader", "INFO"):
+                ok, _, _ = self.run_source(client)
+            self.assertEqual((ok, self.starts(client), client.kinds()[-1:]), ([1.0], [], ["enqueue"]))
+
+    def test_a_cleared_page_cache_is_warmed_once_more(self):
+        client = FakePageClient(self.clock, pages=3)
+        starts = []
+
+        def evict_first(c):
+            starts.append(1)
+            if len(starts) == 1:
+                c.evict()                                               # Suwayomi dropped its cache meanwhile
+        client.on_start = evict_first
+        with self.assertLogs("mangarr.downloader", "WARNING") as cm:
+            ok, failed, why = self.run_source(client)
+        self.assertEqual((ok, failed), ([1.0], []))
+        self.assertEqual(client.kinds(), ["urls"] + ["page"] * 3 + ["enqueue"] + ["urls"] + ["page"] * 3 + ["enqueue"])
+        self.assertEqual(self.memo.rewarmed, {1010})
+        self.assertIn("did not build ch 1 from its page cache", "\n".join(cm.output))
+        self.assertEqual(self.memo.throttle, set())                     # not a rate limit
+
+    def test_a_chapter_still_not_built_after_that_fails(self):
+        client = FakePageClient(self.clock, pages=3)
+        client.on_start = FakePageClient.evict
+        with self.assertLogs("mangarr.downloader", "WARNING"):
+            ok, failed, why = self.run_source(client, numbers=(1, 2), stop_on_fail=True)
+        self.assertEqual((ok, failed), ([], [1.0]))
+        self.assertEqual(why[1.0], downloader.WARM_BUILD_FAILED)
+        self.assertEqual(client.kinds().count("enqueue"), 2)            # ch 1 twice; in order, ch 2 waits
+        self.assertEqual(client.queued, [])                             # ours taken back out each time
+
+    def test_progress_text(self):
+        client = FakePageClient(self.clock, pages=2, busy={page_path(1010, 1): 1})
+        with self.assertLogs("mangarr.pagewarm", "INFO"):
+            self.run_source(client, numbers=(1, 2))
+        self.assertEqual(self.said[:6], [
+            f"{COMICK}: chapter 1 (0 of 2 done)",
+            f"{COMICK}: chapter 1 - fetching page 1 of 2 one at a time (0 of 2 done)",
+            f"{COMICK}: chapter 1 - fetching page 2 of 2 one at a time (0 of 2 done)",
+            f"{COMICK}: chapter 1 - page 2 of 2: image server busy, retry 1 of 5 in 5 s (0 of 2 done)",
+            f"{COMICK}: chapter 1 - fetching page 2 of 2 one at a time (0 of 2 done)",
+            f"{COMICK}: chapter 1 - 2 of 2 pages cached; Suwayomi is building the chapter (0 of 2 done)"])
+        self.assertIn(f"{COMICK}: chapter 2 - fetching page 1 of 2 one at a time (1 of 2 done)", self.said)
+
+    def test_suwayomi_not_answering_stops_it(self):
+        client = FakePageClient(self.clock, pages=4)
+        client.on_page = lambda c, path: setattr(c, "down", True)
+        with self.assertRaises(SuwayomiUnreachable):
+            self.run_source(client)
+        self.assertNotIn("enqueue", client.kinds())
+
+    def test_a_normal_source_never_asks_for_pages(self):
+        client = FakePageClient(self.clock, pages=4, builds_missing=4)
+        client.page_urls = mock.Mock(side_effect=AssertionError("page list asked for"))
+        ok, failed, why = self.run_source(client, numbers=(1, 2), warm=False)
+        self.assertEqual(ok, [1.0, 2.0])
+        client.page_urls.assert_not_called()
+
+    def test_a_series_with_one_chapter_only_on_the_gentle_source(self):
+        from mangarr.model import Series
+        from mangarr.resolver import Plan
+
+        weeb = Source("2", "Weeb Central", "en")
+        weeb = SourceMatch(weeb, 2, "Weeb Central", None, 0, "T", 1,
+                           [Chapter(2000 + n * 10, float(n), None, None, False) for n in (1, 3)])
+        slow = comick([2])
+        cands = {1.0: [weeb], 2.0: [slow], 3.0: [weeb]}
+        plan = Plan(Series(english="T"), [weeb, slow], [], [], {n: c[0] for n, c in cands.items()}, candidates=cands)
+        client = FakePageClient(self.clock, pages=3)
+        real_start = client.start
+
+        def start():                                                    # Weeb Central serves bursts fine
+            for cid in list(client.queued):
+                if cid // 1000 == 2:
+                    client.have.add(cid)
+                    client.queued.remove(cid)
+            real_start()
+        client.start = start
+        with self.assertLogs("mangarr", "INFO"):
+            res = downloader.download(client, plan, only={1.0, 2.0, 3.0}, in_order=True)
+        self.assertEqual(res, {1.0: "ok", 2.0: "ok", 3.0: "ok"})
+        order = [(kind, what) for _, kind, what in client.events if kind != "page"]
+        self.assertEqual(order, [("enqueue", [2010]), ("urls", 1020), ("enqueue", [1020]), ("enqueue", [2030])])
+        pages = [i for i, e in enumerate(client.events) if e[1] == "page"]
+        self.assertEqual(len(pages), 3)
+        self.assertLess(max(pages), client.kinds().index("enqueue", 2))  # every page before ch 2 is queued
+
+
+class DownloadOneWarmTest(WarmBase):
+    def test_a_listed_source_is_warmed(self):
+        a = comick([4])
+        client = FakePageClient(self.clock, pages=2)
+        with self.assertLogs("mangarr.pagewarm", "INFO"):
+            ok, failed, why = downloader.download_one(client, 1, a.chapters[0], "T", COMICK)
+        self.assertTrue(ok)
+        self.assertEqual(client.kinds(), ["urls", "page", "page", "enqueue"])
+
+    def test_unlisted_or_unreadable_setting_downloads_normally(self):
+        a = comick([4])
+        for value in ([], ["weeb central"], 8.0, True, None, "comick (unoriginal) (en)"):
+            self.values["page_warm_sources"] = value
+            client = FakePageClient(self.clock, pages=2, builds_missing=2)
+            ok, failed, why = downloader.download_one(client, 1, a.chapters[0], "T", COMICK)
+            self.assertTrue(ok, repr(value))
+            self.assertEqual(client.kinds(), ["enqueue"], repr(value))
+        with mock.patch("mangarr.settings.get", mock.Mock(side_effect=RuntimeError("database is locked"))):
+            self.assertFalse(downloader._page_warm_name(COMICK))
+
+
+class PacerTest(WarmBase):
+    def test_busy_widens_the_spacing_and_answers_ease_it_back(self):
+        p = pagewarm.pacer(COMICK)
+        self.assertEqual(p.gap(), 2.5)
+        p.done("busy")
+        self.assertAlmostEqual(p.gap(), 3.75)
+        p.done("timeout")
+        self.assertAlmostEqual(p.gap(), 5.625)
+        for _ in range(10):
+            p.done("busy")
+        self.assertEqual(p.gap(), pagewarm.DELAY_MAX_SECS)
+        for _ in range(4):
+            p.done("ok")
+        self.assertEqual(p.gap(), 30.0)                                 # eased every 5 answers, not every one
+        p.done("ok")
+        self.assertAlmostEqual(p.gap(), 25.5)
+        p.done("gone")
+        self.assertAlmostEqual(p.gap(), 25.5)
+        for _ in range(200):
+            p.done("ok")
+        self.assertEqual(p.gap(), 2.5)                                  # never below the setting
+        self.values["page_delay_seconds"] = 4.0
+        self.assertEqual(p.gap(), 4.0)                                  # which is read at every wait
+
+    def test_one_pacer_per_site(self):
+        self.assertIs(pagewarm.pacer(COMICK), pagewarm.pacer("Comick (Unoriginal) (ALL)"))
+        self.assertIsNot(pagewarm.pacer(COMICK), pagewarm.pacer("Weeb Central"))
+        comick_p, weeb = pagewarm.pacer(COMICK), pagewarm.pacer("Weeb Central")
+        self.assertFalse(comick_p.wait())
+        comick_p.done("busy")
+        self.assertFalse(weeb.wait())
+        self.assertEqual(self.page_waits, [0.0, 0.0])                   # another site does not wait
+        self.assertFalse(comick_p.wait())
+        self.assertEqual(self.page_waits[-1], 3.75)
+
+    def test_a_cancel_cuts_the_wait_short(self):
+        p = pagewarm.pacer(COMICK)
+        p.wait()
+        p.done("ok")
+        self.assertTrue(p.wait(lambda: True))
+
+    def test_overlapping_callers_take_their_own_slots(self):
+        p = pagewarm.pacer(COMICK)
+        gaps = []
+        with mock.patch.object(pagewarm, "_pause", lambda secs, c=None: gaps.append(round(secs, 6)) or False):
+            threads = [threading.Thread(target=p.wait) for _ in range(4)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join(5)
+        self.assertEqual(sorted(gaps), [0.0, 2.5, 5.0, 7.5])
+
+
+class _HealthSources:
+    """health._compute's view of Suwayomi: a version and these sources."""
+
+    def __init__(self, sources):
+        self._sources = sources
+
+    def gq(self, query, *a, **k):
+        return {"aboutServer": {"version": "v2"}, "sources": {"totalCount": len(self._sources)}}
+
+    def sources(self):
+        return list(self._sources)
+
+
+class PageWarmHealthTest(unittest.TestCase):
+    def checks(self, sources):
+        with tempfile.TemporaryDirectory() as tmp, \
+             mock.patch("mangarr.config.DB_PATH", tmp + "/t.db"), \
+             mock.patch("mangarr.config.STAGING_ROOT", tmp), mock.patch("mangarr.config.LIBRARY_ROOT", tmp), \
+             mock.patch.object(health, "_ping", lambda name, url, timeout=8: health.Check("ok", name, "x")), \
+             mock.patch.object(health, "_alert", lambda out: []), \
+             mock.patch("mangarr.komga.configured", return_value=False), \
+             mock.patch.dict(health._cache, {"at": 0.0, "checks": []}):
+            settings._cache.clear()
+            try:
+                return {c.name: c for c in health._compute(_HealthSources(sources))}
+            finally:
+                settings._cache.clear()
+
+    def test_a_usable_page_by_page_source(self):
+        c = self.checks([Source("1", COMICK, "en", page_warm=True), Source("2", "Weeb Central", "en")])
+        self.assertEqual(c["Page-by-page sources"].level, "ok")
+        self.assertIn(f"{COMICK}: the image server refuses bursts, so chapters only it has are fetched page by page",
+                      c["Page-by-page sources"].detail)
+
+    def test_one_that_is_switched_off(self):
+        c = self.checks([Source("1", COMICK, "en", unusable=True, page_warm=True), Source("2", "Weeb Central", "en")])
+        self.assertEqual(c["Page-by-page sources"].level, "ok")                  # a hint, never a page
+        self.assertEqual(c["Page-by-page sources"].detail,
+                         f"{COMICK} is set to page by page but disabled in Settings -> Sources; tick it to use it "
+                         "for chapters no other source has.")
+        self.assertNotIn("Page-by-page sources", self.checks([Source("2", "Weeb Central", "en")]))
 
 
 if __name__ == "__main__":

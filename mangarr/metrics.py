@@ -8,6 +8,13 @@
     mangarr_last_refresh_timestamp       unix time of the last completed refresh-all
     mangarr_download_unstarted_total{source}
                                          chunks Suwayomi did not start within 30 min (its queue busy)
+    mangarr_page_fetches_total{source,result}
+                                         page requests on page-by-page sources (ok/busy/timeout/gone/error)
+    mangarr_page_warmups_total{source,result}
+                                         chapters fetched page by page (ok/partial/refused/deadline/no_pages/cancelled)
+    mangarr_page_warm_downloads_total{source,result}
+                                         downloads after that (ok/rewarm: page cache cleared/failed_after_warm)
+    mangarr_page_delay_seconds{source}   current spacing of page requests
 """
 import logging
 
@@ -28,6 +35,13 @@ if AVAILABLE:
     LAST_REFRESH = Gauge("mangarr_last_refresh_timestamp", "last completed refresh-all")
     UNSTARTED = Counter("mangarr_download_unstarted_total", "download chunks Suwayomi did not start in time",
                         ["source"])
+    PAGE_FETCHES = Counter("mangarr_page_fetches_total", "page requests on page-by-page sources",
+                           ["source", "result"])
+    PAGE_WARMUPS = Counter("mangarr_page_warmups_total", "chapters fetched page by page", ["source", "result"])
+    PAGE_WARM_DOWNLOADS = Counter("mangarr_page_warm_downloads_total", "downloads after a page-by-page fetch",
+                                  ["source", "result"])
+    PAGE_DELAY = Gauge("mangarr_page_delay_seconds", "spacing of page requests on a page-by-page source",
+                       ["source"])
 
 
 def record_download(source: str, result: str) -> None:
@@ -38,6 +52,26 @@ def record_download(source: str, result: str) -> None:
 def record_unstarted(source: str) -> None:
     if AVAILABLE:
         UNSTARTED.labels(source=source).inc()
+
+
+def record_page(source: str, result: str) -> None:
+    if AVAILABLE:
+        PAGE_FETCHES.labels(source=source, result=result).inc()
+
+
+def record_warm(source: str, result: str) -> None:
+    if AVAILABLE:
+        PAGE_WARMUPS.labels(source=source, result=result).inc()
+
+
+def record_warm_download(source: str, result: str) -> None:
+    if AVAILABLE:
+        PAGE_WARM_DOWNLOADS.labels(source=source, result=result).inc()
+
+
+def set_page_delay(source: str, secs: float) -> None:
+    if AVAILABLE:
+        PAGE_DELAY.labels(source=source).set(secs)
 
 
 def record_job(kind: str, status: str) -> None:
