@@ -33,7 +33,7 @@ import urllib.request
 from collections.abc import Callable
 from typing import NamedTuple
 
-from . import anilist, config, db, metadata, model
+from . import anilist, config, db, duplicates, metadata, model
 from .matching import close_title, oneline, query_score
 from .model import Series
 
@@ -920,9 +920,11 @@ def sync(con: sqlite3.Connection, row, submit_add: Callable[[Series, bool, bool]
     excluded = excluded_refs(con)
     added = tracked = skipped = deferred = 0
     for s in series:
-        if db.get_series_by_ref(con, s.ref):
+        known = duplicates.tracked_as(con, s)
+        if known is not None:
             tracked += 1
-            log.debug("list %s: %s (%s) already tracked", name, s.title, s.ref)
+            log.debug("list %s: %s (%s) already tracked%s", name, s.title, s.ref,
+                      "" if known["ref"] == s.ref else f" as {known['title']} ({known['ref']})")
             continue
         if s.ref in excluded:
             skipped += 1

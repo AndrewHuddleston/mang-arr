@@ -39,6 +39,7 @@ class Series:
     genres: list[str] = field(default_factory=list)
     year: int | None = None
     demographic: str | None = None      # shounen, shoujo, seinen, josei (when known)
+    anilist_link: int | None = None     # the AniList id a MangaDex record links to; not the identity (duplicates.py)
 
     def __post_init__(self):
         # every way a Series is made (Add form, API, import lists, provider

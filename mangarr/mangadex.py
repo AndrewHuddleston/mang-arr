@@ -51,6 +51,13 @@ def _get(path: str, params: list[tuple[str, str]], retries: int = 3) -> dict:
     raise RuntimeError(f"MangaDex unreachable: {last}")
 
 
+def _anilist_link(a: dict) -> int | None:
+    """The AniList id the record links to (attributes.links.al), when it is one."""
+    links = a.get("links")
+    al = str(links.get("al") or "").strip() if isinstance(links, dict) else ""
+    return int(al) if len(al) <= 9 and al.isascii() and al.isdigit() and int(al) > 0 else None
+
+
 def _to_series(m: dict) -> Series:
     a = m.get("attributes") or {}
     title_map = a.get("title") or {}
@@ -94,6 +101,7 @@ def _to_series(m: dict) -> Series:
         status=status, chapters=chapters,
         adult=(a.get("contentRating") in ("erotica", "pornographic")),
         cover=cover, description=(a.get("description") or {}).get("en"), authors=authors,
+        anilist_link=_anilist_link(a),
     )
 
 

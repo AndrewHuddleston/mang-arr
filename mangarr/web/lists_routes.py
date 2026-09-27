@@ -16,7 +16,7 @@ from fastapi.responses import RedirectResponse
 from pydantic import BaseModel
 from starlette.concurrency import run_in_threadpool
 
-from .. import db, jobs, lists, model
+from .. import db, duplicates, jobs, lists, model
 from . import views
 
 log = logging.getLogger(__name__)
@@ -47,8 +47,9 @@ def _submit_add(series: model.Series, download: bool, monitored: bool, list_name
     """Queue the add job for one series a list yielded. Same checks as the
     Add page; an unmonitored list unmonitors the series once it exists."""
     with db.connect() as con:
-        if db.get_series_by_ref(con, series.ref):
-            return "already tracked"
+        why = duplicates.refusal(con, series)
+        if why:
+            return why
     for j in _app.runner.jobs():
         if j.kind == "add" and j.title == series.title and j.status in ("queued", "running"):
             return f"already queued as job #{j.id}"

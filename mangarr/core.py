@@ -12,9 +12,9 @@ import math
 import os
 import time
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
-from . import db, downloader, komga, library, limits, metadata, metrics
+from . import db, downloader, duplicates, komga, library, limits, metadata, metrics
 from .matching import oneline
 from .model import Series
 from .resolver import Plan, primary, resolve
@@ -53,7 +53,10 @@ def add_series(con, client: Client, series: Series, download: bool = True, do_im
     must still exist afterwards, or the work is abandoned. A cancel cuts the
     Suwayomi call in flight short: while sources are searched it raises
     limits.Cancelled with nothing saved, afterwards what was saved stays (a
-    download returns what arrived)."""
+    download returns what arrived). A new series tracked already under its
+    other reference raises duplicates.AlreadyTracked before any search."""
+    if series_id is None:
+        duplicates.check_new(con, series)
     plan = resolve(client, series, reliability=db.reliability(con), should_cancel=should_cancel, progress=progress)
     lookups = with_cancel(client, should_cancel)
     if series_id is not None and not db.get_series(con, series_id):
@@ -356,10 +359,15 @@ def delete_series(con, client: Client, series_id: int, delete_library: bool = Fa
     """Stop tracking. Optionally remove the library folder (only the links
     this series recorded; Suwayomi's staging files are never touched). The
     Suwayomi entries are taken out of its library so it stops auto-updating
-    them; a Suwayomi outage does not block the delete."""
+    them, except one another series uses too (the one kept when a series
+    tracked twice is cleaned up); a Suwayomi outage does not block the delete."""
     row = db.get_series(con, series_id)
     title, folder = row["title"], row["folder"]
     for s in db.sources(con, series_id):
+        if con.execute("SELECT 1 FROM series_source WHERE manga_id=? AND series_id!=?",
+                       (s["manga_id"], series_id)).fetchone():
+            log.info("%s: %s entry left in Suwayomi's library: another series uses it", title, s["source_name"])
+            continue
         try:
             client.set_in_library(s["manga_id"], False, retries=1, timeout=10)
         except SuwayomiError as e:
@@ -723,10 +731,15 @@ def plan_adopt(client: Client, only: str | None = None, progress: Callable[[str]
 
 def apply_adopt(con, items: list[AdoptItem]) -> tuple[list[int], int]:
     """Register the identified folders. Folders of the same series (one per
-    source) merge into one tracked series. Returns (series ids, chapters)."""
+    source) merge into one tracked series, and a folder of a series tracked
+    under its other reference (duplicates.py) into that one. Returns
+    (series ids, chapters)."""
     by_ref: dict[str, list[AdoptItem]] = {}
     for it in items:
         if it.series:
+            row = duplicates.tracked_as(con, it.series)
+            if row is not None and row["ref"] != it.series.ref:
+                it = replace(it, series=db.series_to_model(row))
             by_ref.setdefault(it.series.ref, []).append(it)
     n_chapters = 0
     ids = []

@@ -30,6 +30,7 @@ from .. import (
     core,
     db,
     downloader,
+    duplicates,
     health,
     jobs,
     komga,
@@ -836,7 +837,7 @@ def add_page(request: Request, term: str = ""):
         if pick and pick.ref not in [c.ref for c in cands]:
             cands.insert(0, pick)
     with db.connect() as con:
-        tracked = {r["ref"]: r["id"] for r in con.execute("SELECT ref, id FROM series")}
+        tracked = duplicates.tracked_ids(con, cands)      # under their own reference or the other one
     return page(request, "add.html", term=term, pick=pick, cands=cands, tracked=tracked, error=error,
                 library_root=config.LIBRARY_ROOT)
 
@@ -860,8 +861,9 @@ def _series_from_ref(ref: str, title: str = "", aliases: list[str] | None = None
 
 def _queue_add(series: model.Series, download: bool, monitored: bool = True) -> jobs.Job | str:
     with db.connect() as con:
-        if db.get_series_by_ref(con, series.ref):
-            return "already tracked"
+        why = duplicates.refusal(con, series)
+        if why:
+            return why
     for j in runner.jobs():
         if j.kind == "add" and j.title == series.title and j.status in ("queued", "running"):
             return f"already queued as job #{j.id}"
@@ -889,9 +891,7 @@ _adopt_scan: dict = {"items": None, "job": None, "gen": 0}
 def _job_adopt_scan(job: jobs.Job):
     items = core.plan_adopt(client, progress=lambda m: setattr(job, "progress", m), should_cancel=lambda: job.cancel)
     with db.connect() as con:
-        tracked = {r["ref"] for r in con.execute("SELECT ref FROM series")}
-    for it in items:
-        it.tracked = bool(it.series and it.series.ref in tracked)
+        duplicates.mark_tracked(con, items)
     _adopt_scan["items"] = items
     _adopt_scan["gen"] += 1
     n_ok = sum(1 for i in items if i.series and not i.tracked)

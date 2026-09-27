@@ -83,6 +83,8 @@ mangarr/
   mangadex.py    MangaDex lookup (fallback database)
   metadata.py    picks the one record a typed title means
   matching.py    title normalisation and the strict match rules
+  duplicates.py  one series tracked once: the same AniList id, its own or the
+                 one a MangaDex record links to, is the same series
   suwayomi.py    Suwayomi GraphQL client (the only module that talks to it)
   resolver.py    search every source, accept matches, build the per-chapter plan
   downloader.py  paced per-source download through Suwayomi, with the
