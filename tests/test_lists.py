@@ -40,16 +40,17 @@ class ListsTest(unittest.TestCase):
         with mock.patch.object(lists, "_get_text", lambda url, **kw: "One Piece\n\n# c\nBerserk\nanilist:30002\n"), \
                 mock.patch.object(lists.metadata, "lookup", lambda t: (picks[t], [])), \
                 mock.patch.object(lists.metadata, "by_ref", lambda r: S(30002, "Berserk (by ref)")):
-            series, review = lists.fetch_url_text({"url": "http://x/list.txt"})
+            series, review, skipped = lists.fetch_url_text({"url": "http://x/list.txt"})
         self.assertEqual([s.ref for s in series], ["anilist:30013", "anilist:30002"])
         self.assertEqual(review, ["Berserk"])
+        self.assertEqual(skipped, 0)
 
     def test_url_text_lookup_failure_is_review_not_crash(self):
         def boom(t):
             raise RuntimeError("AniList unreachable")
         with mock.patch.object(lists, "_get_text", lambda url, **kw: "Something\n"), \
                 mock.patch.object(lists.metadata, "lookup", boom):
-            series, review = lists.fetch_url_text({"url": "http://x"})
+            series, review, _ = lists.fetch_url_text({"url": "http://x"})
         self.assertEqual(series, [])
         self.assertEqual(review, ["Something"])
 
@@ -77,7 +78,7 @@ class ListsTest(unittest.TestCase):
             media = [anilist_media(page * 100 + i, f"T{page}-{i}", chapters=(5 if i % 2 else 50)) for i in range(50)]
             return {"data": {"Page": {"pageInfo": {"hasNextPage": page < 3}, "media": media}}}
         with mock.patch.object(lists.anilist, "_post", post):
-            series, review = lists.fetch_anilist_top({"sort": "SCORE_DESC", "limit": 60, "min_chapters": 10})
+            series, review, _ = lists.fetch_anilist_top({"sort": "SCORE_DESC", "limit": 60, "min_chapters": 10})
         self.assertEqual(len(series), 60)
         self.assertEqual(review, [])
         self.assertEqual([c["page"] for c in calls], [1, 2, 3])       # 25 usable per page -> 3 pages

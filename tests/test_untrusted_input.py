@@ -236,6 +236,26 @@ class SeriesPagingWebTest(WebBase):
 
 
 
+# -- import list URLs ---------------------------------------------------------------
+
+class ImportListWebTest(WebBase):
+    def test_internal_urls_are_refused_when_added(self):
+        from mangarr import lists
+        h = {"X-Api-Key": self.key}
+        for url, why in (("http://169.254.169.254/latest/meta-data/", "link-local"),
+                         ("http://127.0.0.1:6789/api/v1/settings", "loopback"), ("http://localhost:4567/", "this machine")):
+            r = self.client.post("/api/v1/importlist", headers=h, json={"kind": "url_text", "params": {"url": url}})
+            self.assertEqual(r.status_code, 400, url)
+            self.assertIn(why, r.json()["detail"])
+            r = self.client.post("/lists/add", data={"kind": "url_text", "url": url, "sync_now": "1"},
+                                 follow_redirects=False)
+            self.assertEqual(r.status_code, 303)
+        with db.connect() as con:
+            self.assertEqual(lists.all_lists(con), [])
+        r = self.client.post("/api/v1/importlist", headers=h,
+                             json={"kind": "url_text", "params": {"url": "http://192.168.1.10/manga.txt"}})
+        self.assertEqual(r.status_code, 200)                                     # the LAN is fine
+
 
 if __name__ == "__main__":
     unittest.main()

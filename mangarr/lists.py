@@ -9,22 +9,26 @@ an exclusion on its ref. Adds are capped per sync so a first sync of a long
 list does not queue hundreds of jobs; the next sync continues where it left
 off.
 
-Each list kind is a fetch(params) -> (series, review_titles) function in
-FETCHERS; review_titles are lines a text list could not identify with
-confidence and that the user has to add by hand.
+Each list kind is a fetch(params) -> Fetched(series, review, skipped)
+function in FETCHERS; review are lines of a text list that look like titles
+but could not be identified with confidence (the user adds them by hand),
+skipped counts lines that do not look like titles at all.
 """
 import functools
 import http.client
 import ipaddress
 import json
 import logging
+import re
 import socket
 import sqlite3
 import threading
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 from collections.abc import Callable
+from typing import NamedTuple
 
 from . import anilist, config, db, metadata, model
 from .matching import MAX_TITLE, oneline
@@ -40,7 +44,12 @@ KINDS = {"anilist_user": "AniList user list", "anilist_top": "AniList top charts
 _NOVEL = {"NOVEL", "LIGHT_NOVEL"}
 _PAGE = 50                      # AniList's maximum perPage
 
-Fetched = tuple[list[Series], list[str]]
+
+class Fetched(NamedTuple):
+    series: list[Series]
+    review: list[str]           # look like titles, no confident match: listed for the user
+    skipped: int = 0            # text list lines that are not titles: neither looked up nor shown
+
 
 # -- AniList: a user's lists ----------------------------------------------------
 
@@ -79,7 +88,7 @@ def fetch_anilist_user(params: dict) -> Fetched:
     if not d or d.get("data", {}).get("MediaListCollection") is None:
         errs = "; ".join(e.get("message", "?") for e in (d or {}).get("errors") or []) or "not found or private"
         raise ValueError(f"AniList user {username!r}: {errs}")
-    return user_entries(d, params.get("statuses") or USER_STATUSES), []
+    return Fetched(user_entries(d, params.get("statuses") or USER_STATUSES), [])
 
 
 # -- AniList: charts -----------------------------------------------------------
@@ -110,7 +119,7 @@ def fetch_anilist_top(params: dict) -> Fetched:
         if not (pg.get("pageInfo") or {}).get("hasNextPage"):
             break
         page += 1
-    return list(out.values()), []
+    return Fetched(list(out.values()), [])
 
 
 # -- a text file of titles ----------------------------------------------------
@@ -127,23 +136,68 @@ MAX_REVIEW_CHARS = 80           # ... each cut to this many characters
 
 
 class ListFetchError(ValueError):
-    """A text list URL could not be fetched within the limits."""
+    """A text list URL could not be fetched within the limits, or what it
+    returned is not a title list. The message is shown on /lists and by the
+    API, so it never quotes what the server sent."""
+
+
+NOT_A_LIST = "the URL did not return a title list"
+_THIS_NETWORK = ipaddress.ip_network("0.0.0.0/8")
+_LOCAL_NAMES = ("localhost", "localhost.localdomain", "ip6-localhost", "ip6-loopback")
+
+
+def _refused(ip) -> str | None:
+    """Why no list may be fetched from this address, or None. Loopback
+    (mang-arr itself, its container, Docker's DNS), link-local (169.254/16,
+    fe80::/10: cloud metadata services), multicast and unspecified ones are
+    refused. Private LAN addresses stay allowed: a list on a NAS is the
+    normal case."""
+    if getattr(ip, "ipv4_mapped", None):
+        ip = ip.ipv4_mapped
+    if ip.is_loopback:
+        return "a loopback address"
+    if ip.is_link_local:
+        return "a link-local address"
+    if ip.is_multicast:
+        return "a multicast address"
+    if ip.is_unspecified or (ip.version == 4 and ip in _THIS_NETWORK):
+        return "an unspecified address"
+    return None
+
+
+def _refused_host(host: str) -> str | None:
+    """Why a list URL's host is refused before anything is fetched: a name
+    of this machine, or an address _refused() rejects in any form the
+    resolver accepts (127.1, 2130706433, 0x7f.0.0.1, [::ffff:127.0.0.1]).
+    Other names are not resolved here - that would hold the form on a slow
+    DNS server and prove nothing about the fetch later, as DNS answers
+    change - but checked on the address actually connected to (_check_peer)."""
+    h = host.strip().lower().rstrip(".")
+    if h in _LOCAL_NAMES or h.endswith(".localhost"):
+        return "a name of this machine"
+    try:
+        ip = ipaddress.ip_address(h.split("%")[0])
+    except ValueError:
+        try:
+            ip = ipaddress.IPv4Address(socket.inet_aton(h))     # the legacy numeric forms
+        except (OSError, ValueError):
+            return None
+    return _refused(ip)
 
 
 def _check_peer(sock) -> None:
-    """Refuse link-local (169.254/16, fe80::/10: cloud metadata services),
-    multicast and unspecified addresses, checked on the address actually
-    connected to so DNS tricks cannot get around it. Private LAN and
-    loopback addresses stay allowed: a list on a NAS is the normal case."""
+    """Refuse the connection when the address actually connected to is one
+    _refused() rejects - checked right after connect, before TLS or the
+    request, so no DNS answer or redirect gets around the check."""
     try:
         ip = ipaddress.ip_address(sock.getpeername()[0].split("%")[0])
     except (OSError, ValueError, IndexError):
         return
-    if getattr(ip, "ipv4_mapped", None):
-        ip = ip.ipv4_mapped
-    if ip.is_link_local or ip.is_multicast or ip.is_unspecified:
+    why = _refused(ip)
+    if why:
         sock.close()
-        raise ListFetchError(f"refusing to fetch a list from {ip} (link-local, multicast or unspecified address)")
+        log.warning("list fetch refused: the host resolved to %s (%s)", ip, why)
+        raise ListFetchError(f"refusing to fetch a list from {ip} ({why})")
 
 
 class _Watchdog:
@@ -226,32 +280,30 @@ class _Watchdog:
                 pass
 
 
-class _WatchedConnection:
-    """Mixin: hands every socket the connection opens to its _Watchdog.
-    http.client sets _create_connection per instance in __init__, so it is
-    wrapped there rather than overridden."""
+class _GuardedConnection:
+    """Mixin: every socket the connection opens is checked (_check_peer)
+    and then handed to its _Watchdog, right after the TCP connect and so
+    before any TLS handshake. http.client sets _create_connection per
+    instance in __init__, so it is wrapped there rather than overridden."""
     def __init__(self, *a, watchdog: _Watchdog | None = None, **kw):
         super().__init__(*a, **kw)
-        if watchdog is not None:
-            create = self._create_connection
+        create = self._create_connection
 
-            def create_watched(*ca, **ckw):
-                sock = create(*ca, **ckw)
+        def create_guarded(*ca, **ckw):
+            sock = create(*ca, **ckw)
+            _check_peer(sock)
+            if watchdog is not None:
                 watchdog.register(sock)
-                return sock
-            self._create_connection = create_watched
+            return sock
+        self._create_connection = create_guarded
 
 
-class _GuardedHTTPConnection(_WatchedConnection, http.client.HTTPConnection):
-    def connect(self):
-        super().connect()
-        _check_peer(self.sock)
+class _GuardedHTTPConnection(_GuardedConnection, http.client.HTTPConnection):
+    pass
 
 
-class _GuardedHTTPSConnection(_WatchedConnection, http.client.HTTPSConnection):
-    def connect(self):
-        super().connect()
-        _check_peer(self.sock)
+class _GuardedHTTPSConnection(_GuardedConnection, http.client.HTTPSConnection):
+    pass
 
 
 class _GuardedHTTPHandler(urllib.request.HTTPHandler):
@@ -278,14 +330,52 @@ class _SameHostRedirects(urllib.request.HTTPRedirectHandler):
     def redirect_request(self, req, fp, code, msg, headers, newurl):
         old, new = urllib.parse.urlsplit(req.full_url), urllib.parse.urlsplit(newurl)
         if new.scheme not in ("http", "https") or (new.hostname or "").lower() != (old.hostname or "").lower():
-            raise ListFetchError(f"list URL redirects to another host or scheme ({oneline(newurl, 120)}); "
-                                 "not followed - use the final URL instead")
+            # only where it points, not the whole Location: its path and query are the server's text
+            raise ListFetchError(f"list URL redirects to another host or scheme ({oneline(new.scheme, 10)}://"
+                                 f"{oneline(new.hostname, 60)}); not followed - use the final URL instead")
         return super().redirect_request(req, fp, code, msg, headers, newurl)
 
 
 def _opener(watchdog: _Watchdog | None = None):
     return urllib.request.build_opener(_GuardedHTTPHandler(watchdog), _GuardedHTTPSHandler(watchdog),
                                        _SameHostRedirects)
+
+
+# Content types a plain text file of titles is served with (none at all, or
+# octet-stream for an unknown file extension on a NAS or in cloud storage)
+_TEXT_TYPES = ("", "text/plain", "text/csv", "text/markdown", "application/octet-stream", "binary/octet-stream",
+               "application/binary")
+
+
+def _not_text(content_type: str) -> str | None:
+    """What a response of this Content-Type is, in plain words, when it is
+    not a plain text file; None when it may be one."""
+    ctype = content_type.split(";")[0].strip().lower()
+    if ctype in _TEXT_TYPES:
+        return None
+    for key, what in (("json", "JSON"), ("html", "a web page"), ("xml", "XML")):
+        if key in ctype:
+            return what
+    return "not plain text"
+
+
+def _fetch_error(e: Exception) -> str:
+    """A failed fetch in plain words, without anything the server sent (an
+    HTTP reason phrase, the banner of a service that does not speak HTTP)."""
+    if isinstance(e, urllib.error.HTTPError):
+        return f"the server answered HTTP {e.code}"
+    reason = e.reason if isinstance(e, urllib.error.URLError) else e
+    if isinstance(reason, (TimeoutError, socket.timeout)):
+        return "the server did not answer in time"
+    if isinstance(reason, socket.gaierror):
+        return "the host name could not be resolved"
+    if isinstance(reason, ConnectionRefusedError):
+        return "the connection was refused"
+    if isinstance(reason, http.client.HTTPException):
+        return "the server did not answer with valid HTTP"
+    if isinstance(reason, OSError):
+        return f"could not connect ({type(reason).__name__})"
+    return f"download failed ({type(reason).__name__})"
 
 
 def _get_text(url: str, max_bytes: int = MAX_LIST_BYTES, deadline: float = FETCH_DEADLINE,
@@ -295,7 +385,9 @@ def _get_text(url: str, max_bytes: int = MAX_LIST_BYTES, deadline: float = FETCH
     for the whole fetch - connect, headers and body - or should_cancel()
     turning true (checked a few times a second throughout, see _Watchdog).
     So a huge or trickling response can neither exhaust memory nor hold the
-    job thread, and Cancel works while the list downloads."""
+    job thread, and Cancel works while the list downloads. A response that
+    says it is JSON, a web page or another non-text type is refused before
+    its body is read. Every failure is a ListFetchError in plain words."""
     if urllib.parse.urlsplit(url).scheme.lower() not in ("http", "https"):
         raise ListFetchError("the URL must start with http:// or https://")
     req = urllib.request.Request(url, headers={"User-Agent": config.USER_AGENT})
@@ -303,6 +395,11 @@ def _get_text(url: str, max_bytes: int = MAX_LIST_BYTES, deadline: float = FETCH
     with _Watchdog(deadline, should_cancel) as wd:
         try:
             with _opener(wd).open(req, timeout=FETCH_TIMEOUT) as r:
+                what = _not_text(r.headers.get("Content-Type") or "")
+                if what:
+                    log.warning("list %s: the response is %s (%s), not a text list; refused", oneline(url, 120),
+                                what, oneline(r.headers.get("Content-Type"), 60))
+                    raise ListFetchError(f"{NOT_A_LIST} (it sent {what})")
                 while True:
                     chunk = r.read1(65536) if hasattr(r, "read1") else r.read(65536)
                     if wd.reason:           # fired between reads, or the read ended because it fired
@@ -315,9 +412,10 @@ def _get_text(url: str, max_bytes: int = MAX_LIST_BYTES, deadline: float = FETCH
                         raise ListFetchError(f"list is larger than {max_bytes // 1000} KB")
         except ListFetchError:
             raise
-        except Exception:
+        except Exception as e:
             if not wd.reason:
-                raise
+                log.debug("list %s: %s: %s", oneline(url, 120), type(e).__name__, oneline(e, 200))
+                raise ListFetchError(_fetch_error(e)) from e
             # the watchdog shut the socket: whatever the read raised is a symptom
         if wd.reason == "cancelled":
             log.info("list %s: download cancelled", oneline(url, 120))
@@ -329,19 +427,75 @@ def _get_text(url: str, max_bytes: int = MAX_LIST_BYTES, deadline: float = FETCH
     return buf.decode("utf-8", "replace")
 
 
-def parse_titles(text: str, max_lines: int | None = None) -> list[str]:
-    """One title per line; blank lines and lines starting with # are skipped,
-    and so are repeats and lines longer than MAX_LINE (logged). With
-    max_lines, at most that many titles are returned (logged)."""
+# What JSON, markup, config files, logs and API answers are made of and a
+# title never is. Titles do use ':', '"', '!', '?', ';', '&', '+', '%', '[]'
+# and '//' (Re:Zero, "Oshi no Ko", Steins;Gate, [Oshi no Ko], .hack//G.U.),
+# and even '<...>' (<Infinite Dendrogram>), so none of those alone counts.
+_NOT_TITLE = re.compile(
+    r"[{}\\\t\x00-\x08\x0b-\x1f\x7f]"                           # braces, backslashes, tabs, control characters
+    r"|</[A-Za-z]|<[!?]|<[A-Za-z][\w-]*(?:\s[^>]*=|\s*/?>)"     # tags: </p>, <!doctype, <?xml, <br>, <a href=
+    r'|"[^"]*"\s*:'                                             # a JSON member: "key": ...
+    r"|^(?:export\s+)?[A-Za-z_][\w.-]*\s*="                     # KEY=value (env and ini files, query strings)
+    r"|^[a-z][a-z0-9]*_[\w-]*\s*:"                              # snake_case_key: value
+    r"|^[\w.-]+:$"                                              # a bare 'section:' line
+    r"|[A-Za-z][\w+.-]*://"                                     # a URL or connection string
+    r"|[\w.+-]+@[\w-]+\.\w"                                     # an e-mail address
+    r"|\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b")                 # an IPv4 address
+_TOKEN = re.compile(r"[A-Za-z0-9+/_=.-]{33,}")                  # no word of a title is this long ...
+
+
+def looks_like_title(line: str) -> bool:
+    """Whether one stripped line of a text list could be a title (or an
+    anilist:/mangadex: reference). Only such lines are looked up at
+    AniList/MangaDex and quoted in 'needs review'; a list URL can point at
+    any server, and the lines of an API answer or a config file must go
+    neither to the providers nor onto the Lists page."""
+    if model.valid_ref(line) and not line.startswith("manual:"):
+        return True
+    if not any(ch.isalpha() for ch in line) or _NOT_TITLE.search(line):
+        return False
+    # ... that also has digits: a key, a hash, base64 or a token
+    return not any(any(ch.isdigit() for ch in t) for t in _TOKEN.findall(line))
+
+
+def _body_kind(text: str) -> str | None:
+    """What a response body is when it is plainly not a list of lines -
+    'JSON', 'a web page or XML', 'binary data' - or None. Judged on its
+    start and a sample, never quoted."""
+    head = text.lstrip("\ufeff \t\r\n")
+    sample = text[:8192]
+    if "\x00" in sample or sample.count("\ufffd") > len(sample) // 10:
+        return "binary data"
+    if head.startswith("{"):
+        return "JSON"
+    if head.startswith("["):                            # or a title such as "[Oshi no Ko]"
+        try:
+            if isinstance(json.loads(text), (list, dict)):
+                return "JSON"
+        except ValueError:
+            pass
+    if head.startswith("<"):
+        return "a web page or XML"
+    return None
+
+
+def _split(text: str, max_lines: int | None = None) -> tuple[list[str], int]:
+    """(titles, lines skipped as not titles): one title per line; blank
+    lines and lines starting with # are skipped, and so are repeats, lines
+    longer than MAX_LINE and lines that do not look like titles (counts
+    logged, the lines never). With max_lines, at most that many titles."""
     out: list[str] = []
     seen: set[str] = set()
-    too_long = 0
+    too_long = junk = 0
     for line in text.splitlines():
-        line = line.strip().lstrip("﻿")
+        line = line.strip().lstrip("\ufeff")
         if not line or line.startswith("#"):
             continue
         if len(line) > MAX_LINE:
             too_long += 1
+            continue
+        if not looks_like_title(line):
+            junk += 1
             continue
         if line in seen:
             continue
@@ -352,16 +506,41 @@ def parse_titles(text: str, max_lines: int | None = None) -> list[str]:
         out.append(line)
     if too_long:
         log.warning("text list: %d line(s) longer than %d characters skipped (not titles)", too_long, MAX_LINE)
-    return out
+    if junk:
+        log.warning("text list: %d line(s) that do not look like titles skipped (not looked up, not shown)", junk)
+    return out, too_long + junk
+
+
+def parse_titles(text: str, max_lines: int | None = None) -> list[str]:
+    """The titles of a text list (see _split)."""
+    return _split(text, max_lines)[0]
+
+
+def list_titles(text: str, max_lines: int | None = None) -> tuple[list[str], int]:
+    """(titles, lines skipped) of a response that should be a text list.
+    Raises ListFetchError with NOT_A_LIST - and nothing of the body - when it
+    is JSON, a web page, XML or binary data, or when more of its lines are
+    not titles than are: then it is some other document (a status page, a
+    config file), and even its title-like lines are not used."""
+    kind = _body_kind(text)
+    if kind:
+        log.warning("text list: the response is %s, not a list of titles; refused", kind)
+        raise ListFetchError(f"{NOT_A_LIST} (it looks like {kind})")
+    titles, skipped = _split(text, max_lines)
+    if skipped > len(titles):
+        log.warning("text list: %d line(s) are not titles and only %d are; not a title list, refused", skipped,
+                    len(titles))
+        raise ListFetchError(f"{NOT_A_LIST} (most of its lines are not titles)")
+    return titles, skipped
 
 
 def fetch_url_text(params: dict, should_cancel: Callable[[], bool] | None = None) -> Fetched:
-    """Every line is looked up like a typed title on the Add page; only a
-    confident pick is added, the rest are reported for review. A line that
-    is already a reference (anilist:123, mangadex:uuid) is used as is. At
-    most MAX_LIST_LINES lines are looked up; should_cancel is checked
-    during the download and between lines."""
-    titles = parse_titles(_get_text(params["url"], should_cancel=should_cancel), MAX_LIST_LINES)
+    """Every line that looks like a title is looked up like a typed title on
+    the Add page; only a confident pick is added, the rest are reported for
+    review. A line that is already a reference (anilist:123, mangadex:uuid)
+    is used as is. At most MAX_LIST_LINES lines are looked up;
+    should_cancel is checked during the download and between lines."""
+    titles, skipped = list_titles(_get_text(params["url"], should_cancel=should_cancel), MAX_LIST_LINES)
     series: dict[str, Series] = {}
     review: list[str] = []
     for i, t in enumerate(titles):
@@ -384,7 +563,7 @@ def fetch_url_text(params: dict, should_cancel: Callable[[], bool] | None = None
         else:
             log.debug("list line %r: no confident match", t)
             review.append(t)
-    return list(series.values()), review
+    return Fetched(list(series.values()), review, skipped)
 
 
 FETCHERS: dict[str, Callable[[dict], Fetched]] = {
@@ -445,6 +624,11 @@ def validate_params(kind: str, raw: dict) -> dict:
         raise ValueError("the URL must start with http:// or https:// and name a host")
     if len(url) > 2000:
         raise ValueError("the URL is longer than 2000 characters")
+    why = _refused_host(parts.hostname)
+    if why:
+        log.info("import list URL refused: %s is %s", oneline(parts.hostname, 80), why)
+        raise ValueError(f"the URL's host is {why}: lists are fetched from the internet or the LAN, not from "
+                         "mang-arr's own machine, link-local (cloud metadata) or multicast addresses")
     return {"url": url}
 
 
@@ -579,12 +763,14 @@ def sync(con: sqlite3.Connection, row, submit_add: Callable[[Series, bool, bool]
     mark_synced(con, row["id"], "sync in progress (or interrupted)")
     con.commit()
     try:
-        series, review = fetch(kind, params, should_cancel)
+        series, review, *more = fetch(kind, params, should_cancel)
     except Exception as e:
-        msg = f"error: {type(e).__name__}: {e}"[:300]
+        # a ListFetchError is already plain words (and quotes nothing the server sent)
+        msg = (f"error: {e}" if isinstance(e, ListFetchError) else f"error: {type(e).__name__}: {e}")[:300]
         log.error("list %s: %s", name, msg)
         mark_synced(con, row["id"], msg)
         return msg
+    not_titles = more[0] if more else 0
     excluded = excluded_refs(con)
     added = tracked = skipped = deferred = 0
     for s in series:
@@ -605,6 +791,8 @@ def sync(con: sqlite3.Connection, row, submit_add: Callable[[Series, bool, bool]
     parts = [f"{len(series)} fetched", f"{added} added"]
     if review:
         parts.append(f"{len(review)} review")
+    if not_titles:
+        parts.append(f"{not_titles} line(s) skipped (not titles)")
     if tracked:
         parts.append(f"{tracked} already tracked")
     if skipped:
@@ -613,7 +801,8 @@ def sync(con: sqlite3.Connection, row, submit_add: Callable[[Series, bool, bool]
         parts.append(f"{deferred} deferred (cap {MAX_ADDS} per sync; next sync continues)")
     msg = ", ".join(parts)
     if review:
-        # quoted lines are cut short: they are whatever the URL served
+        # only lines that look like titles get here (looks_like_title), and
+        # they are cut short all the same: they are whatever the URL served
         shown = [oneline(t, MAX_REVIEW_CHARS) for t in review[:MAX_REVIEW_SHOWN]]
         msg += "; needs review: " + " | ".join(shown) + (" | ..." if len(review) > MAX_REVIEW_SHOWN else "")
     mark_synced(con, row["id"], msg)

@@ -403,7 +403,12 @@ default current and planning), an AniList chart (trending / popularity /
 score / favourites, top 1-100, optional country JP / KR / CN and minimum
 chapter count; manga format only, no adult titles), or a text file at a
 URL with one title per line (`#` comments; an `anilist:123` /
-`mangadex:uuid` reference works too). Each list has its own sync interval
+`mangadex:uuid` reference works too). The file may be on the internet or
+the LAN (a NAS is fine), not on mang-arr's own machine (localhost,
+127.0.0.1) or a link-local address; a URL that returns JSON, a web page or
+another document instead of a list of titles is refused as a whole, and
+lines that are not titles (`key=value`, markup, URLs, tokens) are skipped:
+they are neither looked up nor shown. Each list has its own sync interval
 (default 24 h), a download flag and a monitored flag, and can be disabled.
 Lists are checked every ten minutes and synced when due, or by *Sync now*;
 every series a sync yields that is not tracked yet is queued as an ordinary

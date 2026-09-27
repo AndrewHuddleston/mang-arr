@@ -57,7 +57,7 @@
 </div>
 
 <div data-kind="url_text" class="kindblock">
-  {% call m.form_group('URL', 'One title per line (or an anilist:123 / mangadex:uuid reference); blank lines and lines starting with # are ignored. Titles without a single exact database match are listed for review, not added.', 'url') %}<input class="input" id="url" name="url" placeholder="https://.../manga.txt">{% endcall %}
+  {% call m.form_group('URL', 'One title per line (or an anilist:123 / mangadex:uuid reference); blank lines, lines starting with # and lines that are not titles are ignored. Titles without a single exact database match are listed for review, not added. The file must be on the internet or your LAN, not on the machine mang-arr runs on.', 'url') %}<input class="input" id="url" name="url" placeholder="https://.../manga.txt">{% endcall %}
 </div>
 
 {% call m.form_group('Sync every', none, 'sync_hours') %}<input class="input" id="sync_hours" name="sync_hours" value="24"><span class="input-unit">hours</span>{% endcall %}
