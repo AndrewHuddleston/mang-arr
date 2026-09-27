@@ -746,15 +746,34 @@ def system_update_check():
 
 
 @app.get("/system/backup")
-def system_backup_create_and_download():
-    """Take a backup now and download it."""
-    p = backup.create("download")
-    return FileResponse(p, filename=os.path.basename(p), media_type="application/x-sqlite3")
+def system_backup_download():
+    """Download a fresh copy of the database. A GET must not change anything
+    (links, prefetch and cross-site navigations make GETs), so this streams a
+    temporary copy that is deleted once sent: no kept backup is written and
+    none is pruned. Kept backups are made only by POST."""
+    from starlette.background import BackgroundTask
+    try:
+        p, name = backup.snapshot_for_download()
+    except backup.FAILURES as e:
+        log.error("database download failed: %s", e)
+        raise HTTPException(500, f"cannot copy the database: {e}") from e
+    return FileResponse(p, filename=name, media_type="application/x-sqlite3",
+                        background=BackgroundTask(_remove_quietly, p))
+
+
+def _remove_quietly(path: str) -> None:
+    try:
+        os.remove(path)
+    except OSError as e:
+        log.warning("cannot remove temporary download %s: %s", path, e)
 
 
 @app.post("/system/backups/create")
 def system_backups_create():
-    p = backup.create("manual")
+    try:
+        p = backup.create("manual")
+    except backup.FAILURES as e:
+        return _flash("/system", f"backup failed: {e}")
     return _flash("/system", f"backup written: {os.path.basename(p)}")
 
 
@@ -777,44 +796,117 @@ def system_backups_delete(name: str):
 
 
 def _restore_guard() -> str | None:
-    if runner.current or any(j.status == "queued" for j in runner.jobs()):
+    if runner.current or any(j.status in ("queued", "running") for j in runner.jobs()):
         return "cannot restore while a job is queued or running (cancel it on the Activity page first)"
     return None
 
 
+RESTORE_START_WAIT = 10.0     # seconds a restore waits for the job worker before giving up
+
+
+def _restore_exclusive(title: str, fn) -> str:
+    """Run a restore on the job runner's own worker thread and return its
+    message. The worker runs one job at a time, so no job can run while the
+    database is swapped, and anything submitted meanwhile waits behind the
+    restore (checking only before the restore left a window in which a
+    scheduled refresh could start and write into the restored database).
+    Raises backup.RestoreError when refused."""
+    import threading
+    if (why := _restore_guard()):
+        raise backup.RestoreError(why)
+    if not runner._thread.is_alive():               # no worker (not started): nothing can run alongside
+        return fn()
+    state = {"phase": "waiting", "result": None, "error": None}
+    lock, started, done = threading.Lock(), threading.Event(), threading.Event()
+
+    def run(job: jobs.Job):
+        with lock:
+            if state["phase"] != "waiting":
+                return "skipped: the restore request stopped waiting"
+            state["phase"] = "running"
+        started.set()
+        try:
+            state["result"] = fn()
+            return state["result"]
+        except Exception as e:
+            state["error"] = e
+            raise
+        finally:
+            done.set()
+
+    runner.submit("restore", title, run)
+    if not started.wait(RESTORE_START_WAIT):
+        with lock:
+            if state["phase"] == "waiting":
+                state["phase"] = "abandoned"
+                log.warning("restore of %s refused: another job started first", title)
+                raise backup.RestoreError("another job started first; try again when the Activity queue is empty")
+    done.wait()
+    if state["error"] is not None:
+        raise state["error"]
+    return state["result"]
+
+
 @app.post("/system/backups/{name}/restore")
 def system_backups_restore(name: str):
-    if (why := _restore_guard()):
-        return _flash("/system", why)
     try:
-        msg = backup.restore(backup.path_of(name))
-    except (ValueError, FileNotFoundError) as e:
+        path = backup.path_of(name)
+        msg = _restore_exclusive(name, lambda: backup.restore(path))
+    except backup.FAILURES as e:
         return _flash("/system", f"restore refused: {e}")
     return _flash("/system", msg)
+
+
+class _UploadTooLarge(Exception):
+    pass
+
+
+async def _limited_body(request: Request, limit: int):
+    """The request body, aborted once it passes `limit` bytes (also for a
+    chunked upload that sends no Content-Length)."""
+    n = 0
+    async for chunk in request.stream():
+        n += len(chunk)
+        if n > limit:
+            raise _UploadTooLarge()
+        yield chunk
 
 
 @app.post("/system/backups/upload")
 async def system_backups_upload(request: Request):
     if (why := _restore_guard()):
         return _flash("/system", why)
-    form = await request.form()
-    up = form.get("file")
-    if up is None or not getattr(up, "filename", ""):
-        return _flash("/system", "choose a .db file to restore")
-    import tempfile
-    tmp = tempfile.NamedTemporaryFile(prefix="mangarr-upload-", suffix=".db", delete=False)
+    limit = backup.upload_limit()
+    too_big = f"restore refused: the file is larger than the upload limit ({limit // 1048576} MB)"
     try:
-        while chunk := await up.read(1 << 20):
-            tmp.write(chunk)
-        tmp.close()
-        msg = backup.restore(tmp.name)
-    except ValueError as e:
+        declared = int(request.headers.get("content-length") or 0)
+    except ValueError:
+        declared = 0
+    if declared > limit:
+        log.warning("backup upload refused: %d bytes declared, the limit is %d", declared, limit)
+        return _flash("/system", too_big)
+    if not request.headers.get("content-type", "").startswith("multipart/form-data"):
+        return _flash("/system", "choose a .db file to restore")
+    from starlette.concurrency import run_in_threadpool
+    from starlette.formparsers import MultiPartException, MultiPartParser
+    parser = MultiPartParser(request.headers, _limited_body(request, limit), max_files=1, max_fields=5)
+    try:
+        form = await parser.parse()                 # the file part is spooled once, to a temporary file
+    except _UploadTooLarge:
+        log.warning("backup upload refused: the body passed the limit of %d bytes", limit)
+        return _flash("/system", too_big)
+    except MultiPartException as e:
+        return _flash("/system", f"restore refused: {e}")
+    try:
+        up = form.get("file")
+        if up is None or not getattr(up, "filename", ""):
+            return _flash("/system", "choose a .db file to restore")
+        # blocking work (copy, checks, swap) runs off the event loop, on the job worker
+        msg = await run_in_threadpool(_restore_exclusive, f"uploaded {up.filename}", lambda: backup.restore(up.file))
+    except backup.FAILURES as e:
         return _flash("/system", f"restore refused: {e}")
     finally:
-        try:
-            os.remove(tmp.name)
-        except OSError:
-            pass
+        await form.close()
     return _flash("/system", msg)
 
 

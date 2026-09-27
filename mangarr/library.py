@@ -170,6 +170,20 @@ def library_dir(folder: str, root: str | None = None) -> str:
     return os.path.join(root or config.LIBRARY_ROOT, folder)
 
 
+def is_within(path: str, root: str) -> bool:
+    """Is `path` inside `root` (or root itself) once symlinks and '..' are
+    resolved? Paths stored in the database (which a restored backup can set
+    to anything) are only acted on when this holds for their root."""
+    if not path or not root:
+        return False
+    real_root = os.path.realpath(root)
+    real = os.path.realpath(path)
+    try:
+        return os.path.commonpath([real, real_root]) == real_root
+    except ValueError:            # mixed absolute/relative, or different drives
+        return False
+
+
 _copy_warned = False
 COPIED = 0          # chapters copied because a hard link was impossible
 
