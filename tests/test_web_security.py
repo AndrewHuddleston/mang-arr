@@ -5,6 +5,7 @@ import asyncio
 import hashlib
 import hmac
 import http.cookiejar
+import inspect
 import json
 import logging
 import os
@@ -591,7 +592,7 @@ class LoginTest(WebBase):
         with mock.patch("mangarr.web.app.asyncio.sleep", record):
             self.client.post("/login", data={"username": "andy", "password": "bad"})
         self.assertEqual(len(calls), 1)
-        self.assertTrue(asyncio.iscoroutinefunction(self.web.login_submit))
+        self.assertTrue(inspect.iscoroutinefunction(self.web.login_submit))   # asyncio's: deprecated in 3.14
 
 
 class ThrottleBurstTest(WebBase):
@@ -1234,6 +1235,7 @@ class FailClosedTest(WebBase):
 
     def test_missing_setting_table_is_an_error_not_defaults(self):
         con = sqlite3.connect(":memory:")
+        self.addCleanup(con.close)
         con.row_factory = sqlite3.Row
         with self.assertRaises(sqlite3.OperationalError):
             self.settings._load(con)
