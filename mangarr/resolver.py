@@ -18,7 +18,7 @@ from . import config
 from .limits import Cancelled
 from .matching import ACCEPTED, AUTHOR_DIFFER, MAX_TITLE, author_level, match_level, oneline
 from .model import Series
-from .suwayomi import Chapter, Client, Source, SuwayomiError, SuwayomiUnreachable
+from .suwayomi import Chapter, Client, Source, SuwayomiError, SuwayomiUnreachable, with_cancel
 
 log = logging.getLogger(__name__)
 
@@ -140,8 +140,7 @@ def resolve(client: Client, series: Series, sources: list[Source] | None = None,
     with nothing decided; `progress` hears which source is being searched."""
     cancel = should_cancel or (lambda: False)
     report = progress or (lambda m: None)
-    if should_cancel is not None and isinstance(client, Client):
-        client = client.cancellable(should_cancel)   # each search title, each chapter list: never a full timeout
+    client = with_cancel(client, should_cancel)   # each search title, each chapter list: never a full timeout
     sources = sources if sources is not None else client.sources()
     reliability = reliability or {}
     titles = capped_search_titles(series)

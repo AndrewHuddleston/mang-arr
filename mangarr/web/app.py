@@ -42,7 +42,7 @@ from .. import (
     updates,
 )
 from ..resolver import ranges
-from ..suwayomi import BREAKER_SECS, Client, SuwayomiError, SuwayomiUnreachable
+from ..suwayomi import BREAKER_SECS, Client, SuwayomiError, SuwayomiUnreachable, with_cancel
 from . import lists_routes, security, views
 
 log = logging.getLogger(__name__)
@@ -252,7 +252,7 @@ def _run_pass(job: jobs.Job, rows, label: str) -> tuple[int, int, int, int]:
         except core.Gone:
             item["state"], item["result"] = "cancelled", "series was deleted"
             continue
-        except limits.Cancelled:                   # while its sources were searched: nothing was saved
+        except limits.Cancelled:                   # in the middle of the series: not an error of it
             item["state"], item["result"] = "cancelled", "pass cancelled"
             continue                               # the check at the top ends the pass
         except Exception as e:
@@ -815,7 +815,7 @@ _adopt_scan: dict = {"items": None, "job": None, "gen": 0}
 
 
 def _job_adopt_scan(job: jobs.Job):
-    items = core.plan_adopt(client)
+    items = core.plan_adopt(client, progress=lambda m: setattr(job, "progress", m), should_cancel=lambda: job.cancel)
     with db.connect() as con:
         tracked = {r["ref"] for r in con.execute("SELECT ref FROM series")}
     for it in items:
@@ -889,18 +889,28 @@ async def import_apply(request: Request):
     if not chosen:
         return _flash("/import", "nothing selected")
 
+    runner.submit("adopt", f"{len(chosen)} folder(s)", _job_adopt(chosen))
+    return _flash("/activity", "adopt queued")
+
+
+def _job_adopt(chosen: list):
+    """Register the chosen folders, then link each series' files, saying
+    which one it is on; a cancel stops between series (the next refresh of
+    the others links theirs)."""
     def run(job: jobs.Job):
         with db.connect() as con:
             ids, n_ch = core.apply_adopt(con, chosen)
+        _adopt_scan["items"] = None                # adopted: the scan is out of date, whatever happens next
         linked = 0
-        for sid in ids:
+        for i, sid in enumerate(ids, 1):
+            if job.cancel:
+                return (f"adopted {len(ids)} series ({n_ch} chapters), linked {linked} files; cancelled before "
+                        f"linking the other {len(ids) - i + 1} (their next refresh links them)")
+            job.progress = f"linking the files of series {i} of {len(ids)}"
             with db.connect() as con:
-                linked += core.import_series(con, sid, client)
-        _adopt_scan["items"] = None
+                linked += core.import_series(con, sid, with_cancel(client, lambda: job.cancel))
         return f"adopted {len(ids)} series ({n_ch} chapters), linked {linked} files"
-
-    runner.submit("adopt", f"{len(chosen)} folder(s)", run)
-    return _flash("/activity", "adopt queued")
+    return run
 
 
 @app.get("/wanted")
@@ -1074,6 +1084,7 @@ def _restore_exclusive(title: str, fn) -> str:
             if state["phase"] != "waiting":
                 return "skipped: the restore request stopped waiting"
             state["phase"] = "running"
+        job.progress = "replacing the database with the backup (a restore cannot be cancelled)"
         started.set()
         try:
             state["result"] = fn()

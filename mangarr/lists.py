@@ -355,12 +355,14 @@ def parse_titles(text: str, max_lines: int | None = None) -> list[str]:
     return out
 
 
-def fetch_url_text(params: dict, should_cancel: Callable[[], bool] | None = None) -> Fetched:
+def fetch_url_text(params: dict, should_cancel: Callable[[], bool] | None = None,
+                   progress: Callable[[str], None] | None = None) -> Fetched:
     """Every line is looked up like a typed title on the Add page; only a
     confident pick is added, the rest are reported for review. A line that
     is already a reference (anilist:123, mangadex:uuid) is used as is. At
-    most MAX_LIST_LINES lines are looked up; should_cancel is checked
-    during the download and between lines."""
+    most MAX_LIST_LINES lines are looked up (rate limited: a long list takes
+    a while, and `progress` hears which line it is on); should_cancel is
+    checked during the download and between lines."""
     titles = parse_titles(_get_text(params["url"], should_cancel=should_cancel), MAX_LIST_LINES)
     series: dict[str, Series] = {}
     review: list[str] = []
@@ -368,6 +370,8 @@ def fetch_url_text(params: dict, should_cancel: Callable[[], bool] | None = None
         if should_cancel and should_cancel():
             log.info("text list sync cancelled after %d of %d line(s)", i, len(titles))
             break
+        if progress:
+            progress(f"looking up line {i + 1} of {len(titles)}")
         try:
             if model.valid_ref(t) and not t.startswith("manual:"):
                 s = metadata.by_ref(t)
@@ -394,13 +398,14 @@ FETCHERS: dict[str, Callable[[dict], Fetched]] = {
 }
 
 
-def fetch(kind: str, params: dict, should_cancel: Callable[[], bool] | None = None) -> Fetched:
+def fetch(kind: str, params: dict, should_cancel: Callable[[], bool] | None = None,
+          progress: Callable[[str], None] | None = None) -> Fetched:
     try:
         fn = FETCHERS[kind]
     except KeyError:
         raise ValueError(f"unknown list kind {kind!r}") from None
-    if should_cancel is not None and fn is fetch_url_text:      # the only fetcher that loops for long
-        return fn(params, should_cancel=should_cancel)
+    if fn is fetch_url_text:                                     # the only fetcher that loops for long
+        return fn(params, should_cancel=should_cancel, progress=progress)
     return fn(params)
 
 
@@ -568,18 +573,19 @@ def is_due(row, now: float | None = None) -> bool:
 
 
 def sync(con: sqlite3.Connection, row, submit_add: Callable[[Series, bool, bool], object],
-         should_cancel: Callable[[], bool] | None = None) -> str:
+         should_cancel: Callable[[], bool] | None = None, progress: Callable[[str], None] | None = None) -> str:
     """Fetch one list and hand every new series to submit_add(series,
-    download, monitored) - the caller queues the actual add job. Records
-    last_sync and a one-line last_result, which is also returned. A fetch
-    failure is recorded, logged with the list's name and returned; it never
-    raises. last_sync is stamped before the fetch too, so a sync that
-    crashes the process is not retried right after the restart."""
+    download, monitored) - the caller queues the actual add job; `progress`
+    hears how far a long fetch got. Records last_sync and a one-line
+    last_result, which is also returned. A fetch failure is recorded, logged
+    with the list's name and returned; it never raises. last_sync is stamped
+    before the fetch too, so a sync that crashes the process is not retried
+    right after the restart."""
     name, kind, params = row["name"], row["kind"], params_of(row)
     mark_synced(con, row["id"], "sync in progress (or interrupted)")
     con.commit()
     try:
-        series, review = fetch(kind, params, should_cancel)
+        series, review = fetch(kind, params, should_cancel, progress)
     except Exception as e:
         msg = f"error: {type(e).__name__}: {e}"[:300]
         log.error("list %s: %s", name, msg)

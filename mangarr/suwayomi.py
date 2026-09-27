@@ -97,11 +97,12 @@ class Client:
         self.api = url.rstrip("/") + "/api/graphql"
 
     def cancellable(self, should_cancel: Callable[[], bool]) -> "Client":
-        """This client for one job's lookups: every call checks should_cancel
-        before it starts, while it waits for Suwayomi and between its retries,
-        and raises limits.Cancelled at once instead of running into its
-        timeout. The request in flight is left to finish on its own, so this
-        is only for reads and source lookups, never for queue changes."""
+        """This client for one job: every call checks should_cancel before it
+        starts, while it waits for Suwayomi and between its retries, and
+        raises limits.Cancelled at once instead of running into its timeout.
+        The request in flight is left to finish on its own, so a change cut
+        short may still land: the downloader takes such queue changes back
+        (see downloader._dequeue); reads and lookups are simply dropped."""
         c = copy.copy(self)
         c._cancel = should_cancel
         return c
@@ -299,6 +300,14 @@ class Client:
         d = self.gq("{ downloadStatus { queue { chapter { id } state tries progress } } }", timeout=30, retries=2)
         return [{"id": x["chapter"]["id"], "state": x["state"], "tries": x["tries"],
                  "progress": x.get("progress") or 0.0} for x in d["downloadStatus"]["queue"]]
+
+
+def with_cancel(client, should_cancel: Callable[[], bool] | None):
+    """client.cancellable(should_cancel) for a real Client when there is a
+    cancel to watch; anything else (no cancel, a test double) unchanged."""
+    if should_cancel is None or not isinstance(client, Client):
+        return client
+    return client.cancellable(should_cancel)
 
 
 def dedupe(raw: list[dict]) -> list[Chapter]:

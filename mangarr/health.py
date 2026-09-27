@@ -29,6 +29,7 @@ CACHE_SECS = 60
 FORCE_MIN_SECS = 15      # force=True re-checks at most this often, whoever asks
 DEADLINE = 25            # seconds a caller waits for a run; the run itself carries on in the background
 STALLED_JOB_SECS = 30 * 60   # a running job whose progress has not changed for this long is reported
+NOT_CANCELLABLE = {"restore"}  # job kinds that finish what they started, whatever the Queue page asks
 
 
 @dataclass
@@ -231,7 +232,10 @@ def _compute(client: Client) -> list[Check]:
 
 def stalled_job(now: float | None = None) -> Check | None:
     """A warning when the running job's progress has not changed for
-    STALLED_JOB_SECS: every other job waits behind it."""
+    STALLED_JOB_SECS: every other job waits behind it. Every job kind reports
+    each step that can take long (a source, a chapter batch, a staged
+    folder, a series); a wait (for another process's download run) reports
+    the same words throughout, so it counts as no progress."""
     global _stall_logged
     job = _runner.current if _runner is not None else None
     if job is None or job.started_at is None:
@@ -245,8 +249,10 @@ def stalled_job(now: float | None = None) -> Check | None:
     if _stall_logged != job.id:
         _stall_logged = job.id
         log.warning("health: %s has made no progress for %.0f min%s", what, idle / 60, last)
+    hint = ("it cannot be cancelled" if job.kind in NOT_CANCELLABLE
+            else "cancel it on the Queue page if it is stuck")
     return Check("warning", "Jobs", f"{what} has made no progress for {idle / 60:.0f} min{last}. Other jobs "
-                                    "wait until it ends; cancel it on the Activity page if it is stuck")
+                                    f"wait until it ends; {hint}")
 
 
 def summary(client: Client, wait: float = 5) -> dict:

@@ -87,7 +87,7 @@ DEFAULTS: dict[str, object] = {
     "session_secret": "",    # signs login cookies; random per install
     "session_epoch": 0,      # bumped to sign every session out (logout-all, password / user / API key change)
     "revoked_sessions": [],  # "sid:expiry" of sessions signed out one by one
-    "leftover_queue_ids": [],  # chapter ids a failed download could not take out of Suwayomi's queue (downloader)
+    "leftover_queue_ids": [],  # chapter ids mang-arr may have left in Suwayomi's queue (downloader.leftovers)
 }
 SECRET_KEYS = {"pushover_token", "pushover_user", "komga_api_key", "auth_password", "discord_webhook", "slack_webhook",
                "telegram_token", "ntfy_token", "gotify_token", "smtp_password", "notifiarr_api_key",

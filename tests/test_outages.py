@@ -5,16 +5,21 @@ ends the pass within minutes, a cancel is noticed within about a second, and
 a job that stops moving shows up in health. The real Client.gq runs against
 a faked urlopen and clock: no network, no real sleeps beyond a few short
 waits for helper threads."""
+import contextlib
+import fcntl
 import io
 import json
+import os
+import sqlite3
 import tempfile
 import threading
 import time
 import unittest
 import urllib.error
+import zipfile
 from unittest import mock
 
-from mangarr import anilist, core, db, downloader, health, jobs, limits, resolver, settings, suwayomi
+from mangarr import anilist, core, db, downloader, health, jobs, limits, lists, resolver, settings, suwayomi
 from mangarr.model import Series
 from mangarr.resolver import Plan, SourceMatch
 from mangarr.suwayomi import Chapter, CircuitOpen, Client, Source, SuwayomiUnreachable
@@ -48,20 +53,29 @@ class FakeSuwayomi:
     (startDownloader downloads everything queued at once). An outage is
     'refuse' (connection refused) or 'hang' (accepts, never answers: every
     request costs its full timeout on the clock). after[op] = (mode, secs)
-    starts an outage for secs once op has been answered. Every request is
-    logged as (op, variables, what happened)."""
+    starts an outage for secs once op has been answered. stall[op] makes a
+    request really wait (real time) until that event is set, then go on as
+    usual: answered (a change lands late) or not, per the outage. Every
+    request is logged as (op, variables, what happened), and its timeout in
+    `timeouts`. `hits` is what every search finds, `entries` the chapter
+    list per manga id."""
 
     OPS = ("enqueueChapterDownloads", "dequeueChapterDownloads", "startDownloader", "downloadStatus",
-           "aboutServer", "fetchSourceManga", "fetchMangaAndChapters", "fetchChapterPages", "sources", "manga(")
+           "aboutServer", "fetchSourceManga", "fetchMangaAndChapters", "fetchChapterPages", "sources", "updateManga",
+           "manga(")
 
     def __init__(self, clock: Clock, sources: int = 1):
         self.clock, self.sources = clock, sources
         self.queue: list[int] = []
         self.downloaded: set[int] = set()
         self.log: list[tuple] = []
+        self.timeouts: list[tuple[str, float]] = []
         self.outage: tuple[str, float] | None = None
         self.after: dict[str, tuple[str, float]] = {}
         self.block: threading.Event | None = None     # set: a hung request really blocks until it is set
+        self.stall: dict[str, threading.Event] = {}
+        self.hits: list[dict] = []
+        self.entries: dict[int, list[dict]] = {}
 
     def requests(self, op: str) -> list[tuple]:
         return [(v, how) for o, v, how in self.log if o == op]
@@ -72,6 +86,9 @@ class FakeSuwayomi:
         body = json.loads(req.data)
         op = next(o for o in self.OPS if o in body["query"])
         variables = body.get("variables") or {}
+        self.timeouts.append((op, timeout))
+        if op in self.stall:
+            self.stall[op].wait(10)
         mode = self.outage[0] if self.outage and self.clock.now() < self.outage[1] else "up"
         if mode == "refuse":
             self.log.append((op, variables, "refused"))
@@ -110,7 +127,12 @@ class FakeSuwayomi:
             return {op: {"nodes": [{"id": str(i), "displayName": f"Source {i}", "lang": "en"}
                                    for i in range(1, self.sources + 1)]}}
         if op == "fetchSourceManga":
-            return {op: {"mangas": []}}
+            return {op: {"mangas": self.hits}}
+        if op == "fetchMangaAndChapters":
+            hit = next(h for h in self.hits if h["id"] == v["id"])
+            return {op: {"manga": {**hit, "artist": None, "inLibrary": False}, "chapters": self.entries[v["id"]]}}
+        if op == "updateManga":
+            return {op: {"manga": {"id": v["id"]}}}
         if op == "manga(":
             return {"manga": {"chapters": {"nodes": [{"id": i, "isDownloaded": True} for i in self.downloaded]}}}
         raise AssertionError(f"unexpected {op}")
@@ -143,6 +165,8 @@ class Base(unittest.TestCase):
             self.addCleanup(p.stop)
         suwayomi._down.clear()
         self.addCleanup(suwayomi._down.clear)
+        downloader._unsaved = downloader._SAVED
+        self.addCleanup(setattr, downloader, "_unsaved", downloader._SAVED)
         settings._cache.clear()
         self.addCleanup(settings._cache.clear)
         self.client = Client(API)
@@ -276,6 +300,86 @@ class LeftoverBackgroundTest(Base):
             self.assertTrue(free)
 
 
+class LeftoverUnsavedTest(Base):
+    """The database will not take the list (busy past its timeout, round-2
+    re-check): the ids are kept in memory, where leftovers() and the next
+    download run see them, and the background retry saves them and takes
+    them out once it can."""
+
+    def setUp(self):
+        super().setUp()
+        self.retries = []
+        p = mock.patch.object(downloader, "_retry_leftovers_later",
+                              lambda client, first=None: self.retries.append(client))
+        p.start()
+        self.addCleanup(p.stop)
+        with db.connect():
+            pass                                                   # the database exists (WAL)
+        real = sqlite3.connect                                     # busy for 0.2 s, not 30 s
+        p = mock.patch.object(db.sqlite3, "connect", lambda path, timeout=5.0, **kw: real(path, timeout=0.2, **kw))
+        p.start()
+        self.addCleanup(p.stop)
+
+    @contextlib.contextmanager
+    def locked(self):
+        """Another connection holds the write lock: reads work, writes fail."""
+        c = sqlite3.connect(self.tmp + "/t.db")
+        c.execute("BEGIN EXCLUSIVE")
+        try:
+            yield
+        finally:
+            c.rollback()
+            c.close()
+
+    def stored(self) -> list:
+        c = sqlite3.connect(self.tmp + "/t.db")
+        try:
+            row = c.execute("SELECT value FROM setting WHERE key='leftover_queue_ids'").fetchone()
+            return json.loads(row[0]) if row else []
+        finally:
+            c.close()
+
+    def test_remembered_while_the_database_is_locked(self):       # the round-2 evidence
+        self.fake.after["enqueueChapterDownloads"] = ("refuse", 15)
+        with self.locked():
+            with self.assertRaises(SuwayomiUnreachable), self.assertLogs("mangarr.downloader", "WARNING") as cm:
+                downloader.download(self.client, one_chapter_plan(), only={1.0}, in_order=True)
+            self.assertIn("could not save the chapter ids left in Suwayomi's queue (OperationalError: database is "
+                          "locked)", "\n".join(cm.output))
+            self.assertEqual(self.stored(), [])
+            self.assertEqual(downloader.leftovers(), [7001])       # kept in memory, not dropped
+            self.assertEqual(self.fake.queue, [7001])
+            self.assertEqual(self.retries, [self.client])
+        self.clock.advance(100)                                    # Suwayomi back, the database free again
+        with self.assertLogs("mangarr.downloader", "INFO") as cm:
+            downloader._retry_leftovers(self.client, first=0)      # what the background retry does
+        self.assertEqual(self.fake.queue, [])
+        self.assertEqual((downloader.leftovers(), self.stored()), ([], []))
+        self.assertEqual(downloader._unsaved, downloader._SAVED)
+        self.assertIn("removed chapter id(s) [7001]", "\n".join(cm.output))
+
+    def test_the_next_download_run_sees_them_too(self):
+        self.fake.queue = [7001]
+        with self.locked(), self.assertLogs("mangarr.downloader", "WARNING"):
+            downloader._remember_leftovers([7001])
+        res = downloader.download(self.client, one_chapter_plan(7002, 2.0), only={2.0}, in_order=True)
+        self.assertEqual(res, {2.0: "ok"})
+        self.assertEqual(self.fake.requests("dequeueChapterDownloads"), [({"ids": [7001]}, "answered")])
+        self.assertEqual((downloader.leftovers(), self.stored()), ([], []))
+
+    def test_a_forget_that_cannot_be_saved_is_kept_too(self):
+        downloader._remember_leftovers([7001])
+        self.assertEqual(self.stored(), [7001])
+        with self.locked(), self.assertLogs("mangarr.downloader", "WARNING"):
+            self.assertTrue(downloader.clear_leftovers(self.client))     # 7001 is no longer queued
+        self.assertEqual(self.stored(), [7001])
+        self.assertEqual(downloader.leftovers(), [])               # not taken for ours again meanwhile
+        self.assertEqual(self.retries, [self.client])
+        downloader._retry_leftovers(self.client, first=0)
+        self.assertEqual(self.stored(), [])
+        self.assertEqual(self.fake.requests("dequeueChapterDownloads"), [])
+
+
 # -- finding 78: a freeze while sources are searched ------------------------------------------
 
 @unittest.skipIf(web is None, "web extras not installed")
@@ -376,6 +480,144 @@ class ResolveCancelTest(Base):
         self.assertEqual(limits.interruptible(lambda: 6, None), 6)
 
 
+# -- round-2 re-check: cancel during a download on a hung Suwayomi -------------------------------
+
+class CancelDuringDownloadTest(Base):
+    """Cancel while Suwayomi hangs in the middle of a download (round-2
+    re-check: 190 simulated s without a cancel check inside start(), about
+    125 s inside a chapter job's chapter list). Requests really block here,
+    so the job must give up on them, not wait them out; the chunk's ids are
+    taken out once Suwayomi answers again."""
+
+    def setUp(self):
+        super().setUp()
+        self.retries = []
+        p = mock.patch.object(downloader, "_retry_leftovers_later",
+                              lambda client, first=None: self.retries.append(client))
+        p.start()
+        self.addCleanup(p.stop)
+        self.flag: list = []
+        with db.connect():
+            pass                                # created and migrated now, not inside the timed part
+
+    def cancelled(self) -> bool:
+        return bool(self.flag)
+
+    def stall(self, op) -> threading.Event:
+        """Requests for op really block until the event is set (at the latest when the test ends)."""
+        ev = threading.Event()
+        self.addCleanup(ev.set)
+        self.fake.stall[op] = ev
+        return ev
+
+    def cancel_when_sent(self, op, cancel=None):
+        """Cancel once a request for op has gone out."""
+        def watch():
+            deadline = time.perf_counter() + 5
+            while time.perf_counter() < deadline and op not in [o for o, _ in self.fake.timeouts]:
+                time.sleep(0.01)
+            (cancel or (lambda: self.flag.append(1)))()
+        t = threading.Thread(target=watch, daemon=True)
+        t.start()
+        self.addCleanup(t.join, 6)
+
+    def test_hung_start(self):
+        self.fake.after["enqueueChapterDownloads"] = ("hang", 10**6)
+        self.stall("startDownloader")
+        self.cancel_when_sent("startDownloader")
+        t0 = time.perf_counter()
+        with self.assertLogs("mangarr.downloader", "WARNING") as cm:
+            res = downloader.download(self.client, one_chapter_plan(), only={1.0}, should_cancel=self.cancelled,
+                                      in_order=True)
+        self.assertLess(time.perf_counter() - t0, 3.0)             # start() alone: 3 x 10 s real here
+        self.assertEqual(res, {})
+        # one short try after the cancel, not 3 x 30 s
+        self.assertEqual([t for o, t in self.fake.timeouts if o == "dequeueChapterDownloads"],
+                         [downloader.CANCEL_DEQUEUE_SECS])
+        self.assertIn("will try again once it answers", "\n".join(cm.output))
+        self.assertEqual(self.fake.queue, [7001])                   # it got no answer ...
+        self.assertEqual(downloader.leftovers(), [7001])            # ... so the id is remembered
+        self.assertEqual(self.retries, [self.client])
+        self.fake.outage = None                                     # Suwayomi answers again
+        self.assertTrue(downloader.clear_leftovers(self.client))
+        self.assertEqual((self.fake.queue, downloader.leftovers()), ([], []))
+
+    def test_hung_enqueue_that_lands_after_the_cancel(self):
+        landing = self.stall("enqueueChapterDownloads")            # Suwayomi applies it, but late
+        self.cancel_when_sent("enqueueChapterDownloads")
+        t0 = time.perf_counter()
+        with self.assertLogs("mangarr.downloader", "DEBUG") as cm:
+            downloader.download(self.client, one_chapter_plan(), only={1.0}, should_cancel=self.cancelled,
+                                in_order=True)
+        self.assertLess(time.perf_counter() - t0, 3.0)
+        self.assertIn("was cut short by the cancel and may still land", "\n".join(cm.output))
+        self.assertEqual(self.fake.requests("dequeueChapterDownloads"), [({"ids": [7001]}, "answered")])
+        self.assertEqual(self.fake.queue, [])                       # nothing queued yet ...
+        self.assertEqual(downloader.leftovers(), [7001])            # ... but it may still land
+        landing.set()
+        deadline = time.perf_counter() + 5
+        while not self.fake.queue and time.perf_counter() < deadline:
+            time.sleep(0.01)
+        self.assertEqual(self.fake.queue, [7001])                   # it did, after the dequeue
+        self.assertTrue(downloader.clear_leftovers(self.client))
+        self.assertEqual((self.fake.queue, downloader.leftovers()), ([], []))
+
+    def test_chapter_job_waits_for_no_chapter_list(self):
+        with db.connect() as con:
+            sid = db.upsert_series(con, Series(english="T"))
+            con.execute("INSERT INTO series_source (series_id, manga_id, source_name, title, match_level,"
+                        " author_level, chapter_count, max_chapter, is_primary, seen_at)"
+                        " VALUES (?, 7, 'A', 'T', 0, 1, 1, 1, 1, ?)", (sid, db.now()))
+        self.fake.outage = ("hang", 10**6)
+        self.stall("manga(")
+        self.cancel_when_sent("manga(")
+        t0 = time.perf_counter()
+        with db.connect() as con, self.assertRaises(limits.Cancelled):
+            core.download_chapter(con, self.client, sid, 1.0, should_cancel=self.cancelled)
+        self.assertLess(time.perf_counter() - t0, 3.0)             # the chapter list alone: 2 x 10 s real here
+
+    def test_import_links_the_rest_when_the_name_lookup_is_cancelled(self):
+        folder = os.path.join(self.tmp, "staging", "A", "T")
+        os.makedirs(folder)
+        for name in ("Chapter 1.cbz", "Official_S2 - Episode 5.cbz"):   # numbered, and one only Suwayomi can place
+            with zipfile.ZipFile(os.path.join(folder, name), "w") as z:
+                z.writestr("001.jpg", os.urandom(2000))
+
+        class Cancelling:
+            def chapters(self, manga_id):
+                raise limits.Cancelled()
+        with db.connect() as con, mock.patch.object(core.komga, "scan", lambda: False):
+            sid = db.upsert_series(con, Series(english="T"))
+            con.execute("INSERT INTO series_source (series_id, manga_id, source_name, title, match_level,"
+                        " author_level, chapter_count, max_chapter, is_primary, seen_at)"
+                        " VALUES (?, 7, 'A', 'T', 0, 1, 1, 1, 1, ?)", (sid, db.now()))
+            with self.assertLogs("mangarr.core", "INFO") as cm:
+                self.assertEqual(core.import_series(con, sid, Cancelling()), 1)
+        self.assertIn("cancelled before 1 unnumbered file(s)", "\n".join(cm.output))
+
+    @unittest.skipIf(web is None, "web extras not installed")
+    def test_pass_on_a_series_with_a_wanted_chapter(self):             # the round-2 evidence, end to end
+        self.fake.hits = [{"id": 7, "title": "S1", "author": None, "status": "ONGOING"}]
+        self.fake.entries = {7: [{"id": 7001, "name": "Chapter 1", "chapterNumber": 1, "scanlator": None,
+                                  "isDownloaded": False, "uploadDate": 0}]}
+        self.fake.after["enqueueChapterDownloads"] = ("hang", 10**6)
+        self.stall("startDownloader")
+        with db.connect() as con:
+            db.upsert_series(con, Series(english="S1"))
+            rows = [dict(r) for r in db.series_rows(con)]
+        job = jobs.Job(1, "refresh-all", "all")
+        self.cancel_when_sent("startDownloader", lambda: setattr(job, "cancel", True))
+        t0 = time.perf_counter()
+        with mock.patch.object(web, "client", self.client), self.assertLogs(level="WARNING"):
+            web._run_pass(job, rows, "sim")
+        self.assertLess(time.perf_counter() - t0, 3.0)
+        self.assertEqual(self.fake.requests("enqueueChapterDownloads"), [({"ids": [7001]}, "answered")])
+        self.assertEqual(downloader.leftovers(), [7001])
+        self.fake.outage = None
+        self.assertTrue(downloader.clear_leftovers(self.client))
+        self.assertEqual(self.fake.queue, [])
+
+
 # -- AniList breaker ----------------------------------------------------------------------------
 
 class AniListBreakerTest(Base):
@@ -464,6 +706,39 @@ class StalledJobTest(unittest.TestCase):
         self.assertGreaterEqual(job.progress_at, first)
         self.assertIn("progressAt", job.as_dict())
 
+    def test_a_restore_is_not_said_to_be_cancellable(self):
+        self.running(45).kind = "restore"
+        with self.assertLogs("mangarr.health", "WARNING"):
+            c = health.stalled_job()
+        self.assertIn("it cannot be cancelled", c.detail)
+        self.assertNotIn("cancel it", c.detail)
+
+    def test_waiting_for_another_download_run_is_no_progress(self):   # round-2 re-check
+        with tempfile.TemporaryDirectory() as tmp:
+            path = tmp + "/lock"
+            fd = os.open(path, os.O_RDWR | os.O_CREAT)
+            fcntl.flock(fd, fcntl.LOCK_EX)                         # another process's run holds it
+            try:
+                job = jobs.Job(3, "chapter", "T ch 1", status="running", started_at=time.time())
+                said = []
+
+                def report(m):
+                    job.progress = m
+                    said.append((m, job.progress_at))
+                with mock.patch("time.sleep"), self.assertRaises(limits.Cancelled), \
+                        self.assertLogs("mangarr.downloader", "INFO"):
+                    with downloader.download_lock(path, should_cancel=lambda: len(said) > 5, progress=report):
+                        pass
+            finally:
+                os.close(fd)
+        self.assertEqual(len(set(said)), 1, said)                 # the same words, never "progress"
+        self.assertIn("waiting for another download run to finish", said[0][0])
+        job.progress_at -= 31 * 60
+        self.runner.current = job
+        with self.assertLogs("mangarr.health", "WARNING"):
+            c = health.stalled_job()
+        self.assertIn("has made no progress for 31 min; last step: waiting for another download run", c.detail)
+
     def test_in_the_health_checks(self):
         self.running(45)
         with tempfile.TemporaryDirectory() as tmp, \
@@ -480,6 +755,55 @@ class StalledJobTest(unittest.TestCase):
             checks = health._compute(client)
             settings._cache.clear()
         self.assertIn("Jobs", [c.name for c in checks if c.level == "warning"])
+
+
+class LongJobProgressTest(Base):
+    """Jobs that work through many slow lookups report each step (round-2
+    re-check: a big staging tree was flagged as stuck while it was being
+    worked through), and adopting stops on a cancel between them."""
+
+    class NoEntries:
+        def mangas_page(self, offset, first):
+            return [], False
+
+    def test_scan_reports_each_folder(self):
+        for name in ("One", "Two", "Three"):
+            os.makedirs(os.path.join(self.tmp, "staging", "Src", name))
+        said = []
+        with mock.patch.object(core.metadata, "lookup", lambda name: (None, [])):
+            items = core.plan_adopt(self.NoEntries(), progress=said.append)
+        self.assertEqual(len(items), 3)
+        self.assertEqual(said, ["listing what Suwayomi has downloaded (0 entries so far)",
+                                "identifying folder 1 of 3: One", "identifying folder 2 of 3: Three",
+                                "identifying folder 3 of 3: Two"])
+        looked = []
+        with mock.patch.object(core.metadata, "lookup", lambda name: looked.append(name) or (None, [])), \
+                self.assertRaises(limits.Cancelled):
+            core.plan_adopt(self.NoEntries(), should_cancel=lambda: len(looked) >= 2)
+        self.assertEqual(looked, ["One", "Three"])
+
+    @unittest.skipIf(web is None, "web extras not installed")
+    def test_adopt_job_reports_each_series_and_stops_on_cancel(self):
+        job = jobs.Job(1, "adopt", "3 folder(s)")
+        seen = []
+
+        def link(con, sid, client=None):
+            seen.append((sid, job.progress))
+            job.cancel = sid == 2
+            return 1
+        with mock.patch.object(core, "apply_adopt", lambda con, chosen: ([1, 2, 3], 9)), \
+                mock.patch.object(core, "import_series", link):
+            msg = web._job_adopt([])(job)
+        self.assertEqual(seen, [(1, "linking the files of series 1 of 3"), (2, "linking the files of series 2 of 3")])
+        self.assertIn("linked 2 files; cancelled before linking the other 1", msg)
+
+
+    def test_text_list_sync_reports_each_line(self):
+        said = []
+        with mock.patch.object(lists, "_get_text", lambda url, **kw: "One\nTwo"), \
+                mock.patch.object(lists.metadata, "lookup", lambda t: (None, [])):
+            lists.fetch("url_text", {"url": "http://x"}, progress=said.append)
+        self.assertEqual(said, ["looking up line 1 of 2", "looking up line 2 of 2"])
 
 
 class DownloadProgressTest(Base):

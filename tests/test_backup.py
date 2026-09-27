@@ -13,7 +13,7 @@ import time
 import unittest
 from unittest import mock
 
-from mangarr import backup, core, db, library, settings
+from mangarr import backup, core, db, downloader, library, settings
 from mangarr.model import Series
 
 try:
@@ -313,6 +313,36 @@ class BackupTest(_Base):
             con.execute("DELETE FROM setting WHERE key IN ('auth_user', 'auth_password')")
         backup.restore(with_login)
         self.assertEqual(settings.all_values()["auth_user"], "")
+
+    # -- round 2, #68: what mang-arr left in Suwayomi's queue is about the live Suwayomi, not the data
+
+    def leftovers(self, ids=None):
+        with db.connect() as con:
+            if ids is not None:
+                settings.set_many(con, {"leftover_queue_ids": ids}, internal=True)
+            return settings.all_values(con)["leftover_queue_ids"]
+
+    def test_restore_keeps_the_live_leftover_queue_ids(self):
+        self.assertIn(downloader.LEFTOVER_KEY, backup.LIVE_SETTINGS)
+        self.assertTrue(set(backup.LIVE_SETTINGS) <= set(settings.DEFAULTS))
+        self.leftovers([5001])
+        old = backup.create("t")
+        self.leftovers([7001])                                 # really left in Suwayomi's queue now
+        backup.restore(old, keep_auth=False)                   # kept even when the login is not
+        self.assertEqual(self.leftovers(), [7001])
+        self.leftovers([])
+        backup.restore(old)
+        self.assertEqual(self.leftovers(), [])                 # 5001 may be the user's own entry by now
+
+    def test_unreadable_live_leftovers_are_not_taken_from_the_backup(self):
+        self.leftovers([5001])
+        old = backup.create("t")
+        real = backup._current_settings
+        with mock.patch.object(backup, "_current_settings",
+                               lambda keys=backup.PRESERVED_SETTINGS: None if keys == backup.LIVE_SETTINGS else
+                               real(keys)):
+            backup.restore(old)
+        self.assertEqual(self.leftovers(), [])
 
     # -- #3 / #6 / #38: stored paths from a restored file stay inside their roots
 

@@ -26,7 +26,7 @@ class FakeClient:
         self.calls: list[str] = []
 
     def enqueue(self, ids): self.queued = list(ids)
-    def dequeue(self, ids): self.queued = [c for c in self.queued if c not in ids]
+    def dequeue(self, ids, timeout=30): self.queued = [c for c in self.queued if c not in ids]
     def start(self):
         self.calls.append(f"start {sorted(self.queued)}")
         for cid in self.queued:
