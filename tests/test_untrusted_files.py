@@ -372,11 +372,15 @@ class ImportTest(unittest.TestCase):
 class AdoptEntriesTest(unittest.TestCase):
     def test_source_display_name_is_keyed_like_its_staging_folder(self):
         # Suwayomi writes "Src: Scans (EN)" downloads to a "Src_ Scans (EN)" folder
+        nodes = [{"id": 7, "title": "Title: Two", "downloadCount": 3, "source": {"displayName": "Src: Scans (EN)"}},
+                 {"id": 8, "title": "Other", "downloadCount": 0, "source": {"displayName": "Src (EN)"}}]
+
         class Client:
             def gq(self, query, timeout=None):
-                return {"mangas": {"nodes": [
-                    {"id": 7, "title": "Title: Two", "downloadCount": 3, "source": {"displayName": "Src: Scans (EN)"}},
-                    {"id": 8, "title": "Other", "downloadCount": 0, "source": {"displayName": "Src (EN)"}}]}}
+                return {"mangas": {"nodes": nodes}}
+
+            def mangas_page(self, offset, limit):         # the paged listing (jobs branch)
+                return nodes[offset:offset + limit], False
         entries = core.suwayomi_downloaded_entries(Client())
         self.assertEqual(entries, {("Src_ Scans (EN)", "Title_ Two"): 7})
 
