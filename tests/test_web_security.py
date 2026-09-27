@@ -816,5 +816,30 @@ class HealthCacheTest(unittest.TestCase):
             gate.set()
 
 
+class LogFileTest(unittest.TestCase):
+    def test_log_file_is_private(self):
+        import logging
+        import os
+        import stat
+        import tempfile
+
+        from mangarr import logsetup
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "mangarr.log")
+            root = logging.getLogger()
+            old = list(root.handlers), root.level
+            try:
+                logsetup.setup("INFO", path, console=False)
+                logging.getLogger("t").info("hello")
+                self.assertEqual(stat.S_IMODE(os.stat(path).st_mode), 0o600)
+            finally:
+                for h in list(root.handlers):
+                    root.removeHandler(h)
+                    h.close()
+                for h in old[0]:
+                    root.addHandler(h)
+                root.setLevel(old[1])
+
+
 if __name__ == "__main__":
     unittest.main()

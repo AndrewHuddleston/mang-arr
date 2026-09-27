@@ -38,6 +38,19 @@ class JsonFormatter(logging.Formatter):
         return json.dumps(d, ensure_ascii=False)
 
 
+class _PrivateRotatingFileHandler(logging.handlers.RotatingFileHandler):
+    """The log names series, sources and settings keys: owner-only (0600),
+    including every file a rotation creates."""
+
+    def _open(self):
+        stream = super()._open()
+        try:
+            os.chmod(self.baseFilename, 0o600)
+        except OSError:
+            pass
+        return stream
+
+
 def setup(level: str | None = None, file: str | None = None, console: bool = True,
           json_lines: bool | None = None) -> None:
     level_name = (level or os.environ.get("MANGARR_LOG_LEVEL") or "INFO").upper()
@@ -59,7 +72,7 @@ def setup(level: str | None = None, file: str | None = None, console: bool = Tru
     if file:
         try:
             os.makedirs(os.path.dirname(file) or ".", exist_ok=True)
-            fh = logging.handlers.RotatingFileHandler(file, maxBytes=10_000_000, backupCount=5, encoding="utf-8")
+            fh = _PrivateRotatingFileHandler(file, maxBytes=10_000_000, backupCount=5, encoding="utf-8")
             fh.setFormatter(fmt)
             root.addHandler(fh)
         except OSError as e:                  # unwritable volume: keep running, say so on the console

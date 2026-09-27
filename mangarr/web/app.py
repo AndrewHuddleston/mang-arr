@@ -853,23 +853,31 @@ async def import_apply(request: Request):
         log.warning("import: form from scan %s submitted, current scan is %s; refused", form.get("gen"),
                     _adopt_scan["gen"])
         return _flash("/import", "the folder list changed since this page was loaded; check it and import again")
-    chosen = []
-    for it in items:
-        if it.tracked:
-            continue
-        if it.series:
-            if form.get(f"adopt_{it.key}") == "1":
-                chosen.append(it)
-            continue
-        choice = str(form.get(f"choice_{it.key}", "skip"))
-        if choice == "skip":
-            continue
-        try:
-            series = _series_from_ref("manual" if choice == "manual" else choice, it.folder_name)
-        except ValueError as e:
-            log.error("import: %s for %s: %s", choice, it.folder_name, e)
-            continue
-        chosen.append(dataclasses.replace(it, series=series))    # a copy: the shared scan result stays as scanned
+    picks = {it.key: (form.get(f"adopt_{it.key}"), str(form.get(f"choice_{it.key}", "skip"))) for it in items}
+
+    def choose() -> list:
+        """Metadata lookups (AniList/MangaDex) happen here, off the event loop."""
+        chosen = []
+        for it in items:
+            if it.tracked:
+                continue
+            adopt, choice = picks[it.key]
+            if it.series:
+                if adopt == "1":
+                    chosen.append(it)
+                continue
+            if choice == "skip":
+                continue
+            try:
+                series = _series_from_ref("manual" if choice == "manual" else choice, it.folder_name)
+            except ValueError as e:
+                log.error("import: %s for %s: %s", choice, it.folder_name, e)
+                continue
+            chosen.append(dataclasses.replace(it, series=series))    # a copy: the shared scan result stays as scanned
+        return chosen
+
+    from starlette.concurrency import run_in_threadpool
+    chosen = await run_in_threadpool(choose)
     if not chosen:
         return _flash("/import", "nothing selected")
 
