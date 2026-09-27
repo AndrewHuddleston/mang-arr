@@ -28,6 +28,7 @@
   </div>
 </div>
 <form method="post" action="/import/apply" id="import-form">
+<input type="hidden" name="gen" value="{{ gen }}">
 <div class="table-container"><table class="table import">
 <thead><tr><th>Source</th><th>Folder</th><th class="num">Chapters</th><th>Series</th><th>Action</th></tr></thead>
 <tbody>
@@ -43,9 +44,9 @@
   <td>
     {% if it.tracked %}{{ m.label('tracked', 'success') }}
     {% elif it.series %}
-      <label class="check-inline">{{ m.check('adopt_' ~ loop.index0, true) }} adopt</label>
+      <label class="check-inline">{{ m.check('adopt_' ~ it.key, true) }} adopt</label>
     {% else %}
-      <select name="choice_{{ loop.index0 }}" class="input select" aria-label="Choice for {{ it.folder_name }}">
+      <select name="choice_{{ it.key }}" class="input select" aria-label="Choice for {{ it.folder_name }}">
         <option value="skip">skip</option>
         {% for c in it.candidates[:6] %}<option value="{{ c.ref }}">{{ c.title }} ({{ c.format or '?' }} {{ c.country or '?' }}, {{ c.chapters or '?' }} ch)</option>{% endfor %}
         <option value="manual">as-is: "{{ it.folder_name }}" (no metadata)</option>

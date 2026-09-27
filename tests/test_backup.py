@@ -13,7 +13,7 @@ import time
 import unittest
 from unittest import mock
 
-from mangarr import backup, core, db, settings
+from mangarr import backup, core, db, library, settings
 from mangarr.model import Series
 
 try:
@@ -375,11 +375,11 @@ class BackupTest(_Base):
         self.assertTrue(any("is not a folder inside" in m for m in logs.output))
 
     def test_series_whose_folder_ends_in_a_space_is_deleted_and_restored_as_is(self):
-        # 'Foo ...' gets the folder 'Foo ' (safe_title strips, then drops the dots): still its own folder
+        # a folder mang-arr made itself (here from 'Foo ...') survives restore as it is and is deleted cleanly
         with db.connect() as con:
             sid = db.upsert_series(con, Series(anilist_id=7, english="Foo ..."))
             folder = con.execute("SELECT folder FROM series WHERE id=?", (sid,)).fetchone()[0]
-        self.assertEqual(folder, "Foo ")
+        self.assertEqual(folder, library.safe_title("Foo ..."))
         p = backup.create("t")
         msg = backup.restore(p)
         self.assertNotIn("folder name(s) replaced", msg)
@@ -387,7 +387,7 @@ class BackupTest(_Base):
         os.makedirs(os.path.dirname(own))
         open(own, "w").close()
         with db.connect() as con:
-            self.assertEqual(con.execute("SELECT folder FROM series WHERE id=?", (sid,)).fetchone()[0], "Foo ")
+            self.assertEqual(con.execute("SELECT folder FROM series WHERE id=?", (sid,)).fetchone()[0], folder)
             db.set_have(con, sid, 1.0, None, own)
             core.delete_series(con, mock.Mock(), sid, delete_library=True)
         self.assertFalse(os.path.exists(own))
