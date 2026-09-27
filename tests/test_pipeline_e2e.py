@@ -287,11 +287,35 @@ class StopTest(PipelineBase):
             job, out = self.run_pass(fake, plans, rows)
         s1 = self.status(rows[0]["id"])
         self.assertEqual(s1, {1.0: ("wanted", downloader.UNSTARTED_REASON), 2.0: ("wanted", downloader.UNSTARTED_REASON)})
+        # nothing arrived: reported like a failure, so the failed-downloads notification names it
+        self.assertEqual((job.items[0]["state"], job.items[0]["result"]),
+                         ("failed", "2 not started (Suwayomi's download queue was busy with other downloads)"))
         with db.connect() as con:
             self.assertEqual(db.auto_throttled(con), set())
         self.assertEqual(set(self.statuses(rows[1]).values()), {"have"})
         self.assertEqual(set(self.statuses(rows[2]).values()), {"have"})
         self.assertEqual(fake.items, [])                    # taken back out
+
+    def test_a_chapter_not_started_goes_to_another_source(self):
+        fake = self.fake(foreign={999001: X})             # Site X stays busy with someone else's download
+        plans = {f"S{k}": [entry(fake, X, k, f"S{k}", [1, 2, 3]), entry(fake, Y, 10 + k, f"S{k}", [1, 2])]
+                 for k in (1, 2, 3)}                      # X ranks first: it lists more
+        rows = self.seed(*plans)
+        with mock.patch.object(downloader, "QUEUED_CAP_SECS", 0.3), self.assertLogs("mangarr.downloader", "WARNING"):
+            job, out = self.run_pass(fake, plans, rows, in_order=False)
+        self.assertEqual({e[3] for e in fake.kinds("enqueue", X)}, {1})   # the others did not queue on X at all
+        for r in rows:
+            st = self.status(r["id"])
+            self.assertEqual({n: s for n, (s, _) in st.items()}, {1.0: "have", 2.0: "have", 3.0: "wanted"})
+            self.assertEqual(st[3.0][1], downloader.UNSTARTED_REASON)
+        self.assertEqual(out, (3, 6, 6, 0))
+        for it in job.items:
+            self.assertEqual((it["state"], it["result"]),
+                             ("done", "2 downloaded; 1 not started (Suwayomi's download queue was busy with other "
+                                      "downloads)"))
+        with db.connect() as con:
+            self.assertEqual(db.auto_throttled(con), set())
+        self.assertEqual(fake.items, [])
 
 
 class EndTest(PipelineBase):

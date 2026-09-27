@@ -393,7 +393,7 @@ class RateLimitTest(unittest.TestCase):
         self.assertEqual([s for s in self.paused if s >= 60], [60, 120, 240, 300])
         self.assertEqual((ok, failed), ([], [1.0, 2.0]))
         self.assertEqual(why[2.0], "download made no progress, gave up after 300s of backoff")
-        self.assertEqual((memo.throttle, memo.gave_up, memo.stop), ({"A"}, {"A"}, None))
+        self.assertEqual((memo.throttle, memo.gave_up, memo.unstarted), ({"A"}, {"A"}, []))
 
     def test_with_a_fallback_the_backoff_stops_at_60(self):
         memo = downloader.RunMemo(shared=downloader.PassShared())
@@ -414,13 +414,73 @@ class RateLimitTest(unittest.TestCase):
         self.assertEqual(client.enqueued, [[1010]])        # nothing else was queued behind it
         self.assertEqual(client.dequeued, [[1010]])        # and ours was taken back out
         self.assertEqual({reasons[n] for n in (1.0, 2.0, 3.0)}, {downloader.UNSTARTED_REASON})
-        self.assertIn("stopping this series for now", "\n".join(cm.output))
+        self.assertIn("it and the later chapters wait for the next pass", "\n".join(cm.output))
+
+    def test_not_started_goes_on_to_the_next_source(self):
+        # Suwayomi downloads one chapter per source at a time: a queue busy for A need not be for B
+        for in_order in (False, True):
+            with self.subTest(in_order=in_order):
+                client, throttled, reasons = BusyForOneSource(), set(), {}
+                plan = plan_for([match("A", 1, [1, 2]), match("B", 2, [1, 2])])
+                with self.assertLogs("mangarr.downloader", "WARNING"):
+                    res = downloader.download(client, plan, only={1.0, 2.0}, reasons=reasons, throttled=throttled,
+                                              in_order=in_order)
+                self.assertEqual(res, {1.0: "ok", 2.0: "ok"})
+                self.assertEqual(throttled, set())
+                self.assertEqual(client.enqueued[0], [1010] if in_order else [1010, 1020])
+                self.assertEqual(client.dequeued, [client.enqueued[0]])     # taken back out of A's queue
+                self.assertEqual({c // 1000 for ids in client.enqueued[1:] for c in ids}, {2})  # A not asked again
+
+    def test_a_chapter_only_the_busy_source_has_waits_for_the_next_pass(self):
+        client, reasons = BusyForOneSource(), {}
+        plan = plan_for([match("A", 1, [1, 2, 3]), match("B", 2, [1, 2])])
+        with self.assertLogs("mangarr.downloader", "WARNING"):
+            res = downloader.download(client, plan, only={1.0, 2.0, 3.0}, reasons=reasons, in_order=False)
+        self.assertEqual(res, {1.0: "ok", 2.0: "ok"})                  # 3 is not failed: it was never attempted
+        self.assertEqual(reasons[3.0], downloader.UNSTARTED_REASON)
+        self.assertEqual(client.enqueued, [[1010, 1020, 1030], [2010, 2020]])
+
+    def test_the_busy_source_is_left_alone_for_a_while_by_the_whole_pass(self):
+        shared, client = downloader.PassShared(), BusyForOneSource()
+        a = match("A", 1, [1, 2, 3])
+
+        def run(chapter):
+            memo = downloader.RunMemo(shared=shared)                   # each series of the pass has its own
+            downloader._download_source(client, 1, [chapter], 1, "T", "A", True, lambda: False, lambda m: None, memo)
+            return memo.unstarted
+        with self.assertLogs("mangarr.downloader", "WARNING"):
+            self.assertEqual(run(a.chapters[0]), [1.0])
+        with self.assertLogs("mangarr.downloader", "INFO") as cm:
+            self.assertEqual(run(a.chapters[1]), [2.0])
+        self.assertIn("not queueing ch 2 there now", "\n".join(cm.output))
+        self.assertEqual(client.enqueued, [[1010]])
+        self.clock.advance(downloader.QUEUED_BUSY_SECS)
+        with self.assertLogs("mangarr.downloader", "WARNING"):
+            self.assertEqual(run(a.chapters[2]), [3.0])                # tried again after a while
+        self.assertEqual(client.enqueued, [[1010], [1030]])
 
     def test_download_one_says_it_was_not_started(self):
         a = match("A", 1, [4])
         with self.assertLogs("mangarr.downloader", "WARNING"):
             ok, failed, why = downloader.download_one(StuckClient(("QUEUED", 0, 0.0)), 1, a.chapters[0], "T", "A")
         self.assertEqual((ok, failed, why), (False, [4.0], {4.0: downloader.UNSTARTED_REASON}))
+
+
+class BusyForOneSource(StuckClient):
+    """Suwayomi never gets to manga 1's chapters (its source is busy with
+    someone else's download); every other chapter arrives at once."""
+
+    def __init__(self):
+        super().__init__(("QUEUED", 0, 0.0))
+        self.have: set[int] = set()
+
+    def start(self):
+        for c in [c for c in self.queued if c // 1000 != 1]:
+            self.have.add(c)
+            self.queued.remove(c)
+
+    def downloaded_ids(self, manga_id):
+        return {c for c in self.have if c // 1000 == manga_id}
 
 
 class LockSplitTest(unittest.TestCase):

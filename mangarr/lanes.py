@@ -563,8 +563,8 @@ class LanePool:
             finally:
                 metrics.record_lane_time(src.name, self.clock() - t0)
             task.steps.record(run, ok, failed, why)
-            if memo.stop:
-                task.steps.stop(memo.stop)
+            if memo.unstarted:
+                task.steps.not_started(run, memo.unstarted)
             self.outages.ok()
             rest = limits.setting("throttled_delay_seconds") if src.throttled or self.shared.seen(src.name) else 0.0
             if src.name in memo.gave_up:

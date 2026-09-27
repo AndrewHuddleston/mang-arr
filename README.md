@@ -866,8 +866,12 @@ that stops (a cancel, Suwayomi not answering) ends only once every lane has
 finished its step, so what arrived is written and linked first. A lane that
 fails unexpectedly loses only its series; the others go on. A batch that
 Suwayomi never started (its queue busy with other downloads) does not count
-as stalled: after 30 minutes it is taken back out and the series waits for
-the next pass, and the source is not marked as rate-limited.
+as stalled: after 30 minutes it is taken back out and its chapters go on to
+their next source, like a failure but without marking the source as
+rate-limited; a chapter no other source lists waits for the next pass, and
+the pass shows the series as *failed* (*N not started*) when nothing of it
+arrived. For 30 minutes after that nothing more of the pass is queued on
+that source.
 
 Some image servers (Comick's) answer the burst of page requests Suwayomi
 makes for a chapter with HTTP 429, yet serve the same pages one at a time.

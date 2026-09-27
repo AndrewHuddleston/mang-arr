@@ -10,8 +10,9 @@ process and across the worker and the CLI (a file lock guards it). What to
 fetch next for a series, and what came of it, is kept apart from the loop
 that fetches it (SeriesSteps), so a caller can interleave several series,
 one per site. A chapter Suwayomi has not started yet (its queue is busy)
-does not count as stalled; after QUEUED_CAP_SECS its series is left for the
-next pass, with no verdict on the source.
+does not count as stalled; after QUEUED_CAP_SECS it goes on to its next
+source, or is left for the next pass when it has none, with no verdict on
+the source, which is not queued on again for a while.
 
 Within a source the batch size adapts: it shrinks to 1 and backs off when
 the source errors, and grows back when downloads succeed. A chapter that
@@ -51,11 +52,15 @@ CHUNK_CAP_SECS = 3 * 3600
 # every try errored out faster than this: a dead chapter, not rate limiting
 INSTANT_FAIL_SECS = 45
 # How long our chapters may wait in Suwayomi's queue without being started
-# (its queue busy with its own updates or the user's downloads) before the
-# series is left for the next pass. Not rate limiting: the source never saw them.
+# (its queue busy with its own updates or the user's downloads) before they
+# go on to their next source, or are left for the next pass. Not rate
+# limiting: the source never saw them. For QUEUED_BUSY_SECS after that the run
+# (the pass) queues nothing more on that source.
 QUEUED_CAP_SECS = 1800
+QUEUED_BUSY_SECS = 1800
 UNSTARTED_REASON = (f"not attempted: Suwayomi did not start this chapter within {QUEUED_CAP_SECS // 60} min "
                     "(its download queue was busy with other downloads)")
+UNSTARTED_TRIED = f"not started by Suwayomi within {QUEUED_CAP_SECS // 60} min (its download queue was busy)"
 # A page-by-page source whose image server refuses even paced page requests is
 # backed off like a rate limit, but at most this long: its lane waits meanwhile.
 WARM_BACKOFF_MAX = 120
@@ -184,13 +189,15 @@ def _lock_holder(fd: int) -> str:
 
 
 class PassShared:
-    """Sources seen rate-limiting us during one refresh pass, shared by the
-    series that download at the same time, so the second one does not have
-    to learn it again."""
+    """Sources seen rate-limiting us during one refresh pass, and sources
+    whose chapters Suwayomi did not start (when), shared by the series that
+    download at the same time, so the second one does not have to learn it
+    again."""
 
     def __init__(self):
         self._lock = threading.Lock()
         self._names: set[str] = set()
+        self._unstarted: dict[str, float] = {}
 
     def seen(self, name: str) -> bool:
         with self._lock:
@@ -199,6 +206,14 @@ class PassShared:
     def add(self, name: str) -> None:
         with self._lock:
             self._names.add(name)
+
+    def unstarted_at(self, name: str) -> float | None:
+        with self._lock:
+            return self._unstarted.get(name)
+
+    def note_unstarted(self, name: str, at: float) -> None:
+        with self._lock:
+            self._unstarted[name] = at
 
 
 @dataclass
@@ -209,7 +224,8 @@ class RunMemo:
     shared: PassShared | None = None                   # the same, pass-wide
     gave_up: set[str] = field(default_factory=set)     # sources backed off until we gave up on them
     rewarmed: set[int] = field(default_factory=set)    # chapter ids whose pages were fetched a second time
-    stop: str | None = None                            # set: stop this series, with this reason for the rest
+    unstarted: list[float] = field(default_factory=list)   # chapters Suwayomi did not start here (SeriesSteps)
+    busy: dict[str, float] = field(default_factory=dict)   # source -> when Suwayomi did not start its chapters
 
     def paced(self, name: str) -> bool:
         return name in self.throttle or (self.shared is not None and self.shared.seen(name))
@@ -218,6 +234,19 @@ class RunMemo:
         self.throttle.add(name)
         if self.shared is not None:
             self.shared.add(name)
+
+    def queue_busy(self, name: str) -> bool:
+        """Suwayomi did not start chapters of source `name` less than
+        QUEUED_BUSY_SECS ago (this run, or the pass): nothing more is queued
+        there meanwhile."""
+        times = [self.busy.get(name), self.shared.unstarted_at(name) if self.shared is not None else None]
+        at = max((t for t in times if t is not None), default=None)
+        return at is not None and time.monotonic() - at < QUEUED_BUSY_SECS
+
+    def note_unstarted(self, name: str) -> None:
+        self.busy[name] = now = time.monotonic()
+        if self.shared is not None:
+            self.shared.note_unstarted(name, now)
 
 
 def lanes_key(name: str) -> str:
@@ -256,13 +285,16 @@ class SeriesSteps:
     on its other sources at once, and one no source can deliver stops the
     series there (the later chapters wait for it, and their reason says so).
     Otherwise chapters are grouped per source in rounds; the ones that fail
-    go to their next source in the next round."""
+    go to their next source in the next round. A chapter Suwayomi did not
+    start goes on to its next source the same way (not_started), but with
+    no source left it is not attempted this time instead of failed."""
 
     def __init__(self, plan: Plan, wanted: set[float], in_order: bool, label: str, reasons: dict):
         self.plan, self.in_order, self.label, self.reasons = plan, in_order, label, reasons
         self.results: dict[float, str] = {}
         self.tried: dict[float, list[str]] = {}            # what happened on each source, per chapter
         self.dead: set[int] = set()                        # manga ids that failed everything
+        self.held: set[float] = set()                      # its last source did not start it (not_started)
         self.finished = False
         pending = {n for n in wanted if plan.candidates.get(n)}
         for n in wanted - pending:
@@ -306,6 +338,11 @@ class SeriesSteps:
             return []
         n = order[self.idx]
         m = self._next_source(n)
+        if m is None and n in self.held:
+            log.warning("%s: ch %g was not started on any source left (Suwayomi's queue is busy); it and the "
+                        "later chapters wait for the next pass", self.label, n)
+            self.stop(UNSTARTED_REASON)
+            return []
         if m is None:
             cands = self.plan.candidates[n]
             results[n] = "failed"
@@ -331,6 +368,11 @@ class SeriesSteps:
         groups: dict[int, _Group] = {}
         for n in sorted(self.pending):
             m = self._next_source(n)
+            if m is None and n in self.held:
+                self.reasons[n] = UNSTARTED_REASON
+                log.warning("%s: ch %g was not started on any source left (Suwayomi's queue is busy); it waits "
+                            "for the next pass", self.label, n)
+                continue
             if m is None:
                 cands = plan.candidates[n]
                 self.results[n] = "failed"
@@ -404,6 +446,7 @@ class SeriesSteps:
             for x in failed:
                 self.attempt[x] += 1
                 self.tried.setdefault(x, []).append(f"{m.source.name}: {why.get(x, 'failed')}")
+                self.held.discard(x)
             self.idx = self.order.index(min(failed))    # resume at the first chapter that did not arrive
             return
         if not failed:
@@ -414,6 +457,7 @@ class SeriesSteps:
         for n in failed:
             self.attempt[n] += 1
             self.tried.setdefault(n, []).append(f"{m.source.name}: {why.get(n, 'failed')}")
+            self.held.discard(n)
             if self.attempt[n] < len(plan.candidates[n]):
                 nxt = plan.candidates[n][self.attempt[n]].source.name
                 log.info("%s: ch %g failed on %s, will try %s", self.label, n, m.source.name, nxt)
@@ -424,6 +468,22 @@ class SeriesSteps:
                 self.reasons[n] = ("; ".join(self.tried[n]) +
                                    (" (no other source has this chapter)" if only_one else ""))
                 log.warning("%s: ch %g failed: %s", self.label, n, self.reasons[n])
+
+    def not_started(self, run: Run, nums: list[float]) -> None:
+        """Chapters Suwayomi did not start from the run's source (its queue
+        was busy with other downloads; memo.unstarted): no verdict on the
+        source. Each goes on to its next source; one with no source left is
+        not attempted this time (UNSTARTED_REASON), and in order the series
+        waits there."""
+        name = run.match.source.name
+        for n in nums:
+            self.attempt[n] += 1
+            self.tried.setdefault(n, []).append(f"{name}: {UNSTARTED_TRIED}")
+            self.held.add(n)
+        if self.in_order:
+            self.idx = self.order.index(min(nums))
+        else:
+            self.pending.update(nums)
 
     def stop(self, reason: str) -> None:
         """Nothing more for this series: every wanted chapter not tried to the
@@ -474,8 +534,9 @@ def download(client: Client, plan: Plan, only: set[float] | None = None,
                                                    stop_on_fail=run.in_order, throttled=run.match.source.throttled,
                                                    warm=run.match.source.page_warm, gone=gone)
                 steps.record(run, ok, failed, why)
-                if memo.stop:
-                    steps.stop(memo.stop)
+                if memo.unstarted:
+                    steps.not_started(run, memo.unstarted)
+                    memo.unstarted = []
     except Cancelled:
         log.warning("%s: download cancelled; %d done", label, sum(1 for r in steps.results.values() if r == "ok"))
     return steps.results
@@ -517,8 +578,8 @@ def download_one(client: Client, manga_id: int, chapter, label: str, source_name
                                            cancel, report, memo, warm=warm)
     if not ok and not failed and cancel():         # stopped by the cancel, not a failure of the source
         raise Cancelled()
-    if memo.stop and not ok:                        # Suwayomi never got to it
-        return False, [chapter.number], {chapter.number: memo.stop}
+    if memo.unstarted and not ok:                   # Suwayomi never got to it
+        return False, [chapter.number], {chapter.number: UNSTARTED_REASON}
     return bool(ok), failed, why
 
 
@@ -544,8 +605,10 @@ def _download_source(client, manga_id, todo, batch, label, source_name, patient,
     neither list. A cancel cuts every Suwayomi call short, also a hung one;
     the chunk's ids are then taken back out (_dequeue) and what arrived so
     far is returned. A chunk Suwayomi never started (its queue busy with
-    other downloads) sets memo.stop and ends the call: that is no verdict
-    on the source. On a page-by-page source (`warm`) each chapter's pages
+    other downloads) ends the call with it and the chapters after it in
+    memo.unstarted, as does a source whose chapters it did not start a
+    short while ago (memo.queue_busy): that is no verdict on the source. On
+    a page-by-page source (`warm`) each chapter's pages
     are fetched one by one before it is queued; one whose pages the image
     server keeps refusing is backed off like a rate limit without ever
     being queued, and one Suwayomi does not build from its cache gets its
@@ -569,6 +632,11 @@ def _download_source(client, manga_id, todo, batch, label, source_name, patient,
         span = min(size, len(todo) - i)             # how far this chunk moves us along todo
         chunk = [c for c in todo[i:i + span] if c.number not in skip]
         ids = [c.id for c in chunk]
+        if memo.queue_busy(source_name):
+            memo.unstarted = [c.number for c in todo[i:] if c.number not in skip]
+            log.info("%s: Suwayomi did not start chapters of %s within %d min lately (its queue is busy); not "
+                     "queueing ch %s there now", label, source_name, QUEUED_CAP_SECS // 60, ranges(memo.unstarted))
+            break
         status = (f"{source_name}: chapter {ranges([c.number for c in chunk])} ({len(ok)} of {len(todo)} done"
                   + (", rate-limited source: one at a time" if paced and size == 1 else ""))
         report(status + ")")
@@ -608,11 +676,13 @@ def _download_source(client, manga_id, todo, batch, label, source_name, patient,
                 if outcome not in ("done", "not sent"):     # stalled, timeout, unstarted, cancelled, or an exception
                     _dequeue(client, ids, label, outcome, cancel, unsure)
             if outcome == "unstarted":
-                memo.stop = UNSTARTED_REASON
+                memo.note_unstarted(source_name)
+                memo.unstarted = [c.number for c in todo[i:] if c.number not in skip]
                 metrics.record_unstarted(source_name)
-                log.warning("%s: %s did not start ch %s within %d min (Suwayomi's queue is busy); stopping this "
-                            "series for now", label, source_name, ranges([c.number for c in chunk]),
-                            QUEUED_CAP_SECS // 60)
+                log.warning("%s: Suwayomi did not start ch %s from %s within %d min (its queue is busy); trying "
+                            "ch %s on other sources, or leaving them for the next pass", label,
+                            ranges([c.number for c in chunk]), source_name, QUEUED_CAP_SECS // 60,
+                            ranges(memo.unstarted))
                 break
             instant = outcome == "stalled" and time.monotonic() - t_start < INSTANT_FAIL_SECS
             if outcome == "cancelled":
