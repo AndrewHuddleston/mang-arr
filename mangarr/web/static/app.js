@@ -623,6 +623,38 @@
     }, { once: true });
   });
 
+  /* -- behaviour that used to be inline on*= attributes / <script> blocks.
+        The Content-Security-Policy allows scripts from /static only. ------- */
+  // forms that ask first: <form data-confirm="Delete X?">
+  document.addEventListener('submit', (e) => {
+    const f = e.target.closest && e.target.closest('form[data-confirm]');
+    if (f && !window.confirm(f.dataset.confirm)) { e.preventDefault(); e.stopImmediatePropagation(); }
+  }, true);
+  // a checkbox that hides an element while ticked: <input type=checkbox data-hides="element-id">
+  $$('input[data-hides]').forEach((cb) => {
+    const sync = () => { const el = document.getElementById(cb.dataset.hides); if (el) el.hidden = cb.checked; };
+    cb.addEventListener('change', sync);
+  });
+  // Lists: show only the fields of the chosen list kind
+  const kindSel = $('#addlist #kind');
+  if (kindSel) {
+    const showKind = () => $$('#addlist [data-kind]').forEach((d) => { d.style.display = d.dataset.kind === kindSel.value ? '' : 'none'; });
+    kindSel.addEventListener('change', showKind);
+    showKind();
+  }
+  // Settings -> Security: reveal the API key (fetched from the API, never in the page source)
+  const keyBtn = $('[data-reveal-api-key]');
+  if (keyBtn) keyBtn.addEventListener('click', async () => {
+    const input = document.getElementById(keyBtn.dataset.revealApiKey);
+    try {
+      const r = await fetch('/api/v1/settings', { headers: { Accept: 'application/json' } });
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      const d = await r.json();
+      if (input) { input.type = 'text'; input.value = d.api_key || ''; input.select(); }
+      keyBtn.hidden = true;
+    } catch (err) { toast('could not read the API key: ' + (err.message || err), 'danger'); }
+  });
+
   /* -- pages that reload themselves while something runs ------------------ */
   const main = $('main[data-reload]');
   if (main) {

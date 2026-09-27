@@ -30,7 +30,7 @@
   <td class="col-actions">
     <form method="post" action="/lists/{{ r.id }}/sync" class="iconform"><button class="iconbtn" title="Sync now" {% if r.name in busy %}disabled{% endif %}>{{ m.icon('refresh') }}</button></form>
     <form method="post" action="/lists/{{ r.id }}/toggle" class="iconform"><button class="iconbtn" title="{{ 'Disable' if r.enabled else 'Enable' }}">{{ m.icon('bookmark' if r.enabled else 'bookmark-off') }}</button></form>
-    <form method="post" action="/lists/{{ r.id }}/delete" class="iconform" data-name="{{ r.name }}" onsubmit="return confirm('Delete list ' + this.dataset.name + '? Series it added stay tracked.')"><button class="iconbtn" title="Delete">{{ m.icon('delete') }}</button></form>
+    <form method="post" action="/lists/{{ r.id }}/delete" class="iconform" data-confirm="Delete list {{ r.name }}? Series it added stay tracked."><button class="iconbtn" title="Delete">{{ m.icon('delete') }}</button></form>
   </td>
 </tr>
 {% endfor %}
@@ -78,7 +78,7 @@
 <tbody>
 {% for x in exclusions %}
 <tr><td><code>{{ x.ref }}</code></td><td>{{ x.title or '' }}</td><td class="muted">{{ x.reason or '' }}</td><td class="muted">{{ x.created_at|ago }}</td>
-<td class="col-actions"><form method="post" action="/lists/exclusions/{{ x.ref }}/delete" class="iconform"><button class="iconbtn" title="Remove">{{ m.icon('x') }}</button></form></td></tr>
+<td class="col-actions"><form method="post" action="/lists/exclusions/{{ x.ref|path_segment }}/delete" class="iconform"><button class="iconbtn" title="Remove">{{ m.icon('x') }}</button></form></td></tr>
 {% endfor %}
 {% if not exclusions %}<tr><td colspan="5" class="muted">none</td></tr>{% endif %}
 </tbody></table></div>
@@ -89,10 +89,4 @@
 </form>
 </fieldset>
 {% endblock %}
-{% block script %}<script>
-(function(){
-  const sel = document.getElementById('kind');
-  const show = () => document.querySelectorAll('#addlist [data-kind]').forEach(d => { d.style.display = d.dataset.kind === sel.value ? '' : 'none'; });
-  sel.addEventListener('change', show); show();
-})();
-</script>{% endblock %}
+

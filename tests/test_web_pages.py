@@ -210,6 +210,10 @@ class PagesTest(unittest.TestCase):
 
     def tearDown(self):
         self.client.close()
+        from mangarr import health
+        running = health._running             # a health run still going: let it end while the fakes are in place
+        if running is not None:
+            running.wait(30)
         for p in self.patches:
             p.stop()
         from mangarr import settings
@@ -319,7 +323,7 @@ class PagesTest(unittest.TestCase):
         html = self._ok("/activity/history", "added by test", "boom", 'id="history-filter"', 'data-kind="failed"')
         self.assertIn('class="col-icon event-icon danger"', html)                   # event type icon per row
         self._ok("/settings", 'id="sources"', 'id="scheduling"', 'id="komga"', 'id="notifications"', 'id="security"',
-                 "Weeb Central", 'name="refresh_hours"', 'name="api_key"', 'value="test-komga"')
+                 "Weeb Central", 'name="refresh_hours"', 'id="api_key"', 'value="test-komga"')
         html = self._ok("/system", 'id="tasks"', 'id="backups"', "Suwayomi", "/system/logs",
                         'action="/system/backups/create"', 'id="health-table"', 'class="description-list"')
         self.assertEqual(html.count('id="status"'), 1)                               # the poller's element only

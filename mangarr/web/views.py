@@ -2,8 +2,12 @@
 Sonarr-style "seasons", how a series status reads, how a description is
 made plain. No database, no network - unit-testable on plain rows/dicts.
 """
+import hashlib
+import hmac
 import html
 import re
+import secrets
+import urllib.parse
 
 from .. import library, model
 
@@ -308,6 +312,56 @@ def install(env) -> None:
     env.filters["plain"] = plain_description
     env.filters["snippet"] = snippet
     env.filters["human_size"] = human_size
+    env.filters["path_segment"] = path_segment
+    env.filters["css_url"] = css_url
+
+
+# -- output safety -------------------------------------------------------------
+
+def path_segment(value) -> str:
+    """Percent-encode a value for use as ONE URL path segment ('/', '?', '#'
+    and '..' included), e.g. a ref in /lists/exclusions/<ref>/delete. Jinja's
+    urlencode leaves '/' alone, which lets 'manual:../../series/5' re-route a form."""
+    return urllib.parse.quote(str(value), safe="")
+
+
+def css_url(url) -> str:
+    """A URL safe inside style="...url('...')": http(s) only, and the
+    characters that could end the CSS string or the url() percent-encoded.
+    HTML escaping alone is not enough there (the browser decodes &#39; before
+    the CSS parser sees it). Anything else becomes '' (no image)."""
+    u = str(url or "").strip()
+    if not re.match(r"(?i)^https?://", u):
+        return ""
+    return re.sub(r"""['"()\\\s<>]""", lambda m: f"%{ord(m.group()):02X}", u)
+
+
+# Flash messages travel in the redirect URL (?m=...) so the async forms in
+# app.js can read them, but only text this process generated is shown: each
+# carries an HMAC with a per-process key. A crafted link (?m=Security update:
+# re-enter your password at ...) is ignored instead of shown as a system message.
+_FLASH_KEY = secrets.token_bytes(32)
+
+
+def _flash_sig(name: str, msg: str) -> str:
+    return hmac.new(_FLASH_KEY, f"{name}\0{msg}".encode(), hashlib.sha256).hexdigest()[:32]
+
+
+def flash_query(msg: str, name: str = "m") -> str:
+    """'m=<text>&ms=<signature>' for a redirect URL."""
+    return f"{name}={urllib.parse.quote(msg)}&{name}s={_flash_sig(name, msg)}"
+
+
+def flash_from(query_params, name: str = "m") -> str | None:
+    """The flash text from a request's query, or None when it is missing or
+    was not signed by this process."""
+    msg = query_params.get(name)
+    if not msg:
+        return None
+    sig = query_params.get(name + "s") or ""
+    if hmac.compare_digest(sig.encode("utf-8", "replace"), _flash_sig(name, msg).encode()):
+        return msg
+    return None
 
 
 def human_size(n: int | float | None) -> str:

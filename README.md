@@ -138,8 +138,10 @@ Suwayomi is down or a path is missing, and a restart would not fix either.
 Authentication is optional and off until you set a username and password
 under Settings → Security (a login page by default, or the browser's basic
 auth prompt). Scripts use the API key shown on the same page instead.
-`/api/v1/health`, `/api/v1/system/status` and `/metrics` stay open so
-health checks and scrapers work without credentials.
+`/api/v1/ping`, `/api/v1/health`, `/api/v1/system/status` and `/metrics`
+stay open so health checks and scrapers work without credentials. See
+[Security](#security) for what the web UI refuses and why (other sites'
+forms, unknown host names, oversized requests).
 
 ### Plain Python
 
@@ -196,6 +198,8 @@ with an asterisk to the container mounts (`/config`, `/data/staging`,
 | `MANGARR_PUSHOVER_USER` | unset | Default Pushover user key. |
 | `MANGARR_WEBHOOK_URL` | unset | Default URL to POST `{"title", "message", "kind"}` JSON to on every notification. |
 | `MANGARR_UNUSABLE_SOURCES` | `comick (unoriginal) (en),mangakakalot (en),readcomiconline (en)` | Default set of disabled sources: comma-separated Suwayomi source names (case-insensitive) that are neither searched nor downloaded from, because they cannot deliver images, or rate-limit into uselessness. Change it in Settings -> Sources. |
+| `MANGARR_ALLOWED_HOSTS` | unset | Comma-separated host names the web UI answers to besides IP addresses, `localhost`, single-label names (`mangarr`) and `.local` / `.lan` / `.home.arpa` / `.internal` / `.localdomain` names; `.example.org` allows a whole domain, `*` turns the check off. Needed for a public name behind a reverse proxy (e.g. `manga.example.com`). Also editable in Settings → Security. See [Security](#security). |
+| `MANGARR_MAX_UPLOAD_MB` | `2048` | Largest backup file *Restore from file* accepts; every other request body is limited to 1 MB. |
 | `MANGARR_THROTTLED_SOURCES` | `manganato (en)` | Default set of throttled sources: they work but throttle, so they lose every close call and get single-chapter batches; chapters nobody else has are still taken from them. |
 
 Source names are Suwayomi's display names as shown on the System page, e.g.
@@ -216,13 +220,24 @@ applies to the next job.
 | Minimum pages for a fractional chapter | A `12.5` with fewer pages than this is treated as a notice image and marked junk. Default 8. |
 | Komga URL, API key, library id | When URL and key are set, every import that linked at least one chapter asks Komga to scan (the given library, or all of them). The key comes from Komga's account menu → API keys. *Save & test Komga* lists the libraries it can see; the health check calls the same API. |
 | Notifications | Discord webhook, Telegram bot token + chat id, ntfy topic URL (+ token), Gotify URL + app token, Pushover token + user key, Slack webhook, Notifiarr API key + Discord channel id, SMTP email, Apprise API URL, webhook URL. Every configured channel gets each message; each has a *Test* button that sends to that channel only. *Notify on* picks the events: new chapters, series added, failed downloads (after a pass, with the reasons), health problems (when a check turns red). |
-| Login method | *login page* (a form and a signed session cookie that lasts 30 days, with a *Sign out* button in the top bar) or *browser prompt* (HTTP basic auth). Only active once a username is set. |
-| Web username / password | The login for the UI and API. Empty username means no login; the health check then warns that anyone on the network can use the page. |
-| API key | Generated on first start and shown in the clear (it is not a secret field). When a login is set, a request carrying it as an `X-Api-Key` header or `?apikey=` query parameter is accepted without a session or basic auth. Edit it to rotate it; rotating it, or changing the password, also signs every browser out. |
+| Login method | *login page* (a form and a signed session cookie that lasts 30 days, with a *Sign out* button in the top bar) or *browser prompt* (HTTP basic auth, accepted only in this mode). Only active once a username is set. |
+| Web username / password | The login for the UI and API. Empty username means no login; the health check then warns that anyone on the network can use the page. A password is required while a username is set (clear the username to turn the login off); the username cannot contain `:`. The password is stored as a salted PBKDF2-SHA256 hash (a password an older version stored in clear is converted at start-up or on the next sign-in). |
+| API key | Generated on first start, shown as `********` (*Show* reveals it). When a login is set, a request carrying it as an `X-Api-Key` header is accepted without a session or basic auth; `?apikey=` works only for `GET` requests under `/api/`. *Regenerate* makes a new one. It is not taken from the general Settings form; `PUT /api/v1/settings` can set it. |
+| Sessions | *Sign out everywhere* invalidates every login cookie. Changing the username, password or API key does the same (the browser that made the change stays signed in); *Sign out* also invalidates that one cookie on the server, so a copy of it stops working. |
+| Allowed host names | Extra host names the UI answers to, see `MANGARR_ALLOWED_HOSTS`. |
 
-Secrets (the Komga API key, notification tokens and webhook URLs, password) are never shown again once
+Secrets (the password, the API key, the Komga API key, notification tokens,
+the Discord / Slack / ntfy / Apprise / webhook URLs) are never shown again once
 saved: the field shows `********`. Leave that as it is to keep the value,
-type a new one to replace it, or clear the field to remove it.
+type a new one to replace it, or clear the field to remove it. They are
+logged as `***`; other URLs are logged as `scheme://host/...` only.
+
+A secret belongs to the place it was entered for. When the Komga URL,
+Gotify URL, ntfy topic URL or SMTP server changes and its secret (Komga API
+key, Gotify token, ntfy token, SMTP password) is left as `********`, the
+stored secret is cleared instead of being sent to the new address; the
+page (or, for `PUT /api/v1/settings`, the `X-Mangarr-Notice` header) says
+so. Type the secret again for the new address.
 
 The remaining knobs are constants in `config.py`: `DISAGREE` (a source
 whose highest chapter is more than 1.5× what the series should have is
@@ -631,9 +646,13 @@ something.
 
 ## Monitoring
 
-- **Health checks** run on every page load and API status call (cached for
-  a minute; the System page forces a fresh run). Each is *ok*, a *warning*
-  or an *error*:
+- **Health checks** run in the background, one run at a time, and are
+  cached for a minute: a page load or status poll that finds the cache
+  stale gets the previous result at once and triggers one re-check. The
+  System page asks for a fresh run (at most every 15 s). A caller waits at
+  most 25 s for a run; a backend or disk mount that hangs longer shows up
+  as a *Health checks* error while the run carries on. Each check is *ok*,
+  a *warning* or an *error*:
 
   | Check | Error when | Warning when |
   |---|---|---|
@@ -645,15 +664,23 @@ something.
   | Hard links | - | staging and library are on different filesystems (chapters are copied) |
   | Disk | less than 2 GB free on the library volume | less than 20 GB free |
   | Notifications | - | no notification channel is configured |
-  | Security | - | no web login is set |
+  | Security | a username is set without a password | no web login is set |
 
 - **`GET /api/v1/health`** returns `{"ok": true, "problems": [],
   "warnings": [...], "version": "..."}` with 200, or 503 and the problems
-  when any check is an error. Use it for alerting, not for restarting the
-  container: the Docker `HEALTHCHECK` deliberately uses
-  `/api/v1/system/status`, which only proves the process is alive.
+  when any check is an error. It is served from the health cache, so
+  polling it never makes mang-arr hammer Suwayomi, Komga, AniList or
+  MangaDex. With a login set, a caller without credentials gets only the
+  names of the failing checks (no URLs, paths or error text); send the API
+  key for the details. Use it for alerting, not for restarting the
+  container.
+- **`GET /api/v1/ping`** returns `{"ok": true}` as long as the web server
+  runs: no database, no network, no login. That is the liveness probe for
+  the Docker `HEALTHCHECK`.
 - **`GET /api/v1/system/status`** includes `health: {errors, warnings}`
   and `update: {current, latest, url, updateAvailable, checkedAt, error}`.
+  With a login set, a caller without credentials gets only the version,
+  uptime, health counts and the running job's kind and status (no titles).
 - **`GET /metrics`** is a Prometheus exposition (needs `prometheus-client`,
   included in the `web` extra and the Docker image; otherwise the endpoint
   says so in plain text). Gauges are refreshed from the database on each
@@ -676,8 +703,8 @@ something.
 - **`MANGARR_LOG_JSON=1`** switches both the console and the log file to one
   JSON object per line, for Loki/Promtail, Vector and similar.
 
-`/metrics`, `/api/v1/health` and `/api/v1/system/status` are exempt from
-the login.
+`/metrics`, `/api/v1/ping`, `/api/v1/health` and `/api/v1/system/status`
+are exempt from the login.
 
 ## How it works
 
@@ -795,9 +822,10 @@ rejected.
 The web process exposes a JSON API under `/api/v1/`, used by the pages'
 live updates and usable from scripts. Interactive docs (Swagger UI) are at
 **`/api/docs`**. When a web login is set in Settings it applies to the API
-as well, except for the three endpoints listed under Monitoring; send the
-API key from Settings → Security as an `X-Api-Key` header (or `?apikey=`)
-instead of a session or basic auth:
+as well, except for the endpoints listed under Monitoring; send the API key
+from Settings → Security as an `X-Api-Key` header instead of a session or
+basic auth (`?apikey=` is accepted too, but only on `GET` requests under
+`/api/`: query strings end up in proxy logs and browser history):
 
 ```sh
 curl -H "X-Api-Key: $KEY" http://localhost:6789/api/v1/wanted
@@ -805,6 +833,7 @@ curl -H "X-Api-Key: $KEY" http://localhost:6789/api/v1/wanted
 
 | Method and path | Purpose |
 |---|---|
+| `GET /api/v1/ping` | `{"ok": true}`: liveness only; see Monitoring |
 | `GET /api/v1/health` | 200 `{"ok": true, "problems": [], "warnings": [...], "version"}` or 503 with the problems; see Monitoring |
 | `GET /api/v1/system/status` | version, uptime, the running job, next scheduled refresh, `update` (release check) and `health` (error and warning counts); polled by the top bar |
 | `GET /api/v1/system/backup` | the kept backups: `[{"name", "size", "mtime"}]` |
@@ -838,8 +867,49 @@ Jobs are returned as `{"id", "kind", "title", "seriesId", "status",
 "queuedAt", "startedAt", "finishedAt", "progress", "message"}`; poll
 `/api/v1/queue` to follow one.
 
+`GET /api/v1/settings` returns the settings with secrets masked, plus the
+API key itself (the caller is already authenticated, or no login is set);
+`PUT /api/v1/settings` takes `{key: value}` and answers 400 for unknown or
+invalid values (nothing is stored then), e.g. a username without a
+password.
+
 Without a web login the API is open; keep it on your LAN or behind a
 reverse proxy in that case.
+
+## Security
+
+What the web server refuses, and what to do if it refuses you:
+
+- **Requests from other web sites.** A `POST`, `PUT`, `PATCH` or `DELETE`
+  whose `Origin` (or, without one, `Referer`) header names a different
+  host and port than the request's `Host` is refused with 403, whether or
+  not a login is set: a web page you visit cannot submit mang-arr's forms
+  (delete series, change settings, restore a backup) through your browser.
+  Requests with neither header (curl, scripts) go on to the normal login
+  check, and a valid `X-Api-Key` header skips this check. Behind a reverse
+  proxy, pass the original host through (`proxy_set_header Host $host;` in
+  nginx, or `X-Forwarded-Host`).
+- **Unknown host names (DNS rebinding).** The UI answers only when the
+  `Host` header is an IP address, `localhost`, a single-label name
+  (`mangarr`), a `.local` / `.lan` / `.home.arpa` / `.internal` /
+  `.localdomain` name, or listed in `MANGARR_ALLOWED_HOSTS` / Settings →
+  Security → Allowed Host Names; anything else gets 400 with that hint.
+  `/api/v1/ping` is exempt.
+- **Large requests.** Bodies over 1 MB get 413 (the backup upload takes up
+  to `MANGARR_MAX_UPLOAD_MB`).
+- **Password guessing.** Failed sign-ins (login page and basic auth alike)
+  are counted per client address: after 5 failures in 15 minutes each
+  further attempt is refused with 429 for 2 s, 4 s, 8 s ... up to 15
+  minutes; a successful sign-in resets it. Behind a reverse proxy every
+  client shares the proxy's address.
+- **Settings that cannot be read.** If the database cannot be read at all,
+  the UI answers 503 instead of running as if no login were set; after one
+  good read, the last values read stay in force while the database is
+  unavailable.
+- **Pages** send a `Content-Security-Policy` that only allows scripts from
+  `/static/`; every value from metadata, sources or backups is escaped.
+  Flash messages (`?m=`) are signed, so a link cannot make the UI show text
+  of its choosing.
 
 ## Roadmap
 

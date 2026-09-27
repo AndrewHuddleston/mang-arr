@@ -28,7 +28,7 @@
   <thead><tr><th class="col-check">Enabled</th><th>Source</th><th>Language</th><th>Reliability</th><th>Rate limiting</th></tr></thead>
   <tbody>
   {% for s in sources %}
-  <tr><td class="col-check"><input type="hidden" name="listed_sources" value="{{ s.name|lower }}">{{ m.check('enabled_sources', (s.name|lower not in v.unusable_sources), s.name|lower, none, 'primary', 'aria-label="Enable ' ~ s.name ~ '"') }}</td>
+  <tr><td class="col-check"><input type="hidden" name="listed_sources" value="{{ s.name|lower }}">{{ m.check('enabled_sources', (s.name|lower not in v.unusable_sources), s.name|lower, none, 'primary', {'aria-label': 'Enable ' ~ s.name}) }}</td>
   <td>{{ s.name }}</td><td class="muted">{{ s.lang }}</td>
   {% set st = stats.get(s.name) %}<td class="muted small">{% if st %}{% set tot = st.ok + st.failed + st.corrupt %}{{ ((st.ok / tot) * 100)|round|int if tot else 0 }}% of {{ tot }} chapter{{ 's' if tot != 1 }}{% if st.corrupt %} ({{ st.corrupt }} corrupt){% endif %}{% else %}no downloads yet{% endif %}</td>
   <td class="small">{% if s.throttled %}<span class="text-warning">paced</span>{% if st and st.last_throttled %} <span class="muted">- limited us {{ st.throttled }}x, last {{ st.last_throttled|ago }}</span>{% endif %}{% else %}<span class="muted">none seen</span>{% endif %}</td></tr>
@@ -39,7 +39,7 @@
 
 <fieldset class="fieldset" id="scheduling">
   <legend class="legend">Scheduling &amp; Matching</legend>
-  {% call m.form_group('Download In Order', 'Each series is downloaded in chapter order. If a chapter cannot be downloaded from any source, that series waits at it (and it is retried on schedule) while the other series carry on.', 'download_in_order') %}<input type="hidden" name="download_in_order" value="0">{{ m.check('download_in_order', v.download_in_order, '1', 'download_in_order', 'primary', 'onchange="document.getElementById(\'order-warning\').hidden=this.checked"') }}<div class="alert warning small" id="order-warning" {% if v.download_in_order %}hidden{% endif %}>Off: chapters are fetched from whichever source has them, so they can arrive out of order and a series can have gaps (e.g. 34-77 present while 33 is still missing).</div>{% endcall %}
+  {% call m.form_group('Download In Order', 'Each series is downloaded in chapter order. If a chapter cannot be downloaded from any source, that series waits at it (and it is retried on schedule) while the other series carry on.', 'download_in_order') %}<input type="hidden" name="download_in_order" value="0">{{ m.check('download_in_order', v.download_in_order, '1', 'download_in_order', 'primary', {'data-hides': 'order-warning'}) }}<div class="alert warning small" id="order-warning" {% if v.download_in_order %}hidden{% endif %}>Off: chapters are fetched from whichever source has them, so they can arrive out of order and a series can have gaps (e.g. 34-77 present while 33 is still missing).</div>{% endcall %}
   {% call m.form_group('Refresh Interval', 'Hours between automatic refreshes of every monitored series', 'refresh_hours') %}<input class="input" id="refresh_hours" name="refresh_hours" value="{{ v.refresh_hours }}"><span class="input-unit">hours</span>{% endcall %}
   {% call m.form_group('Throttled Delay', 'Seconds between chapters on rate-limited sources; a steady pause stays under the site\'s limit, bursts get HTTP 429 and long backoffs', 'throttled_delay_seconds') %}<input class="input" id="throttled_delay_seconds" name="throttled_delay_seconds" value="{{ v.throttled_delay_seconds }}"><span class="input-unit">seconds</span>{% endcall %}
   {% call m.form_group('Re-check Finished Series', 'Days between checks of a finished series with nothing missing; 0 = every pass', 'recheck_finished_days') %}<input class="input" id="recheck_finished_days" name="recheck_finished_days" value="{{ v.recheck_finished_days }}"><span class="input-unit">days</span>{% endcall %}
@@ -69,7 +69,7 @@
   {% call m.form_group('Bot Token', 'From @BotFather', 'telegram_token') %}<input class="input" id="telegram_token" name="telegram_token" type="password" value="{{ v.telegram_token }}" autocomplete="off">{% endcall %}
   {% call m.form_group('Chat ID', 'Your user or group id (message @userinfobot)', 'telegram_chat_id') %}<input class="input" id="telegram_chat_id" name="telegram_chat_id" value="{{ v.telegram_chat_id }}" placeholder=""> <button class="button small" name="action" value="test-notify-telegram" type="submit">Test</button>{% endcall %}
   <h3 class="subhead">ntfy</h3>
-  {% call m.form_group('Topic URL', 'e.g. https://ntfy.sh/my-manga or your own server', 'ntfy_url') %}<input class="input" id="ntfy_url" name="ntfy_url" value="{{ v.ntfy_url }}" placeholder="https://ntfy.sh/your-topic">{% endcall %}
+  {% call m.form_group('Topic URL', 'e.g. https://ntfy.sh/my-manga or your own server', 'ntfy_url') %}<input class="input" id="ntfy_url" name="ntfy_url" type="password" value="{{ v.ntfy_url }}" autocomplete="off" placeholder="https://ntfy.sh/your-topic">{% endcall %}
   {% call m.form_group('Access Token', 'Only for protected topics', 'ntfy_token') %}<input class="input" id="ntfy_token" name="ntfy_token" type="password" value="{{ v.ntfy_token }}" autocomplete="off"> <button class="button small" name="action" value="test-notify-ntfy" type="submit">Test</button>{% endcall %}
   <h3 class="subhead">Gotify</h3>
   {% call m.form_group('Server URL', none, 'gotify_url') %}<input class="input" id="gotify_url" name="gotify_url" value="{{ v.gotify_url }}" placeholder="http://gotify:80">{% endcall %}
@@ -91,9 +91,9 @@
   {% call m.form_group('From', 'Defaults to the username', 'smtp_from') %}<input class="input" id="smtp_from" name="smtp_from" value="{{ v.smtp_from }}" placeholder="">{% endcall %}
   {% call m.form_group('To', 'Comma-separated addresses', 'smtp_to') %}<input class="input" id="smtp_to" name="smtp_to" value="{{ v.smtp_to }}" placeholder=""> <button class="button small" name="action" value="test-notify-email" type="submit">Test</button>{% endcall %}
   <h3 class="subhead">Apprise</h3>
-  {% call m.form_group('Apprise API URL', 'An Apprise API notify endpoint, e.g. http://apprise:8000/notify/mangarr - reaches ~100 more services', 'apprise_url') %}<input class="input" id="apprise_url" name="apprise_url" value="{{ v.apprise_url }}" placeholder=""> <button class="button small" name="action" value="test-notify-apprise" type="submit">Test</button>{% endcall %}
+  {% call m.form_group('Apprise API URL', 'An Apprise API notify endpoint, e.g. http://apprise:8000/notify/mangarr - reaches ~100 more services', 'apprise_url') %}<input class="input" id="apprise_url" name="apprise_url" type="password" value="{{ v.apprise_url }}" autocomplete="off" placeholder=""> <button class="button small" name="action" value="test-notify-apprise" type="submit">Test</button>{% endcall %}
   <h3 class="subhead">Webhook</h3>
-  {% call m.form_group('Webhook URL', 'POSTs {title, message, kind} as JSON', 'webhook_url') %}<input class="input" id="webhook_url" name="webhook_url" value="{{ v.webhook_url }}" placeholder=""> <button class="button small" name="action" value="test-notify-webhook" type="submit">Test</button>{% endcall %}
+  {% call m.form_group('Webhook URL', 'POSTs {title, message, kind} as JSON', 'webhook_url') %}<input class="input" id="webhook_url" name="webhook_url" type="password" value="{{ v.webhook_url }}" autocomplete="off" placeholder=""> <button class="button small" name="action" value="test-notify-webhook" type="submit">Test</button>{% endcall %}
 </fieldset>
 
 <fieldset class="fieldset" id="security">
@@ -101,9 +101,11 @@
   {% call m.form_group('Authentication') %}
     <select class="input select" name="auth_method"><option value="forms" {% if v.auth_method != 'basic' %}selected{% endif %}>Forms (login page)</option><option value="basic" {% if v.auth_method == 'basic' %}selected{% endif %}>Basic (browser prompt)</option></select>
   {% endcall %}
-  {% call m.form_group('Username', 'Empty = no login', 'auth_user') %}<input class="input" id="auth_user" name="auth_user" value="{{ v.auth_user }}">{% endcall %}
-  {% call m.form_group('Password', 'Stored secrets show as ********; leave that as it is to keep the value, or clear the field to remove it', 'auth_password') %}<input class="input" id="auth_password" name="auth_password" type="password" value="{{ v.auth_password }}" autocomplete="new-password">{% endcall %}
-  {% call m.form_group('API Key', 'Send as X-Api-Key header (or ?apikey=) to use the JSON API when a login is set', 'api_key') %}<input class="input" id="api_key" name="api_key" value="{{ v.api_key }}">{% endcall %}
+  {% call m.form_group('Username', 'Empty = no login (clear it to turn the login off)', 'auth_user') %}<input class="input" id="auth_user" name="auth_user" value="{{ v.auth_user }}" autocomplete="username">{% endcall %}
+  {% call m.form_group('Password', 'Required while a username is set. Stored as a salted hash and shown as ********: leave that as it is to keep the password. Changing it signs every browser out.', 'auth_password') %}<input class="input" id="auth_password" name="auth_password" type="password" value="{{ v.auth_password }}" autocomplete="new-password">{% endcall %}
+  {% call m.form_group('API Key', 'Send it as the X-Api-Key header to use the JSON API when a login is set (?apikey= is accepted only on GET requests under /api/). Regenerating it breaks every script that uses the old key and signs every browser out.', 'api_key') %}<input class="input" id="api_key" type="password" value="{{ v.api_key }}" readonly autocomplete="off" aria-label="API key"> <button class="button small" type="button" data-reveal-api-key="api_key">Show</button> <button class="button small" type="submit" form="regenerate-api-key">Regenerate</button>{% endcall %}
+  {% call m.form_group('Sessions', 'Sign every browser out, including this one (e.g. after using a shared computer)') %}<button class="button small" type="submit" form="logout-all">Sign out everywhere</button>{% endcall %}
+  {% call m.form_group('Allowed Host Names', 'The web UI answers only to IP addresses, localhost, single-label names (mangarr) and .local / .lan / .home.arpa / .internal / .localdomain names, which blocks DNS rebinding. Add any other name you open it by, e.g. manga.example.com behind a reverse proxy (comma-separated; also MANGARR_ALLOWED_HOSTS).', 'allowed_hosts') %}<input class="input" id="allowed_hosts" name="allowed_hosts" value="{{ v.allowed_hosts|join(', ') }}" placeholder="manga.example.com">{% endcall %}
 </fieldset>
 
 <div class="form-actions">
@@ -112,4 +114,6 @@
   <button name="action" value="test-notify" class="button">Save &amp; send test notification</button>
 </div>
 </form>
+<form method="post" action="/settings/api-key/regenerate" id="regenerate-api-key" data-confirm="Regenerate the API key? Scripts using the old key stop working and every browser is signed out."></form>
+<form method="post" action="/settings/logout-all" id="logout-all" data-confirm="Sign every browser out, including this one?"></form>
 {% endblock %}
