@@ -984,10 +984,19 @@ What the web server refuses, and what to do if it refuses you:
   with its port if it is not 80/443 (`proxy_set_header Host $http_host;`
   in nginx, or `X-Forwarded-Host`), and `X-Forwarded-Proto` if the proxy
   serves HTTPS. A proxy that drops the port (nginx `$host`) must send
-  `X-Forwarded-Port` when it listens on a port other than 80/443: without
-  it a `Host` with no port stands for 80 (443 over HTTPS), so over plain
-  HTTP every browser gets 403 on another port. The log line of a refusal
-  says which of these a proxy is missing.
+  `X-Forwarded-Port` when it listens on a port other than 80/443. Without
+  it a `Host` with no port stands for 80 (443 with `X-Forwarded-Proto:
+  https`): over plain HTTP every browser gets 403 from mang-arr's own
+  pages on the proxy's port, while a page on port 80 of the same host name
+  counts as mang-arr's own for browsers that send no `Sec-Fetch-Site`.
+  One exception keeps a TLS proxy on 443 that sends no `X-Forwarded-Proto`
+  working for those browsers (Safari before 16.4): for a request that came
+  through a proxy (`X-Forwarded-For`, `X-Real-IP`, `Forwarded` or
+  `X-Forwarded-Host`, or a peer in `MANGARR_TRUSTED_PROXIES`) with a `Host`
+  without a port and no `X-Forwarded-Proto`, `https://` on the same host
+  name counts as well as `http://`. Send `X-Forwarded-Proto` to have the
+  scheme checked too. The log line of a refusal says which of these a
+  proxy is missing.
 - **Unknown host names (DNS rebinding).** The UI answers only when the
   `Host` header is an IP address, `localhost`, a single-label name
   (`mangarr`), a LAN name (`.local`, `.lan`, `.home`, `.home.arpa`,

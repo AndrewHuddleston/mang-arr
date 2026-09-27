@@ -291,6 +291,40 @@ def request_scheme(request: Request) -> str:
     return proto if proto in DEFAULT_PORTS else request.url.scheme
 
 
+_PROXY_HEADERS = ("x-forwarded-for", "x-real-ip", "forwarded", "x-forwarded-host")
+
+
+def _proxied(request: Request) -> bool:
+    """The request came through a reverse proxy: it carries a header only a
+    proxy adds (a page cannot send any of them without a CORS preflight), or
+    its peer is one of MANGARR_TRUSTED_PROXIES."""
+    if any(request.headers.get(h) for h in _PROXY_HEADERS):
+        return True
+    nets = _trusted_proxies(os.environ.get("MANGARR_TRUSTED_PROXIES", ""))
+    return bool(nets) and _is_trusted(request.client.host if request.client else "", nets)
+
+
+def _tls_proxy_page(request: Request, origin_scheme: str, origin: tuple[str, int | None], name: str,
+                    fport: str) -> bool:
+    """https://host (port 443) is this server's own page when a reverse
+    proxy passes a Host without a port (`name`) and says nothing about the
+    scheme. A TLS proxy without `proxy_set_header X-Forwarded-Proto` (stock
+    nginx) reaches mang-arr over plain HTTP that way, and a browser that
+    sends no Sec-Fetch-Site (Safari before 16.4) has only the Origin to go
+    by. The host names match and both ports are the defaults of the
+    Origin's scheme, so only the scheme is taken on trust.
+
+    The trade-off: when mang-arr is on plain HTTP port 80 behind such a
+    proxy, a page of another site on https://<the same host name> passes
+    too, for those browsers. Its form would post from HTTPS to plain HTTP,
+    which browsers warn about before sending. A proxy that sends
+    X-Forwarded-Proto (or an X-Forwarded-Port other than 443) gets the
+    strict check, and so does a request that did not come through a proxy:
+    its connection's scheme is the one the browser used."""
+    return (origin_scheme == "https" and origin == (name, 443) and fport in ("", "443")
+            and request.url.scheme == "http" and not request.headers.get("x-forwarded-proto") and _proxied(request))
+
+
 def same_origin(request: Request) -> tuple[bool, str]:
     """CSRF check for state-changing requests: (ok, why it was refused, for
     the log). Refused unless the request comes from mang-arr's own pages:
@@ -308,9 +342,14 @@ def same_origin(request: Request) -> tuple[bool, str]:
       header's, or X-Forwarded-Host's (a page cannot add either X- header
       without a CORS preflight). A Host without a port stands for the port
       X-Forwarded-Port names, else the default port of the request's scheme
-      (80/443), never of the Origin's: a proxy that drops the port (nginx
-      `$host`) on another port must say which it was, or a page on another
-      port or scheme of the same host name would pass.
+      (80/443). A proxy that drops the port (nginx `$host`) on another port
+      must say which it was: nothing else tells mang-arr's own page there
+      from Suwayomi or Komga on another port of the same host name, so that
+      page is refused, and one on the default port of the same host name is
+      taken for this server (see the README).
+    - One exception keeps a TLS proxy that sends neither the port nor
+      X-Forwarded-Proto working for browsers without Sec-Fetch-Site (Safari
+      before 16.4): see _tls_proxy_page.
     - A request with none of these headers is not a browser form (curl,
       scripts) and goes on to the normal login check."""
     src = request.headers.get("origin") or request.headers.get("referer")
@@ -337,12 +376,15 @@ def same_origin(request: Request) -> tuple[bool, str]:
         if not h:
             continue
         name, port = _host_port(h, "")           # port None: this header carries none
-        if port is None:
+        bare = port is None
+        if bare:
             port = int(fport) if fport.isdigit() else DEFAULT_PORTS.get(scheme)
             if name == want[0] and portless is None:
                 portless = (h, port)
         named = named or name == want[0]
         if (name, port) == want and u.scheme == scheme:
+            return True, ""
+        if bare and _tls_proxy_page(request, u.scheme, want, name, fport):
             return True, ""
     if named and u.scheme != scheme:
         return False, f"{refused}: it is {u.scheme}, this request came over {scheme} (a TLS proxy must send " \
@@ -491,6 +533,7 @@ async def check_password(v: dict, ip: str, user: str, password: str) -> tuple[bo
         if wait:
             return False, wait
         if remembered(v, user, password):
+            throttle.succeeded(ip)               # a right password clears the address, however it was checked
             return True, 0
         memo = _memo(v, user, password)
         with _checking_lock:
@@ -502,6 +545,8 @@ async def check_password(v: dict, ip: str, user: str, password: str) -> tuple[bo
             ok = await asyncio.wrap_future(running)
             if ok is None:
                 continue                         # that check never finished (reserve refused, client gone)
+            if ok:
+                throttle.succeeded(ip)           # the check may have been another address's
             return ok, 0
         try:
             wait = throttle.reserve(ip)

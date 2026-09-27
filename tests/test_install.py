@@ -176,6 +176,9 @@ def respond():
         return 200, {"ok": True}
     if path == "/api/v1/settings":
         s = M["settings"]
+        if method == "GET" and M.get("puts") and M.get("silent", 0) > 0:      # after the PUT: no answer
+            M["silent"] -= 1
+            return M.get("silent_code"), "Bad Gateway"
         if s.get("auth_user") and headers.get("x-api-key") != s["api_key"]:
             return 401, "authentication required"
         if method == "PUT":
@@ -514,6 +517,39 @@ class MangarrChangedMeanwhileTest(InstallerHarness):
 
     def test_other_user_after_the_put(self):
         self.assertStops({"auth_user": "eve"})
+
+
+class MangarrSilentAfterPutTest(InstallerHarness):
+    """Round 3: mang-arr not answering the check after the PUT (curl's 000, a 5xx) is not tampering: the
+    installer asks again, and if it still gets nothing it stops without telling the user to delete the
+    Komga key and reset the login."""
+
+    def run_with(self, silent, code=None):
+        st = self.state()
+        st["mangarr"].update(silent=silent, silent_code=code)
+        self.save_state(st)
+        return self.run_installer()
+
+    def assertStopsUnconfirmed(self, code):
+        rc, out, err = self.run_with(99, code)
+        self.assertNotEqual(rc, 0, out)
+        self.assertIn(f"did not answer the check of its new settings (HTTP {code or '000'} without the key", err)
+        self.assertIn("could not be confirmed", err)
+        self.assertNotIn("not the one this install set", err)
+        self.assertNotIn("Delete the Komga API key", err)
+        self.assertNotIn("Done.", out)
+        self.assertEqual([a for a in self.argv_log() if a == ["sleep", "2"]][:2], [["sleep", "2"]] * 2)  # asked 3x
+
+    def test_connection_failure_is_not_called_tampering(self):
+        self.assertStopsUnconfirmed(None)                   # curl: refused or timed out (000)
+
+    def test_server_error_is_not_called_tampering(self):
+        self.assertStopsUnconfirmed(502)
+
+    def test_a_brief_outage_is_asked_again(self):
+        rc, out, err = self.run_with(2)                      # the first pair of GETs gets nothing
+        self.assertInstalled(rc, out, err)
+        self.assertIn("mang-arr refuses requests without its login or API key", out + err)
 
 
 class KomgaStopTest(InstallerHarness):

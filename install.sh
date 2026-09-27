@@ -333,6 +333,8 @@ req() {
 
 resp() { cat "$WORK/resp"; }
 
+no_answer() { [[ -z "$1" || "$1" == 000 || "$1" == 5* ]]; }  # no_answer <status from req>: nothing usable came back
+
 jsonget() {  # jsonget <dotted.path> < json: the value ("" when missing); status 1 on bad JSON
   python3 -c 'import json,sys
 try:
@@ -690,10 +692,20 @@ print(json.dumps(b))' >"$WORK/mangarr.json"
 # After the PUT mang-arr must refuse a request without the key, and show the key this run holds (and the
 # user it set) to one with it. Anything else means something else on the network changed its settings
 # while it had no login: stop rather than report a protected mang-arr, holding the Komga key, that is not.
+# No answer at all (curl's 000, or a 5xx) proves nothing either way: asked again a few times, then the
+# installer stops without claiming tampering.
 check_mangarr() {  # check_mangarr <user this run set, or empty>
-  local st anon
-  anon=$(req GET "$MANGARR/api/v1/settings")
-  st=$(req GET "$MANGARR/api/v1/settings" "$MA_HDR")
+  local st anon try
+  for try in 1 2 3; do
+    anon=$(req GET "$MANGARR/api/v1/settings")
+    st=$(req GET "$MANGARR/api/v1/settings" "$MA_HDR")
+    no_answer "$anon" || no_answer "$st" || break
+    [[ $try == 3 ]] || sleep 2
+  done
+  if no_answer "$anon" || no_answer "$st"; then
+    warn "mang-arr did not answer the check of its new settings (HTTP $anon without the key, $st with it)."
+    die "Its login and API key are stored but could not be confirmed: check that it is running (docker compose logs mangarr) and asks for the login, then run the installer again"
+  fi
   if [[ "$anon" != 401 || "$st" != 2* || "$(resp | jsonget api_key 2>/dev/null)" != "$MA_KEY" ]] \
      || [[ -n "$1" && "$(resp | jsonget auth_user 2>/dev/null)" != "$1" ]]; then
     warn "mang-arr's login or API key is not the one this install set (HTTP $anon without the key, $st with it):"
