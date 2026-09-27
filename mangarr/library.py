@@ -608,6 +608,7 @@ MAX_UNCOMPRESSED = 1 << 30          # 1 GiB, declared total
 MAX_RATIO = 20                      # uncompressed / compressed, per entry and for the whole file ...
 RATIO_MIN_SIZE = 256 << 10          # ... once over 256 KiB (a small ComicInfo.xml compresses well)
 VERIFY_SECONDS = 120                # reading every entry back to check its CRC
+MAX_EXTENTS = 4096                  # runs of data a file's holes are counted around (_stored_bytes)
 # Stored and deflate are all Suwayomi (and any comic tool) writes, and the
 # only methods zipfile decompresses a piece at a time: it inflates a whole
 # bzip2 or LZMA read at once whatever size the directory declares, so a few
@@ -647,8 +648,7 @@ def verify_archive(src: str | StagedFile) -> tuple[bool | None, str]:
         except Exception as e:
             return False, f"{type(e).__name__}: {e}"[:300]
     try:
-        st = os.fstat(src.fd)
-        size = st.st_size
+        size = os.fstat(src.fd).st_size
         if size < 1024:
             return False, "file is empty"
         snap = _Snapshot(src.fd, size)
@@ -660,7 +660,7 @@ def verify_archive(src: str | StagedFile) -> tuple[bool | None, str]:
             return _rejected(src.path, problem)
         with zipfile.ZipFile(snap) as z:
             infos = z.infolist()
-            problem = _archive_limits(infos, _stored_bytes(st))
+            problem = _archive_limits(infos, _stored_bytes(src.fd, size))
             if problem:
                 return _rejected(src.path, problem)
             bad = _read_entries(z, infos)
@@ -678,14 +678,48 @@ def verify_archive(src: str | StagedFile) -> tuple[bool | None, str]:
         return False, f"{type(e).__name__}: {e}"[:300]
 
 
-def _stored_bytes(st: os.stat_result) -> int:
-    """The bytes a file really holds: its size, or the blocks it takes on
-    disk when that is less. A sparse file (holes that read back as zeros)
-    has a size far above what is stored, and would pass the ratio and
-    overlap limits on its size. A file system that reports no blocks at
-    all (some FUSE mounts) gets its size."""
-    blocks = getattr(st, "st_blocks", 0) * 512
-    return min(st.st_size, blocks) if blocks > 0 else st.st_size
+def _stored_bytes(fd: int, size: int) -> int:
+    """The bytes a file really holds: its size less its holes. A sparse file
+    (holes that read back as zeros) is far longer than what it stores, and
+    would pass the ratio and overlap limits on its length. The holes are
+    asked for (SEEK_DATA/SEEK_HOLE), not worked out from the blocks the file
+    takes on disk: a file system that compresses (ZFS, btrfs) keeps a
+    legitimate archive in fewer blocks than its length, and it has no holes.
+    (ZFS with compression does keep a run of zeros as a hole; the pages of a
+    chapter have none worth counting.) Where holes cannot be asked for, the
+    size counts. Past MAX_EXTENTS runs of data the rest counts as a hole: a
+    downloaded file is one run. The file offset is left as it was."""
+    if not hasattr(os, "SEEK_DATA"):
+        return size
+    try:
+        was = os.lseek(fd, 0, os.SEEK_CUR)
+    except OSError:
+        return size
+    at = stored = 0
+    try:
+        for _ in range(MAX_EXTENTS):
+            try:
+                data = os.lseek(fd, at, os.SEEK_DATA)
+            except OSError as e:
+                if e.errno == errno.ENXIO:          # nothing but a hole from `at` to the end
+                    break
+                raise
+            if data >= size:
+                break
+            hole = min(os.lseek(fd, data, os.SEEK_HOLE), size)
+            if hole <= data:                        # a file system answering nonsense: take the size
+                return size
+            stored, at = stored + hole - data, hole
+            if at >= size:
+                break
+        return stored
+    except OSError:                                 # EINVAL and the like: this file system cannot say
+        return size
+    finally:
+        try:
+            os.lseek(fd, was, os.SEEK_SET)
+        except OSError:
+            pass
 
 
 def _rejected(path: str, problem: str) -> tuple[bool, str]:

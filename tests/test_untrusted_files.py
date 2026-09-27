@@ -7,6 +7,7 @@ import errno
 import logging
 import os
 import random
+import re
 import struct
 import subprocess
 import sys
@@ -516,18 +517,57 @@ class SparseArchiveTest(unittest.TestCase):
                 self.assertLogs("mangarr.library", "WARNING"):
             ok, detail = verify_archive(p)
         self.assertFalse(ok)
-        self.assertIn("entries overlap or the file is sparse: they claim 52428800 bytes of data from a file that "
-                      f"stores {st.st_blocks * 512} bytes", detail)
+        m = re.fullmatch(r"entries overlap or the file is sparse: they claim 52428800 bytes of data from a file "
+                         r"that stores (\d+) bytes", detail)
+        self.assertTrue(m, detail)
+        self.assertLess(int(m[1]), st.st_size // 4)
         opened.assert_not_called()
 
-    def test_stored_bytes(self):
-        from types import SimpleNamespace as St
-        self.assertEqual(library._stored_bytes(St(st_size=50_000, st_blocks=8)), 4096)        # sparse
-        self.assertEqual(library._stored_bytes(St(st_size=50_000, st_blocks=200)), 50_000)    # blocks round up
-        self.assertEqual(library._stored_bytes(St(st_size=50_000, st_blocks=0)), 50_000)      # FUSE: no blocks said
-        self.assertEqual(library._stored_bytes(St(st_size=50_000)), 50_000)
-        p = make_cbz(os.path.join(self.d, "real.cbz"), 5)
-        self.assertEqual(verify_archive(p), (True, "5 pages"))
+    def holey(self) -> str:
+        """8 KiB of data, a hole to 1 MiB, 4 KiB of data; skipped where holes are not kept."""
+        p = os.path.join(self.d, "holey")
+        with open(p, "wb") as f:
+            f.write(b"x" * 8192)
+            f.seek(1 << 20)
+            f.write(b"y" * 4096)
+        if os.stat(p).st_blocks * 512 >= os.stat(p).st_size:
+            self.skipTest("this file system does not keep sparse files")
+        return p
+
+    def test_stored_bytes_counts_holes(self):
+        p = self.holey()
+        size = os.stat(p).st_size
+        fd = os.open(p, os.O_RDONLY)
+        try:
+            os.lseek(fd, 123, os.SEEK_SET)
+            self.assertEqual(library._stored_bytes(fd, size), 8192 + 4096)
+            self.assertEqual(os.lseek(fd, 0, os.SEEK_CUR), 123)                  # the offset is left alone
+            with mock.patch.object(library, "MAX_EXTENTS", 1):
+                self.assertEqual(library._stored_bytes(fd, size), 8192)           # past the cap: a hole
+            real = os.lseek
+
+            def cannot_say(fd, at, how):
+                if how == os.SEEK_DATA:
+                    raise OSError(errno.EINVAL, "Invalid argument")
+                return real(fd, at, how)
+            with mock.patch.object(library.os, "lseek", cannot_say):
+                self.assertEqual(library._stored_bytes(fd, size), size)          # no answer: the size counts
+        finally:
+            os.close(fd)
+
+    def test_a_compressing_file_system_is_not_sparse(self):
+        """The verifier's case: on ZFS or btrfs with compression, a file takes fewer blocks than its length
+        without any hole, and an archive of stored pages that compress well (PNG at level 0, BMP) was
+        refused as sparse when the stored bytes came from st_blocks."""
+        p = build_zip(os.path.join(self.d, "bmp.cbz"),
+                      [(f"{i:03d}.png", *stored(b"\x89PNG" + bytes(range(256)) * 1024)) for i in range(20)])
+        real = os.fstat
+
+        def compressed(fd):
+            st = real(fd)
+            return os.stat_result(tuple(st)[:10], {"st_blocks": 16})           # 8 KiB on disk
+        with mock.patch.object(library.os, "fstat", compressed):
+            self.assertEqual(verify_archive(p), (True, "20 pages"))
 
 
 class CopyFallbackTest(unittest.TestCase):
@@ -737,14 +777,17 @@ class Round3ImportTest(ImportBase):
             with mock.patch.object(library, "VERIFY_SECONDS", -1), self.assertLogs("mangarr", "WARNING") as cm:
                 self.assertEqual(core.import_series(con, sid), 0)
             row = db.chapters(con, sid)[0]
-            self.assertEqual((row["status"], row["reason"]), ("wanted", None))
+            self.assertEqual((row["status"], row["reason"]),       # shown on the series page, status unchanged
+                             ("wanted", "Src (EN): downloaded, not linked yet: checking it took longer than -1s "
+                                        "(slow or busy storage); checked again at the next import"))
             self.assertEqual(con.execute("SELECT COUNT(*) FROM source_stats").fetchone()[0], 0)   # no penalty
             self.assertTrue(os.path.exists(p))
             self.assertFalse(os.path.exists(p + ".corrupt"))
             self.assertIn("could not be checked", "\n".join(cm.output))
             self.assertIn("trying again at the next import", "\n".join(cm.output))
             self.assertEqual(core.import_series(con, sid), 1)                # the next import, in time
-            self.assertEqual(db.chapters(con, sid)[0]["status"], "have")
+            row = db.chapters(con, sid)[0]
+            self.assertEqual((row["status"], row["reason"]), ("have", None))
 
     @unittest.skipIf(os.geteuid() == 0, "root reads and writes through any mode")
     def test_staging_failures_name_the_staging_folder(self):

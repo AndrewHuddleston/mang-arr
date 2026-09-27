@@ -541,6 +541,11 @@ def _import_file(con, series_id: int, title: str, folder: str, n: float, prev, f
     to the caller."""
     ok, detail = library.verify_archive(f)
     if ok is None:                          # ran out of time: slow or busy storage, nothing wrong with the file
+        # the status stays (no quarantine, no failure, no source penalty); the
+        # reason says on the series page why the chapter is not in the library
+        db.set_reason(con, series_id, n, f"{source_name}: downloaded, not linked yet: {detail}; checked again at "
+                      "the next import")
+        con.commit()
         log.warning("%s: ch %g from %s could not be checked (%s); trying again at the next import",
                     title, n, source_name, detail)
         return None

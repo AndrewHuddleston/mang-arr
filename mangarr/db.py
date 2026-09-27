@@ -536,11 +536,20 @@ def set_have(con, series_id: int, number: float, staging_path: str | None,
     con.execute(
         "INSERT INTO chapter (series_id, number, status, source_name, staging_path, library_path, updated_at)"
         " VALUES (?,?,'have',?,?,?,?)"
-        " ON CONFLICT(series_id, number) DO UPDATE SET status='have',"
+        " ON CONFLICT(series_id, number) DO UPDATE SET status='have', reason=NULL,"
         " staging_path=COALESCE(excluded.staging_path, chapter.staging_path),"
         " library_path=COALESCE(excluded.library_path, chapter.library_path),"
         " source_name=COALESCE(excluded.source_name, chapter.source_name), updated_at=excluded.updated_at",
         (series_id, number, source_name, staging_path, library_path, now()))
+
+
+def set_reason(con, series_id: int, number: float, reason: str) -> bool:
+    """Say why a chapter is where it is without changing its status (a
+    downloaded file that could not be checked in time). A chapter the
+    library has is left alone. Returns whether a row changed."""
+    cur = con.execute("UPDATE chapter SET reason=?, updated_at=? WHERE series_id=? AND number=? AND status != 'have'",
+                      (reason[:300], now(), series_id, number))
+    return cur.rowcount > 0
 
 
 RETRY_HOURS = (0, 24, 72, 168)      # after the 1st failure: next pass; then 1 day, 3 days, a week (cap)
