@@ -238,6 +238,35 @@ class CompleteSeriesTest(PipelineBase):
                          [("skipped", "skipped: complete and cancelled; next check in about 7 day(s)")])
 
 
+class DueFirstTest(PipelineBase):
+    def test_a_series_whose_first_missing_chapter_waits_for_its_retry_still_goes_first(self):
+        # in order, ch 1 failed and waits for its next try; the pass still fetches 2 and 3, so the
+        # series has chapters due and goes before a continuing series with nothing due
+        fake = self.fake()
+        plans = {"A continuing": [entry(fake, Y, 1, "A continuing", [1])],
+                 "B held": [entry(fake, X, 2, "B held", [1, 2, 3])]}
+        with db.connect() as con:
+            a = db.upsert_series(con, Series(english="A continuing", status="RELEASING"))
+            b = db.upsert_series(con, Series(english="B held", status="FINISHED"))
+            con.execute("INSERT INTO chapter (series_id, number, status, updated_at) VALUES (?, 1, 'have', ?)",
+                        (a, db.now()))
+            con.execute("INSERT INTO chapter (series_id, number, status, next_try, reason, updated_at) VALUES"
+                        " (?, 1, 'failed', '2999-01-01 00:00:00', 'broken', ?)", (b, db.now()))
+            for n in (2, 3):
+                con.execute("INSERT INTO chapter (series_id, number, status, updated_at) VALUES (?, ?, 'wanted', ?)",
+                            (b, n, db.now()))
+            con.commit()
+            settings.set_many(con, {"download_in_order": True})
+        settings._cache.clear()
+        job = jobs.Job(1, "refresh-all", "all")
+        with mock.patch.object(web, "client", fake), mock.patch.object(core, "resolve", resolver_for(fake, plans)), \
+                self.assertLogs("mangarr.web.app", "INFO") as cm:
+            web._job_refresh_all(job)
+        self.assertEqual([i["title"] for i in job.items], ["B held", "A continuing"])
+        self.assertIn("refresh pass: 2 series (1 with chapters due first, then 1 continuing)", "\n".join(cm.output))
+        self.assertEqual({n: st for n, (st, _) in self.status(b).items()}, {1.0: "failed", 2.0: "have", 3.0: "have"})
+
+
 class ChapterSearchTest(PassBase):
     """A chapter's Search button (core.download_chapter without an entry)
     asks the sources in the order a resolve ranks them."""

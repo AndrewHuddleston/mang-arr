@@ -452,7 +452,7 @@ def _pass_stopped_text(items: list, reached: int, why: str) -> str:
 def _job_refresh_all(job: jobs.Job):
     with db.connect() as con:
         duplicates.read_links(con)                 # the AniList links of MangaDex series, skipped ones too
-        due = db.chapters_due(con, bool(settings.get("download_in_order")))
+        due = db.chapters_due(con)
         rows, skippable = plan_pass(db.series_rows(con), due)
     log.info("refresh pass: %d series (%d with chapters due first, then %d continuing), and %d complete finished "
              "series last, skipped unless their status changed", len(rows), sum(1 for r in rows if due.get(r["id"])),
