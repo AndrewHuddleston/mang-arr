@@ -9,30 +9,58 @@ except ImportError:                      # web extras not installed
     web = None
 
 
-def row(title, status="RELEASING", wanted=0, monitored=1, last=None):
-    return {"title": title, "status": status, "wanted": wanted, "monitored": monitored, "last_resolved": last}
+def row(title, status="RELEASING", wanted=0, monitored=1, last=None, sid=None):
+    return {"id": sid, "title": title, "status": status, "wanted": wanted, "monitored": monitored,
+            "last_resolved": last}
+
+
+def ago(days):
+    return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(time.time() - days * 86400))
 
 
 @unittest.skipIf(web is None, "web extras not installed")
 class PassTest(unittest.TestCase):
     def test_order_and_skip(self):
         now = time.strftime("%Y-%m-%d %H:%M:%S")
-        old = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(time.time() - 30 * 86400))
         rows = [row("B ongoing"), row("A finished complete", "FINISHED", 0, last=now),
                 row("C finished missing", "FINISHED", 3, last=now), row("D unmonitored", wanted=5, monitored=0),
-                row("E finished stale", "FINISHED", 0, last=old), row("F ongoing missing", wanted=2)]
+                row("E finished stale", "FINISHED", 0, last=ago(30)), row("F ongoing missing", wanted=2)]
         with mock.patch("mangarr.web.app.settings.get", lambda k: 7.0):
-            keep, skipped = web.plan_pass(rows)
+            keep, skippable = web.plan_pass(rows)
         self.assertEqual([r["title"] for r in keep],
                          ["C finished missing", "F ongoing missing", "B ongoing", "E finished stale"])
-        self.assertEqual(skipped, 1)
+        self.assertEqual([(r["title"], left) for r, left in skippable], [("A finished complete", 7)])
 
     def test_zero_days_means_always(self):
         rows = [row("A", "FINISHED", 0, last=time.strftime("%Y-%m-%d %H:%M:%S"))]
         with mock.patch("mangarr.web.app.settings.get", lambda k: 0):
-            keep, skipped = web.plan_pass(rows)
+            keep, skippable = web.plan_pass(rows)
         self.assertEqual(len(keep), 1)
-        self.assertEqual(skipped, 0)
+        self.assertEqual(skippable, [])
+
+    def test_due_first_then_continuing_then_the_rest_in_the_order_given(self):
+        rows = [row("Z hiatus", "HIATUS", sid=1), row("Y failed later", "FINISHED", 2, last=ago(1), sid=2),
+                row("X ongoing", sid=3), row("W failed now", "RELEASING", 1, sid=4),
+                row("V finished done long ago", "FINISHED", 0, last=ago(8), sid=5), row("U ongoing", sid=6),
+                row("T wanted", "FINISHED", 4, last=ago(1), sid=7), row("S unknown", None, sid=8),
+                row("R cancelled complete", "CANCELLED", 0, last=ago(2.5), sid=9),
+                row("Q hiatus complete", "HIATUS", 0, last=ago(1), sid=10)]
+        due = {4: 1, 7: 4}                         # Y's failed chapters wait for their next attempt
+        with mock.patch("mangarr.web.app.settings.get", lambda k: 7.0), \
+                self.assertLogs("mangarr.web.app", "DEBUG") as cm:
+            keep, skippable = web.plan_pass(rows, due)
+        self.assertEqual([r["title"] for r in keep],
+                         ["W failed now", "T wanted", "X ongoing", "U ongoing", "Z hiatus", "Y failed later",
+                          "V finished done long ago", "S unknown", "Q hiatus complete"])
+        # never skipped: failed chapters (their retry schedule), hiatus, continuing
+        self.assertEqual([(r["title"], left) for r, left in skippable], [("R cancelled complete", 5)])
+        self.assertIn("pass order: W failed now in group 1 (1 chapter(s) due)", "\n".join(cm.output))
+        self.assertTrue(all(line.startswith("DEBUG:") for line in cm.output))
+
+    def test_skip_text(self):
+        self.assertEqual(web._skip_text("FINISHED", 3), "skipped: complete and finished; next check in about 3 day(s)")
+        self.assertEqual(web._skip_text("CANCELLED", 1),
+                         "skipped: complete and cancelled; next check in about 1 day(s)")
 
 
 @unittest.skipIf(web is None, "web extras not installed")

@@ -1001,14 +1001,14 @@ class RunPassOutageTest(unittest.TestCase):
             if sid == 1:
                 return R()
             raise SuwayomiUnreachable("Suwayomi at x unreachable")
-        rows = [{"id": i, "title": f"S{i}", "wanted": 1} for i in range(1, 6)]
+        rows = [{"id": i, "title": f"S{i}", "wanted": 1, "status": "RELEASING"} for i in range(1, 6)]
         job = jobs.Job(1, "refresh-all", "all")
         sent = []
         with mock.patch.object(core, "refresh_series", first_then_down), \
              mock.patch.object(core, "describe_outcome", lambda con, sid, o: ("done", "1 downloaded")), \
              mock.patch.object(core, "downloads_due", lambda con, o: []), \
              mock.patch.object(web.db, "connect", mock.MagicMock()), \
-             mock.patch.object(web, "plan_pass", lambda r: (rows, 0)), \
+             mock.patch.object(web, "plan_pass", lambda r, due=None: (rows, [])), \
              mock.patch.object(web, "_record_error", lambda sid, e: None), \
              mock.patch.object(web.limits, "pause", lambda s, c=None: False), \
              mock.patch.object(web.notify, "send", lambda title, body, kind: sent.append((kind, title))), \

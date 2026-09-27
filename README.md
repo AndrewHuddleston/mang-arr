@@ -244,7 +244,7 @@ applies to the next job.
 | Download lanes | How many sources download at the same time during a refresh pass or *Search all wanted now* (1-8, default 3). Each source serves one series at a time and keeps its pacing, so a slow or rate-limited source holds up only the series that need it. Suwayomi's own *max sources in parallel* must allow as many: a pass uses the lower of the two. The field shows Suwayomi's value and, when it is lower, a *Save and let Suwayomi use N* button that changes it in Suwayomi: the only Suwayomi setting mang-arr ever changes, and only on that button. Adding one series, refreshing one and a chapter search still download from one source at a time. |
 | Parallel searches | How many sites are searched at the same time while a series is resolved (1-8, default 5), so a pass gets to its downloads sooner. The sources of one site (its `(EN)` and `(ALL)` variants) are still searched one after the other with the usual spacing (1 s between searches, 3 s on a page-by-page source), and the result does not depend on which site answers first. 1 searches one source after the other. |
 | Page delay (seconds) | Spacing between page requests on sources fetched page by page (default 2.5, 0.5-60). It is the start and the minimum: it widens 1.5× after each busy answer from the image server (up to 30 s) and eases back 0.85× every five pages that arrive. |
-| Re-check complete finished series every (days) | A pass does series with missing chapters first, then the rest; a *finished* series with nothing missing is skipped until this many days (default 7) have passed since its last check. 0 re-checks everything every pass. |
+| Re-check complete finished series every (days) | A scheduled pass (and *Update All*) does series with chapters due first (wanted, or failed with their next try reached), then continuing series, then the rest, so downloads start within its first minute. A *finished* or *cancelled* series with nothing wanted or failed is skipped until this many days (default 7) have passed since its last check: at the end of the pass AniList and MangaDex are asked for the status of all of them at once (no source is searched), and one that goes on after all (continuing again, or another chapter count) is checked in that pass; the others show *skipped: complete and finished; next check in about N day(s)*. A series with failed chapters is never skipped, so their retries keep their schedule, and refreshing one series always checks it. 0 re-checks everything every pass. |
 | Minimum pages for a fractional chapter | A `12.5` with fewer pages than this is treated as a notice image and marked junk. Default 8. |
 | Komga URL, API key, library id | When URL and key are set, every import that linked at least one chapter asks Komga to scan (the given library, or all of them). The key comes from Komga's account menu → API keys. *Save & test Komga* lists the libraries it can see; the health check calls the same API. |
 | Notifications | Discord webhook, Telegram bot token + chat id, ntfy topic URL (+ token), Gotify URL + app token, Pushover token + user key, Slack webhook, Notifiarr API key + Discord channel id, SMTP email, Apprise API URL, webhook URL. Every configured channel gets each message; each has a *Test* button that sends to that channel only. *Notify on* picks the events: new chapters, series added, failed downloads (after a pass, with the reasons), health problems (when a check turns red). |
@@ -463,7 +463,8 @@ pass it lists every series with its state: *queued* (not resolved yet),
 *working*, *waiting* (resolved, waiting for a download lane: the source it
 needs is busy with another series or resting between series, or Suwayomi
 is not answering; the text says which), then *done*, *no match*, *failed*,
-*error* or *cancelled*. While the pass downloads, a *Download lanes* table
+*error*, *cancelled* or *skipped* (complete and finished, not due for a
+check yet). While the pass downloads, a *Download lanes* table
 above it shows each lane: the source, the series, what it is doing and
 since when, or *idle*. History is the last 200 events
 across all series.
@@ -881,7 +882,9 @@ manual download is the same machinery for one chapter from one entry.
 
 A refresh pass (and *Search all wanted now*) resolves its series one after
 the other and hands every series with chapters due to the download lanes,
-then goes on resolving. A lane downloads one series from one source at a
+then goes on resolving. A scheduled pass takes the series with chapters due
+first, then continuing ones, then the rest, and leaves complete finished
+series for the end (see *Re-check complete finished series*). A lane downloads one series from one source at a
 time: a free lane takes the first waiting series, in pass order, that wants
 a source no other lane is on. So each source serves one series at a time
 and keeps its pacing, a rate-limited source rests *Throttled delay* seconds

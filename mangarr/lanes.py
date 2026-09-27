@@ -53,8 +53,8 @@ SHUTDOWN_JOIN_SECS = 100
 LANE_DIED = "download worker stopped unexpectedly"
 # job.lanes entry of a lane between steps
 _IDLE = {"source": None, "series_id": None, "title": None, "text": "", "since": None}
-# item states of a series the pass is done with
-FINISHED = ("done", "nomatch", "failed", "error")
+# item states of a series the pass is done with ("skipped": complete and finished, not checked this time)
+FINISHED = ("done", "nomatch", "failed", "error", "skipped")
 
 
 class PoolStopped(RuntimeError):

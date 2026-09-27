@@ -8,6 +8,7 @@ API:     /api/v1/...  (mirrors the pages; used by the pages' live updates)
 import asyncio
 import dataclasses
 import logging
+import math
 import os
 import re
 import sqlite3
@@ -192,27 +193,50 @@ def _job_add(series: model.Series, download: bool, monitored: bool = True):
     return run
 
 
-def plan_pass(rows) -> tuple[list, int]:
-    """Order a refresh pass: series with missing chapters first (so downloads
-    start at once), then the rest; finished series with nothing missing are
-    skipped until recheck_finished_days have passed. Returns (rows, skipped)."""
+# a series with these statuses gets no new chapters: once complete it is re-checked only now and then
+COMPLETE_STATUSES = ("FINISHED", "CANCELLED")
+
+
+def plan_pass(rows, due: dict | None = None) -> tuple[list, list]:
+    """Order a refresh pass so the download lanes get work within its first
+    minute: series with chapters due now first (`due`: series id -> wanted
+    chapters and failed ones whose next attempt is due, db.chapters_due;
+    without it, any wanted or failed chapter counts), then continuing
+    (RELEASING) series, then the rest, each group in the order given.
+    Unmonitored series are left out. A finished or cancelled series with no
+    wanted or failed chapter that was checked less than
+    recheck_finished_days ago is in none of these: those come back
+    separately as (row, days until its next check), for the end of the pass
+    (_run_pass skips them unless their status changed). Returns (rows,
+    skippable)."""
     days = limits.clamp("recheck_finished_days", settings.get("recheck_finished_days") or 0)
-    cutoff = time.time() - days * 86400
-    keep, skipped = [], 0
+    now_ = time.time()
+    groups: tuple[list, list, list] = ([], [], [])
+    skippable = []
     for r in rows:
         if not r["monitored"]:
             continue
-        if days and r["status"] == "FINISHED" and not r["wanted"] and r["last_resolved"]:
+        n_due = due.get(r["id"], 0) if due is not None else r["wanted"]
+        if days and r["status"] in COMPLETE_STATUSES and not r["wanted"] and r["last_resolved"]:
             try:
-                last = time.mktime(time.strptime(r["last_resolved"], "%Y-%m-%d %H:%M:%S"))
+                left = time.mktime(time.strptime(r["last_resolved"], "%Y-%m-%d %H:%M:%S")) + days * 86400 - now_
             except ValueError:
-                last = 0
-            if last > cutoff:
-                skipped += 1
+                left = 0
+            if left > 0:
+                skippable.append((r, max(1, math.ceil(left / 86400))))
+                log.debug("pass order: %s last, complete and %s (skipped unless its status changed)",
+                          r["title"], r["status"].lower())
                 continue
-        keep.append(r)
-    keep.sort(key=lambda r: (0 if r["wanted"] else 1, r["title"].lower()))
-    return keep, skipped
+        k, why = (0, f"{n_due} chapter(s) due") if n_due else (1, "continuing") if r["status"] == "RELEASING" \
+            else (2, "nothing due")
+        log.debug("pass order: %s in group %d (%s)", r["title"], k + 1, why)
+        groups[k].append(r)
+    return groups[0] + groups[1] + groups[2], skippable
+
+
+def _skip_text(status: str, days_left: int) -> str:
+    return (f"skipped: complete and {'cancelled' if status == 'CANCELLED' else 'finished'}; next check in about "
+            f"{days_left} day(s)")
 
 
 class PassStopped(SuwayomiUnreachable):
@@ -225,11 +249,18 @@ class PassStopped(SuwayomiUnreachable):
         self.counts = counts
 
 
-def _run_pass(job: jobs.Job, rows, label: str) -> tuple[int, int, int, int]:
+def _run_pass(job: jobs.Job, rows, label: str, skippable=()) -> tuple[int, int, int, int]:
     """Refresh every series in rows, keeping job.items current so the
     Activity page shows the whole pass: what is queued, being resolved,
     waiting for a download lane or downloading, and what happened to each.
     Returns (done, downloaded, imported, errors).
+
+    `skippable` (plan_pass: complete finished series, with the days until
+    their next check) come last. Once the pass gets to them their status is
+    asked from AniList / MangaDex in one go (no source is searched): one
+    that is still finished or cancelled, with the same chapter count, is
+    skipped; one that is not (it goes on after all) is refreshed like the
+    others.
 
     Series are resolved one after the other on this thread. The chapters due
     are downloaded by download lanes (lanes.LanePool: up to Download Lanes
@@ -240,7 +271,10 @@ def _run_pass(job: jobs.Job, rows, label: str) -> tuple[int, int, int, int]:
     (PassStopped, with the counts so far) instead of timing out on every
     series. One outage seen by the resolve step and several lanes at once
     counts once (lanes.Outages)."""
+    later = {r["id"]: (r, left) for r, left in skippable}
+    rows = list(rows) + [r for r, _ in skippable]
     job.items = [{"series_id": r["id"], "title": r["title"], "state": "queued", "result": ""} for r in rows]
+    status_now: dict | None = None                 # what the providers say of the skippable ones now
     downloader.retry_leftovers_now(client)         # queue entries an earlier run could not take back out
     outages = lanes.Outages()
     pool: lanes.LanePool | None = None
@@ -277,6 +311,17 @@ def _run_pass(job: jobs.Job, rows, label: str) -> tuple[int, int, int, int]:
                                                                   else pool.stop_why))
                 break
             reached = i
+            if r["id"] in later:
+                if status_now is None:
+                    say(f"{head} - checking whether {len(later)} complete finished series go on")
+                    try:
+                        status_now = _statuses_now([row for row, _ in later.values()], cancel)
+                    except limits.Cancelled:        # the check above ends the pass
+                        item["state"], item["result"] = "cancelled", "pass cancelled"
+                        continue
+                if not _goes_on(r, status_now.get(r["ref"])):
+                    item["state"], item["result"] = "skipped", _skip_text(r["status"], later[r["id"]][1])
+                    continue
             say(head)
             item["state"], item["result"] = "running", "checking sources"
             job.active_series_id = r["id"]         # pending_for() sees the series this pass is on
@@ -346,7 +391,7 @@ def _run_pass(job: jobs.Job, rows, label: str) -> tuple[int, int, int, int]:
     if pool is not None:
         d, im, er = pool.counts()
         downloaded, imported, errors = downloaded + d, imported + im, errors + er
-    done = sum(1 for it in job.items if it["state"] in lanes.FINISHED)
+    done = sum(1 for it in job.items if it["state"] in lanes.FINISHED and it["state"] != "skipped")
     if busy is not None:
         raise busy
     if outages.stopped:                            # by the resolve step or by the lanes
@@ -355,6 +400,32 @@ def _run_pass(job: jobs.Job, rows, label: str) -> tuple[int, int, int, int]:
                   label, reached, len(rows), left)
         raise PassStopped(_pass_stopped_text(job.items, reached, outages.why), (done, downloaded, imported, errors))
     return done, downloaded, imported, errors
+
+
+def _statuses_now(rows, cancel) -> dict:
+    """metadata.statuses for these series rows, by reference; {} when it
+    cannot be had (then every one of them is skipped as planned). A cancel
+    cuts a slow provider short (limits.Cancelled)."""
+    try:
+        return limits.interruptible(lambda: metadata.statuses([r["ref"] for r in rows]), cancel)
+    except limits.Cancelled:
+        raise
+    except Exception as e:
+        log.warning("could not check whether complete finished series go on: %s: %s", type(e).__name__, e)
+        return {}
+
+
+def _goes_on(r, now: tuple | None) -> bool:
+    """A complete finished series is refreshed after all: its provider has
+    it continuing (or on hiatus) now, or with another chapter count."""
+    if now is None:
+        return False
+    status, chapters = now
+    changed = status not in COMPLETE_STATUSES or (chapters is not None and chapters != r["expected"])
+    if changed:
+        log.info("%s: now %s with %s chapter(s) (was %s, %s); checking it in this pass after all", r["title"],
+                 status, chapters, r["status"], r["expected"])
+    return changed
 
 
 _CUT = re.compile(r"pass (?:cancelled|stopped: .*?)(?: after (\d+) chapter\(s\) downloaded)?\Z", re.S)
@@ -381,14 +452,17 @@ def _pass_stopped_text(items: list, reached: int, why: str) -> str:
 def _job_refresh_all(job: jobs.Job):
     with db.connect() as con:
         duplicates.read_links(con)                 # the AniList links of MangaDex series, skipped ones too
-        rows, skipped = plan_pass(db.series_rows(con))
-    log.info("refresh pass: %d series (%d with missing chapters first), %d finished series skipped until due",
-             len(rows), sum(1 for r in rows if r["wanted"]), skipped)
+        due = db.chapters_due(con, bool(settings.get("download_in_order")))
+        rows, skippable = plan_pass(db.series_rows(con), due)
+    log.info("refresh pass: %d series (%d with chapters due first, then %d continuing), and %d complete finished "
+             "series last, skipped unless their status changed", len(rows), sum(1 for r in rows if due.get(r["id"])),
+             sum(1 for r in rows if not due.get(r["id"]) and r["status"] == "RELEASING"), len(skippable))
     stopped = None
     try:
-        done, downloaded, imported, errors = _run_pass(job, rows, "refresh-all")
+        done, downloaded, imported, errors = _run_pass(job, rows, "refresh-all", skippable)
     except PassStopped as e:        # Suwayomi went away: still notify about what the pass did before that
         stopped, (done, downloaded, imported, errors) = e, e.counts
+    skipped = sum(1 for i in job.items if i["state"] == "skipped")
     msg = f"{done} series, {downloaded} downloaded, {imported} imported, {errors} errors" + \
         (f", {skipped} complete finished series skipped" if skipped else "")
     if imported:

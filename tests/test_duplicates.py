@@ -327,7 +327,7 @@ class ReadLinksTest(DbBase):
         with db.connect() as con:
             db.set_monitored(con, m, False)
         passed = []
-        with mock.patch.object(web, "_run_pass", lambda job, rows, label: passed.extend(rows) or (0, 0, 0, 0)):
+        with mock.patch.object(web, "_run_pass", lambda job, rows, label, skippable=(): passed.extend(rows) or (0, 0, 0, 0)):
             web._job_refresh_all(jobs.Job(1, "refresh-all", "all"))
         self.assertEqual([r["id"] for r in passed], [a])     # the pass skips the unmonitored one ...
         self.assertIn("Duplicate series", health.duplicate_series().name)      # ... and still reads its link
