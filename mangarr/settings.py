@@ -7,6 +7,9 @@ through get(), so a change on the Settings page applies to the next job.
     min_pages            int    MIN_PAGES
     unusable_sources     list   UNUSABLE_SOURCES   (lower-cased source names)
     throttled_sources    list   THROTTLED_SOURCES
+    page_warm_sources    list   PAGE_WARM_SOURCES  fetched page by page (image server refuses bursts)
+    download_lanes       int    3      sources downloading at once in a pass (1-8; Suwayomi's cap wins)
+    page_delay_seconds   float  2.5    starting and minimum gap between page requests (page by page)
     pushover_token       str    PUSHOVER_TOKEN
     pushover_user        str    PUSHOVER_USER
     webhook_url          str    WEBHOOK_URL
@@ -49,8 +52,11 @@ DEFAULTS: dict[str, object] = {
     "recheck_finished_days": 7.0,   # a finished series with nothing missing is re-checked this often
     "min_pages": config.MIN_PAGES,
     "throttled_delay_seconds": 8.0,  # pause between chapters on a rate-limited source (avoids 429 -> long backoff)
+    "download_lanes": 3,             # sources downloading at once in a pass, one series each (see limits.RANGES)
+    "page_delay_seconds": 2.5,       # gap between page requests on a page-by-page source (grows when it is busy)
     "unusable_sources": sorted(config.UNUSABLE_SOURCES),
     "throttled_sources": sorted(config.THROTTLED_SOURCES),
+    "page_warm_sources": sorted(config.PAGE_WARM_SOURCES),
     "pushover_token": config.PUSHOVER_TOKEN or "",
     "pushover_user": config.PUSHOVER_USER or "",
     "webhook_url": config.WEBHOOK_URL or "",
@@ -556,6 +562,14 @@ def _coerce(key: str, v):
             return out
         return f
     if isinstance(d, int):
+        from .limits import RANGES, bound
+        if key in RANGES:                       # clamped like the floats above; not a number is still refused
+            f = float(v)
+            out = int(round(bound(key, f)))
+            if out != f:
+                log.warning("setting %s = %r is outside %g..%g or not a whole number; saved as %d", key, v,
+                            *RANGES[key], out)
+            return out
         return int(v)
     if key in ID_LIST_KEYS:
         if not isinstance(v, (list, tuple)):
