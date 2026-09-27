@@ -33,6 +33,7 @@ from .. import (
     health,
     jobs,
     komga,
+    lanes,
     library,
     limits,
     metadata,
@@ -220,72 +221,143 @@ class PassStopped(SuwayomiUnreachable):
 
 
 def _run_pass(job: jobs.Job, rows, label: str) -> tuple[int, int, int, int]:
-    """Refresh every series in rows, one at a time, keeping job.items current
-    so the Activity page shows the whole pass: what is queued, what is running
-    and what happened to each. Returns (done, downloaded, imported, errors).
+    """Refresh every series in rows, keeping job.items current so the
+    Activity page shows the whole pass: what is queued, being resolved,
+    waiting for a download lane or downloading, and what happened to each.
+    Returns (done, downloaded, imported, errors).
+
+    Series are resolved one after the other on this thread. The chapters due
+    are downloaded by download lanes (lanes.LanePool: up to Download Lanes
+    sites at once, one series per site) while the next series is resolved.
 
     When Suwayomi itself stops answering, the pass waits one breaker window
-    and tries the next series; if Suwayomi is still down it stops with one
-    clear error (PassStopped, with the counts so far) instead of timing out
-    on every series."""
+    and goes on; if Suwayomi is still down it stops with one clear error
+    (PassStopped, with the counts so far) instead of timing out on every
+    series. One outage seen by the resolve step and several lanes at once
+    counts once (lanes.Outages)."""
     job.items = [{"series_id": r["id"], "title": r["title"], "state": "queued", "result": ""} for r in rows]
     downloader.retry_leftovers_now(client)         # queue entries an earlier run could not take back out
-    done = downloaded = imported = errors = 0
-    outages = 0                                    # consecutive series that failed because Suwayomi is down
-    for i, (r, item) in enumerate(zip(rows, job.items, strict=True), 1):
-        if job.cancel:
-            job.progress = f"cancelled after {done} of {len(rows)}"
-            for it in job.items[i - 1:]:
-                it["state"], it["result"] = "cancelled", "pass cancelled"
-            break
-        head = f"{i}/{len(rows)}: {r['title']}"
-        job.progress = head
-        item["state"], item["result"] = "running", "checking sources"
-        job.active_series_id = r["id"]             # pending_for() sees the series this pass is on
+    outages = lanes.Outages()
+    pool: lanes.LanePool | None = None
+    downloaded = imported = errors = 0
+    reached = 0                                    # series whose resolve was started
+    stop_msg: str | None = None
+    busy: downloader.LockBusy | None = None
 
-        def prog(m, head=head, item=item):
-            job.progress = f"{head} - {m}"
-            item["result"] = m
-        try:
-            with db.connect() as con:
-                o = core.refresh_series(con, client, r["id"], download=True, should_cancel=lambda: job.cancel,
-                                        progress=prog)
-                item["state"], item["result"] = core.describe_outcome(con, r["id"], o)
-            downloaded += o.downloaded
-            imported += o.imported
-            outages = 0
-        except core.Gone:
-            item["state"], item["result"] = "cancelled", "series was deleted"
-            continue
-        except limits.Cancelled:                   # in the middle of the series: not an error of it
-            item["state"], item["result"] = "cancelled", "pass cancelled"
-            continue                               # the check at the top ends the pass
-        except Exception as e:
-            errors += 1
-            item["state"], item["result"] = "error", f"{type(e).__name__}: {e}"[:300]
-            log.error("%s: %s: %s: %s", label, r["title"], type(e).__name__, e)
-            try:                                   # bookkeeping must never end the pass
-                _record_error(r["id"], e)
-            except Exception as rec:
-                log.warning("%s: could not record the error for %s: %s: %s", label, r["title"],
-                            type(rec).__name__, rec)
-            if isinstance(e, SuwayomiUnreachable):
-                outages += 1
-                if outages >= 2:
-                    rest = job.items[i:]
-                    for it in rest:
-                        it["state"], it["result"] = "cancelled", "pass stopped: Suwayomi is not answering"
-                    log.error("%s: Suwayomi is not answering; stopping the pass after %d of %d series (%d left)",
-                              label, i, len(rows), len(rest))
-                    raise PassStopped(f"pass stopped after {i} of {len(rows)} series, {len(rest)} not checked: {e}",
-                                      (done + 1, downloaded, imported, errors)) from e
-                job.progress = f"{head} - Suwayomi is not answering; waiting {BREAKER_SECS} s before going on"
-                log.warning("%s: Suwayomi is not answering; waiting %d s, the pass stops if it still is",
-                            label, BREAKER_SECS)
-                limits.pause(BREAKER_SECS, lambda: job.cancel)
-        finally:
-            job.active_series_id = None
-        done += 1
+    def cancel() -> bool:
+        return job.cancel
+
+    def say(text: str) -> None:
+        if pool is None:
+            job.progress = text
+        else:
+            pool.resolving(text)
+
+    def not_checked(rest: list, why: str) -> None:
+        for it in rest:
+            it["state"], it["result"] = "cancelled", why
+    try:
+        for i, (r, item) in enumerate(zip(rows, job.items, strict=True), 1):
+            head = f"{i}/{len(rows)}: {r['title']}"
+            if (left := outages.hold_left()) and not job.cancel:
+                say(f"{head} - Suwayomi is not answering; waiting {left:.0f} s before going on")
+                limits.pause(left, cancel)
+                outages.served()
+            if job.cancel:
+                done = sum(1 for it in job.items if it["state"] in lanes.FINISHED)
+                say(f"cancelled after {done} of {len(rows)}")
+                not_checked(job.items[i - 1:], "pass cancelled")
+                break
+            if outages.stopped or (pool is not None and pool.cancelled()):
+                rest = job.items[i - 1:]
+                not_checked(rest, "pass stopped: " + ("Suwayomi is not answering" if outages.stopped
+                                                      else pool.stop_why))
+                if outages.stopped:
+                    stop_msg = (f"pass stopped after {i - 1} of {len(rows)} series, {len(rest)} not checked: "
+                                f"Suwayomi is not answering ({outages.why})")
+                break
+            reached = i
+            say(head)
+            item["state"], item["result"] = "running", "checking sources"
+            job.active_series_id = r["id"]         # pending_for() sees the series this pass is on
+
+            def prog(m, head=head, item=item):
+                item["result"] = m
+                say(f"{head} - {m}")
+            try:
+                with db.connect() as con:
+                    o = core.refresh_series(con, client, r["id"], download=False, should_cancel=cancel,
+                                            progress=prog)
+                    downloaded += o.downloaded
+                    imported += o.imported
+                    due = core.downloads_due(con, o)
+                    if not due:
+                        item["state"], item["result"] = core.describe_outcome(con, r["id"], o)
+                outages.ok()
+                if due:
+                    if pool is None:
+                        n, cap = lanes.effective_lanes(with_cancel(client, cancel))
+                        pool = lanes.LanePool(client, job, n, label, outages, cap=cap,
+                                              on_error=lambda sid, e: _record_error(sid, e))
+                        pool.start()
+                    pool.submit(i, r["id"], r["title"], item, o.plan, due, progress=prog)
+            except core.Gone:
+                item["state"], item["result"] = "cancelled", "series was deleted"
+                continue
+            except limits.Cancelled:               # not an error of the series; the check above ends the pass
+                item["state"], item["result"] = "cancelled", "pass cancelled"
+                continue
+            except lanes.PoolStopped as e:          # the lanes stopped while it was handed over: the same
+                item["state"], item["result"] = "cancelled", "pass cancelled" if job.cancel else f"pass stopped: {e}"
+                continue
+            except downloader.LockBusy as e:
+                errors += 1
+                item["state"], item["result"] = "error", f"{type(e).__name__}: {e}"[:300]
+                not_checked(job.items[i:], "pass stopped: another download run holds the download lock")
+                busy = e
+                break
+            except Exception as e:
+                errors += 1
+                item["state"], item["result"] = "error", f"{type(e).__name__}: {e}"[:300]
+                log.error("%s: %s: %s: %s", label, r["title"], type(e).__name__, e)
+                try:                               # bookkeeping must never end the pass
+                    _record_error(r["id"], e)
+                except Exception as rec:
+                    log.warning("%s: could not record the error for %s: %s: %s", label, r["title"],
+                                type(rec).__name__, rec)
+                if isinstance(e, SuwayomiUnreachable):
+                    if outages.report(e) == "stop":
+                        rest = job.items[i:]
+                        not_checked(rest, "pass stopped: Suwayomi is not answering")
+                        if pool is not None:
+                            pool.stop("Suwayomi is not answering")
+                        stop_msg = f"pass stopped after {i} of {len(rows)} series, {len(rest)} not checked: {e}"
+                        break
+                    say(f"{head} - Suwayomi is not answering; waiting {BREAKER_SECS} s before going on")
+                    log.warning("%s: Suwayomi is not answering; waiting %d s, the pass stops if it still is",
+                                label, BREAKER_SECS)
+            finally:
+                job.active_series_id = None
+        if pool is not None and stop_msg is None and busy is None:
+            pool.close()
+            pool.join()
+            if pool.stopped_for_outage:
+                stop_msg = (f"pass stopped after {reached} of {len(rows)} series, {len(rows) - reached} not "
+                            f"checked: Suwayomi is not answering ({outages.why})")
+    finally:
+        if pool is not None:
+            pool.shutdown()
+    if pool is not None:
+        d, im, er = pool.counts()
+        downloaded, imported, errors = downloaded + d, imported + im, errors + er
+    done = sum(1 for it in job.items if it["state"] in lanes.FINISHED)
+    if busy is not None:
+        raise busy
+    if stop_msg is not None:
+        left = sum(1 for it in job.items if it["state"] == "cancelled")
+        log.error("%s: Suwayomi is not answering; stopping the pass after %d of %d series (%d left)",
+                  label, reached, len(rows), left)
+        raise PassStopped(stop_msg, (done, downloaded, imported, errors))
     return done, downloaded, imported, errors
 
 

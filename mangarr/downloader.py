@@ -393,7 +393,10 @@ class SeriesSteps:
             self.results[n] = "ok"
         if run.in_order:
             if not failed:
-                self.idx = run.end
+                # all of it arrived: go on after it; cut short (a cancel), wants() goes
+                # on from the first chapter that did not arrive
+                if all(self.results.get(c.number) == "ok" for c in run.todo):
+                    self.idx = run.end
                 return
             if not ok:
                 self.dead.add(m.manga_id)

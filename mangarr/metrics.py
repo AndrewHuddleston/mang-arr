@@ -6,6 +6,10 @@
     mangarr_jobs_total{kind,status}
     mangarr_suwayomi_up                  1 when the API answers
     mangarr_last_refresh_timestamp       unix time of the last completed refresh-all
+    mangarr_download_lanes               download lanes of the running pass (0: none)
+    mangarr_download_lanes_busy          lanes downloading right now
+    mangarr_series_waiting_for_lane      series resolved and waiting for a lane
+    mangarr_lane_seconds_total{source}   time lanes spent on each source (rate() near 1: the bottleneck)
     mangarr_download_unstarted_total{source}
                                          chunks Suwayomi did not start within 30 min (its queue busy)
     mangarr_page_fetches_total{source,result}
@@ -33,6 +37,10 @@ if AVAILABLE:
     JOBS = Counter("mangarr_jobs_total", "jobs by outcome", ["kind", "status"])
     SUWAYOMI_UP = Gauge("mangarr_suwayomi_up", "Suwayomi API reachable")
     LAST_REFRESH = Gauge("mangarr_last_refresh_timestamp", "last completed refresh-all")
+    LANES = Gauge("mangarr_download_lanes", "download lanes of the running pass")
+    LANES_BUSY = Gauge("mangarr_download_lanes_busy", "download lanes downloading right now")
+    LANE_WAITING = Gauge("mangarr_series_waiting_for_lane", "series waiting for a download lane")
+    LANE_SECONDS = Counter("mangarr_lane_seconds_total", "time download lanes spent on each source", ["source"])
     UNSTARTED = Counter("mangarr_download_unstarted_total", "download chunks Suwayomi did not start in time",
                         ["source"])
     PAGE_FETCHES = Counter("mangarr_page_fetches_total", "page requests on page-by-page sources",
@@ -47,6 +55,18 @@ if AVAILABLE:
 def record_download(source: str, result: str) -> None:
     if AVAILABLE:
         DOWNLOADS.labels(source=source, result=result).inc()
+
+
+def record_lanes(lanes: int, busy: int, waiting: int) -> None:
+    if AVAILABLE:
+        LANES.set(lanes)
+        LANES_BUSY.set(busy)
+        LANE_WAITING.set(waiting)
+
+
+def record_lane_time(source: str, secs: float) -> None:
+    if AVAILABLE and secs > 0:
+        LANE_SECONDS.labels(source=source).inc(secs)
 
 
 def record_unstarted(source: str) -> None:

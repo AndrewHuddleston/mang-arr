@@ -214,6 +214,22 @@ class RunnerTest(unittest.TestCase):
         broke = self.run_one(lambda job: {}["x"])
         self.assertEqual((broke.status, broke.message), ("failed", "KeyError: 'x'"))
 
+    def test_pending_for_sees_the_series_a_passs_lanes_are_on(self):
+        r = jobs.Runner()
+        p = r.submit("refresh-all", "all", lambda j: None)
+        p.status, p.active_series_ids = "running", frozenset({7, 8})
+        self.assertTrue(r.pending_for(8))
+        self.assertFalse(r.pending_for(9))
+
+    def test_lanes_are_shown_and_cleared_when_the_job_ends(self):
+        def fn(job):
+            job.active_series_ids = frozenset({3})
+            job.lanes = [{"lane": 1, "source": "X", "series_id": 3, "title": "T", "text": "", "since": 0}]
+            self.assertEqual(job.as_dict()["lanes"], job.lanes)
+        j = self.run_one(fn)
+        self.assertEqual((j.status, j.lanes, j.active_series_ids), ("done", [], frozenset()))
+        self.assertEqual(j.as_dict()["lanes"], [])
+
 
 class SchedulerTest(unittest.TestCase):              # findings 80, 89
     def test_bad_interval_never_breaks_next_at(self):
@@ -956,6 +972,7 @@ class RunPassOutageTest(unittest.TestCase):
         job = jobs.Job(1, "refresh-all", "all")
         with mock.patch.object(core, "refresh_series", fake_refresh), \
              mock.patch.object(core, "describe_outcome", lambda con, sid, o: ("done", "ok")), \
+             mock.patch.object(core, "downloads_due", lambda con, o: []), \
              mock.patch.object(web.db, "connect", mock.MagicMock()), \
              mock.patch.object(web.limits, "pause", lambda s, c=None: False):
             try:
@@ -989,6 +1006,7 @@ class RunPassOutageTest(unittest.TestCase):
         sent = []
         with mock.patch.object(core, "refresh_series", first_then_down), \
              mock.patch.object(core, "describe_outcome", lambda con, sid, o: ("done", "1 downloaded")), \
+             mock.patch.object(core, "downloads_due", lambda con, o: []), \
              mock.patch.object(web.db, "connect", mock.MagicMock()), \
              mock.patch.object(web, "plan_pass", lambda r: (rows, 0)), \
              mock.patch.object(web, "_record_error", lambda sid, e: None), \
@@ -1032,6 +1050,7 @@ class RunPassOutageTest(unittest.TestCase):
         job_ref.append(job)
         with mock.patch.object(core, "refresh_series", look), \
              mock.patch.object(core, "describe_outcome", lambda con, sid, o: ("done", "ok")), \
+             mock.patch.object(core, "downloads_due", lambda con, o: []), \
              mock.patch.object(web.db, "connect", mock.MagicMock()):
             web._run_pass(job, rows, "test")
         self.assertEqual(seen, [5, 6])

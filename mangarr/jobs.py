@@ -2,10 +2,12 @@
 
 Adding, refreshing and downloading take minutes to hours, so the web layer
 never runs them inline: it submits a Job and the single worker thread runs
-jobs one at a time (Suwayomi has one download queue, so parallel downloads
-would fight). The scheduler thread submits a "refresh all" job every
-REFRESH_HOURS. Every job's progress and outcome is visible on the Activity
-page and in the log.
+jobs one at a time (Suwayomi has one download queue, so two download jobs
+would fight over it). Within one job, a refresh pass (refresh all, search
+wanted) downloads from up to Download Lanes sites at once through its lanes
+(lanes.LanePool), one series per site. The scheduler thread submits a
+"refresh all" job every REFRESH_HOURS. Every job's progress and outcome is
+visible on the Activity page and in the log.
 """
 import collections
 import logging
@@ -41,8 +43,12 @@ class Job:
     message: str = ""
     cancel: bool = False
     key: str | None = None         # dedupe key: one queued/running job per key (see Runner.submit)
-    # the series a multi-series pass is working on right now (pending_for sees it)
+    # the series a multi-series pass is working on right now (pending_for sees it):
+    # the one it resolves, and the ones its download lanes download or write
     active_series_id: int | None = None
+    active_series_ids: frozenset = frozenset()
+    # a pass's download lanes at work: [{lane, source, series_id, title, text, since}]
+    lanes: list = field(default_factory=list)
     # a multi-series job (refresh pass) lists every series it covers:
     # {series_id, title, state: queued|running|done|nomatch|failed|error|cancelled, result}
     items: list = field(default_factory=list)
@@ -58,7 +64,7 @@ class Job:
         return {"id": self.id, "kind": self.kind, "title": self.title, "seriesId": self.series_id,
                 "status": self.status, "queuedAt": self.queued_at, "startedAt": self.started_at,
                 "finishedAt": self.finished_at, "progress": self.progress, "progressAt": self.progress_at,
-                "message": self.message, "items": self.items}
+                "message": self.message, "items": self.items, "lanes": self.lanes}
 
 
 class Runner:
@@ -143,7 +149,8 @@ class Runner:
         """A job for this series is queued or running, including a pass
         (refresh-all, search wanted) that is working on it right now."""
         with self._lock:
-            return any(j.status in ACTIVE and series_id in (j.series_id, j.active_series_id) for j in self._jobs)
+            return any(j.status in ACTIVE and (series_id in (j.series_id, j.active_series_id)
+                                               or series_id in j.active_series_ids) for j in self._jobs)
 
     def _loop(self) -> None:
         while True:
@@ -176,6 +183,7 @@ class Runner:
                 with self._lock:
                     job.finished_at = time.time()
                     job.active_series_id = None
+                    job.active_series_ids, job.lanes = frozenset(), []
                     self.current = None
                     self._trim()
                 metrics.record_job(job.kind, job.status)

@@ -254,6 +254,13 @@ class SeriesStepsTest(unittest.TestCase):
             self.assertEqual(steps.wants(set()), [])
             self.assertEqual((reasons.get(2.0), reasons.get(3.0), reasons.get(1.0)), ("not now", "not now", None))
 
+    def test_a_run_cut_short_goes_on_from_the_first_chapter_that_did_not_arrive(self):
+        # a cancel ends a run with neither failures nor all of it: the series is not done
+        steps, _ = steps_for([match("A", 1, [1, 2, 3])], [1, 2, 3])
+        steps.record(steps.take("a", set()), [1.0], [], {})
+        self.assertEqual(steps.wants(set()), ["a"])
+        self.assertEqual([c.number for c in steps.take("a", set()).todo], [2.0, 3.0])
+
     def test_a_page_by_page_source_takes_one_chapter_at_a_time(self):
         m = match("Comick (Unoriginal) (EN)", 1, [1, 2, 3])
         m.source = Source("1", m.source.name, "en", page_warm=True)

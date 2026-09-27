@@ -53,6 +53,7 @@ class RunPassTest(unittest.TestCase):
         job = jobs.Job(1, "refresh-all", "all")
         with mock.patch.object(core, "refresh_series", fake_refresh), \
              mock.patch.object(core, "describe_outcome", lambda con, sid, o: outcomes[sid]), \
+             mock.patch.object(core, "downloads_due", lambda con, o: []), \
              mock.patch.object(web, "_record_error", lambda sid, e: None), \
              mock.patch.object(web.db, "connect", mock.MagicMock()):
             done, dl, imp, errors = web._run_pass(job, rows, "test")
