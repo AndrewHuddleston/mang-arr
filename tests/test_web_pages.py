@@ -168,7 +168,11 @@ class PagesTest(unittest.TestCase):
                         mock.patch("mangarr.web.app.client.sources", lambda *a, **k: [_FakeSource("Weeb Central")]),
                         mock.patch("mangarr.web.app.client.gq", _fake_gq),
                         mock.patch.object(health, "_ping", lambda name, url, timeout=8: health.Check("ok", name, "stub")),
-                        mock.patch.dict(health._cache, {"at": 0.0, "checks": []})]
+                        mock.patch.dict(health._cache, {"at": 0.0, "checks": []}),
+                        # never notify or reach Komga for real, not even from the background health run
+                        mock.patch("mangarr.notify.send", return_value=None),
+                        mock.patch("mangarr.notify.send_detailed", return_value={}),
+                        mock.patch("mangarr.komga.test", return_value=(True, "faked in tests"))]
         for p in self.patches:
             p.start()
         from mangarr import db, settings

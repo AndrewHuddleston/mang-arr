@@ -128,13 +128,36 @@ def ensure_security(con: sqlite3.Connection) -> None:
     ensure_api_key(con)
     v = all_values(con)
     if not v["session_secret"]:
-        set_many(con, {"session_secret": secrets.token_hex(32)}, internal=True)
+        # a new secret invalidates every older cookie, so the epoch and revocation list are
+        # (re)written too: that also repairs unreadable ones (see _load)
+        try:
+            epoch = int(v["session_epoch"] or 0)
+        except (TypeError, ValueError):
+            epoch = 0
+        for k, val in (("session_secret", secrets.token_hex(32)), ("session_epoch", epoch), ("revoked_sessions", [])):
+            _store(con, k, val)
+        con.commit()
+        refresh(con)
     pw = str(v["auth_password"] or "")
     if pw and not is_hashed(pw):
         _store(con, "auth_password", hash_password(pw))
         con.commit()
         refresh(con)
         log.info("web login password was stored in clear; replaced it with a salted hash")
+
+
+def reset_login(con: sqlite3.Connection) -> None:
+    """MANGARR_RESET_LOGIN=1 at startup: clear the web login (for an owner
+    locked out: forgotten password, or a username left without one) and sign
+    every session out. Written directly, so it also repairs unreadable values."""
+    for k, v in (("auth_user", ""), ("auth_password", ""), ("session_secret", secrets.token_hex(32)),
+                 ("revoked_sessions", [])):
+        _store(con, k, v)
+    con.commit()
+    refresh(con)
+    log.warning("MANGARR_RESET_LOGIN is set: the web login was cleared and every session signed out; anyone who can "
+                "reach mang-arr can use it now. Set a new login in Settings -> Security and remove "
+                "MANGARR_RESET_LOGIN, or the login is cleared again at the next start")
 
 
 def rotate_api_key(con: sqlite3.Connection) -> str:
@@ -192,17 +215,33 @@ _lock = threading.Lock()
 TTL = 5.0        # seconds between re-reads; the UI and jobs share one file
 
 
+UNREADABLE_USER = "(unreadable)"   # auth_user when the stored login cannot be decoded: login on, nobody signs in
+
+
 def _load(con: sqlite3.Connection) -> dict[str, object]:
     """The stored values over the defaults. Any error reading the table
     propagates: treating an unreadable table as 'nothing set' would switch
-    the web login off (fail open)."""
+    the web login off (fail open). Likewise a corrupt login or session value
+    never falls back to its default: an unreadable auth_user/auth_password
+    leaves a login nobody can pass with a password (API key and
+    MANGARR_RESET_LOGIN still work), an unreadable session value signs every
+    session out (default epoch 0 would revive revoked cookies)."""
     out = dict(DEFAULTS)
+    bad = []
     for r in con.execute("SELECT key, value FROM setting"):
         if r["key"] in DEFAULTS:
             try:
                 out[r["key"]] = json.loads(r["value"])
             except json.JSONDecodeError:
+                bad.append(r["key"])
                 log.warning("setting %s has unreadable value; using default", r["key"])
+    if {"auth_user", "auth_password"} & set(bad):
+        out["auth_user"], out["auth_password"] = UNREADABLE_USER, ""
+        log.error("the stored web login is unreadable: password sign-in refused until it is set again "
+                  "(use the API key, or restart with MANGARR_RESET_LOGIN=1)")
+    if {"session_secret", "session_epoch", "revoked_sessions"} & set(bad):
+        out["session_secret"] = ""
+        log.error("stored session data is unreadable: every web session is signed out")
     return out
 
 
@@ -287,6 +326,8 @@ def set_many(con: sqlite3.Connection, values: dict[str, object], internal: bool 
         elif v == current.get(k):
             continue                                    # unchanged: no write, no log line
         new[k] = v
+    if current.get("auth_user") == UNREADABLE_USER and "auth_user" in new:
+        new.setdefault("auth_password", "")              # rewrite the unreadable pair together (see _load)
     notices = _unbind_moved_secrets(current, values, new)
     if any(k in new for k in ("auth_user", "auth_password", "auth_method")):
         _validate({**current, **new})

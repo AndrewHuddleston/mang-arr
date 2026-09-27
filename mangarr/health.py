@@ -7,7 +7,10 @@ Only one run happens at a time (single flight), in a background thread:
 callers get the cached result at once when there is one (a stale one
 triggers the re-check), otherwise they wait at most DEADLINE seconds, so a
 hung backend or a hung disk mount can never pile up request threads. A
-forced run (System page) re-checks at most every FORCE_MIN_SECS."""
+run still going after DEADLINE is an error for every caller, so a hang
+shows up (and /api/v1/health fails) instead of the last good result being
+served forever. A forced run (System page) re-checks at most every
+FORCE_MIN_SECS."""
 import logging
 import os
 import shutil
@@ -36,6 +39,8 @@ class Check:
 _cache: dict = {"at": 0.0, "checks": []}
 _lock = threading.Lock()
 _running: threading.Event | None = None      # set when the run in progress finishes
+_started = 0.0                               # when the run in progress started (monotonic)
+_hang_logged: threading.Event | None = None  # the run already reported as hung (log it once, not per caller)
 
 
 def _ping(name: str, url: str, timeout: int = 8) -> Check:
@@ -56,26 +61,44 @@ def run(client: Client, force: bool = False, wait: float = DEADLINE, note_timeou
     force wants a fresh result (at most FORCE_MIN_SECS old) and waits for it;
     otherwise a stale result is returned at once while the re-check runs.
     With nothing cached, waits up to `wait` s; if the run is still going
-    then, returns what is cached plus (note_timeout) an error saying so."""
-    global _running
+    then, returns what is cached plus (note_timeout) an error saying so.
+    A run going for longer than DEADLINE is reported as an error to every
+    caller (cached or not, note_timeout or not): a hung check must not
+    leave monitoring reading the last good result forever."""
+    global _running, _started
     with _lock:
+        now = time.monotonic()
         have = bool(_cache["checks"])
-        if have and time.monotonic() - _cache["at"] < (FORCE_MIN_SECS if force else CACHE_SECS):
+        hung = _running is not None and now - _started > DEADLINE
+        if have and not hung and now - _cache["at"] < (FORCE_MIN_SECS if force else CACHE_SECS):
             return list(_cache["checks"])
         done = _running
         if done is None:                     # single flight: start the one run
             done = _running = threading.Event()
+            _started = now
             threading.Thread(target=_background, args=(client, done), name="mangarr-health", daemon=True).start()
-    if have and not force:
-        return list(_cache["checks"])        # stale while revalidating
-    finished = done.wait(wait)
+    finished = done.is_set() if (have and not force) else done.wait(wait)   # stale while revalidating: no wait
     with _lock:
         checks = list(_cache["checks"])
-    if not finished and note_timeout:
-        log.warning("health: checks still running after %g s: a backend or a disk mount is not answering", wait)
-        checks.append(Check("error", "Health checks", f"not finished after {wait:g} s: a backend or a disk mount "
-                                                      "is not answering (the check carries on in the background)"))
+        running_for = time.monotonic() - _started if _running is done and not done.is_set() else 0.0
+    if finished or running_for <= 0:
+        return checks
+    if running_for > DEADLINE or (note_timeout and not (have and not force)):
+        _note_hang(done, running_for)
+        checks.append(Check("error", "Health checks", f"not finished after {running_for:.1f} s: a backend or a disk "
+                                                      "mount is not answering (the check carries on in the "
+                                                      "background)"))
     return checks
+
+
+def _note_hang(done: threading.Event, secs: float) -> None:
+    """Log a slow or hung run once per run, not once per caller."""
+    global _hang_logged
+    with _lock:
+        if _hang_logged is done:
+            return
+        _hang_logged = done
+    log.warning("health: checks still running after %.1f s: a backend or a disk mount is not answering", secs)
 
 
 def _background(client: Client, done: threading.Event) -> None:

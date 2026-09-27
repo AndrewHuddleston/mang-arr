@@ -6,6 +6,7 @@ here; app.py wires them up (see the comment above its middleware).
 """
 import base64
 import binascii
+import functools
 import hashlib
 import hmac
 import ipaddress
@@ -29,7 +30,12 @@ SAFE_METHODS = ("GET", "HEAD", "OPTIONS")
 MAX_BODY = 1 << 20                           # request bodies above this get 413 (1 MB)
 # bigger bodies for specific routes: the backup upload (MANGARR_MAX_UPLOAD_MB, default 2 GB)
 BODY_LIMITS: dict[str, int] = {"/system/backups/upload": int(os.environ.get("MANGARR_MAX_UPLOAD_MB", "2048")) << 20}
-LAN_SUFFIXES = (".local", ".lan", ".home.arpa", ".internal", ".localdomain")
+# names that cannot be an attacker's public DNS name: LAN-only suffixes (RFC 6762 appendix G, RFC 8375),
+# router and container names (FRITZ!Box, Docker) and Tailscale MagicDNS (*.ts.net, controlled by Tailscale)
+LAN_SUFFIXES = (".local", ".lan", ".home.arpa", ".internal", ".localdomain", ".home", ".corp", ".intranet",
+                ".private", ".fritz.box", ".docker", ".ts.net")
+# headers only a reverse proxy adds (a cross-site page cannot set them without a CORS preflight)
+PROXY_HEADERS = ("x-forwarded-for", "x-real-ip", "forwarded", "x-forwarded-proto")
 CSP = ("default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src * data:; "
        "connect-src 'self'; object-src 'none'; base-uri 'self'; form-action 'self'")
 MAX_REVOKED = 200                            # sessions signed out one by one; more -> sign everyone out
@@ -41,8 +47,46 @@ def clip(value, n: int = 64) -> str:
     return repr(text[:n] + ("..." if len(text) > n else ""))
 
 
+@functools.lru_cache(maxsize=4)
+def _trusted_proxies(spec: str) -> tuple:
+    """MANGARR_TRUSTED_PROXIES: comma-separated addresses or networks of reverse proxies."""
+    nets = []
+    for part in spec.split(","):
+        if part.strip():
+            try:
+                nets.append(ipaddress.ip_network(part.strip(), strict=False))
+            except ValueError:
+                log.warning("MANGARR_TRUSTED_PROXIES: %s is not an address or network; ignored", clip(part))
+    return tuple(nets)
+
+
+def _is_trusted(addr: str, nets: tuple) -> bool:
+    try:
+        ip = ipaddress.ip_address(addr.strip())
+    except ValueError:
+        return False
+    return any(ip.version == n.version and ip in n for n in nets)
+
+
 def client_ip(request: Request) -> str:
-    return request.client.host if request.client else "?"
+    """The address failed-password throttling and log lines are keyed on:
+    the peer, or, when the peer is a reverse proxy listed in
+    MANGARR_TRUSTED_PROXIES, the last X-Forwarded-For hop that is not a
+    trusted proxy (hops further left are client-supplied and not trusted).
+    Without it every client behind a proxy shares the proxy's address, so
+    other people's failures would lock the owner out."""
+    peer = request.client.host if request.client else "?"
+    nets = _trusted_proxies(os.environ.get("MANGARR_TRUSTED_PROXIES", ""))
+    if not nets or not _is_trusted(peer, nets):
+        return peer
+    hops = [h.strip() for h in ",".join(request.headers.getlist("x-forwarded-for")).split(",") if h.strip()]
+    for hop in reversed(hops):
+        if not _is_trusted(hop, nets):
+            try:
+                return str(ipaddress.ip_address(hop))
+            except ValueError:
+                return peer                      # garbled: throttle on the proxy's address
+    return peer
 
 
 class LogBudget:
@@ -201,7 +245,7 @@ def host_allowed(host_header: str, extra: set[str]) -> bool:
     """DNS rebinding defence: a rebound page reaches us under the attacker's
     host name, so only names that cannot be an attacker's public DNS name are
     answered: IP literals, localhost, single-label names (mangarr), LAN
-    suffixes (.local .lan .home.arpa .internal .localdomain) and the names in
+    suffixes (LAN_SUFFIXES: .local .lan .home .fritz.box .ts.net ...) and the names in
     `extra` ('*' allows everything, '.example.com' a whole domain)."""
     host = hostname(host_header)
     if not host:
@@ -213,7 +257,8 @@ def host_allowed(host_header: str, extra: set[str]) -> bool:
         return True
     except ValueError:
         pass
-    if host == "localhost" or host.endswith(".localhost") or "." not in host or host.endswith(LAN_SUFFIXES):
+    if host in ("localhost", "fritz.box") or host.endswith(".localhost") or "." not in host \
+            or host.endswith(LAN_SUFFIXES):
         return True
     return any(e.startswith(".") and host.endswith(e) for e in extra)
 
@@ -231,7 +276,10 @@ def same_origin(request: Request) -> tuple[bool, str]:
     A browser always sends Origin (or at least Referer) with a cross-site
     POST, so a request with neither is not a browser form and goes on to the
     normal login check. Behind a reverse proxy X-Forwarded-Host counts too (a
-    cross-site page cannot add that header without a CORS preflight)."""
+    cross-site page cannot add that header without a CORS preflight), and so
+    does a proxy that drops the port from Host (nginx `$host`): when a proxy
+    header (PROXY_HEADERS) is present and Host has no port, the host names
+    must match and the port only if X-Forwarded-Port says which it was."""
     src = request.headers.get("origin") or request.headers.get("referer")
     if request.headers.get("sec-fetch-site") == "cross-site":
         return False, src or "Sec-Fetch-Site: cross-site"
@@ -244,8 +292,14 @@ def same_origin(request: Request) -> tuple[bool, str]:
     if u.scheme not in ("http", "https") or not u.netloc:
         return False, src                        # 'null' (sandboxed frames, no-referrer pages), file:, ...
     want = _host_port(u.netloc, u.scheme)
-    for h in (request.headers.get("host", ""), request.headers.get("x-forwarded-host", "").split(",")[0]):
+    host = request.headers.get("host", "")
+    for h in (host, request.headers.get("x-forwarded-host", "").split(",")[0]):
         if h and _host_port(h, u.scheme) == want:
+            return True, src
+    name, port = _host_port(host, "")            # port None: Host carries none
+    if host and port is None and name == want[0] and any(request.headers.get(h) for h in PROXY_HEADERS):
+        fport = request.headers.get("x-forwarded-port", "").split(",")[0].strip()
+        if not fport or (fport.isdigit() and int(fport) == want[1]):
             return True, src
     return False, src
 
@@ -290,11 +344,13 @@ def session_ok(v: dict, cookie: str | None) -> bool:
     return parse_session(v, cookie) is not None
 
 
-def set_session(request: Request, resp: Response, v: dict) -> None:
+def set_session(request: Request, resp: Response, v: dict, persistent: bool = True) -> None:
+    """persistent=False: a browser-session cookie (gone when the browser
+    closes, like the Basic credentials it stands in for)."""
     https = request.url.scheme == "https" or \
         request.headers.get("x-forwarded-proto", "").split(",")[0].strip().lower() == "https"
-    resp.set_cookie(SESSION_COOKIE, make_session(v), max_age=SESSION_DAYS * 86400, httponly=True,
-                    samesite="lax", secure=https)
+    resp.set_cookie(SESSION_COOKIE, make_session(v), max_age=SESSION_DAYS * 86400 if persistent else None,
+                    httponly=True, samesite="lax", secure=https)
 
 
 _verified: dict[str, float] = {}             # sha256(stored hash, user, password) -> until

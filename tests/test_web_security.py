@@ -26,6 +26,21 @@ def _offline(*a, **k):
     raise SuwayomiError("offline in tests")
 
 
+def no_network_patches(calls: list) -> list:
+    """Never reach the outside from web tests, even from the background
+    health thread: notifications and the Komga test are faked, and any
+    other outbound connection attempt fails and is recorded in `calls`
+    (tearDown asserts it stays empty)."""
+    def blocked(host, *a, **k):
+        calls.append((host, threading.current_thread().name))
+        raise OSError(f"network disabled in tests ({host})")
+    return [mock.patch("mangarr.notify.send", return_value=None),
+            mock.patch("mangarr.notify.send_detailed", return_value={}),
+            mock.patch("mangarr.komga.test", return_value=(True, "faked in tests")),
+            mock.patch("socket.getaddrinfo", blocked),
+            mock.patch("socket.create_connection", lambda addr, *a, **k: blocked(addr[0]))]
+
+
 class _FakeSource:
     def __init__(self, name):
         self.id, self.name, self.lang, self.unusable, self.throttled = "1", name, "en", False, False
@@ -40,7 +55,11 @@ class WebBase(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         from mangarr import health, settings
         from mangarr.web import app as web
-        from mangarr.web import lists_routes, security
+        from mangarr.web import lists_routes
+        try:                                  # optional, so these tests fail on a version without the fixes
+            from mangarr.web import security  # for what they check, not with an ImportError in setUp
+        except ImportError:
+            security = None
         self.patches = [mock.patch("mangarr.config.DATA_DIR", self.tmp.name),
                         mock.patch("mangarr.config.DB_PATH", os.path.join(self.tmp.name, "t.db")),
                         mock.patch("mangarr.config.STAGING_ROOT", self.tmp.name),
@@ -49,17 +68,21 @@ class WebBase(unittest.TestCase):
                         mock.patch.object(web.client, "sources", lambda *a, **k: [_FakeSource("Weeb Central")]),
                         mock.patch.object(health, "_ping", lambda name, url, timeout=8: health.Check("ok", name, "x")),
                         mock.patch.dict(health._cache, {"at": 0.0, "checks": []}),
-                        mock.patch.object(settings, "PBKDF2_ITERATIONS", 1000),
-                        mock.patch.object(security, "throttle", security.Throttle()),
-                        mock.patch.object(security, "_verified", {}),
-                        mock.patch.object(lists_routes, "_app", web),
-                        mock.patch("mangarr.web.app.asyncio.sleep", self._no_sleep)]
+                        mock.patch.object(settings, "PBKDF2_ITERATIONS", 1000, create=True),
+                        mock.patch.object(lists_routes, "_app", web)]
+        if security is not None:
+            self.patches += [mock.patch.object(security, "throttle", security.Throttle()),
+                             mock.patch.object(security, "_verified", {})]
+        if hasattr(web, "asyncio"):
+            self.patches.append(mock.patch("mangarr.web.app.asyncio.sleep", self._no_sleep))
+        self.net_calls: list = []
+        self.patches += no_network_patches(self.net_calls)
         for p in self.patches:
             p.start()
         settings._cache.clear()
         from mangarr import db
         with db.connect() as con:
-            settings.ensure_security(con)
+            getattr(settings, "ensure_security", settings.ensure_api_key)(con)
             if self.login:
                 settings.set_many(con, {"auth_user": self.login[0], "auth_password": self.login[1],
                                         "auth_method": "forms"})
@@ -74,7 +97,7 @@ class WebBase(unittest.TestCase):
     def tearDown(self):
         self.client.close()
         from mangarr import health
-        running = health._running             # a health run still going: let it end while the fakes are in place
+        running = getattr(health, "_running", None)  # a health run still going: let it end while the fakes are in place
         if running is not None:
             running.wait(30)
         for p in reversed(self.patches):
@@ -82,6 +105,7 @@ class WebBase(unittest.TestCase):
         from mangarr import settings
         settings._cache.clear()
         self.tmp.cleanup()
+        self.assertEqual(self.net_calls, [], "a web test tried to reach the network")
 
     def set(self, **values):
         from mangarr import db
@@ -152,7 +176,8 @@ class EscapingTest(WebBase):
     def test_no_inline_script_and_csp_header(self):
         import glob
         for path in glob.glob(os.path.join(os.path.dirname(self.web.__file__), "templates", "*.html")):
-            text = open(path, encoding="utf-8").read()
+            with open(path, encoding="utf-8") as f:
+                text = f.read()
             self.assertNotIn("|safe", text, path)
             self.assertNotRegex(text, r"\son(submit|change|click)=", path)
             self.assertNotIn("<script>", text, path)
@@ -196,12 +221,27 @@ class CsrfHostTest(WebBase):
         with db.connect() as con:
             self.assertIsNotNone(db.get_series(con, sid))
 
+    def test_proxy_that_drops_the_port(self):
+        """Review 3(b): nginx `proxy_set_header Host $host` on port 8443 (Host without its port)."""
+        c = self.client
+        proxied = {"Origin": "https://manga.lan:8443", "Host": "manga.lan", "X-Forwarded-For": "192.168.1.4"}
+        self.assertEqual(c.post("/wanted/search", headers=proxied, follow_redirects=False).status_code, 303)
+        self.assertEqual(c.post("/wanted/search", headers={**proxied, "X-Forwarded-Port": "8443"},
+                                follow_redirects=False).status_code, 303)
+        for bad in ({**proxied, "X-Forwarded-Port": "443"},                         # proxy says another port
+                    {**proxied, "Origin": "https://evil.example:8443"},              # another host
+                    {"Origin": "https://manga.lan:8443", "Host": "manga.lan"},       # no proxy header: strict
+                    {**proxied, "Host": "manga.lan:6789"}):                          # Host has a port: strict
+            self.assertEqual(c.post("/wanted/search", headers=bad).status_code, 403, bad)
+
     def test_host_allowlist(self):
         c = self.client
-        for host in ("evil.example", "rebind.attacker.com:6789"):
+        for host in ("evil.example", "rebind.attacker.com:6789", "evil.box", "home.example.com"):
             self.assertEqual(c.get("/api/v1/series", headers={"Host": host}).status_code, 400, host)
         for host in ("localhost:6789", "127.0.0.1", "192.168.1.10:6789", "[::1]:6789", "mangarr", "nas.lan",
-                     "nas.local:6789", "box.home.arpa", "testserver"):
+                     "nas.local:6789", "box.home.arpa", "testserver",
+                     # review 3(a): common home names
+                     "nas.fritz.box", "fritz.box", "nas.home:6789", "nas.tail1234.ts.net", "mangarr.docker"):
             self.assertEqual(c.get("/api/v1/series", headers={"Host": host}).status_code, 200, host)
         with mock.patch.dict(os.environ, {"MANGARR_ALLOWED_HOSTS": "manga.example.com, .mydomain.org"}):
             self.assertEqual(c.get("/api/v1/series", headers={"Host": "manga.example.com"}).status_code, 200)
@@ -293,10 +333,95 @@ class LoginTest(WebBase):
         self.security.throttle.succeeded("testclient")
         self.assertEqual(c.get("/api/v1/series", auth=("andy", "pw")).status_code, 401)
         self.set(auth_method="basic")
-        self.assertEqual(c.get("/api/v1/series", auth=("andy", "pw")).status_code, 200)
-        for _ in range(6):
+        r = c.get("/api/v1/series", auth=("andy", "pw"))
+        self.assertEqual(r.status_code, 200)
+        owner_cookie = c.cookies.get("mangarr_session")        # Basic checked once -> browser-session cookie
+        self.assertTrue(owner_cookie)
+        self.assertNotIn("max-age", r.headers["set-cookie"].lower())
+        c.cookies.clear()
+        for _ in range(6):                                     # someone else at the same address guesses
             c.get("/api/v1/series", auth=("andy", "nope"))
         self.assertEqual(c.get("/api/v1/series", auth=("andy", "pw")).status_code, 429)
+        # review 3(c): the owner's browser, already signed in, is not locked out by those failures
+        c.cookies.set("mangarr_session", owner_cookie)
+        self.assertEqual(c.get("/api/v1/series", auth=("andy", "pw")).status_code, 200)
+
+    def test_trusted_proxy_client_address(self):
+        """Review 3(c): behind a listed reverse proxy, throttling is per real client."""
+        from types import SimpleNamespace
+
+        from starlette.datastructures import Headers
+
+        def req(peer, xff=None):
+            return SimpleNamespace(client=SimpleNamespace(host=peer),
+                                   headers=Headers({"x-forwarded-for": xff} if xff else {}))
+        ip = self.security.client_ip
+        self.assertEqual(ip(req("10.0.0.2", "1.2.3.4")), "10.0.0.2")          # no trusted proxies: the peer
+        with mock.patch.dict(os.environ, {"MANGARR_TRUSTED_PROXIES": "10.0.0.0/24, bogus"}):
+            self.assertEqual(ip(req("10.0.0.2", "6.6.6.6, 1.2.3.4")), "1.2.3.4")   # left hops are client-made
+            self.assertEqual(ip(req("10.0.0.2", "1.2.3.4, 10.0.0.9")), "1.2.3.4")  # chained proxies skipped
+            self.assertEqual(ip(req("10.0.0.2", "not-an-ip")), "10.0.0.2")
+            self.assertEqual(ip(req("10.0.0.2")), "10.0.0.2")
+            self.assertEqual(ip(req("192.168.1.5", "1.2.3.4")), "192.168.1.5")    # not a proxy: header ignored
+
+    def test_login_without_password_explains_recovery(self):
+        """Review 3(d): a login left without a password says how to get back in."""
+        from mangarr import db
+        with db.connect() as con:
+            con.execute("UPDATE setting SET value='\"\"' WHERE key='auth_password'")    # the old bug's state
+            con.commit()
+            self.settings.refresh(con)
+        self.assertIn("MANGARR_RESET_LOGIN", self.client.get("/login").text)
+        r = self.client.post("/login", data={"username": "andy", "password": "x"})
+        self.assertEqual(r.status_code, 401)
+        self.assertIn("MANGARR_RESET_LOGIN", r.text)
+        self.assertEqual(self.client.get("/api/v1/series").status_code, 401)         # still closed
+        self.web._startup_security()                             # an ordinary restart changes nothing
+        self.assertEqual(self.client.get("/api/v1/series").status_code, 401)
+        with mock.patch.dict(os.environ, {"MANGARR_RESET_LOGIN": "1"}), \
+                self.assertLogs("mangarr.settings", logging.WARNING) as logs:
+            self.web._startup_security()                         # restart with the variable
+        self.assertIn("MANGARR_RESET_LOGIN", "\n".join(logs.output))
+        self.assertEqual(self.settings.all_values()["auth_user"], "")
+        self.assertEqual(self.client.get("/api/v1/series").status_code, 200)
+
+    def test_corrupt_login_value_stays_closed(self):
+        """Review 4 (#27): an undecodable auth_user never switches the login off."""
+        from mangarr import db
+        self.signin()
+        with db.connect() as con:
+            con.execute("UPDATE setting SET value='{broken' WHERE key='auth_user'")
+            con.commit()
+            with self.assertLogs("mangarr.settings", logging.ERROR):
+                self.settings.refresh(con)
+        v = self.settings.all_values()
+        self.assertEqual((v["auth_user"], v["auth_password"]), (self.settings.UNREADABLE_USER, ""))
+        self.assertEqual(TestClient(self.web.app).get("/api/v1/series").status_code, 401)
+        self.assertEqual(self.client.get("/api/v1/series").status_code, 401)        # old session no longer valid
+        self.assertEqual(self.client.post("/login", data={"username": "(unreadable)", "password": "x"}).status_code,
+                         401)
+        self.assertEqual(self.client.get("/api/v1/series", headers={"X-Api-Key": self.key}).status_code, 200)
+        self.set(auth_user="")                                  # turning it off rewrites the pair
+        self.assertEqual(self.settings.all_values()["auth_user"], "")
+        with db.connect() as con:
+            self.assertEqual(con.execute("SELECT value FROM setting WHERE key='auth_user'").fetchone()[0], '""')
+
+    def test_corrupt_session_value_signs_everyone_out(self):
+        """Review 4: an undecodable session_epoch must not fall back to 0 (reviving old cookies)."""
+        from mangarr import db
+        self.signin()
+        self.assertEqual(self.client.get("/api/v1/series").status_code, 200)
+        with db.connect() as con:
+            con.execute("UPDATE setting SET value='oops' WHERE key='session_epoch'")
+            con.commit()
+            self.settings.refresh(con)
+            self.assertEqual(self.settings.all_values()["session_secret"], "")
+        self.assertEqual(self.client.get("/api/v1/series").status_code, 401)
+        self.signin()                                           # signing in repairs it (new secret, epoch)
+        self.assertEqual(self.client.get("/api/v1/series").status_code, 200)
+        with db.connect() as con:
+            self.settings.refresh(con)
+        self.assertTrue(self.settings.all_values()["session_secret"])
 
     def test_login_failure_delay_does_not_block_a_thread(self):
         """#70: the delay is an asyncio sleep in an async route."""
@@ -404,6 +529,50 @@ class ApiKeyTest(WebBase):
         self.assertEqual(c.post(f"/settings?apikey={self.key}", data={"auth_user": "x"}).status_code, 401)
         self.assertEqual(c.post(f"/api/v1/command?apikey={self.key}", json={"name": "Nope"}).status_code, 401)
         c.close()
+
+
+class ApiKeyRotationTest(WebBase):
+    """#50 (d): a key readable while there was no login stops working when a login is switched on."""
+
+    def test_form_enabling_login_rotates_the_key(self):
+        c = self.client
+        old = c.get("/api/v1/settings").json()["api_key"]              # anyone could read it: no login yet
+        self.assertEqual(old, self.key)
+        with self.assertLogs("mangarr.web.app", logging.WARNING) as logs:
+            r = c.post("/settings", data={"auth_user": "andy", "auth_password": "pw", "auth_method": "forms"},
+                       follow_redirects=False)
+        self.assertEqual(r.status_code, 303)
+        self.assertIn("API key was regenerated", "\n".join(logs.output))
+        anon = TestClient(self.web.app)
+        self.assertEqual(anon.get("/api/v1/series", headers={"X-Api-Key": old}).status_code, 401)
+        new = self.settings.all_values()["api_key"]
+        self.assertNotEqual(new, old)
+        self.assertEqual(anon.get("/api/v1/series", headers={"X-Api-Key": new}).status_code, 200)
+        anon.close()
+
+    def test_api_enabling_login_without_the_key_rotates_it(self):
+        old = self.key
+        r = self.client.put("/api/v1/settings", json={"auth_user": "andy", "auth_password": "pw"})
+        self.assertEqual(r.status_code, 200)
+        self.assertIn("API key was regenerated", r.headers.get("x-mangarr-notice", ""))
+        new = r.json()["api_key"]                                         # the caller gets the new key
+        self.assertNotEqual(new, old)
+        self.assertEqual(self.client.get("/api/v1/series", headers={"X-Api-Key": old}).status_code, 401)
+        self.assertEqual(self.client.get("/api/v1/series", headers={"X-Api-Key": new}).status_code, 200)
+
+    def test_installer_flow_keeps_its_key(self):
+        """GET key -> PUT login with X-Api-Key -> the same key keeps working (install.sh)."""
+        key = self.client.get("/api/v1/settings").json()["api_key"]
+        r = self.client.put("/api/v1/settings", json={"auth_user": "andy", "auth_password": "pw"},
+                            headers={"X-Api-Key": key})
+        self.assertEqual(r.status_code, 200)
+        self.assertNotIn("x-mangarr-notice", r.headers)
+        self.assertEqual(self.client.get("/api/v1/series", headers={"X-Api-Key": key}).status_code, 200)
+        self.assertEqual(self.client.get("/api/v1/series").status_code, 401)
+        # a key chosen in the same call is kept too
+        self.set(auth_user="")
+        r = self.client.put("/api/v1/settings", json={"auth_user": "andy", "auth_password": "pw", "api_key": "c" * 32})
+        self.assertEqual(self.client.get("/api/v1/series", headers={"X-Api-Key": "c" * 32}).status_code, 200)
 
 
 class SecretDestinationTest(WebBase):
@@ -584,7 +753,7 @@ class HealthCacheTest(unittest.TestCase):
 
     def _settle(self):
         """Wait for a background run another test started to finish."""
-        done = self.health._running
+        done = getattr(self.health, "_running", None)
         if done is not None:
             done.wait(5)
 
@@ -621,6 +790,29 @@ class HealthCacheTest(unittest.TestCase):
             self.assertLess(time.monotonic() - t0, 2)
             self.assertEqual(checks[-1].name, "Health checks")
             self.assertEqual(self.health.summary(None, wait=0.1)["errors"], 0)
+            gate.set()
+
+    def test_hung_run_is_reported_to_cached_callers(self):
+        """Review regression 2: a run hung past DEADLINE must not leave everyone on the last good result."""
+        gate = threading.Event()
+
+        def hang(client):
+            gate.wait(5)
+        with self.health._lock:
+            self.health._cache.update(at=0.0, checks=[self.health.Check("ok", "X", "fine")])   # stale, good
+        try:
+            with mock.patch.object(self.health, "_compute", hang), mock.patch.object(self.health, "DEADLINE", 0.3):
+                self.assertEqual([c.name for c in self.health.run(None)], ["X"])   # stale-while-revalidate
+                self.assertEqual(self.health.summary(None)["errors"], 0)            # not overdue yet
+                time.sleep(0.5)
+                with self.assertLogs("mangarr.health", logging.WARNING):
+                    checks = self.health.run(None)
+                self.assertEqual(checks[-1].name, "Health checks")
+                self.assertEqual(self.health.summary(None)["errors"], 1)            # the status poller too
+                with self.health._lock:                                            # even a fresh cache
+                    self.health._cache["at"] = time.monotonic()
+                self.assertEqual(self.health.run(None)[-1].level, "error")
+        finally:
             gate.set()
 
 

@@ -86,8 +86,7 @@ async def lifespan(app: FastAPI):
         scheduler = jobs.Scheduler(runner, _job_refresh_all)
         scheduler.start()
     try:
-        with db.connect() as con:
-            settings.ensure_security(con)        # API key, session secret, legacy clear-text password -> hash
+        _startup_security()
     except Exception as e:
         log.error("could not open the database at %s: %s", config.DB_PATH, e)
     updates.start_background()
@@ -97,6 +96,13 @@ async def lifespan(app: FastAPI):
              config.LIBRARY_ROOT)
     yield
     log.info("web shutting down")
+
+
+def _startup_security() -> None:
+    with db.connect() as con:
+        if os.environ.get("MANGARR_RESET_LOGIN", "").strip().lower() in ("1", "true", "yes"):
+            settings.reset_login(con)            # locked out: the operator restarts with MANGARR_RESET_LOGIN=1
+        settings.ensure_security(con)            # API key, session secret, legacy clear-text password -> hash
 
 
 app = FastAPI(title="mang-arr", version=__version__, docs_url="/api/docs", redoc_url=None, lifespan=lifespan)
@@ -325,8 +331,8 @@ async def authentication(request: Request, call_next):
                 log.warning("refused cross-site %s %s from %s: Origin/Referer %s does not match Host %s",
                             request.method, security.clip(path, 200), ip, security.clip(src, 200), security.clip(host))
             return Response("mang-arr: cross-site request refused (its Origin/Referer is not this server). Behind "
-                            "a reverse proxy, pass the original Host header (or X-Forwarded-Host).\n", 403,
-                            media_type="text/plain")
+                            "a reverse proxy, pass the original Host header with its port ($http_host in nginx), "
+                            "or X-Forwarded-Host.\n", 403, media_type="text/plain")
 
     if not v["auth_user"]:
         request.state.authed, request.state.via = True, "open"       # no login configured: everyone is admin
@@ -361,6 +367,10 @@ async def authentication(request: Request, call_next):
             return Response("authentication required", 401, headers=prompt)   # forms mode: no Basic prompt
     response = await call_next(request)
     security.security_headers(path, response)
+    if via == "basic" and v.get("session_secret"):
+        # Basic credentials checked once: from now on this browser is signed in by its session cookie
+        # (checked before Basic), so other clients' failed passwords from a shared address cannot lock it out
+        security.set_session(request, response, v, persistent=False)
     return response
 
 
@@ -379,7 +389,17 @@ def login_page(request: Request, next: str = "/"):
     target = security.safe_next(next)
     if not v["auth_user"] or security.session_ok(v, request.cookies.get(security.SESSION_COOKIE)):
         return RedirectResponse(target, 303)
-    return _login_form(request, target, None)
+    return _login_form(request, target, _no_password_note(v))
+
+
+def _no_password_note(v: dict) -> str | None:
+    """A login left without a password (an older version allowed it, or its
+    value is unreadable) cannot be used: say how to get back in."""
+    if v["auth_user"] and not v["auth_password"]:
+        return ("A username is set without a password, so nobody can sign in. Restart mang-arr once with "
+                "MANGARR_RESET_LOGIN=1 to clear the login, or set a password through the API with the X-Api-Key "
+                "header.")
+    return None
 
 
 @app.post("/login")
@@ -399,7 +419,7 @@ async def login_submit(request: Request, username: str = Form(""), password: str
         log.warning("failed login for %s from %s%s", security.clip(username), ip,
                     f"; further attempts refused for {blocked} s" if blocked else "")
         await asyncio.sleep(1)                   # slow down guessing (without holding a thread)
-        return _login_form(request, target, "wrong username or password", 401)
+        return _login_form(request, target, _no_password_note(v) or "wrong username or password", 401)
     security.throttle.succeeded(ip)
     if not v.get("session_secret"):              # startup could not create it (DB was unavailable then)
         v = await run_in_threadpool(_ensure_security)
@@ -1013,10 +1033,12 @@ def _settings_save(request: Request, form) -> Response:
         enabled = {str(x).lower().strip() for x in form.getlist("enabled_sources")}
         listed = {str(x).lower().strip() for x in form.getlist("listed_sources")}
         values["unusable_sources"] = sorted(listed - enabled)
-    epoch = settings.all_values()["session_epoch"]
+    before = settings.all_values()
+    epoch = before["session_epoch"]
     try:
         with db.connect() as con:
             notices = settings.set_many(con, values)
+            notices += _rotate_key_if_login_enabled(con, before, request, values)
     except (ValueError, KeyError) as e:
         log.warning("settings not saved: %s", e)
         return _flash("/settings", f"invalid value, nothing saved: {e}")
@@ -1028,6 +1050,23 @@ def _settings_save(request: Request, form) -> Response:
     if settings.all_values()["session_epoch"] != epoch:
         _reissue_session(request, resp)                # changed the password: keep this browser signed in
     return resp
+
+
+def _rotate_key_if_login_enabled(con, before: dict, request: Request, submitted: dict) -> list[str]:
+    """When a login is switched on, the API key minted while everything was
+    open must count as disclosed (anyone could read it then), so it is
+    replaced, unless this very request authenticated with it (the installer
+    reads the key, then enables the login and keeps using the key) or set a
+    new key itself. The new key is in the PUT response / on the Settings page."""
+    if before["auth_user"] or not settings.all_values(con)["auth_user"]:
+        return []
+    if security.key_ok(before, request.headers.get("x-api-key")) or \
+            str(submitted.get("api_key", settings.MASK)).strip() != settings.MASK:
+        return []
+    settings.rotate_api_key(con)
+    msg = "login switched on, so the API key was regenerated (the old one was readable while there was no login)"
+    log.warning("settings: %s", msg)
+    return [msg]
 
 
 def _settings_action(action: str, notice: str) -> Response:
@@ -1205,10 +1244,14 @@ def api_settings_put(request: Request, body: dict):
     """Set runtime settings: {key: value}. Lists take arrays or comma-separated
     strings; a secret given as the mask keeps its value. Unknown keys -> 400.
     A secret cleared because its destination changed is named in the
-    X-Mangarr-Notice header (and the log)."""
+    X-Mangarr-Notice header (and the log), and so is a new API key when this
+    call switched the login on without sending X-Api-Key (the response then
+    carries the new key)."""
+    before = settings.all_values()
     try:
         with db.connect() as con:
             notices = settings.set_many(con, body)
+            notices += _rotate_key_if_login_enabled(con, before, request, body)
     except (KeyError, ValueError) as e:
         raise HTTPException(400, f"invalid setting: {e}") from e
     headers = {"X-Mangarr-Notice": "; ".join(notices)} if notices else None
