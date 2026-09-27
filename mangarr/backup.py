@@ -356,6 +356,9 @@ class UploadSpool:
             raise RestoreError(self._too_big())
         _check_room(os.path.dirname(self.path), len(data), end)     # every time: others write to that disk too
         self._f.write(data)
+        # on disk now, where the next _check_room sees it and a full disk fails this write, not a later one:
+        # the file's buffer holds back up to 128 KB from Python 3.14 on (st_blksize, often 4 KB, before)
+        self._f.flush()
         self.size = end
 
     def take(self, dst: str) -> None:

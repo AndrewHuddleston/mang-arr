@@ -474,6 +474,18 @@ class BackupTest(_Base):
         self.assertEqual(self.titles(), ["Uploaded"])
         self.assertEqual(self.backups_dir_extras(), [])
 
+    def test_upload_spool_is_on_disk_as_it_arrives(self):
+        # Python 3.14: the spool's 128 KB file buffer held the first chunks back from the disk (and from the
+        # free-space check on the next write)
+        spool = backup.UploadSpool()
+        try:
+            for n in (70000, 10, 200000):
+                spool.write(b"x" * n)
+                self.assertEqual(os.path.getsize(spool.path), spool.size)
+        finally:
+            spool.discard()
+        self.assertEqual(self.backups_dir_extras(), [])
+
     def test_restore_refused_while_a_download_run_holds_the_lock(self):
         import fcntl
         with db.connect() as con:
