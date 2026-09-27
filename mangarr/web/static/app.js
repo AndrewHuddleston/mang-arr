@@ -365,7 +365,8 @@
   // group search: queue an automatic search for every wanted chapter in the group
   $$('[data-group-search]').forEach((b) => b.addEventListener('click', async () => {
     const group = b.closest('.season');
-    const forms = $$('tr.episode-row.wanted form[action$="/search"], tr.episode-row.failed form[action$="/search"]', group);
+    // the action may carry ?page=N (a paged series page), so not action$="/search"
+    const forms = $$('tr.episode-row.wanted form[action*="/search"], tr.episode-row.failed form[action*="/search"]', group);
     if (!forms.length) { toast('nothing wanted in this group'); return; }
     b.disabled = true; $('svg', b).classList.add('spin');
     let n = 0;

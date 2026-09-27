@@ -3,7 +3,8 @@
     series (AniList/MangaDex/manual) -> search every source with every title
                                      -> accept only exact title matches
                                      -> drop implausible chapter numbers
-                                     -> distrust sources whose length is off
+                                     -> distrust sources whose length is off,
+                                        or that add up to more than any series
                                      -> union the chapter numbers
                                      -> drop fractional "chapters" with no pages
                                      -> pick a source for each chapter
@@ -29,6 +30,8 @@ OUTLIER_FACTOR = 10          # a top number this many times the next one ...
 OUTLIER_MIN_JUMP = 1000      # ... and this far above it is a typo or a date, not a chapter,
 OUTLIER_MIN_BELOW = 5        # ... judged only with this many chapters below it (not [1, 1500])
 MAX_CHAPTERS_PER_SOURCE = 10_000
+MAX_PLAN_CHAPTERS = 10_000   # the same bound for the union of the trusted sources
+PLAIN_DENSITY = 1.5          # numbers per unit of a source's top number in a plain listing (1, 2, 2.5, 3 ...)
 MAX_SEARCH_TITLES = 8
 MAX_GAP_SPANS = 40
 MAX_CHAPTER_NAME = 500
@@ -175,14 +178,15 @@ def capped_search_titles(series: Series) -> list[str]:
     the series, and aliases can be user-typed or come from a provider. The
     native title is always kept (last, as in search_titles) even when the
     Latin titles alone would fill the cap: Korean, Chinese and Japanese
-    sources often index only that one."""
+    sources often index only that one. Linear in the number of titles, and
+    search_titles is computed once (not again for the log line)."""
     titles = series.search_titles
     if len(titles) > MAX_SEARCH_TITLES:
+        total = len(titles)
         native = series.native if series.native in titles[MAX_SEARCH_TITLES:] else None
         kept = [t for t in titles if t != native][:MAX_SEARCH_TITLES - (1 if native else 0)]
         titles = kept + ([native] if native else [])
-        log.debug("%s: %d titles; searching with %d of them", oneline(series.title), len(series.search_titles),
-                  len(titles))
+        log.debug("%s: %d titles; searching with %d of them", oneline(series.title), total, len(titles))
     return [t[:MAX_TITLE] for t in titles]
 
 
@@ -311,7 +315,8 @@ def plausible_chapters(source_name: str, chapters: list[Chapter]) -> list[Chapte
 
 
 def _trust(series: Series, matches: list[SourceMatch]) -> None:
-    """Flag sources whose length says they merged in another series."""
+    """Flag sources whose length says they merged in another series, then
+    those that would take the plan past MAX_PLAN_CHAPTERS."""
     good = [m for m in matches if m.usable and m.max]
     if not good:
         return
@@ -320,12 +325,43 @@ def _trust(series: Series, matches: list[SourceMatch]) -> None:
         expected = float(series.chapters)
     elif len(good) >= 3:
         expected = statistics.median(m.max for m in good)
-    if not expected:
-        return
-    for m in good:
-        if m.max > expected * config.DISAGREE:
-            m.note = f"too long: max {m.max:g} vs expected ~{expected:g}"
+    if expected:
+        for m in good:
+            if m.max > expected * config.DISAGREE:
+                m.note = f"too long: max {m.max:g} vs expected ~{expected:g}"
+                log.warning("%s: %s - not trusted", m.source.name, m.note)
+    _cap_union(matches)
+
+
+def _plausibility(numbers: set[float]) -> tuple[float, float]:
+    """Sort key for _cap_union, most plausible first: a plain listing (at
+    most PLAIN_DENSITY numbers per unit of its top number: 1, 2, 3 with the
+    odd .5) before a dense one - fractions packed below the top, which is
+    padding or chapters split into .1/.2 parts - and among plain ones, the
+    one that reaches least far (a merged-in series only adds numbers
+    above). So a source can only come first by listing about as few
+    numbers as its top number, and cannot take the budget from the others."""
+    top = max(numbers, default=0.0)
+    return max(len(numbers) / max(top, 1.0), PLAIN_DENSITY), top
+
+
+def _cap_union(matches: list[SourceMatch]) -> None:
+    """Each source is capped (MAX_CHAPTERS_PER_SOURCE), but two or three
+    sources listing different numbers can still add up to a plan no real
+    series has - and every number becomes a wanted chapter row. Without a
+    known length to judge by (an ongoing series on fewer than three
+    sources), the most plausible set is kept: sources in _plausibility()
+    order, best-ranked among equals, as long as their union stays within
+    MAX_PLAN_CHAPTERS. The others are not trusted."""
+    union: set[float] = set()
+    usable = [(m, m.numbers) for m in matches if m.usable]
+    for m, numbers in sorted(usable, key=lambda mn: (*_plausibility(mn[1]), mn[0].rank())):
+        total = len(union) + len(numbers - union)
+        if total > MAX_PLAN_CHAPTERS:
+            m.note = f"would make the plan {total} chapters, more than any real series ({MAX_PLAN_CHAPTERS})"
             log.warning("%s: %s - not trusted", m.source.name, m.note)
+            continue
+        union |= numbers
 
 
 def _assign(matches: list[SourceMatch]) -> dict[float, list[SourceMatch]]:

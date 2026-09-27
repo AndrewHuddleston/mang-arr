@@ -64,10 +64,11 @@ def _to_series(m: dict) -> Series:
             romaji = primary
     native = next((t.get(k) for t in [title_map, *alts] for k in ("ja", "ko", "zh", "zh-hk") if t.get(k)),
                   None)
-    synonyms = []
+    synonyms, seen = [], {english, romaji, native}         # a set: linear however many alt titles come back
     for t in alts:
         for k, v in t.items():
-            if v and v not in (english, romaji, native) and k in _TITLE_LANGS and v not in synonyms:
+            if v and isinstance(v, str) and k in _TITLE_LANGS and v not in seen:
+                seen.add(v)
                 synonyms.append(v)
     authors, cover = [], None
     for rel in m.get("relationships") or []:

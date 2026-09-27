@@ -505,9 +505,17 @@ def save_plan(con, series_id: int, plan, primary_manga_id: int | None) -> list[s
             " ON CONFLICT(series_id, number) DO UPDATE SET status='junk', pages=excluded.pages,"
             " reason=excluded.reason, updated_at=excluded.updated_at WHERE chapter.status NOT IN ('have','ignored')",
             (series_id, n, "junk", m.manga_id, m.source.name, pages, reason, now()))
-    # title and release date from the source that lists each chapter, whatever its status
+    # title and release date from the source that lists each chapter, whatever
+    # its status; each source's chapters are indexed once (a lookup per
+    # chapter would be quadratic, with the write lock held throughout)
+    by_number: dict[int, dict] = {}
     for n, m in plan.assignment.items():
-        ch = next((c for c in m.chapters if c.number == n), None)
+        listed = by_number.get(id(m))
+        if listed is None:
+            listed = by_number[id(m)] = {}
+            for c in m.chapters:
+                listed.setdefault(c.number, c)          # the first listed, as before
+        ch = listed.get(n)
         if ch and (ch.name or ch.uploaded):
             con.execute("UPDATE chapter SET name=COALESCE(?, name), uploaded=COALESCE(?, uploaded)"
                         " WHERE series_id=? AND number=?", (ch.name, ch.uploaded, series_id, n))
@@ -570,8 +578,16 @@ def set_status(con, series_id: int, number: float, status: str, reason: str | No
     return cur.rowcount > 0
 
 
-def chapters(con, series_id: int):
-    return con.execute("SELECT * FROM chapter WHERE series_id=? ORDER BY number", (series_id,)).fetchall()
+def chapters(con, series_id: int, limit: int | None = None, offset: int = 0):
+    """The series' chapter rows by number; with limit, only that many from offset."""
+    if limit is None:
+        return con.execute("SELECT * FROM chapter WHERE series_id=? ORDER BY number", (series_id,)).fetchall()
+    return con.execute("SELECT * FROM chapter WHERE series_id=? ORDER BY number LIMIT ? OFFSET ?",
+                       (series_id, limit, offset)).fetchall()
+
+
+def chapter_count(con, series_id: int) -> int:
+    return con.execute("SELECT COUNT(*) FROM chapter WHERE series_id=?", (series_id,)).fetchone()[0]
 
 
 def wanted(con, series_id: int) -> list[float]:

@@ -283,7 +283,7 @@ published.
 | Page | One line |
 |---|---|
 | **Series** (`/`) | Every tracked series as posters or a table; search, sort, filter, monitored toggle, status and have/listed progress. |
-| **Series detail** (`/series/{id}`) | Cover, description, a details panel, per-status counts, chapters in groups with a reason and actions per chapter, the sources that matched, recent history. |
+| **Series detail** (`/series/{id}`) | Cover, description, a details panel, per-status counts, chapters in groups with a reason and actions per chapter (2000 per page, newest first, when a series lists more), the sources that matched, recent history. |
 | **Add New** (`/add`) | Type a title; pick an AniList / MangaDex candidate or add by exact title with aliases. |
 | **Library Import** (`/import`) | Scan Suwayomi's download tree and adopt what is already there. |
 | **Lists** (`/lists`) | Import lists (AniList user list, AniList chart, text file at a URL) and the exclusion list. |
@@ -385,7 +385,9 @@ index's *wanted* number is the same sum.
 Type a title; get AniList / MangaDex candidates with covers, status, format,
 country and chapter counts, and a mark on the ones already tracked. A
 single exact match is highlighted. Pick one, or add by exact title with
-aliases when no database has it. Adding is queued as a job.
+aliases when no database has it (at most 50 aliases of up to 300
+characters are kept, here, from the API and from the databases' synonyms).
+Adding is queued as a job.
 
 #### Library Import
 
@@ -402,18 +404,27 @@ the next refresh. See *Adopting an existing Suwayomi library* below.
 Import lists, as in Sonarr: an AniList user's manga list (chosen statuses;
 default current and planning), an AniList chart (trending / popularity /
 score / favourites, top 1-100, optional country JP / KR / CN and minimum
-chapter count; manga format only, no adult titles), or a text file at a
-URL with one title per line (`#` comments; an `anilist:123` /
-`mangadex:uuid` reference works too). Each list has its own sync interval
-(default 24 h), a download flag and a monitored flag, and can be disabled.
-Lists are checked every ten minutes and synced when due, or by *Sync now*;
-every series a sync yields that is not tracked yet is queued as an ordinary
-add job (at most 25 per sync; the next sync continues), with the list's
-download / monitored flags. Titles from a text list without a single exact
-database match are reported as *needs review* in the list's result, not
-added. **Exclusions** are references a list must never add: tick *exclude
-from import lists* when deleting a series, or add one by reference.
-Deleting a list keeps the series it added.
+chapter count; manga format only, no adult titles), or a text file at a URL
+with one title per line (`#` comments; an `anilist:123` / `mangadex:uuid`
+reference works too). The file may be on the internet or the LAN (a NAS is
+fine), not on mang-arr's own machine (localhost, 127.0.0.1) or a link-local
+address; a URL that returns JSON, a web page or another document instead of
+a list of titles is refused as a whole, and lines that are not titles
+(`key=value`, markup, URLs, tokens) are skipped: they are neither looked up
+nor shown. A text file only counts as a title list once AniList or MangaDex
+know its lines: when none of the first five lines looked up is a series
+they know, the sync stops with an error that quotes nothing. Each list has
+its own sync interval (default 24 h), a download flag and a monitored flag,
+and can be disabled. Lists are checked every ten minutes and synced when
+due, or by *Sync now*; every series a sync yields that is not tracked yet
+is queued as an ordinary add job (at most 25 per sync; the next sync
+continues), with the list's download / monitored flags. Titles from a text
+list without a single exact database match are reported as *needs review*
+in the list's result, not added - quoted when at least half of the lines
+looked up are series AniList or MangaDex know, by line number otherwise.
+**Exclusions** are references a list must never add: tick *exclude from
+import lists* when deleting a series, or add one by reference. Deleting a
+list keeps the series it added.
 
 #### Queue and History
 
@@ -892,7 +903,7 @@ curl -H "X-Api-Key: $KEY" http://localhost:6789/api/v1/wanted
 | `GET /api/v1/system/backup` | the kept backups: `[{"name", "size", "mtime"}]` |
 | `POST /api/v1/system/backup` | take a backup now; returns `{"name", "size"}` |
 | `GET /api/v1/series` | every tracked series with counts |
-| `GET /api/v1/series/{id}` | one series with its sources and chapters (each chapter with `status`, `reason`, `name`, `uploaded`, `source_name`, paths) |
+| `GET /api/v1/series/{id}?limit=5000&offset=0` | one series with its sources and chapters by number (each chapter with `status`, `reason`, `name`, `uploaded`, `source_name`, paths), at most 5000 chapters per call; `chapterTotal`, `limit` and `offset` in the answer say where the page is (next page: `offset=offset+limit`) |
 | `POST /api/v1/series` | add. Body: `{"ref": "anilist:123", "download": true}` or `{"ref": "mangadex:<uuid>"}` or `{"ref": "manual", "title": "...", "aliases": ["..."]}`; `download` defaults to true. Returns the job. 400 on a bad reference, 409 when the series is already tracked or already queued. |
 | `POST /api/v1/series/{id}/refresh?download=true` | queue a refresh; returns the job; 409 if one is already queued for the series |
 | `DELETE /api/v1/series/{id}?files=false` | stop tracking, optionally delete the library folder; 409 while a job for the series runs |

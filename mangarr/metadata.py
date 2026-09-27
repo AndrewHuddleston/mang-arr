@@ -52,12 +52,15 @@ def _pick(cands: list[Series], query: str, author_hint: str | None) -> Series | 
 
 def _safe(fn, query):
     """A provider failure is logged and treated as 'no candidates from it';
-    the other provider still gets a chance."""
+    the other provider still gets a chance. The query is logged only at
+    DEBUG: it may be a line of an import list URL's answer, and the log is
+    readable on the System page."""
+    provider = fn.__module__.split(".")[-1]
     try:
         return fn(query)
     except Exception as e:
-        log.warning("%s lookup for %r failed: %s: %s", fn.__module__.split(".")[-1], query[:200],
-                    type(e).__name__, oneline(e, 300))
+        log.warning("%s lookup failed: %s: %s", provider, type(e).__name__, oneline(e, 300))
+        log.debug("%s lookup that failed was for %r", provider, query[:200])
         return []
 
 
