@@ -1,5 +1,5 @@
 """Numeric settings as the jobs use them, clamped to sane ranges, and a sleep
-that a cancel interrupts.
+and a blocking call that a cancel interrupts.
 
 Settings are clamped to RANGES when they are saved, but a value already in the
 database (or written by an older version, or by hand) must not be able to
@@ -9,6 +9,7 @@ which rejects non-finite values and clamps to RANGES, and says so in the log.
 """
 import logging
 import math
+import threading
 import time
 from collections.abc import Callable
 
@@ -24,6 +25,10 @@ RANGES: dict[str, tuple[float, float]] = {
 }
 
 _warned: dict[str, object] = {}                 # key -> last bad value logged (log once per value)
+
+
+class Cancelled(Exception):
+    """A job was cancelled while it waited or looked something up."""
 
 
 def bound(key: str, value) -> float:
@@ -84,3 +89,35 @@ def pause(seconds: float, should_cancel: Callable[[], bool] | None = None, step:
         time.sleep(min(step, seconds))
         seconds -= step
     return cancel()
+
+
+def interruptible(fn: Callable, should_cancel: Callable[[], bool] | None, step: float = 1.0):
+    """fn() run in a helper thread while this one checks should_cancel()
+    every `step` s: returns what fn returns (or raises what it raises), or
+    raises Cancelled as soon as a cancel comes. fn is then left to finish on
+    its own and its result is dropped, so this is only for calls that are
+    safe to abandon (reads, searches), never for a change that must be undone
+    if it lands. Without should_cancel, fn() is simply called."""
+    if should_cancel is None:
+        return fn()
+    if should_cancel():
+        raise Cancelled()
+    box: dict = {}
+    done = threading.Event()
+
+    def run():
+        try:
+            box["value"] = fn()
+        except BaseException as e:              # handed to the caller below
+            box["error"] = e
+        finally:
+            done.set()
+    threading.Thread(target=run, name="mangarr-call", daemon=True).start()
+    while not done.wait(step):
+        if should_cancel():
+            log.debug("cancelled while waiting for %s; leaving it to finish in the background",
+                      getattr(fn, "__qualname__", "a call"))
+            raise Cancelled()
+    if "error" in box:
+        raise box["error"]
+    return box["value"]

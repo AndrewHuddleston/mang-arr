@@ -1,5 +1,6 @@
 """Suwayomi GraphQL client. Suwayomi is the download engine; this is the only
 module that talks to it."""
+import copy
 import json
 import logging
 import re
@@ -7,9 +8,10 @@ import threading
 import time
 import urllib.error
 import urllib.request
+from collections.abc import Callable
 from dataclasses import dataclass
 
-from . import config
+from . import config, limits
 
 log = logging.getLogger(__name__)
 
@@ -25,6 +27,11 @@ class SuwayomiUnreachable(SuwayomiError):
     for every series."""
 
 
+class CircuitOpen(SuwayomiUnreachable):
+    """Refused without sending anything: Suwayomi failed moments ago and the
+    circuit breaker is open, so nothing of this call reached it."""
+
+
 # Circuit breaker, shared by every Client pointing at the same Suwayomi: after
 # a transport failure, calls fail at once for BREAKER_SECS instead of each
 # waiting out its own timeouts and retries. The first call after the window
@@ -33,9 +40,13 @@ BREAKER_SECS = 60
 _down: dict[str, tuple[float, str]] = {}          # api url -> (monotonic time it tripped, why)
 _down_lock = threading.Lock()
 
-# These ask the source website for something, so a timeout means the site is
-# slow, not that Suwayomi is down: they never trip the breaker on a timeout.
+# These ask the source website for something, so a timeout may only mean the
+# site is slow. After one times out, Suwayomi is asked something that touches
+# no website (waiting at most PROBE_SECS): only when that goes unanswered too
+# is Suwayomi itself down (breaker tripped, SuwayomiUnreachable), so a pass
+# stops instead of waiting out every source of every series.
 _REMOTE_OPS = {"fetchSourceManga", "fetchMangaAndChapters", "fetchChapterPages"}
+PROBE_SECS = 30
 
 
 def _failure_kind(e: BaseException) -> str:
@@ -80,8 +91,20 @@ class Chapter:
 
 
 class Client:
+    _cancel: Callable[[], bool] | None = None      # set on a cancellable() copy
+
     def __init__(self, url: str = config.SUWAYOMI_URL):
         self.api = url.rstrip("/") + "/api/graphql"
+
+    def cancellable(self, should_cancel: Callable[[], bool]) -> "Client":
+        """This client for one job's lookups: every call checks should_cancel
+        before it starts, while it waits for Suwayomi and between its retries,
+        and raises limits.Cancelled at once instead of running into its
+        timeout. The request in flight is left to finish on its own, so this
+        is only for reads and source lookups, never for queue changes."""
+        c = copy.copy(self)
+        c._cancel = should_cancel
+        return c
 
     # -- transport --------------------------------------------------------
 
@@ -95,15 +118,14 @@ class Client:
         with _down_lock:
             down = _down.get(self.api)
         if down and time.monotonic() - down[0] < BREAKER_SECS:
-            raise SuwayomiUnreachable(f"Suwayomi at {self.api} unreachable: {down[1]} (not retrying for "
-                                      f"{BREAKER_SECS - (time.monotonic() - down[0]):.0f} s)")
+            raise CircuitOpen(f"Suwayomi at {self.api} unreachable: {down[1]} (not retrying for "
+                              f"{BREAKER_SECS - (time.monotonic() - down[0]):.0f} s)")
         for attempt in range(1, retries + 1):
             t0 = time.monotonic()
             try:
                 req = urllib.request.Request(self.api, json.dumps(body).encode(),
                                              {"Content-Type": "application/json"})
-                with urllib.request.urlopen(req, timeout=timeout) as r:
-                    d = json.load(r)
+                d = self._send(req, timeout)
                 if down:
                     self._breaker_close()
                     down = None
@@ -114,17 +136,18 @@ class Client:
                     raise SuwayomiError(msg)
                 log.debug("suwayomi %s %s -> ok in %.1fs", op, variables or "", time.monotonic() - t0)
                 return d["data"]
-            except SuwayomiError:
+            except (SuwayomiError, limits.Cancelled):
                 raise
             except Exception as e:
                 last = e
                 log.debug("suwayomi %s attempt %d/%d failed after %.1fs: %s", op, attempt, retries,
                           time.monotonic() - t0, e)
-                if attempt < retries:
-                    time.sleep(5)
+                if attempt < retries and limits.pause(5, self._cancel):
+                    raise limits.Cancelled() from e
         kind = _failure_kind(last) if last is not None else "other"
         if kind == "timeout" and op in _REMOTE_OPS:
-            # the source website is slow; Suwayomi itself answered other calls
+            if timeout >= PROBE_SECS:               # a short (page) call timing out proves nothing either way
+                self._check_answers(op, timeout)
             raise SuwayomiError(f"{op} timed out after {timeout} s (the source did not answer in time)")
         if kind in ("connect", "timeout"):
             # A short probe (the health check, a page's status widget) timing
@@ -134,6 +157,28 @@ class Client:
                 self._breaker_trip(f"{type(last).__name__}: {last}")
             raise SuwayomiUnreachable(f"Suwayomi at {self.api} unreachable: {last}")
         raise SuwayomiError(f"Suwayomi at {self.api} failed: {type(last).__name__}: {last}")
+
+    def _send(self, req: urllib.request.Request, timeout: int) -> dict:
+        def call() -> dict:
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                return json.load(r)
+        return limits.interruptible(call, self._cancel)
+
+    def _check_answers(self, op: str, waited: int) -> None:
+        """After a source request got no answer: raise SuwayomiUnreachable
+        (the breaker is tripped by the probe's own failure) when Suwayomi does
+        not answer a query that touches no website either. When it does, the
+        website is what is slow, and the caller treats it as that source's
+        failure."""
+        try:
+            self.gq("{ aboutServer { version } }", timeout=PROBE_SECS, retries=1)
+        except SuwayomiUnreachable as e:
+            raise SuwayomiUnreachable(f"Suwayomi at {self.api} stopped answering: {op} got no answer in {waited} s, "
+                                      "and neither did a status query") from e
+        except SuwayomiError as e:
+            log.debug("suwayomi answered a status query (%s) after %s timed out: the source is slow", e, op)
+            return
+        log.debug("suwayomi answers after %s timed out: the source is slow", op)
 
     def _breaker_trip(self, why: str) -> None:
         with _down_lock:

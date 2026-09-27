@@ -28,6 +28,7 @@ from .. import (
     config,
     core,
     db,
+    downloader,
     health,
     jobs,
     komga,
@@ -48,6 +49,7 @@ log = logging.getLogger(__name__)
 HERE = os.path.dirname(os.path.abspath(__file__))
 
 runner = jobs.Runner()
+health.watch_jobs(runner)                    # a running job that stops moving is a health warning
 scheduler: jobs.Scheduler | None = None
 client = Client()
 STARTED = time.time()
@@ -154,6 +156,8 @@ def _job_refresh(series_id: int, download: bool):
                                         progress=lambda m: setattr(job, "progress", m))
         except core.Gone as e:
             return str(e)
+        except limits.Cancelled:
+            raise                                  # asked to stop: not an error of the series
         except Exception as e:
             _record_error(series_id, e)
             raise
@@ -220,6 +224,7 @@ def _run_pass(job: jobs.Job, rows, label: str) -> tuple[int, int, int, int]:
     clear error (PassStopped, with the counts so far) instead of timing out
     on every series."""
     job.items = [{"series_id": r["id"], "title": r["title"], "state": "queued", "result": ""} for r in rows]
+    downloader.retry_leftovers_now(client)         # queue entries an earlier run could not take back out
     done = downloaded = imported = errors = 0
     outages = 0                                    # consecutive series that failed because Suwayomi is down
     for i, (r, item) in enumerate(zip(rows, job.items, strict=True), 1):
@@ -247,6 +252,9 @@ def _run_pass(job: jobs.Job, rows, label: str) -> tuple[int, int, int, int]:
         except core.Gone:
             item["state"], item["result"] = "cancelled", "series was deleted"
             continue
+        except limits.Cancelled:                   # while its sources were searched: nothing was saved
+            item["state"], item["result"] = "cancelled", "pass cancelled"
+            continue                               # the check at the top ends the pass
         except Exception as e:
             errors += 1
             item["state"], item["result"] = "error", f"{type(e).__name__}: {e}"[:300]

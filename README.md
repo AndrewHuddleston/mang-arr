@@ -696,6 +696,7 @@ something.
   |---|---|---|
   | Suwayomi | the GraphQL API does not answer | - (ok shows version, source count and latency) |
   | Sources | Suwayomi has no English sources, or every source is disabled in Settings | - |
+  | Jobs | - | the running job has shown no progress for 30 minutes (every other job waits behind it; cancel it on the Queue page if it is stuck) |
   | Komga | the configured URL / API key fails a real `GET /api/v1/libraries` | not configured (new chapters appear only at Komga's own scan interval) |
   | AniList, MangaDex | - | the site is unreachable or answers an error |
   | Staging, Library | the path does not exist, or the library is not writable | - |
@@ -795,6 +796,19 @@ for the rest of the run; only chapters no source could deliver end up
 (`MANGARR_LOCK`) makes sure only one download run exists at a time across
 the web worker and the CLI; a second one waits. A per-chapter search or
 manual download is the same machinery for one chapter from one entry.
+
+When Suwayomi stops answering, calls to it fail at once for a minute
+instead of each waiting out its timeouts, and a refresh pass stops with one
+error after two series in a row found it down. A source search that times
+out is followed by a quick question to Suwayomi itself: a slow website only
+costs that source, a frozen Suwayomi ends the pass within minutes. Cancel
+takes effect within about a second, also in the middle of a search or a
+chapter-list fetch. Chapter ids that could not be taken back out of
+Suwayomi's queue because it was down are remembered, and removed once it
+answers again (by a background retry, or at the start of the next download
+run); only mang-arr's own ids are ever removed. AniList gets the same
+treatment: after two failed lookups in a row it is left alone for five
+minutes, and refreshes keep the stored series details meanwhile.
 
 ```
 mangarr/

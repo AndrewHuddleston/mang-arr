@@ -14,7 +14,7 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
 
-from . import db, downloader, komga, library, metadata, metrics
+from . import db, downloader, komga, library, limits, metadata, metrics
 from .matching import oneline
 from .model import Series
 from .resolver import Plan, primary, resolve
@@ -50,8 +50,9 @@ def add_series(con, client: Client, series: Series, download: bool = True, do_im
                progress: Callable[[str], None] | None = None) -> Outcome:
     """Track a series: resolve it, remember the plan, fetch what is missing,
     link the results into the library. With series_id (a refresh) the row
-    must still exist afterwards, or the work is abandoned."""
-    plan = resolve(client, series, reliability=db.reliability(con))
+    must still exist afterwards, or the work is abandoned. A cancel while
+    sources are searched raises limits.Cancelled with nothing saved."""
+    plan = resolve(client, series, reliability=db.reliability(con), should_cancel=should_cancel, progress=progress)
     if series_id is not None and not db.get_series(con, series_id):
         raise Gone(f"{series.title} was deleted during the refresh")
     series_id = db.upsert_series(con, series)
@@ -88,14 +89,14 @@ def refresh_series(con, client: Client, series_id: int, download: bool = True,
                    progress: Callable[[str], None] | None = None) -> Outcome:
     """Re-check a tracked series. Metadata is refreshed first (status,
     chapter count, new synonyms) and falls back to the stored row when the
-    provider is unavailable."""
+    provider is unavailable. A cancel cuts a slow provider lookup short."""
     row = db.get_series(con, series_id)
     if not row:
         raise Gone(f"series #{series_id} does not exist")
     series = db.series_to_model(row)
     if not series.manual:
         try:
-            fresh = metadata.by_ref(row["ref"])
+            fresh = limits.interruptible(lambda: metadata.by_ref(row["ref"]), should_cancel)
             if fresh:
                 series = fresh
                 log.debug("%s: metadata refreshed (%s, %s ch)", series.title, series.status, series.chapters)

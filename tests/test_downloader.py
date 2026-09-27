@@ -119,6 +119,7 @@ class DownloadOneTest(unittest.TestCase):
     def test_download_one(self):
         with tempfile.TemporaryDirectory() as tmp, \
              mock.patch("mangarr.downloader.time.sleep", lambda s: None), \
+             mock.patch("mangarr.config.DB_PATH", tmp + "/test.db"), \
              mock.patch("mangarr.config.LOCK_PATH", tmp + "/lock"):
             a = match("A", 1, [3, 4])
             ok, failed, why = downloader.download_one(FakeClient(), 1, a.chapters[0], "T", "A")

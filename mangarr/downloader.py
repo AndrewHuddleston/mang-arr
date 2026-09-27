@@ -3,8 +3,10 @@
 Suwayomi has a single global download queue shared with its own library
 updates and with the user's own queueing, so this module only ever touches
 its own chapter ids: it enqueues them, watches them, and dequeues them if it
-gives up. It never clears the queue. Only one mang-arr download run may
-exist at a time (a file lock guards it, across the worker and the CLI).
+gives up. It never clears the queue. Ids it could not dequeue because
+Suwayomi was not answering are remembered and taken out later (see
+clear_leftovers). Only one mang-arr download run may exist at a time (a file
+lock guards it, across the worker and the CLI).
 
 Within a source the batch size adapts: it shrinks to 1 and backs off when
 the source errors, and grows back when downloads succeed. A chapter that
@@ -18,13 +20,15 @@ import logging
 import math
 import os
 import socket
+import threading
 import time
 from collections.abc import Callable
 from contextlib import contextmanager
 
 from . import config, limits
+from .limits import Cancelled
 from .resolver import Plan, ranges
-from .suwayomi import Client, SuwayomiError, SuwayomiUnreachable
+from .suwayomi import BREAKER_SECS, CircuitOpen, Client, SuwayomiError, SuwayomiUnreachable
 
 log = logging.getLogger(__name__)
 
@@ -64,10 +68,19 @@ LOCK_POLL_SECS = 2.0
 UNREACHABLE_GIVE_UP_SECS = 120
 # attempts to take our chapters back out of Suwayomi's queue when a chunk ends badly
 DEQUEUE_TRIES = 3
-
-
-class Cancelled(Exception):
-    pass
+# Ids still not dequeued after that (Suwayomi not answering) are kept in an
+# internal setting, at most MAX_LEFTOVERS (the newest), and taken out at the
+# start of every download run and by a background retry: started at once by
+# every refresh pass, and after a failed dequeue once the breaker lets calls
+# through again, then backing off to LEFTOVER_RETRY_MAX, at most
+# LEFTOVER_RETRY_TRIES times (the next download run or pass tries again).
+LEFTOVER_KEY = "leftover_queue_ids"
+MAX_LEFTOVERS = 200
+LEFTOVER_RETRY_SECS = BREAKER_SECS + 5
+LEFTOVER_RETRY_MAX = 900
+LEFTOVER_RETRY_TRIES = 12
+_leftover_lock = threading.Lock()             # read-modify-write of the stored list, and the retry thread
+_retrier: threading.Thread | None = None
 
 
 class LockBusy(RuntimeError):
@@ -158,6 +171,7 @@ def download(client: Client, plan: Plan, only: set[float] | None = None,
     if in_order:
         try:
             with download_lock(should_cancel=cancel, progress=report):
+                clear_leftovers(client)
                 _download_in_order(client, plan, sorted(pending), attempt, dead, tried, results, reasons,
                                    cancel, report, seen_throttle, label, gone)
         except Cancelled:
@@ -165,6 +179,7 @@ def download(client: Client, plan: Plan, only: set[float] | None = None,
         return results
     try:
         with download_lock(should_cancel=cancel, progress=report):
+            clear_leftovers(client)
             while pending:
                 pending -= gone()
                 by_source: dict[int, list[float]] = {}
@@ -317,6 +332,7 @@ def download_one(client: Client, manga_id: int, chapter, label: str, source_name
     cancel = should_cancel or (lambda: False)
     report = progress or (lambda m: None)
     with download_lock(should_cancel=cancel, progress=report):
+        clear_leftovers(client)
         ok, failed, why = _download_source(client, manga_id, [chapter], 1, label, source_name, False,
                                            cancel, report, set())
     if not ok and not failed and cancel():         # stopped by the cancel, not a failure of the source
@@ -346,16 +362,22 @@ def _download_source(client, manga_id, todo, batch, label, source_name, patient,
         span = min(size, len(todo) - i)             # how far this chunk moves us along todo
         chunk = [c for c in todo[i:i + span] if c.number not in skip]
         ids = [c.id for c in chunk]
-        report(f"{source_name}: chapter {ranges([c.number for c in chunk])} ({len(ok)} of {len(todo)} done"
-               + (", rate-limited source: one at a time" if paced and size == 1 else "") + ")")
+        status = (f"{source_name}: chapter {ranges([c.number for c in chunk])} ({len(ok)} of {len(todo)} done"
+                  + (", rate-limited source: one at a time" if paced and size == 1 else ""))
+        report(status + ")")
         t_start = time.monotonic()
         outcome = "error"
         try:
-            client.enqueue(ids)
+            try:
+                client.enqueue(ids)
+            except CircuitOpen:
+                outcome = "not sent"                # refused before anything reached Suwayomi: nothing to take back
+                raise
             client.start()
-            outcome = _wait(client, ids, cancel, every=2 if len(ids) == 1 else 5)
+            outcome = _wait(client, ids, cancel, every=2 if len(ids) == 1 else 5,
+                            moved=lambda share, status=status: report(f"{status}, this batch {share:.0%})"))
         finally:
-            if outcome != "done":                   # stalled, timeout, cancelled, or an exception
+            if outcome not in ("done", "not sent"):     # stalled, timeout, cancelled, or an exception
                 _dequeue(client, ids, label, outcome)
         instant = outcome == "stalled" and time.monotonic() - t_start < INSTANT_FAIL_SECS
         if outcome == "cancelled":
@@ -425,18 +447,149 @@ def _download_source(client, manga_id, todo, batch, label, source_name, patient,
 
 def _dequeue(client, ids: list[int], label: str, outcome: str) -> None:
     """Take our chapter ids back out of Suwayomi's queue (leave nothing of
-    ours behind), with a few tries; a failure is logged, never raised, so it
-    cannot hide the error that ended the chunk."""
+    ours behind), with a few tries. When Suwayomi does not answer, the ids
+    are remembered and taken out later (clear_leftovers). A failure is
+    logged, never raised, so it cannot hide the error that ended the chunk."""
     for attempt in range(1, DEQUEUE_TRIES + 1):
         try:
             client.dequeue(ids)
             return
         except Exception as e:
-            if attempt == DEQUEUE_TRIES:
-                log.warning("%s: could not remove chapter id(s) %s from Suwayomi's queue after %s: %s", label,
-                            ids, outcome, e)
+            # the breaker is open: more tries now would fail the same way without asking Suwayomi
+            if attempt == DEQUEUE_TRIES or isinstance(e, CircuitOpen):
+                log.warning("%s: could not remove chapter id(s) %s from Suwayomi's queue after %s (%s); "
+                            "will try again once it answers", label, ids, outcome, e)
+                _remember_leftovers(ids)
+                _retry_leftovers_later(client)
                 return
             time.sleep(2)
+
+
+def leftovers() -> list[int]:
+    """Chapter ids a failed download may have left in Suwayomi's queue."""
+    from . import settings
+    try:
+        return [int(i) for i in settings.get(LEFTOVER_KEY) or []]
+    except (TypeError, ValueError) as e:
+        log.debug("unreadable %s: %s", LEFTOVER_KEY, e)
+        return []
+
+
+def _store_leftovers(change: Callable[[list[int]], list[int]]) -> None:
+    """Rewrite the stored list as change(current), keeping the newest
+    MAX_LEFTOVERS. A failure is logged, never raised (see _dequeue)."""
+    from . import db, settings
+    try:
+        with _leftover_lock, db.connect() as con:
+            settings.refresh(con)                   # the current list, not a cached one
+            cur = [int(i) for i in settings.all_values(con).get(LEFTOVER_KEY) or []]
+            new = change(cur)[-MAX_LEFTOVERS:]
+            if new != cur:
+                settings.set_many(con, {LEFTOVER_KEY: new}, internal=True)
+    except Exception as e:
+        log.warning("could not update the chapter ids left in Suwayomi's queue: %s: %s", type(e).__name__, e)
+
+
+def _remember_leftovers(ids: list[int]) -> None:
+    _store_leftovers(lambda cur: [i for i in cur if i not in ids] + list(ids))
+
+
+def _forget_leftovers(ids: list[int]) -> None:
+    _store_leftovers(lambda cur: [i for i in cur if i not in ids])
+
+
+def clear_leftovers(client) -> bool:
+    """Take the chapter ids an earlier chunk could not dequeue out of
+    Suwayomi's queue; ids it no longer has queued (downloaded, or removed
+    meanwhile) are simply forgotten. Only ever those ids: nothing else in the
+    queue is touched. The caller holds the download lock, so none of them is
+    being downloaded right now. Returns True when nothing is left over; a
+    failure is logged at debug level and tried again later."""
+    ids = leftovers()
+    if not ids:
+        return True
+    try:
+        queued = {x["id"] for x in client.queue()}
+        still = [i for i in ids if i in queued]
+        if still:
+            client.dequeue(still)
+    except Exception as e:
+        log.debug("chapter id(s) %s are still to be taken out of Suwayomi's queue: %s", ids, e)
+        return False
+    _forget_leftovers(ids)
+    if still:
+        log.info("removed chapter id(s) %s that an earlier failed download left in Suwayomi's queue", still)
+    else:
+        log.debug("chapter id(s) %s are no longer in Suwayomi's queue", ids)
+    return True
+
+
+@contextmanager
+def _lock_if_free(path: str | None = None):
+    """The download lock if nobody holds it (yields True); False at once
+    when a download run holds it (never waits)."""
+    path = path or config.LOCK_PATH
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o644)
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            yield False
+            return
+        try:
+            os.ftruncate(fd, 0)                     # who holds it, for a run that waits meanwhile
+            os.pwrite(fd, f"pid {os.getpid()} on {socket.gethostname()}, removing leftover queue entries\n"
+                      .encode(), 0)
+        except OSError as e:
+            log.debug("could not record lock holder in %s: %s", path, e)
+        try:
+            yield True
+        finally:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+    finally:
+        os.close(fd)
+
+
+def retry_leftovers_now(client) -> None:
+    """At the start of a pass: take out ids left over from an earlier run
+    (one that ended, or a process that restarted, before its retry
+    succeeded), in the background so a Suwayomi that is still down cannot
+    hold the pass up."""
+    if leftovers():
+        _retry_leftovers_later(client, first=0)
+
+
+def _retry_leftovers_later(client, first: float | None = None) -> None:
+    """Start the background retry of clear_leftovers, unless it is running."""
+    global _retrier
+    with _leftover_lock:
+        if _retrier is not None and _retrier.is_alive():
+            return
+        _retrier = threading.Thread(target=_retry_leftovers, args=(client, first), name="mangarr-dequeue-retry",
+                                    daemon=True)
+        _retrier.start()
+
+
+def _retry_leftovers(client, first: float | None = None) -> None:
+    """Background: clear_leftovers after `first` s (by default once the
+    breaker lets calls through again), backing off while Suwayomi still does
+    not answer. Skipped while a download run holds the lock (that run clears
+    them at its start)."""
+    delay = LEFTOVER_RETRY_SECS if first is None else first
+    for _ in range(LEFTOVER_RETRY_TRIES):
+        threading.Event().wait(delay)               # not time.sleep: tests patch that out
+        try:
+            with _lock_if_free() as free:
+                if free and clear_leftovers(client):
+                    return
+        except Exception as e:
+            log.debug("retrying the chapter ids left in Suwayomi's queue failed: %s: %s", type(e).__name__, e)
+        if not leftovers():
+            return
+        delay = min(LEFTOVER_RETRY_MAX, max(delay * 2, LEFTOVER_RETRY_SECS))
+    log.warning("stopped retrying for now: chapter id(s) %s may still be in Suwayomi's queue; the next download "
+                "run takes them out", leftovers())
 
 
 def _queue_unreadable(again: bool, e: Exception, extra: str = "") -> None:
@@ -448,11 +601,14 @@ def _queue_unreadable(again: bool, e: Exception, extra: str = "") -> None:
         log.warning("could not read the download queue: %s (still watching%s)", e, extra)
 
 
-def _wait(client, ids: list[int], cancel, every: int = 5) -> str:
+def _wait(client, ids: list[int], cancel, every: int = 5, moved: Callable[[float], None] | None = None) -> str:
     """Watch our chapter ids until they leave the queue.
     Returns 'done', 'stalled' (every remaining one errored out), 'timeout'
-    (no progress for STALL_SECS or CHUNK_CAP_SECS overall) or 'cancelled'."""
+    (no progress for STALL_SECS or CHUNK_CAP_SECS overall) or 'cancelled'.
+    moved(share done, 0..1) hears about every change Suwayomi reports."""
     ours = set(ids)
+    # reading the queue is safe to abandon, so a cancel cuts a hung read short
+    reader = client.cancellable(cancel) if isinstance(client, Client) else client
     started = last_change = time.monotonic()
     last_seen: dict[int, tuple] = {}
     down_since: float | None = None
@@ -462,10 +618,12 @@ def _wait(client, ids: list[int], cancel, every: int = 5) -> str:
         if cancel():
             return "cancelled"
         try:
-            items = [x for x in client.queue() if x["id"] in ours]
+            items = [x for x in reader.queue() if x["id"] in ours]
             if failing:
                 log.info("the download queue can be read again")
             down_since, failing = None, False
+        except Cancelled:
+            return "cancelled"
         except SuwayomiUnreachable as e:
             now = time.monotonic()
             down_since = down_since or now
@@ -487,6 +645,9 @@ def _wait(client, ids: list[int], cancel, every: int = 5) -> str:
             snapshot = {x["id"]: (x["state"], x["tries"], round(x["progress"], 3)) for x in items}
             if snapshot != last_seen:
                 last_seen, last_change = snapshot, now
+                if moved:
+                    moved((len(ours) - len(items) + sum(min(max(x["progress"], 0.0), 1.0) for x in items))
+                          / len(ours))
         if now - last_change > STALL_SECS:
             log.warning("no download progress for %d s", STALL_SECS)
             return "timeout"
