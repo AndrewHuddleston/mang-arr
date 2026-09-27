@@ -189,6 +189,47 @@ class RunnerTest(unittest.TestCase):
             r._loop()
         self.assertEqual(j.status, "cancelled")
 
+    def run_one(self, fn) -> jobs.Job:
+        r = jobs.Runner()
+        j = r.submit("refresh", "S", fn)
+        r._pending.append((None, None))                    # sentinel: ends the loop after the job
+        with self.assertRaises(AttributeError), mock.patch.object(jobs.metrics, "record_job"), \
+             self.assertLogs("mangarr.jobs", "INFO"):
+            r._loop()
+        return j
+
+    def test_cancel_during_the_search_says_so_in_words(self):     # round 3: it said "Cancelled: "
+        def fn(job):
+            job.progress = "searching Weeb Central (3 of 30 sources)"
+            job.cancel = True
+            raise limits.Cancelled()
+        j = self.run_one(fn)
+        self.assertEqual(j.status, "cancelled")
+        self.assertEqual(j.message, "cancelled; last step: searching Weeb Central (3 of 30 sources)")
+
+        def before_any_step(job):
+            job.cancel = True
+            raise limits.Cancelled()
+        self.assertEqual(self.run_one(before_any_step).message, "cancelled")
+        broke = self.run_one(lambda job: {}["x"])
+        self.assertEqual((broke.status, broke.message), ("failed", "KeyError: 'x'"))
+
+    def test_pending_for_sees_the_series_a_passs_lanes_are_on(self):
+        r = jobs.Runner()
+        p = r.submit("refresh-all", "all", lambda j: None)
+        p.status, p.active_series_ids = "running", frozenset({7, 8})
+        self.assertTrue(r.pending_for(8))
+        self.assertFalse(r.pending_for(9))
+
+    def test_lanes_are_shown_and_cleared_when_the_job_ends(self):
+        def fn(job):
+            job.active_series_ids = frozenset({3})
+            job.lanes = [{"lane": 1, "source": "X", "series_id": 3, "title": "T", "text": "", "since": 0}]
+            self.assertEqual(job.as_dict()["lanes"], job.lanes)
+        j = self.run_one(fn)
+        self.assertEqual((j.status, j.lanes, j.active_series_ids), ("done", [], frozenset()))
+        self.assertEqual(j.as_dict()["lanes"], [])
+
 
 class SchedulerTest(unittest.TestCase):              # findings 80, 89
     def test_bad_interval_never_breaks_next_at(self):
@@ -499,7 +540,147 @@ class CoreTest(TmpData):
         self.assertEqual((seen["retries"], seen["variables"]), (1, {"first": 500, "offset": 0}))
 
 
+class DownloadChapterWarmTest(TmpData):
+    """A single chapter (the Download button) from a source Settings has
+    fetched page by page: its pages are requested one by one before it is
+    queued. The plan-less path reads the setting itself."""
+    COMICK = "Comick (Unoriginal) (EN)"
+
+    class PageClient(FakeClient):
+        def __init__(self, chapters):
+            super().__init__()
+            self.calls: list[str] = []
+            self._chapters = chapters
+
+        def chapters(self, manga_id):
+            return self._chapters
+
+        def page_urls(self, chapter_id):
+            self.calls.append("page_urls")
+            return [f"/api/v1/manga/1/chapter/5/page/{p}" for p in range(3)]
+
+        def fetch_page(self, path, timeout=60):
+            self.calls.append("fetch_page")
+            return suwayomi.PageFetch("ok", 200, 10, 0.0)
+
+        def enqueue(self, ids):
+            self.calls.append("enqueue")
+            super().enqueue(ids)
+
+    def download(self, warm_sources):
+        from mangarr import pagewarm, settings
+        sid = self.seed({5: "failed"}, sources=((self.COMICK, 1),))
+        client = self.PageClient(_match(self.COMICK, 1, [5]).chapters)
+        with db.connect() as con:
+            settings.set_many(con, {"page_warm_sources": warm_sources})
+        settings._cache.clear()
+        with db.connect() as con, mock.patch.object(core, "import_series", lambda *a, **k: 0), \
+             mock.patch.dict(pagewarm._pacers, clear=True), self.assertLogs("mangarr", "INFO"):
+            msg = core.download_chapter(con, client, sid, 5.0)
+        self.assertIn(f"downloaded from {self.COMICK}", msg)
+        return client.calls
+
+    def test_pages_are_fetched_before_the_chapter_is_queued(self):
+        self.assertEqual(self.download([self.COMICK]), ["page_urls"] + ["fetch_page"] * 3 + ["enqueue"])
+
+    def test_not_listed_downloads_the_normal_way(self):
+        self.assertEqual(self.download(["weeb central"]), ["enqueue"])
+
+
 # -- Suwayomi outages -------------------------------------------------------------------------
+
+class CoreSplitTest(TmpData):
+    """download_wanted in parts, so a pass can resolve a series, hand its
+    chapters to a download lane, and write the outcome later."""
+
+    def seed_mixed(self):
+        sid = self.seed({1: "have", 2: "ignored", 3: "failed", 4: "failed", 5: "wanted"})
+        with db.connect() as con:
+            con.execute("UPDATE chapter SET next_try='2999-01-01 00:00:00' WHERE series_id=? AND number=3", (sid,))
+            con.execute("UPDATE chapter SET next_try='2000-01-01 00:00:00' WHERE series_id=? AND number=4", (sid,))
+        return sid, _plan([_match("A", 1, [1, 2, 3, 4, 5, 6])])
+
+    def test_downloads_due_filters_like_download_wanted(self):
+        sid, plan = self.seed_mixed()
+        asked = {}
+
+        def fake_download(client, plan, only=None, **kw):
+            asked["only"] = only
+            return {}
+        with db.connect() as con:
+            con.execute("UPDATE series SET monitored=1 WHERE id=?", (sid,))      # a write left open
+            with self.assertLogs("mangarr.core", "INFO") as cm:
+                due = core.downloads_due(con, core.Outcome(sid, plan))
+            self.assertFalse(con.in_transaction)
+            with mock.patch.object(downloader, "download", fake_download):
+                core.download_wanted(con, FakeClient(), sid, plan)
+        self.assertEqual(due, [4.0, 5.0, 6.0])              # not on disk, not ignored, not failed until later
+        self.assertEqual(asked["only"], set(due))
+        self.assertIn("1 failed chapter(s) not due", "\n".join(cm.output))
+
+    def test_nothing_due_without_a_usable_source(self):
+        sid = self.seed({1: "wanted"})
+        m = _match("A", 1, [1])
+        m.note = "author differs"
+        with db.connect() as con:
+            self.assertEqual(core.downloads_due(con, core.Outcome(sid, _plan([m]))), [])
+
+    def test_record_downloads(self):
+        sid = self.seed({1: "wanted", 2: "wanted", 3: "wanted", 4: "wanted", 5: "wanted"})
+        plan = _plan([_match("A", 1, [1, 2, 3, 4, 5])])
+        with db.connect() as con:
+            con.execute("UPDATE chapter SET status='ignored' WHERE series_id=? AND number=4", (sid,))  # the user, meanwhile
+            con.commit()
+            core.record_downloads(con, sid, plan, [1.0, 2.0, 3.0, 4.0, 5.0], {1.0: "ok", 2.0: "failed", 4.0: "failed"},
+                                  {2.0: "broken", 3.0: "waiting for chapter 2: in order"}, {"A"})
+            self.assertFalse(con.in_transaction)
+            rows = {r["number"]: (r["status"], r["reason"]) for r in db.chapters(con, sid)}
+            event = db.events(con, 1)[0]
+            stats = db.source_stats(con)["A"]
+        self.assertEqual(rows[2.0][0], "failed")
+        self.assertTrue(rows[2.0][1].startswith("broken"), rows[2.0])
+        self.assertEqual(rows[3.0], ("wanted", "waiting for chapter 2: in order"))
+        self.assertEqual(rows[4.0][0], "ignored")                                   # kept
+        self.assertIn("cancelled or interrupted", rows[5.0][1])
+        self.assertEqual((event["kind"], event["message"]), ("downloaded", "1 chapter(s) downloaded, 2 failed: "
+                                                                           "ch 2: broken; ch 4: ?"))
+        self.assertEqual((stats["ok"], stats["failed"], stats["throttled"]), (1, 2, 1))
+        self.assertIsNotNone(stats["last_throttled"])
+
+    def test_download_wanted_still_records_throttling(self):
+        sid = self.seed({1: "wanted"})
+
+        def fake_download(client, plan, throttled=None, **kw):
+            throttled.add("A")
+            return {1.0: "ok"}
+        with db.connect() as con, mock.patch.object(downloader, "download", fake_download):
+            self.assertEqual(core.download_wanted(con, FakeClient(), sid, _plan([_match("A", 1, [1])])), {1.0: "ok"})
+            self.assertEqual(db.auto_throttled(con), {"a"})
+
+    def test_finish_download(self):
+        sid = self.seed({1: "wanted"})
+        plan = _plan([_match("A", 1, [1])])
+        with db.connect() as con, mock.patch.object(core, "import_series", lambda con, sid, client=None: 2):
+            out = core.finish_download(con, FakeClient(), core.Outcome(sid, plan, imported=1))
+            self.assertEqual(out.imported, 3)
+            db.delete_series(con, sid)
+            con.commit()
+            with self.assertRaises(core.Gone):
+                core.finish_download(con, FakeClient(), core.Outcome(sid, plan))
+
+    def test_import_failure_is_committed_at_once(self):
+        sid = self.seed({1: "wanted"})
+        with db.connect() as con, self.assertLogs("mangarr.core", "ERROR"):
+            core._import_failed(con, sid, "T", 1.0, "A: cannot read Chapter 1.cbz", OSError("boom"))
+            self.assertFalse(con.in_transaction)
+            other = sqlite3.connect(self.tmp.name + "/t.db", timeout=0.2)     # a web request meanwhile
+            try:
+                other.execute("UPDATE series SET monitored=0")
+                other.commit()
+            finally:
+                other.close()
+        self.assertEqual(self.status(sid)[1], "failed")
+
 
 class ImportWriteLockTest(TmpData):                    # findings 21, 33
     """import_series commits every write at once, so another connection can
@@ -674,10 +855,94 @@ class BreakerTest(unittest.TestCase):                 # finding 78
         self.assertEqual(suwayomi._down, {})
 
 
+class SourcesStampTest(unittest.TestCase):
+    """Client.sources() stamps the Settings flags, and Suwayomi's own
+    'max sources in parallel' is read, and written only when asked."""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        suwayomi._down.clear()
+        self.addCleanup(suwayomi._down.clear)
+        p = mock.patch("mangarr.config.DB_PATH", tmp.name + "/t.db")
+        p.start()
+        self.addCleanup(p.stop)
+        self.sent = []
+
+    def client(self, answer):
+        c = Client("http://suwayomi.test")
+
+        def gq(query, variables=None, **kw):
+            self.sent.append((query, variables, kw))
+            return answer(query) if callable(answer) else answer
+        c.gq = gq
+        return c
+
+    def test_page_warm_is_stamped_and_disabled_still_wins(self):
+        nodes = [{"id": "1", "displayName": "Comick (Unoriginal) (EN)", "lang": "en"},
+                 {"id": "2", "displayName": "Weeb Central", "lang": "en"},
+                 {"id": "3", "displayName": "MangaFire (ALL)", "lang": "all"}]
+        values = {"unusable_sources": ["mangafire (all)"], "throttled_sources": [],
+                  "page_warm_sources": ["comick (unoriginal) (en)", "mangafire (all)"]}
+        with mock.patch("mangarr.settings.all_values", lambda con=None: values):
+            got = {s.name: s for s in self.client({"sources": {"nodes": nodes}}).sources()}
+        comick, weeb, fire = got["Comick (Unoriginal) (EN)"], got["Weeb Central"], got["MangaFire (ALL)"]
+        self.assertEqual((comick.page_warm, comick.tier, comick.unusable), (True, 2, False))
+        self.assertEqual((weeb.page_warm, weeb.tier), (False, 0))
+        self.assertTrue(fire.unusable and fire.page_warm)
+        searched = []
+
+        class Search:
+            def search(self, src, q):
+                searched.append(src.name)
+                return []
+        with mock.patch.object(resolver, "SEARCHES", limits.Spacer(pause=lambda s, c=None: False)):
+            resolver.resolve(Search(), Series(english="T"), sources=list(got.values()))
+        self.assertNotIn("MangaFire (ALL)", searched)       # disabled: not searched, page by page or not
+        with mock.patch("mangarr.settings.all_values",
+                        lambda con=None: {"unusable_sources": [], "throttled_sources": [], "page_warm_sources": 8.0}):
+            self.assertFalse(any(s.page_warm for s in self.client({"sources": {"nodes": nodes}}).sources()))
+
+    def test_tier(self):
+        self.assertEqual([Source("1", "A", "en", throttled=t, page_warm=w).tier
+                          for t, w in ((False, False), (True, False), (False, True), (True, True))], [0, 1, 2, 2])
+
+    def test_max_sources_in_parallel_is_read(self):
+        self.assertEqual(self.client({"settings": {"maxSourcesInParallel": 1}}).max_sources_in_parallel(), 1)
+        self.assertEqual(self.sent[0][2], {"timeout": 30, "retries": 1})
+        for odd in ({"settings": None}, {}, {"settings": {"maxSourcesInParallel": "x"}}):
+            self.assertIsNone(self.client(odd).max_sources_in_parallel(), odd)
+
+        def down(query):
+            raise SuwayomiUnreachable("Suwayomi at x unreachable")
+        self.assertIsNone(self.client(down).max_sources_in_parallel())
+        self.assertFalse(any("setSettings" in q for q, _, _ in self.sent))     # reading never writes
+
+    def test_set_max_sources_in_parallel(self):
+        c = self.client({"setSettings": {"settings": {"maxSourcesInParallel": 3}}})
+        self.assertEqual(c.set_max_sources_in_parallel(3), 3)
+        query, variables, kw = self.sent[0]
+        self.assertIn("setSettings", query)
+        self.assertEqual((variables, kw), ({"n": 3}, {"timeout": 30, "retries": 1}))
+        self.assertEqual(suwayomi._OPNAME.search(query).group(1), "setSettings")
+        self.assertEqual(suwayomi._OPNAME.search("{ settings { maxSourcesInParallel } }").group(1), "settings")
+
+    def test_page_urls(self):
+        c = self.client({"fetchChapterPages": {"pages": ["/api/v1/manga/1/chapter/2/page/0"]}})
+        self.assertEqual(c.page_urls(7), ["/api/v1/manga/1/chapter/2/page/0"])
+        self.assertEqual(self.sent[0][1], {"id": 7})
+        for odd in ({"fetchChapterPages": {"pages": None}}, {"fetchChapterPages": None}, {}):
+            with self.assertRaises(SuwayomiError):
+                self.client(odd).page_urls(7)
+
+
 class ResolverErrorsTest(unittest.TestCase):          # finding 94
     def setUp(self):
         resolver._unreachable.clear()
         self.addCleanup(resolver._unreachable.clear)
+        p = mock.patch.object(resolver, "SEARCHES", limits.Spacer(pause=lambda s, c=None: False))
+        p.start()
+        self.addCleanup(p.stop)
 
     def _search(self, exc):
         client = mock.Mock()
@@ -707,6 +972,7 @@ class RunPassOutageTest(unittest.TestCase):
         job = jobs.Job(1, "refresh-all", "all")
         with mock.patch.object(core, "refresh_series", fake_refresh), \
              mock.patch.object(core, "describe_outcome", lambda con, sid, o: ("done", "ok")), \
+             mock.patch.object(core, "downloads_due", lambda con, o: []), \
              mock.patch.object(web.db, "connect", mock.MagicMock()), \
              mock.patch.object(web.limits, "pause", lambda s, c=None: False):
             try:
@@ -740,6 +1006,7 @@ class RunPassOutageTest(unittest.TestCase):
         sent = []
         with mock.patch.object(core, "refresh_series", first_then_down), \
              mock.patch.object(core, "describe_outcome", lambda con, sid, o: ("done", "1 downloaded")), \
+             mock.patch.object(core, "downloads_due", lambda con, o: []), \
              mock.patch.object(web.db, "connect", mock.MagicMock()), \
              mock.patch.object(web, "plan_pass", lambda r: (rows, 0)), \
              mock.patch.object(web, "_record_error", lambda sid, e: None), \
@@ -783,6 +1050,7 @@ class RunPassOutageTest(unittest.TestCase):
         job_ref.append(job)
         with mock.patch.object(core, "refresh_series", look), \
              mock.patch.object(core, "describe_outcome", lambda con, sid, o: ("done", "ok")), \
+             mock.patch.object(core, "downloads_due", lambda con, o: []), \
              mock.patch.object(web.db, "connect", mock.MagicMock()):
             web._run_pass(job, rows, "test")
         self.assertEqual(seen, [5, 6])

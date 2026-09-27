@@ -22,18 +22,19 @@
 
 <fieldset class="fieldset" id="sources">
   <legend class="legend">Sources</legend>
-  <div class="help-text">The sources installed in Suwayomi. Untick one to stop using it: it is neither searched nor downloaded from. Rate limiting is detected automatically: a source that starts refusing requests is paced (one chapter at a time, a pause between chapters) and loses close calls to other sources for {{ auto_days }} days.</div>
+  <div class="help-text">The sources installed in Suwayomi. Untick one to stop using it: it is neither searched nor downloaded from. Rate limiting is detected automatically: a source that starts refusing requests is paced (one chapter at a time, a pause between chapters) and loses close calls to other sources for {{ auto_days }} days. A source whose image server refuses bursts (Comick) can be fetched page by page ("one by one"): each page is requested through Suwayomi a few seconds apart, then Suwayomi builds the chapter from its cache. That is slow (2-4 min a chapter), so such a source is used only for chapters no other source lists.</div>
   <input type="hidden" name="sources_listed" value="{{ '1' if sources else '0' }}">
   <div class="table-container"><table class="table">
-  <thead><tr><th class="col-check">Enabled</th><th>Source</th><th>Language</th><th>Reliability</th><th>Rate limiting</th></tr></thead>
+  <thead><tr><th class="col-check">Enabled</th><th>Source</th><th>Language</th><th>Reliability</th><th>Rate limiting</th><th>Pages</th></tr></thead>
   <tbody>
   {% for s in sources %}
   <tr><td class="col-check"><input type="hidden" name="listed_sources" value="{{ s.name|lower }}">{{ m.check('enabled_sources', (s.name|lower not in v.unusable_sources), s.name|lower, none, 'primary', {'aria-label': 'Enable ' ~ s.name}) }}</td>
   <td>{{ s.name }}</td><td class="muted">{{ s.lang }}</td>
   {% set st = stats.get(s.name) %}<td class="muted small">{% if st %}{% set tot = st.ok + st.failed + st.corrupt %}{{ ((st.ok / tot) * 100)|round|int if tot else 0 }}% of {{ tot }} chapter{{ 's' if tot != 1 }}{% if st.corrupt %} ({{ st.corrupt }} corrupt){% endif %}{% else %}no downloads yet{% endif %}</td>
-  <td class="small">{% if s.throttled %}<span class="text-warning">paced</span>{% if st and st.last_throttled %} <span class="muted">- limited us {{ st.throttled }}x, last {{ st.last_throttled|ago }}</span>{% endif %}{% else %}<span class="muted">none seen</span>{% endif %}</td></tr>
+  <td class="small">{% if s.throttled %}<span class="text-warning">paced</span>{% if st and st.last_throttled %} <span class="muted">- limited us {{ st.throttled }}x, last {{ st.last_throttled|ago }}</span>{% endif %}{% else %}<span class="muted">none seen</span>{% endif %}</td>
+  <td class="small"><label class="inline-check">{{ m.check('warm_sources', (s.name|lower in v.page_warm_sources), s.name|lower, none, 'primary', {'aria-label': 'Fetch ' ~ s.name ~ ' page by page'}) }} one by one</label></td></tr>
   {% endfor %}
-  {% if not sources %}<tr><td colspan="5" class="text-danger">Suwayomi unreachable - source list unavailable</td></tr>{% endif %}
+  {% if not sources %}<tr><td colspan="6" class="text-danger">Suwayomi unreachable - source list unavailable</td></tr>{% endif %}
   </tbody></table></div>
 </fieldset>
 
@@ -42,6 +43,9 @@
   {% call m.form_group('Download In Order', 'Each series is downloaded in chapter order. If a chapter cannot be downloaded from any source, that series waits at it (and it is retried on schedule) while the other series carry on.', 'download_in_order') %}<input type="hidden" name="download_in_order" value="0">{{ m.check('download_in_order', v.download_in_order, '1', 'download_in_order', 'primary', {'data-hides': 'order-warning'}) }}<div class="alert warning small" id="order-warning" {% if v.download_in_order %}hidden{% endif %}>Off: chapters are fetched from whichever source has them, so they can arrive out of order and a series can have gaps (e.g. 34-77 present while 33 is still missing).</div>{% endcall %}
   {% call m.form_group('Refresh Interval', 'Hours between automatic refreshes of every monitored series', 'refresh_hours') %}<input class="input" id="refresh_hours" name="refresh_hours" value="{{ v.refresh_hours }}"><span class="input-unit">hours</span>{% endcall %}
   {% call m.form_group('Throttled Delay', 'Seconds between chapters on rate-limited sources; a steady pause stays under the site\'s limit, bursts get HTTP 429 and long backoffs', 'throttled_delay_seconds') %}<input class="input" id="throttled_delay_seconds" name="throttled_delay_seconds" value="{{ v.throttled_delay_seconds }}"><span class="input-unit">seconds</span>{% endcall %}
+  {% call m.form_group('Download Lanes', 'How many sources download at the same time during a refresh pass or Search Wanted (1-8). A source still serves one series at a time and keeps its pacing, so a slow or rate-limited source no longer holds up the others. Suwayomi must allow at least as many (\'max sources in parallel\'); the lower number wins.', 'download_lanes') %}<input class="input" id="download_lanes" name="download_lanes" value="{{ v.download_lanes }}"><span class="input-unit">sources</span>
+    <div class="help-text" id="suwayomi-parallel">Suwayomi currently allows {{ suwayomi_cap if suwayomi_cap is not none else '-' }} source{{ 's' if suwayomi_cap != 1 }} in parallel{% if suwayomi_cap is none %} (it did not answer){% endif %}.{% if suwayomi_cap is not none and suwayomi_cap < lanes %} Downloads from different sources take turns until it allows {{ lanes }}. <button class="button small" name="action" value="suwayomi-parallel" type="submit">Save and let Suwayomi use {{ lanes }}</button>{% endif %}</div>{% endcall %}
+  {% call m.form_group('Page Delay', 'Seconds between page requests on sources fetched page by page (Sources: one by one). This is the starting and minimum spacing; it grows by itself when the image server answers busy and eases back slowly.', 'page_delay_seconds') %}<input class="input" id="page_delay_seconds" name="page_delay_seconds" value="{{ v.page_delay_seconds }}"><span class="input-unit">seconds</span>{% endcall %}
   {% call m.form_group('Re-check Finished Series', 'Days between checks of a finished series with nothing missing; 0 = every pass', 'recheck_finished_days') %}<input class="input" id="recheck_finished_days" name="recheck_finished_days" value="{{ v.recheck_finished_days }}"><span class="input-unit">days</span>{% endcall %}
   {% call m.form_group('Minimum Pages', 'Below this a "Chapter 12.5" is treated as a notice image and skipped', 'min_pages') %}<input class="input" id="min_pages" name="min_pages" value="{{ v.min_pages }}"><span class="input-unit">pages</span>{% endcall %}
 </fieldset>

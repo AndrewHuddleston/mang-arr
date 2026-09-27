@@ -62,7 +62,11 @@ yourself. The script:
    drives downloads), adds the Keiyoushi extension repository and installs a
    default set of English sources (Weeb Central, MangaDex, Bato, WEBTOON,
    MANGA Plus, Mangakakalot.fun, Manganato, Asura Scans, Flame Comics; change
-   with `SOURCES=`). Only the exact Keiyoushi package of each is installed;
+   with `SOURCES=`). Only the exact Keiyoushi package of each is installed.
+   On a new Suwayomi it also sets *max sources in parallel* to 3, so mang-arr's
+   three download lanes can run at once (see [Download lanes and page-by-page
+   sources](#download-lanes-and-page-by-page-sources)); a re-run leaves that
+   value as it is;
 5. Komga: an API key for mang-arr and a library on `/library`;
 6. mang-arr: **turns its login on** and stores the Komga URL, key and library
    id, in one step, so the Komga key never sits in a mang-arr anyone on the
@@ -200,6 +204,9 @@ three services the installer writes. Points that matter:
 
 - Settings → Downloads: **Save as CBZ** on; **Auto download new chapters** off
   (mang-arr checks and downloads on its own schedule).
+- **Max sources in parallel** (a server setting): 3 or more. mang-arr downloads
+  from up to 3 sources at once, never from more than Suwayomi allows; its
+  Settings page shows Suwayomi's value and has a button to raise it.
 - Settings → Browse → Extension repositories: add
   `https://raw.githubusercontent.com/keiyoushi/extensions/repo/index.min.json`.
 - Browse → Extensions: install the English sources you want. Good starting
@@ -212,7 +219,7 @@ Through the API instead of the UI (on the Docker host):
 
 ```sh
 S=http://localhost:4567/api/graphql
-curl -s $S -H 'Content-Type: application/json' -d '{"query":"mutation { setSettings(input:{settings:{downloadAsCbz:true, autoDownloadNewChapters:false}}) { clientMutationId } }"}'
+curl -s $S -H 'Content-Type: application/json' -d '{"query":"mutation { setSettings(input:{settings:{downloadAsCbz:true, autoDownloadNewChapters:false, maxSourcesInParallel:3}}) { clientMutationId } }"}'
 curl -s $S -H 'Content-Type: application/json' -d '{"query":"mutation($url: String!) { addExtensionStore(input:{indexUrl:$url}) { clientMutationId } }", "variables":{"url":"https://raw.githubusercontent.com/keiyoushi/extensions/repo/index.min.json"}}'
 curl -s $S -H 'Content-Type: application/json' -d '{"query":"mutation { fetchExtensions(input:{}) { extensions { pkgName } } }"}'
 curl -s $S -H 'Content-Type: application/json' -d '{"query":"mutation($id: String!) { updateExtension(input:{id:$id, patch:{install:true}}) { extension { isInstalled } } }", "variables":{"id":"eu.kanade.tachiyomi.extension.en.weebcentral"}}'
@@ -261,6 +268,31 @@ sources), Komga (real API call), AniList and MangaDex reachability, the
 paths, hard-link viability and disk space. `GET /api/v1/health` returns the
 same as JSON. The Docker health check uses `GET /api/v1/ping`, which only
 says the process is alive.
+
+## Download lanes and page-by-page sources
+
+A refresh pass (and *Search all wanted now*) downloads from several sources
+at once: Settings → Scheduling → **Download Lanes**, 3 by default (1-8).
+Each lane downloads one series from one source at a time, so every source
+keeps its own pacing and a slow or rate-limited source holds up only the
+series that need it. Suwayomi's own *max sources in parallel* has to allow
+as many: a pass uses the lower of the two, and the health check warns when
+Suwayomi's is lower. The Settings page shows Suwayomi's value, and when it is
+lower, **Save and let Suwayomi use N** changes it in Suwayomi. That button is
+the only way mang-arr ever changes a Suwayomi setting. Set Download Lanes to
+1 to download from one source at a time, as before; it applies from the
+next pass.
+
+Some image servers refuse the burst of page requests Suwayomi makes for a
+chapter (HTTP 429) but serve the same pages one at a time; Comick is one.
+Such a source is ticked **one by one** in Settings → Sources (Comick is by
+default, `MANGARR_PAGE_WARM_SOURCES`): mang-arr asks Suwayomi for each page
+of a chapter a few seconds apart (**Page Delay**, 2.5 s by default; it
+widens by itself when the server answers busy), then queues the chapter,
+which Suwayomi builds from the pages it just cached. That takes 2-4 minutes
+a chapter, so such a source is used last, for chapters no other source
+lists. It must also be ticked *Enabled*; the health check says when it is
+not.
 
 ## Existing Suwayomi library
 

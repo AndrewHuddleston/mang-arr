@@ -11,7 +11,7 @@ import urllib.request
 from collections.abc import Callable
 from dataclasses import dataclass
 
-from . import config, limits
+from . import config, limits, outbound
 
 log = logging.getLogger(__name__)
 
@@ -64,7 +64,31 @@ def _failure_kind(e: BaseException) -> str:
 
 _OPNAME = re.compile(r"\b(fetchSourceManga|fetchMangaAndChapters|fetchChapterPages|downloadStatus|"
                      r"enqueueChapterDownloads|dequeueChapterDownloads|startDownloader|stopDownloader|"
-                     r"clearDownloader|updateManga|sources|mangas|manga)\b")
+                     r"clearDownloader|updateManga|setSettings|settings|sources|mangas|manga)\b")
+
+# A page image as Suwayomi serves it: /api/v1/manga/<id>/chapter/<index>/page/<n>, with at most
+# a short cache-busting query. fetchChapterPages returns these; anything else is never requested.
+# (\Z, not $: $ would also accept a trailing newline)
+PAGE_PATH = re.compile(r"^/api/v1/manga/\d{1,10}/chapter/\d{1,6}/page/\d{1,5}(\?[A-Za-z0-9=&_.-]{0,100})?\Z")
+PAGE_MAX_BYTES = 64 << 20
+# answers that mean "busy, try again later" from the image server behind Suwayomi
+_PAGE_BUSY = {429, 500, 502, 503, 504}
+_PAGE_GONE = {404, 410}
+
+
+def site_key(name: str) -> str:
+    """The site a source name stands for: the EN and ALL variants of one
+    extension ('Comick (Unoriginal) (EN)' and '... (ALL)') are one site,
+    with one image server."""
+    return re.sub(r"\s*\((en|all)\)\s*$", "", name.lower().strip())
+
+
+@dataclass(frozen=True)
+class PageFetch:
+    status: str             # ok | busy | gone | error | timeout
+    http: int | None        # the HTTP status, when there was one
+    nbytes: int             # image bytes read (and thrown away)
+    secs: float
 
 
 @dataclass(frozen=True)
@@ -74,10 +98,17 @@ class Source:
     lang: str
     unusable: bool = False      # searched, never downloaded from (Settings)
     throttled: bool = False     # single-chapter batches, loses close calls (Settings)
+    page_warm: bool = False     # pages fetched one by one before a download: slow, used last (Settings)
 
     @property
     def key(self) -> str:
         return self.name.lower().strip()
+
+    @property
+    def tier(self) -> int:
+        """0 normal, 1 rate-limited, 2 page by page: a lower tier wins every
+        choice between sources that list a chapter."""
+        return 2 if self.page_warm else 1 if self.throttled else 0
 
 
 @dataclass
@@ -94,7 +125,8 @@ class Client:
     _cancel: Callable[[], bool] | None = None      # set on a cancellable() copy
 
     def __init__(self, url: str = config.SUWAYOMI_URL):
-        self.api = url.rstrip("/") + "/api/graphql"
+        self.base = url.rstrip("/")
+        self.api = self.base + "/api/graphql"
 
     def cancellable(self, should_cancel: Callable[[], bool]) -> "Client":
         """This client for one job: every call checks should_cancel before it
@@ -116,11 +148,7 @@ class Client:
         last: BaseException | None = None
         m = _OPNAME.search(query)
         op = m.group(1) if m else "query"
-        with _down_lock:
-            down = _down.get(self.api)
-        if down and time.monotonic() - down[0] < BREAKER_SECS:
-            raise CircuitOpen(f"Suwayomi at {self.api} unreachable: {down[1]} (not retrying for "
-                              f"{BREAKER_SECS - (time.monotonic() - down[0]):.0f} s)")
+        down = self._check_breaker()
         for attempt in range(1, retries + 1):
             t0 = time.monotonic()
             try:
@@ -165,6 +193,17 @@ class Client:
                 return json.load(r)
         return limits.interruptible(call, self._cancel)
 
+    def _check_breaker(self) -> tuple | None:
+        """Raise CircuitOpen while the breaker is open. Otherwise returns
+        what tripped it last (None when it is closed): a call that then gets
+        an answer closes it."""
+        with _down_lock:
+            down = _down.get(self.api)
+        if down and time.monotonic() - down[0] < BREAKER_SECS:
+            raise CircuitOpen(f"Suwayomi at {self.api} unreachable: {down[1]} (not retrying for "
+                              f"{BREAKER_SECS - (time.monotonic() - down[0]):.0f} s)")
+        return down
+
     def _check_answers(self, op: str, waited: int) -> None:
         """After a source request got no answer: raise SuwayomiUnreachable
         (the breaker is tripped by the probe's own failure) when Suwayomi does
@@ -198,11 +237,14 @@ class Client:
     # -- sources / search -------------------------------------------------
 
     def sources(self, langs=("en", "all")) -> list[Source]:
-        """Installed sources, with the disabled/throttled flags from Settings
-        stamped once so a run is consistent even if settings change."""
+        """Installed sources, with the disabled/throttled/page-by-page flags
+        from Settings stamped once so a run is consistent even if settings
+        change."""
         from . import settings
         v = settings.all_values()
         unusable, throttled = set(v["unusable_sources"]), set(v["throttled_sources"])
+        warm = v.get("page_warm_sources")
+        warm = set(warm) if isinstance(warm, list) else set()
         try:                                        # plus the ones that rate-limited us recently
             from . import db
             with db.connect() as con:
@@ -215,7 +257,7 @@ class Client:
             if s["lang"] not in langs or s["displayName"] == "Local source":
                 continue
             key = s["displayName"].lower().strip()
-            out.append(Source(s["id"], s["displayName"], s["lang"], key in unusable, key in throttled))
+            out.append(Source(s["id"], s["displayName"], s["lang"], key in unusable, key in throttled, key in warm))
         return out
 
     def search(self, source: Source, query: str) -> list[dict]:
@@ -261,6 +303,71 @@ class Client:
         except SuwayomiError:
             return None
 
+    def page_urls(self, chapter_id: int) -> list[str]:
+        """The chapter's page paths on Suwayomi (fetches the page list from
+        the source, like page_count). Raises SuwayomiError. The caller checks
+        each against PAGE_PATH before requesting it."""
+        d = self.gq('mutation($id: Int!) { fetchChapterPages(input: {chapterId: $id}) { pages } }',
+                    {"id": chapter_id}, timeout=60, retries=1)
+        try:
+            pages = d["fetchChapterPages"]["pages"]
+        except (KeyError, TypeError) as e:
+            raise SuwayomiError(f"fetchChapterPages answered without a page list ({type(e).__name__})") from e
+        if not isinstance(pages, list):
+            raise SuwayomiError("fetchChapterPages answered without a page list")
+        return [str(p) for p in pages]
+
+    def fetch_page(self, path: str, timeout: int = 60, max_bytes: int = PAGE_MAX_BYTES) -> PageFetch:
+        """GET one page image through Suwayomi, which fetches it from the
+        source and keeps it in its cache; the bytes are read in pieces and
+        thrown away. Only a PAGE_PATH is requested (ValueError otherwise),
+        never through gq. Busy answers (429, 5xx) are the image server's, not
+        Suwayomi being down, so they neither trip the breaker nor raise. So is
+        a timeout, unless Suwayomi then does not answer a status query either
+        (as after a source request in gq): SuwayomiUnreachable, so a hung
+        Suwayomi is not taken for a refusing image server. A refused
+        connection trips the breaker and raises SuwayomiUnreachable, and an
+        open breaker fails at once. A cancel (cancellable copy) cuts the
+        request short with limits.Cancelled."""
+        if not isinstance(path, str) or not PAGE_PATH.match(path):
+            raise ValueError(f"not a Suwayomi page path: {str(path)[:100]!r}")
+        down = self._check_breaker()
+        t0 = time.monotonic()
+        try:
+            status, nbytes, truncated = limits.interruptible(
+                lambda: outbound.drain(self.base + path, timeout=timeout, max_bytes=max_bytes,
+                                       what="Suwayomi page URL"), self._cancel)
+        except limits.Cancelled:
+            raise
+        except urllib.error.HTTPError as e:
+            try:
+                body = e.read(1024)
+            except Exception:
+                body = b""
+            finally:
+                e.close()
+            secs = time.monotonic() - t0
+            kind = "busy" if e.code in _PAGE_BUSY else "gone" if e.code in _PAGE_GONE else "error"
+            log.debug("suwayomi page %s -> HTTP %d (%s) in %.1fs: %r", path, e.code, kind, secs, body[:200])
+            return PageFetch(kind, e.code, 0, secs)
+        except Exception as e:
+            secs = time.monotonic() - t0
+            kind = _failure_kind(e)
+            if kind == "connect":
+                self._breaker_trip(f"{type(e).__name__}: {e}")
+                raise SuwayomiUnreachable(f"Suwayomi at {self.base} unreachable: {e}") from e
+            log.debug("suwayomi page %s -> %s after %.1fs: %s", path, kind, secs, e)
+            if kind == "timeout" and timeout >= PROBE_SECS:     # a short one proves nothing either way
+                self._check_answers("a page request", timeout)
+            return PageFetch("timeout" if kind == "timeout" else "error", None, 0, secs)
+        secs = time.monotonic() - t0
+        if down:
+            self._breaker_close()
+        if truncated:
+            log.warning("page %s is larger than %d bytes; stopped reading it", path, max_bytes)
+        log.debug("suwayomi page %s -> HTTP %d, %d bytes in %.1fs", path, status, nbytes, secs)
+        return PageFetch("ok", status, nbytes, secs)
+
     def mangas_page(self, offset: int, first: int = 500) -> tuple[list[dict], bool]:
         """One page of every entry Suwayomi has cached (every search hit is
         cached, so the whole list can run to tens of thousands): returns
@@ -270,6 +377,23 @@ class Client:
                     {"first": first, "offset": offset}, timeout=60, retries=1)
         nodes = d["mangas"]["nodes"]
         return nodes, bool(nodes) and bool((d["mangas"].get("pageInfo") or {}).get("hasNextPage"))
+
+    def max_sources_in_parallel(self) -> int | None:
+        """Suwayomi's own 'max sources in parallel': how many sources its
+        downloader fetches from at once. None when it cannot be read."""
+        try:
+            d = self.gq("{ settings { maxSourcesInParallel } }", timeout=30, retries=1)
+            return int(d["settings"]["maxSourcesInParallel"])
+        except (SuwayomiError, KeyError, TypeError, ValueError) as e:
+            log.debug("could not read Suwayomi's max sources in parallel: %s: %s", type(e).__name__, e)
+            return None
+
+    def set_max_sources_in_parallel(self, n: int) -> int:
+        """Change Suwayomi's global 'max sources in parallel'; returns the
+        value it now has. Only ever on the user's request (Settings)."""
+        d = self.gq('mutation($n: Int!) { setSettings(input: {settings: {maxSourcesInParallel: $n}})'
+                    ' { settings { maxSourcesInParallel } } }', {"n": int(n)}, timeout=30, retries=1)
+        return int(d["setSettings"]["settings"]["maxSourcesInParallel"])
 
     def set_in_library(self, manga_id: int, in_library: bool, retries: int = 3, timeout: int = 60) -> None:
         self.gq('mutation($id: Int!, $v: Boolean!) {'

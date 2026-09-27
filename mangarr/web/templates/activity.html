@@ -45,11 +45,33 @@
 {% endfor %}
 </tbody></table></div>
 {% if pass_job %}
+{% if pass_job.lanes %}
+{% set busy = pass_job.lanes|selectattr('source')|list|length %}
+<h2 class="section-title" id="lanes">Download lanes: {{ busy }} of {{ pass_job.lanes|length }} busy</h2>
+<div class="table-container"><table class="table queue lanes">
+<thead><tr><th class="num">Lane</th><th>Source</th><th>Series</th><th>What it is doing</th><th class="col-date">Since</th></tr></thead>
+<tbody>
+{% for ln in pass_job.lanes %}
+<tr class="queue-row lane-{{ 'busy' if ln.source else 'idle' }}">
+  <td class="num muted">{{ ln.lane }}</td>
+  {% if ln.source %}
+  <td>{{ ln.source }}</td>
+  <td><a href="/series/{{ ln.series_id }}">{{ ln.title }}</a></td>
+  <td class="small message">{{ ln.text or 'starting' }}</td>
+  <td class="col-date nowrap">{{ ln.since|ago }}</td>
+  {% else %}
+  <td class="muted" colspan="4">idle</td>
+  {% endif %}
+</tr>
+{% endfor %}
+</tbody></table></div>
+{% endif %}
 {% set items = pass_job.items %}
 {% set n_done = items|selectattr('state', 'in', ['done', 'nomatch', 'failed', 'error'])|list|length %}
 <h2 class="section-title" id="pass">{{ 'Current' if pass_job.status == 'running' else 'Last' }} {{ pass_job.kind }} pass: {{ n_done }} of {{ items|length }} series
   <span class="muted small">
     {{ items|selectattr('state', 'equalto', 'queued')|list|length }} queued ·
+    {{ items|selectattr('state', 'equalto', 'waiting')|list|length }} waiting ·
     {{ items|selectattr('state', 'equalto', 'done')|list|length }} ok ·
     {{ items|selectattr('state', 'equalto', 'nomatch')|list|length }} no match ·
     {{ items|selectattr('state', 'in', ['failed', 'error'])|list|length }} failed
@@ -59,9 +81,9 @@
 <tbody>
 {% for it in items %}
 {% set lk = {'running': 'info', 'done': 'success', 'nomatch': 'warning', 'failed': 'danger', 'error': 'danger', 'cancelled': 'default'}.get(it.state, 'default') %}
-{% set lt = {'running': 'working', 'done': 'done', 'nomatch': 'no match', 'failed': 'failed', 'error': 'error', 'cancelled': 'cancelled', 'queued': 'queued'}.get(it.state, it.state) %}
-<tr class="queue-row pass-{{ it.state }}" data-status="{{ 'active' if it.state in ['queued', 'running'] else ('failed' if it.state in ['failed', 'error', 'nomatch'] else 'done') }}">
-  <td class="col-icon">{% if it.state == 'running' %}{{ m.icon('spinner', 'sm spin') }}{% elif it.state == 'queued' %}{{ m.icon('clock', 'sm') }}{% elif it.state in ['failed', 'error', 'nomatch'] %}{{ m.icon('warning', 'sm') }}{% elif it.state == 'cancelled' %}{{ m.icon('ignore', 'sm') }}{% else %}{{ m.icon('check-circle', 'sm') }}{% endif %}</td>
+{% set lt = {'running': 'working', 'done': 'done', 'nomatch': 'no match', 'failed': 'failed', 'error': 'error', 'cancelled': 'cancelled', 'queued': 'queued', 'waiting': 'waiting'}.get(it.state, it.state) %}
+<tr class="queue-row pass-{{ it.state }}" data-status="{{ 'active' if it.state in ['queued', 'running', 'waiting'] else ('failed' if it.state in ['failed', 'error', 'nomatch'] else 'done') }}">
+  <td class="col-icon">{% if it.state == 'running' %}{{ m.icon('spinner', 'sm spin') }}{% elif it.state in ['queued', 'waiting'] %}{{ m.icon('clock', 'sm') }}{% elif it.state in ['failed', 'error', 'nomatch'] %}{{ m.icon('warning', 'sm') }}{% elif it.state == 'cancelled' %}{{ m.icon('ignore', 'sm') }}{% else %}{{ m.icon('check-circle', 'sm') }}{% endif %}</td>
   <td class="num muted">{{ loop.index }}</td>
   <td><a href="/series/{{ it.series_id }}">{{ it.title }}</a></td>
   <td>{{ m.label(lt, lk) }}</td>

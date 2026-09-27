@@ -121,6 +121,9 @@ def respond():
         if "extensionRepos:$repos" in q:
             S["repos"] = v.get("repos")
             return 200, {"data": {"setSettings": {"clientMutationId": None}}}
+        if "maxSourcesInParallel" in q:
+            S["max_parallel"] = int(q.split("maxSourcesInParallel:")[1].split("}")[0])
+            return 200, {"data": {"setSettings": {"settings": {"maxSourcesInParallel": S["max_parallel"]}}}}
         if "setSettings" in q:
             S["download_settings"] = True
             return 200, {"data": {"setSettings": {"settings": {"downloadAsCbz": True}}}}
@@ -434,6 +437,17 @@ class FreshInstallTest(InstallerHarness):
         self.assertIn("https://raw.githubusercontent.com/keiyoushi/extensions/repo/index.min.json",
                       self.st["suwayomi"]["repos"])
 
+    def test_a_new_suwayomi_downloads_from_three_sources_at_once(self):
+        # mang-arr's Download Lanes (3) never exceed Suwayomi's 'max sources in parallel': set it on a new
+        # install, in a request of its own so an older Suwayomi cannot undo the CBZ setting with it
+        reqs = [r["query"] for r in self.st["suwayomi"]["requests"] if "setSettings" in r["query"]]
+        par = [q for q in reqs if "maxSourcesInParallel" in q]
+        self.assertEqual(len(par), 1)
+        self.assertIn("setSettings(input:{settings:{maxSourcesInParallel:3}})", par[0])
+        self.assertTrue(any("downloadAsCbz:true" in q and "maxSourcesInParallel" not in q for q in reqs))
+        self.assertEqual(self.st["suwayomi"]["max_parallel"], 3)
+        self.assertIn("Suwayomi downloads from up to 3 sources at once", self.out)
+
 
 class RerunTest(InstallerHarness):
     """finding 96: running the installer again is safe and does not invent a new Komga password."""
@@ -475,6 +489,22 @@ class RerunTest(InstallerHarness):
         rc, out, err = self.run_installer(env={"MANGARR_API_KEY": "MANGARR-API-KEY-SECRET"})
         self.assertNotEqual(rc, 0)
         self.assertIn("rejected MANGARR_API_KEY", err)
+
+    def test_rerun_leaves_suwayomis_parallel_setting_alone(self):
+        self.assertInstalled(*self.run_installer())
+        self.assertEqual(self.state()["suwayomi"]["max_parallel"], 3)
+        with open(self.stack("config", "suwayomi", "server.conf"), "w") as f:     # what Suwayomi writes on start
+            f.write("server.maxSourcesInParallel = 5\n")
+        st = self.state()
+        st["suwayomi"]["max_parallel"] = 5                                          # the user's choice since
+        self.save_state(st)
+        rc, out, err = self.run_installer()
+        self.assertInstalled(rc, out, err)
+        st = self.state()
+        self.assertEqual(st["suwayomi"]["max_parallel"], 5)
+        self.assertEqual(sum("maxSourcesInParallel" in r["query"] for r in st["suwayomi"]["requests"]), 1)
+        self.assertNotIn("sources at once", out)
+        self.assertEqual(sum("downloadAsCbz:true" in r["query"] for r in st["suwayomi"]["requests"]), 2)
 
     def test_rerun_replaces_a_komga_key_mangarr_lost(self):
         self.assertInstalled(*self.run_installer())

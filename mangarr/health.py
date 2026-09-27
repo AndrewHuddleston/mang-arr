@@ -20,7 +20,7 @@ import urllib.parse
 import urllib.request
 from dataclasses import asdict, dataclass
 
-from . import config, komga, notify, settings
+from . import config, komga, limits, notify, settings
 from .matching import oneline
 from .suwayomi import Client, SuwayomiError
 
@@ -166,6 +166,16 @@ def _compute(client: Client) -> list[Check]:
                              f"{', '.join(slow)}: the site limits requests, so chapters only it has download one at "
                              f"a time with pauses and retries (Settings: delay between chapters). Other sources "
                              f"are preferred whenever they list the chapter."))
+        gentle = [s.name for s in sources if s.page_warm and not s.unusable]
+        off = [s.name for s in sources if s.page_warm and s.unusable]
+        if gentle or off:
+            said = [f"{', '.join(gentle)}: the image server refuses bursts, so chapters only it has are fetched "
+                    f"page by page (about 2-4 min a chapter; Settings: Page Delay). Other sources are preferred "
+                    f"whenever they list the chapter."] if gentle else []
+            said += [f"{name} is set to page by page but disabled in Settings -> Sources; tick it to use it for "
+                     f"chapters no other source has." for name in off]
+            out.append(Check("ok", "Page-by-page sources", " ".join(said)))
+        out.append(_lanes(client))
     except SuwayomiError as e:
         out.append(Check("error", "Suwayomi", f"unreachable at {config.SUWAYOMI_URL}: {e}"))
 
@@ -228,6 +238,26 @@ def _compute(client: Client) -> list[Check]:
             log.warning("health: %s: %s", c.name, c.detail)
     _alert(out)
     return out
+
+
+def _lanes(client: Client) -> Check:
+    """Download Lanes against Suwayomi's own 'max sources in parallel': a
+    pass uses the lower of the two (lanes.effective_lanes). A warning at
+    most, never a page."""
+    want = int(limits.setting("download_lanes"))
+    if want <= 1:
+        return Check("ok", "Download lanes", "1 lane: a pass downloads from one source at a time (Settings: "
+                                             "Download Lanes)")
+    cap = client.max_sources_in_parallel()
+    if cap is None:
+        return Check("warning", "Download lanes", f"Download Lanes is {want}, but Suwayomi's 'max sources in "
+                                                  f"parallel' could not be read, so a pass downloads from one "
+                                                  f"source at a time")
+    if cap < want:
+        return Check("warning", "Download lanes", f"Suwayomi allows {cap} source{'s' if cap != 1 else ''} in "
+                                                  f"parallel but Download Lanes is {want}: downloads from "
+                                                  f"different sources take turns. Raise it on the Settings page.")
+    return Check("ok", "Download lanes", f"{want} lanes; Suwayomi allows {cap}")
 
 
 def stalled_job(now: float | None = None) -> Check | None:

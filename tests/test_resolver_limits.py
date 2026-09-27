@@ -2,14 +2,17 @@
 of chapters, a pile of aliases or a hostile title must not blow up memory,
 the plan or the logs."""
 import math
+import os
+import tempfile
+import threading
 import time
 import tracemalloc
 import unittest
 from unittest import mock
 
-from mangarr import core, resolver
+from mangarr import core, db, limits, resolver
 from mangarr.model import Series
-from mangarr.resolver import Plan, Rejected, SourceMatch, plausible_chapters, resolve
+from mangarr.resolver import Plan, Rejected, SourceMatch, plausible_chapters, primary, resolve
 from mangarr.suwayomi import Chapter, Source
 
 SRC = Source("1", "Src", "en")
@@ -111,9 +114,10 @@ class FakeClient:
 class ResolveTest(unittest.TestCase):
     def setUp(self):
         resolver._unreachable.clear()
-        p = mock.patch("mangarr.settings.get", lambda k: 3)
-        p.start()
-        self.addCleanup(p.stop)
+        for p in (mock.patch("mangarr.settings.get", lambda k: 3),
+                  mock.patch.object(resolver, "SEARCHES", limits.Spacer(pause=lambda s, c=None: False))):
+            p.start()
+            self.addCleanup(p.stop)
 
     def test_ongoing_single_source_with_garbage_number(self):
         series = Series(anilist_id=1, english="Title", status="RELEASING")
@@ -154,6 +158,128 @@ class ResolveTest(unittest.TestCase):
         self.assertIn("나 혼자만 레벨업", client.searches)
         few = Series(anilist_id=2, english="A", native="あ")
         self.assertEqual(resolver.capped_search_titles(few), ["A", "あ"])
+
+
+def ranked(name, sid, numbers, throttled=False, page_warm=False, reliability=0.5):
+    m = SourceMatch(Source(sid, name, "en", throttled=throttled, page_warm=page_warm), int(sid), "T", None, 0, "T", 1,
+                    chapters(numbers))
+    m.reliability = reliability
+    return m
+
+
+class RankTest(unittest.TestCase):
+    """Normal sources first, then rate-limited, then page-by-page ones: a
+    page-by-page source is used only for chapters nobody else lists."""
+
+    def test_order_by_tier_before_reliability(self):
+        comick = ranked("Comick", "1", range(1, 21), page_warm=True, reliability=1.0)
+        slow = ranked("Slow", "2", range(1, 11), throttled=True, reliability=0.9)
+        weeb = ranked("Weeb", "3", range(1, 6), reliability=0.2)
+        cands = resolver._assign([comick, slow, weeb])
+        self.assertEqual([m.source.name for m in cands[3.0]], ["Weeb", "Slow", "Comick"])
+        self.assertEqual([m.source.name for m in cands[8.0]], ["Slow", "Comick"])
+        self.assertEqual([m.source.name for m in cands[15.0]], ["Comick"])     # only it lists 15: still taken
+        plan = Plan(Series(english="T"), [comick, slow, weeb], [], [], {n: c[0] for n, c in cands.items()},
+                    candidates=cands)
+        self.assertEqual(primary(plan).source.name, "Weeb")                    # though Comick reaches furthest
+        self.assertEqual(primary(Plan(Series(english="T"), [comick, slow], [], [], {})).source.name, "Slow")
+        self.assertEqual(primary(Plan(Series(english="T"), [comick], [], [], {})).source.name, "Comick")
+
+    def test_waiting_reason_says_page_by_page(self):
+        comick = ranked("Comick", "1", [1], page_warm=True)
+        plan = Plan(Series(english="T"), [comick], [], [], {1.0: comick}, candidates={1.0: [comick]})
+        with tempfile.TemporaryDirectory() as tmp, db.connect(os.path.join(tmp, "t.db")) as con:
+            sid = db.upsert_series(con, Series(anilist_id=1, english="T"))
+            db.save_plan(con, sid, plan, 1)
+            reason = db.chapters(con, sid)[0]["reason"]
+        self.assertIn("available on Comick (images fetched page by page: slow)", reason)
+
+
+class SearchPacingTest(unittest.TestCase):
+    """Searches on one source start SEARCH_GAP_SECS apart (GENTLE_SEARCH_GAP_SECS
+    on a page-by-page one), on a fake clock; other sources do not wait."""
+
+    def setUp(self):
+        resolver._unreachable.clear()
+        self.t = [0.0]
+        self.starts = []
+
+        def pause(secs, should_cancel=None):
+            self.t[0] += max(secs, 0.0)
+            return bool(should_cancel and should_cancel())
+        for p in (mock.patch("mangarr.settings.get", lambda k: 3),
+                  mock.patch.object(resolver, "SEARCHES", limits.Spacer(clock=lambda: self.t[0], pause=pause))):
+            p.start()
+            self.addCleanup(p.stop)
+        test = self
+
+        class Client(FakeClient):
+            def search(self, src, q):
+                test.starts.append((src.name, test.t[0]))
+                test.t[0] += 0.2                            # the search itself takes a while
+                return super().search(src, q)
+        self.client = Client([1], hit_title="Other")
+
+    def gaps(self, name):
+        times = [t for n, t in self.starts if n == name]
+        return [round(b - a, 6) for a, b in zip(times, times[1:], strict=False)]
+
+    def test_same_source_is_spaced(self):
+        series = Series(anilist_id=1, english="A", romaji="B", synonyms=["C", "D"])
+        resolve(self.client, series, sources=[Source("1", "Weeb", "en")])
+        self.assertEqual(self.gaps("Weeb"), [1.0, 1.0, 1.0])
+        self.starts.clear()
+        resolve(self.client, series, sources=[Source("2", "Comick", "en", page_warm=True)])
+        self.assertEqual(self.gaps("Comick"), [3.0, 3.0])       # and only 3 titles
+
+    def test_the_en_and_all_variants_of_one_site_share_the_spacing(self):
+        series = Series(anilist_id=1, english="A", romaji="B", synonyms=["C"])
+        resolve(self.client, series, sources=[Source("111", "Comick (Unoriginal) (ALL)", "all", page_warm=True),
+                                              Source("222", "Comick (Unoriginal) (EN)", "en", page_warm=True)])
+        times = sorted(t for _, t in self.starts)
+        self.assertEqual(len(times), 6)
+        self.assertEqual([round(b - a, 6) for a, b in zip(times, times[1:], strict=False)], [3.0] * 5)
+
+    def test_other_sources_do_not_wait(self):
+        series = Series(anilist_id=1, english="A")
+        resolve(self.client, series, sources=[Source(str(i), f"S{i}", "en") for i in range(1, 5)])
+        self.assertEqual([round(t, 6) for _, t in self.starts], [0.0, 0.2, 0.4, 0.6])
+
+    def test_threads_share_the_spacing(self):
+        spacer, starts, lock = limits.Spacer(), [], threading.Lock()
+        with mock.patch.object(resolver, "SEARCHES", spacer), mock.patch.object(resolver, "SEARCH_GAP_SECS", 0.05):
+            class Stamp(FakeClient):
+                def search(self, src, q):
+                    with lock:
+                        starts.append(time.monotonic())
+                    return super().search(src, q)
+            threads = [threading.Thread(target=resolve, args=(Stamp([1], hit_title="Other"), Series(english="A")),
+                                        kwargs={"sources": [Source("9", "Weeb", "en")]}) for _ in range(4)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join(10)
+        starts.sort()
+        self.assertEqual(len(starts), 4)
+        self.assertGreaterEqual(min(b - a for a, b in zip(starts, starts[1:], strict=False)), 0.04)
+
+    def test_cancel_while_waiting(self):
+        with self.assertRaises(limits.Cancelled):          # cancelled once the first search went out
+            resolve(self.client, Series(anilist_id=1, english="A", romaji="B"), sources=[Source("1", "Weeb", "en")],
+                    should_cancel=lambda: bool(self.starts))
+        self.assertEqual(len(self.starts), 1)              # the second title is never searched
+
+
+class GentleTitlesTest(unittest.TestCase):
+    def test_at_most_three_and_the_native_one_kept(self):
+        series = Series(anilist_id=1, romaji="Na Honjaman Level Up", english="Solo Leveling", native="나 혼자만 레벨업",
+                        synonyms=[f"Solo Leveling alias {i}" for i in range(10)])
+        titles = resolver.gentle_titles(series, resolver.capped_search_titles(series))
+        self.assertEqual(titles, ["Na Honjaman Level Up", "Solo Leveling", "나 혼자만 레벨업"])
+        few = Series(anilist_id=2, english="A", native="あ")
+        self.assertEqual(resolver.gentle_titles(few, ["A", "あ"]), ["A", "あ"])
+        latin = Series(anilist_id=3, english="A", synonyms=["B", "C", "D"])
+        self.assertEqual(resolver.gentle_titles(latin, latin.search_titles), latin.search_titles[:3])
 
 
 class ReviewSummaryTest(unittest.TestCase):

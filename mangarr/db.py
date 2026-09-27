@@ -488,7 +488,9 @@ def save_plan(con, series_id: int, plan, primary_manga_id: int | None) -> list[s
         if prev and prev["status"] == "failed" and prev["next_try"] and prev["next_try"] > now():
             continue                         # scheduled for a later attempt; leave it alone
         others = [c.source.name for c in plan.candidates.get(n, []) if c.manga_id != m.manga_id]
-        reason = (f"available on {m.source.name}" + (" (rate-limited source: slow)" if m.source.throttled else "")
+        slow = (" (images fetched page by page: slow)" if m.source.page_warm
+                else " (rate-limited source: slow)" if m.source.throttled else "")
+        reason = (f"available on {m.source.name}" + slow
                   + (f" (also {', '.join(others[:3])})" if others else "")
                   + "; not downloaded yet - waiting for a download pass")
         con.execute(

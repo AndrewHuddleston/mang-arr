@@ -45,6 +45,7 @@ KOMGA_PENDING=0  # 1 once Komga is known to have no admin (the EXIT trap stops i
 KOMGA_MARK=""    # <STACK_DIR>/.komga-unclaimed: remembers that across runs
 KOMGA_GENERATED=0  # 1 when this run generated the Komga password (not yet saved or applied)
 PUBLISHED_ON=""  # host address of the port host_url last looked up
+SUWA_NEW=0       # 1 when this stack's Suwayomi had never run before this run (see suwayomi_fresh)
 
 say()  { printf '\033[1;36m==>\033[0m %s\n' "$*"; }
 ok()   { printf '\033[1;32m ok\033[0m  %s\n' "$*"; }
@@ -540,6 +541,10 @@ print(next((l["id"] for l in json.load(sys.stdin) if str(l.get("root", "")).rstr
 }
 
 # ------------------------------------------------------------------ Suwayomi
+suwayomi_fresh() {  # true when this stack's Suwayomi has never run (its config folder is empty or missing)
+  [[ -z "$(ls -A -- "$STACK_DIR/config/suwayomi" 2>/dev/null)" ]]
+}
+
 configure_suwayomi() {
   local repos total=0 catalog suf pkg state name i
   say "configuring Suwayomi"
@@ -547,6 +552,17 @@ configure_suwayomi() {
     ok "chapters saved as CBZ; Suwayomi's own auto-download off (mang-arr drives downloads)"
   else
     warn "could not change Suwayomi's download settings: turn Save as CBZ on and auto-download off in its UI"
+  fi
+  # mang-arr downloads from up to 3 sources at once (Download Lanes), and never from more than Suwayomi
+  # allows. Set on a new Suwayomi only: on a re-run the value may be the user's choice (mang-arr's
+  # Settings page has a button to raise it). A request of its own, so an older Suwayomi that does not
+  # know the field cannot undo the CBZ setting above.
+  if [[ "$SUWA_NEW" == 1 ]]; then
+    if gql 'mutation { setSettings(input:{settings:{maxSourcesInParallel:3}}) { settings { maxSourcesInParallel } } }' >/dev/null; then
+      ok "Suwayomi downloads from up to 3 sources at once (mang-arr's Download Lanes)"
+    else
+      warn "could not set Suwayomi's 'max sources in parallel': mang-arr -> Settings -> Download Lanes has a button for it"
+    fi
   fi
   repos=$( (gql '{ extensionStores { indexUrl } }' 2>/dev/null || true; gql '{ settings { extensionRepos } }' 2>/dev/null || true) | tr -d '\n')
   if [[ "$repos" != *keiyoushi* ]]; then
@@ -783,6 +799,7 @@ main() {
   # it has no admin: a claimed Komga that is slow to answer is never stopped.
   local komga_new=0
   if { [[ ! -f "$STACK_DIR/docker-compose.yml" ]] && komga_fresh; } || [[ -f "$KOMGA_MARK" ]]; then komga_new=1; fi
+  if suwayomi_fresh; then SUWA_NEW=1; fi          # asked before `up`: Suwayomi writes its config folder on start
   load_komga_file
   [[ $komga_new == 0 ]] || ask_komga_login
 

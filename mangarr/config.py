@@ -89,11 +89,19 @@ WEBHOOK_URL = os.environ.get("MANGARR_WEBHOOK_URL")
 # Sources that list chapters but cannot deliver images from this network, or
 # that rate-limit so hard under bulk load that they are worthless for a
 # backfill. They are neither searched nor downloaded from (Settings -> Sources).
-# Names are Suwayomi display names, lower-cased.
+# Names are Suwayomi display names, lower-cased. Comick is no longer here: it
+# now downloads page by page, see PAGE_WARM_SOURCES.
 UNUSABLE_SOURCES = {
     s.strip().lower() for s in os.environ.get(
-        "MANGARR_UNUSABLE_SOURCES",
-        "comick (unoriginal) (en),mangakakalot (en),readcomiconline (en)").split(",") if s.strip()}
+        "MANGARR_UNUSABLE_SOURCES", "mangakakalot (en),readcomiconline (en)").split(",") if s.strip()}
+
+# Sources whose image server refuses a burst of page requests (HTTP 429) but
+# serves them one at a time: their chapters are fetched page by page through
+# Suwayomi, a few seconds apart, before Suwayomi builds the chapter from its
+# cache. Slow, so they are used only for chapters no other source lists.
+PAGE_WARM_SOURCES = {
+    s.strip().lower() for s in os.environ.get(
+        "MANGARR_PAGE_WARM_SOURCES", "comick (unoriginal) (en)").split(",") if s.strip()}
 
 # Sources that work but throttle per request. They lose every close call and
 # get the smallest batches, but chapters nobody else has are still taken.
@@ -119,3 +127,8 @@ BATCH_DEFAULT = 4
 BATCH_THROTTLED = 1
 BACKOFF_MAX = 300
 BACKOFF_MAX_WITH_FALLBACK = 60
+# In order, consecutive chapters from one source are fetched in runs of at
+# most this many. That only splits a long run into steps: in a pass the series
+# keeps its place in the pass order, so it gets its site straight back (an
+# earlier series always goes first, see lanes.py).
+RUN_MAX_CHAPTERS = 20

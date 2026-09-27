@@ -135,5 +135,65 @@ class SettingsTest(unittest.TestCase):
             self.assertEqual(settings.invalid_urls(settings.all_values(con)), {"gotify_url"})
 
 
+class LaneSettingsTest(unittest.TestCase):
+    """The download-lane and page-by-page settings: clamped like the other
+    numbers when saved and when read, never refused for being out of range."""
+
+    def setUp(self):
+        from unittest import mock
+
+        from mangarr import limits
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        p = mock.patch("mangarr.config.DB_PATH", os.path.join(self.tmp.name, "s.db"))
+        p.start()
+        self.addCleanup(p.stop)
+        settings._cache.clear()
+        self.addCleanup(settings._cache.clear)
+        limits._warned.clear()
+
+    def save(self, key, value):
+        with db.connect() as con:
+            settings.set_many(con, {key: value})
+            return settings.all_values(con)[key]
+
+    def test_download_lanes(self):
+        self.assertEqual(settings.all_values()["download_lanes"], 3)
+        self.assertEqual(self.save("download_lanes", "5"), 5)
+        with self.assertLogs("mangarr.settings", "WARNING"):
+            self.assertEqual(self.save("download_lanes", "0"), 1)
+        with self.assertLogs("mangarr.settings", "WARNING") as cm:
+            self.assertEqual(self.save("download_lanes", "99"), 8)
+        self.assertIn("saved as 8", cm.output[0])
+        for bad in ("abc", ""):
+            with self.assertRaises(ValueError):
+                self.save("download_lanes", bad)
+        self.assertEqual(settings.all_values()["download_lanes"], 8)            # nothing stored
+
+    def test_hand_written_values_are_clamped_when_read(self):
+        from mangarr import limits
+        with db.connect() as con:
+            con.execute("INSERT INTO setting (key, value) VALUES ('download_lanes', '1e9'),"
+                        " ('page_delay_seconds', '-4')")
+            con.commit()
+            settings.refresh(con)
+        with self.assertLogs("mangarr.limits", "WARNING"):
+            self.assertEqual(int(limits.setting("download_lanes")), 8)
+            self.assertEqual(limits.setting("page_delay_seconds"), 0.5)
+
+    def test_page_delay(self):
+        self.assertEqual(settings.all_values()["page_delay_seconds"], 2.5)
+        self.assertEqual(self.save("page_delay_seconds", "4"), 4.0)
+        for given, want in (("0", 0.5), ("1e9", 60.0), ("nan", 2.5)):
+            with self.assertLogs("mangarr.settings", "WARNING"):
+                self.assertEqual(self.save("page_delay_seconds", given), want)
+
+    def test_page_warm_sources_are_lower_case(self):
+        self.assertEqual(settings.DEFAULTS["page_warm_sources"], ["comick (unoriginal) (en)"])
+        self.assertNotIn("comick (unoriginal) (en)", settings.DEFAULTS["unusable_sources"])
+        self.assertEqual(self.save("page_warm_sources", " Comick (Unoriginal) (EN), MangaFire (ALL)"),
+                         ["comick (unoriginal) (en)", "mangafire (all)"])
+
+
 if __name__ == "__main__":
     unittest.main()
