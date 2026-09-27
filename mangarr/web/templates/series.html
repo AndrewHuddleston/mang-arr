@@ -11,11 +11,11 @@
     {{ m.toolbar_button('History', 'history', href='#history') }}
     {{ m.toolbar_button('Sources', 'network', href='#sources') }}
     {{ m.toolbar_separator() }}
-    {{ m.toolbar_button('Edit', 'edit', attrs='data-open-modal="edit-modal"') }}
-    {{ m.toolbar_button('Delete', 'delete', attrs='data-open-modal="delete-modal"', disabled=busy, title=('a job for this series is running' if busy else none)) }}
+    {{ m.toolbar_button('Edit', 'edit', attrs={'data-open-modal': 'edit-modal'}) }}
+    {{ m.toolbar_button('Delete', 'delete', attrs={'data-open-modal': 'delete-modal'}, disabled=busy, title=('a job for this series is running' if busy else none)) }}
   </div>
   <div class="toolbar-section right">
-    {{ m.toolbar_button('Expand All', 'expand', attrs='id="expand-all" data-expand-all="1"') }}
+    {{ m.toolbar_button('Expand All', 'expand', attrs={'id': 'expand-all', 'data-expand-all': '1'}) }}
   </div>
 </div>
 {% endblock %}
@@ -33,7 +33,7 @@
 {% set pct = progress(counts.have, listed) %}
 {% set wanted_total = counts.wanted + counts.failed %}
 <div class="series-header">
-  <div class="backdrop" {% if s.cover %}style="background-image:url('{{ s.cover }}')"{% endif %}><div class="backdrop-overlay"></div></div>
+  <div class="backdrop" {% if s.cover %}style="background-image:url('{{ s.cover|css_url }}')"{% endif %}><div class="backdrop-overlay"></div></div>
   <div class="header-content">
     <div class="header-poster">{{ m.poster_img(s.cover, '', 'poster-image big') }}</div>
     <div class="header-info">
@@ -188,7 +188,7 @@
   <div class="modal-body">
     {% call m.form_group('Monitored', 'Download new chapters as they are listed by the sources', 'edit-monitored') %}
       <input type="hidden" name="monitored" value="{{ 1 if s.monitored else 0 }}">
-      {{ m.check(none, s.monitored, '1', 'edit-monitored', 'primary', 'data-sync="monitored"') }}
+      {{ m.check(none, s.monitored, '1', 'edit-monitored', 'primary', {'data-sync': 'monitored'}) }}
     {% endcall %}
     {% call m.form_group('Path', 'Where chapters are placed in the library. Set by the folder name; not editable.') %}
       <input type="text" class="input read-only" readonly value="{{ library_path }}">

@@ -50,7 +50,7 @@ EVENTS_KEEP_ROWS = int(os.environ.get("MANGARR_EVENTS_KEEP_ROWS", "100000"))   #
 # backup's (a key the current database does not have is removed from the
 # restored one too, so an old login cannot come back).
 PRESERVED_SETTINGS = ("auth_method", "auth_user", "auth_password", "api_key", "session_epoch", "session_secret",
-                      "allowed_hosts")
+                      "revoked_sessions", "allowed_hosts")
 
 _TMP_PREFIX = ".tmp-"            # work in progress inside the backups folder (never listed as a backup)
 _lock = threading.RLock()        # one backup, prune or restore at a time in this process

@@ -7,7 +7,7 @@
   <div class="toolbar-section left">
     <form method="post" action="/wanted/search" class="toolbar-form" id="search-all-form"><button class="toolbar-button" id="search-missing" data-label-all="Search All" data-label-selected="Search Selected" {% if not rows %}disabled{% endif %} title="Search the sources for every wanted chapter">{{ m.icon('search') }}<span class="toolbar-label">Search All</span></button></form>
     {{ m.toolbar_separator() }}
-    {{ m.toolbar_button('Select All', 'check', attrs='id="select-all-btn"', disabled=(not rows)) }}
+    {{ m.toolbar_button('Select All', 'check', attrs={'id': 'select-all-btn'}, disabled=(not rows)) }}
   </div>
   <div class="toolbar-section right">
     <span class="toolbar-count">{{ rows|length }} series</span>
@@ -22,13 +22,13 @@
 {% else %}
 <div class="table-container"><table class="table missing" id="missing-table">
 <thead><tr>
-  <th class="col-select">{{ m.check(none, false, '1', 'select-all', 'primary', 'aria-label="Select all"') }}</th>
+  <th class="col-select">{{ m.check(none, false, '1', 'select-all', 'primary', {'aria-label': 'Select all'}) }}</th>
   <th>Series</th><th class="num">Missing</th><th>Chapters</th><th class="num">Failed</th><th>Last failure</th><th class="col-date">Last Checked</th><th class="col-actions"></th>
 </tr></thead>
 <tbody>
 {% for r in rows %}
 <tr data-id="{{ r.id }}" data-failed="{{ r.failed or 0 }}">
-  <td class="col-select">{{ m.check(none, false, '1', none, 'primary', 'data-select="' ~ r.id ~ '" aria-label="Select ' ~ r.title ~ '"') }}</td>
+  <td class="col-select">{{ m.check(none, false, '1', none, 'primary', {'data-select': r.id, 'aria-label': 'Select ' ~ r.title}) }}</td>
   <td><a href="/series/{{ r.id }}">{{ r.title }}</a></td>
   <td class="num text-danger">{{ r.wanted }}</td>
   <td class="muted chapters">{{ r.numbers }}</td>

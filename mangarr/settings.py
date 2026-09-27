@@ -13,14 +13,30 @@ through get(), so a change on the Settings page applies to the next job.
     komga_url            str    ""     e.g. http://komga:25600
     komga_api_key        str    ""     triggers a library scan after imports
     komga_library_id     str    ""     optional: scan only this library
-    auth_user            str    ""     basic auth for the web UI (empty = off)
-    auth_password        str    ""
+    auth_user            str    ""     web login (empty = off)
+    auth_password        str    ""     stored as a salted PBKDF2 hash, never in clear
+    api_key              str    ""     X-Api-Key; generated on first start, rotatable
+    allowed_hosts        list   []     extra Host names the web UI answers to
+
+Secrets (SECRET_KEYS) are masked in the UI and the API and logged as ***.
+A secret is bound to its destination: when komga_url, gotify_url, ntfy_url
+or smtp_host changes and the paired secret is not re-entered, the stored
+secret is cleared instead of being sent to the new destination.
+
+Reads fail closed: when the database cannot be read, the last good values
+stay in use; if there never were any, available() is False and the web UI
+refuses requests (503) instead of running with login switched off.
 """
+import base64
+import hashlib
+import hmac
 import json
 import logging
+import secrets
 import sqlite3
 import threading
 import time
+import urllib.parse
 
 from . import config
 
@@ -66,15 +82,30 @@ DEFAULTS: dict[str, object] = {
     "auth_user": "",
     "auth_password": "",
     "api_key": "",           # X-Api-Key for the JSON API when a web login is set; generated on first start
+    "allowed_hosts": [],     # Host names besides IPs, localhost and LAN names (see web.app, MANGARR_ALLOWED_HOSTS)
+    # internal: never shown, never set from a form or the API (INTERNAL_KEYS)
+    "session_secret": "",    # signs login cookies; random per install
+    "session_epoch": 0,      # bumped to sign every session out (logout-all, password / user / API key change)
+    "revoked_sessions": [],  # "sid:expiry" of sessions signed out one by one
 }
 SECRET_KEYS = {"pushover_token", "pushover_user", "komga_api_key", "auth_password", "discord_webhook", "slack_webhook",
-               "telegram_token", "ntfy_token", "gotify_token", "smtp_password", "notifiarr_api_key"}
+               "telegram_token", "ntfy_token", "gotify_token", "smtp_password", "notifiarr_api_key",
+               # the key itself and URLs whose path is the credential (webhook ids, ntfy topics, Apprise keys)
+               "api_key", "webhook_url", "apprise_url", "ntfy_url", "session_secret"}
+INTERNAL_KEYS = {"session_secret", "session_epoch", "revoked_sessions"}
 MASK = "********"        # what the UI shows for a stored secret; submitting it unchanged keeps the value
+# a secret belongs to the destination it was entered for: change the destination
+# without re-entering the secret and the secret is cleared, never sent on
+DESTINATION_SECRETS = {"komga_url": ("komga_api_key",), "gotify_url": ("gotify_token",),
+                       "ntfy_url": ("ntfy_token",), "smtp_host": ("smtp_password",)}
+# changing any of these signs every browser session out
+SESSION_KEYS = ("auth_user", "auth_password", "api_key")
 
 
 def masked(values: dict) -> dict:
-    """The values for a form: secrets replaced by MASK when set."""
-    out = dict(values)
+    """The values for a form: secrets replaced by MASK when set, internal
+    keys left out."""
+    out = {k: v for k, v in values.items() if k not in INTERNAL_KEYS}
     for k in SECRET_KEYS:
         if out.get(k):
             out[k] = MASK
@@ -83,45 +114,160 @@ def masked(values: dict) -> dict:
 
 def ensure_api_key(con: sqlite3.Connection) -> str:
     """Create the API key on first start; returns it."""
-    import secrets as _secrets
     v = all_values(con)
     if not v["api_key"]:
-        set_many(con, {"api_key": _secrets.token_hex(16)})
+        set_many(con, {"api_key": secrets.token_hex(16)})
         v = all_values(con)
     return str(v["api_key"])
 
+
+def ensure_security(con: sqlite3.Connection) -> None:
+    """Run at startup: an API key and a session-signing secret exist, and a
+    password stored in clear by an older version (or a restored backup) is
+    replaced by its hash."""
+    ensure_api_key(con)
+    v = all_values(con)
+    if not v["session_secret"]:
+        # a new secret invalidates every older cookie, so the epoch and revocation list are
+        # (re)written too: that also repairs unreadable ones (see _load)
+        try:
+            epoch = int(v["session_epoch"] or 0)
+        except (TypeError, ValueError):
+            epoch = 0
+        for k, val in (("session_secret", secrets.token_hex(32)), ("session_epoch", epoch), ("revoked_sessions", [])):
+            _store(con, k, val)
+        con.commit()
+        refresh(con)
+    pw = str(v["auth_password"] or "")
+    if pw and not is_hashed(pw):
+        _store(con, "auth_password", hash_password(pw))
+        con.commit()
+        refresh(con)
+        log.info("web login password was stored in clear; replaced it with a salted hash")
+
+
+def reset_login(con: sqlite3.Connection) -> None:
+    """MANGARR_RESET_LOGIN=1 at startup: clear the web login (for an owner
+    locked out: forgotten password, or a username left without one) and sign
+    every session out. Written directly, so it also repairs unreadable values."""
+    for k, v in (("auth_user", ""), ("auth_password", ""), ("session_secret", secrets.token_hex(32)),
+                 ("revoked_sessions", [])):
+        _store(con, k, v)
+    con.commit()
+    refresh(con)
+    log.warning("MANGARR_RESET_LOGIN is set: the web login was cleared and every session signed out; anyone who can "
+                "reach mang-arr can use it now. Set a new login in Settings -> Security and remove "
+                "MANGARR_RESET_LOGIN, or the login is cleared again at the next start")
+
+
+def rotate_api_key(con: sqlite3.Connection) -> str:
+    """A new random API key (Settings -> Security -> Regenerate). Signs every
+    browser session out too."""
+    set_many(con, {"api_key": secrets.token_hex(16)})
+    return str(all_values(con)["api_key"])
+
+
+def logout_everywhere(con: sqlite3.Connection) -> None:
+    """Invalidate every session cookie issued so far."""
+    v = all_values(con)
+    set_many(con, {"session_epoch": int(v["session_epoch"] or 0) + 1, "revoked_sessions": []}, internal=True)
+    log.info("every web session signed out")
+
+
+# -- passwords: salted PBKDF2-SHA256 (stdlib), "pbkdf2_sha256$iterations$salt$hash" --------------------
+
+PBKDF2_ITERATIONS = 120_000
+_HASH_PREFIX = "pbkdf2_sha256$"
+
+
+def is_hashed(stored: str) -> bool:
+    return str(stored).startswith(_HASH_PREFIX)
+
+
+def hash_password(password: str, iterations: int | None = None) -> str:
+    n = iterations or PBKDF2_ITERATIONS
+    salt = secrets.token_bytes(16)
+    dk = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, n)
+    return f"{_HASH_PREFIX}{n}${base64.b64encode(salt).decode()}${base64.b64encode(dk).decode()}"
+
+
+def verify_password(stored: str, given: str) -> bool:
+    """Constant-time check of a password against the stored hash (or, for a
+    value an older version stored in clear, against that). An empty stored
+    or given password never matches."""
+    stored, given = str(stored or ""), str(given or "")
+    if not stored or not given:
+        return False
+    if not is_hashed(stored):
+        return hmac.compare_digest(stored.encode("utf-8"), given.encode("utf-8"))
+    try:
+        _, n, salt, want = stored.split("$", 3)
+        dk = hashlib.pbkdf2_hmac("sha256", given.encode("utf-8"), base64.b64decode(salt), int(n))
+        return hmac.compare_digest(dk, base64.b64decode(want))
+    except (ValueError, TypeError) as e:
+        log.error("stored web password hash is unreadable (%s); login refused until it is set again", e)
+        return False
+
 _cache: dict[str, object] = {}
 _loaded_at = 0.0
+_good = False     # _cache holds values really read from the database
 _lock = threading.Lock()
 TTL = 5.0        # seconds between re-reads; the UI and jobs share one file
 
 
+UNREADABLE_USER = "(unreadable)"   # auth_user when the stored login cannot be decoded: login on, nobody signs in
+
+
 def _load(con: sqlite3.Connection) -> dict[str, object]:
+    """The stored values over the defaults. Any error reading the table
+    propagates: treating an unreadable table as 'nothing set' would switch
+    the web login off (fail open). Likewise a corrupt login or session value
+    never falls back to its default: an unreadable auth_user/auth_password
+    leaves a login nobody can pass with a password (API key and
+    MANGARR_RESET_LOGIN still work), an unreadable session value signs every
+    session out (default epoch 0 would revive revoked cookies)."""
     out = dict(DEFAULTS)
-    try:
-        for r in con.execute("SELECT key, value FROM setting"):
-            if r["key"] in DEFAULTS:
-                try:
-                    out[r["key"]] = json.loads(r["value"])
-                except json.JSONDecodeError:
-                    log.warning("setting %s has unreadable value; using default", r["key"])
-    except sqlite3.OperationalError:          # table not there yet (first migrate)
-        pass
+    bad = []
+    for r in con.execute("SELECT key, value FROM setting"):
+        if r["key"] in DEFAULTS:
+            try:
+                out[r["key"]] = json.loads(r["value"])
+            except json.JSONDecodeError:
+                bad.append(r["key"])
+                log.warning("setting %s has unreadable value; using default", r["key"])
+    if {"auth_user", "auth_password"} & set(bad):
+        out["auth_user"], out["auth_password"] = UNREADABLE_USER, ""
+        log.error("the stored web login is unreadable: password sign-in refused until it is set again "
+                  "(use the API key, or restart with MANGARR_RESET_LOGIN=1)")
+    if {"session_secret", "session_epoch", "revoked_sessions"} & set(bad):
+        out["session_secret"] = ""
+        log.error("stored session data is unreadable: every web session is signed out")
     return out
 
 
 def refresh(con: sqlite3.Connection) -> None:
-    global _cache, _loaded_at
+    global _cache, _loaded_at, _good
+    values = _load(con)
     with _lock:
-        _cache = _load(con)
-        _loaded_at = time.monotonic()
+        _cache, _loaded_at, _good = values, time.monotonic(), True
+
+
+def stale() -> bool:
+    """True when the next all_values() will read the database."""
+    with _lock:
+        return time.monotonic() - _loaded_at > TTL or not _cache
+
+
+def available() -> bool:
+    """False when settings have never been read successfully: the login
+    state is unknown, so the web UI must refuse requests."""
+    with _lock:
+        return bool(_good and _cache)
 
 
 def all_values(con: sqlite3.Connection | None = None) -> dict[str, object]:
-    global _cache, _loaded_at
-    with _lock:
-        stale = time.monotonic() - _loaded_at > TTL or not _cache
-    if stale:
+    global _cache, _loaded_at, _warned
+    if stale():
         try:
             if con is None:
                 from . import db
@@ -129,14 +275,20 @@ def all_values(con: sqlite3.Connection | None = None) -> dict[str, object]:
                     refresh(c)
             else:
                 refresh(con)
-        except Exception as e:                # unreadable DB: run on defaults, say so once
-            global _warned
-            if not _warned:
-                log.warning("settings unavailable (%s: %s); using defaults", type(e).__name__, e)
-                _warned = True
+            if _warned:
+                log.warning("settings readable again")
+                _warned = False
+        except Exception as e:                # unreadable DB: keep the last good values, never the defaults
             with _lock:
-                _cache = dict(DEFAULTS)
-                _loaded_at = time.monotonic()
+                have_good = bool(_good and _cache)
+                if not have_good:
+                    _cache = dict(DEFAULTS)   # for callers that only need a default; available() stays False
+                _loaded_at = time.monotonic()  # retry after TTL, not on every call
+            if not _warned:
+                log.warning("settings unavailable (%s: %s); %s", type(e).__name__, e,
+                            "keeping the last values read" if have_good else
+                            "the web UI refuses requests until the database can be read")
+                _warned = True
     with _lock:
         return dict(_cache)
 
@@ -148,24 +300,108 @@ def get(key: str):
     return all_values().get(key, DEFAULTS[key])
 
 
-def set_many(con: sqlite3.Connection, values: dict[str, object]) -> None:
+def set_many(con: sqlite3.Connection, values: dict[str, object], internal: bool = False) -> list[str]:
     """Store values. A secret submitted as MASK (the form's placeholder for a
     stored secret) keeps its current value; anything else, including an
-    empty field, is stored as given."""
+    empty field, is stored as given. Everything is validated before anything
+    is written (ValueError / KeyError, nothing stored). Returns notices for
+    the user, e.g. a secret cleared because its destination changed.
+    INTERNAL_KEYS can only be set with internal=True."""
     current = all_values(con)
+    new: dict[str, object] = {}
     for k, v in values.items():
-        if k not in DEFAULTS:
+        if k not in DEFAULTS or (k in INTERNAL_KEYS and not internal):
             raise KeyError(k)
+        if v is None:
+            raise ValueError(f"{k}: a value is required (send \"\" to clear it)")
         if k in SECRET_KEYS and isinstance(v, str):
             if v.strip() == MASK or (v == current.get(k)):
                 continue
-            v = v.strip()
+            if k != "auth_password":                    # passwords are taken exactly as typed
+                v = v.strip()
         v = _coerce(k, v)
-        con.execute("INSERT INTO setting (key, value) VALUES (?, ?)"
-                    " ON CONFLICT(key) DO UPDATE SET value=excluded.value", (k, json.dumps(v)))
-        log.info("setting %s = %s", k, "***" if k in SECRET_KEYS and v else v)
+        if k == "auth_password":
+            if (not v and not current.get(k)) or (v and verify_password(str(current.get(k) or ""), str(v))):
+                continue                                # same password again: keep the hash (and the sessions)
+        elif v == current.get(k):
+            continue                                    # unchanged: no write, no log line
+        new[k] = v
+    if current.get("auth_user") == UNREADABLE_USER and "auth_user" in new:
+        new.setdefault("auth_password", "")              # rewrite the unreadable pair together (see _load)
+    notices = _unbind_moved_secrets(current, values, new)
+    if any(k in new for k in ("auth_user", "auth_password", "auth_method")):
+        _validate({**current, **new})
+    if "auth_password" in new and new["auth_password"]:
+        new["auth_password"] = hash_password(str(new["auth_password"]))
+    if not internal and any(k in new for k in SESSION_KEYS):
+        new["session_epoch"] = int(current.get("session_epoch") or 0) + 1
+        new["revoked_sessions"] = []
+        log.info("login or API key changed: every web session is signed out")
+    for k, v in new.items():
+        _store(con, k, v)
+        if k not in INTERNAL_KEYS:
+            log.info("setting %s = %s", k, _loggable(k, v))
     con.commit()
     refresh(con)
+    return notices
+
+
+def _store(con: sqlite3.Connection, k: str, v) -> None:
+    con.execute("INSERT INTO setting (key, value) VALUES (?, ?)"
+                " ON CONFLICT(key) DO UPDATE SET value=excluded.value", (k, json.dumps(v)))
+
+
+def _loggable(k: str, v) -> str:
+    """What the log may show: never a secret, and for other URLs only
+    scheme://host (paths and query strings often carry tokens)."""
+    if k in SECRET_KEYS:
+        return "***" if v else "(cleared)"
+    if k.endswith("_url") and isinstance(v, str) and v:
+        return redact_url(v)
+    return str(v)
+
+
+def redact_url(url: str) -> str:
+    """scheme://host[:port]/... without user info, path or query."""
+    try:
+        u = urllib.parse.urlsplit(url)
+        host = u.hostname or ""
+        if u.port:
+            host = f"{host}:{u.port}"
+        return f"{u.scheme}://{host}" + ("/..." if (u.path.strip("/") or u.query) else "") if u.scheme else "..."
+    except ValueError:
+        return "..."
+
+
+def _unbind_moved_secrets(current: dict, submitted: dict, new: dict) -> list[str]:
+    """When a destination changes and its secret was not re-entered (left as
+    the MASK or not sent), clear the secret so it is never sent to the new
+    destination. Adds the clears to `new`; returns what to tell the user."""
+    notices = []
+    for dest, keys in DESTINATION_SECRETS.items():
+        if dest not in new:
+            continue                                    # destination unchanged
+        for k in keys:
+            given = submitted.get(k)
+            if current.get(k) and k not in new and (given is None or str(given).strip() == MASK):
+                new[k] = ""
+                msg = f"{dest} changed, so the stored {k} was cleared: enter it again for the new destination"
+                log.warning("settings: %s", msg)
+                notices.append(msg)
+    return notices
+
+
+def _validate(v: dict) -> None:
+    """Cross-field rules on the merged values."""
+    user = str(v.get("auth_user") or "")
+    if user:
+        if ":" in user or any(ord(c) < 32 or ord(c) == 127 for c in user):
+            raise ValueError("auth_user: the username cannot contain ':' or control characters")
+        if not v.get("auth_password"):
+            raise ValueError("auth_password: a password is required when a username is set "
+                             "(clear the username to turn the login off)")
+    if v.get("auth_method") not in ("forms", "basic"):
+        raise ValueError("auth_method: must be 'forms' or 'basic'")
 
 
 # Settings holding a URL that mang-arr sends requests to: http(s) only (urllib
@@ -209,7 +445,13 @@ def _coerce(key: str, v):
     if isinstance(d, list):
         if isinstance(v, str):
             v = [s for s in v.replace("\n", ",").split(",")]
+        elif not isinstance(v, (list, tuple, set)):
+            raise ValueError(f"{key}: expected a list or comma-separated text")
         return sorted({str(s).strip().lower() for s in v if str(s).strip()})
+    if not isinstance(v, (str, int, float)):
+        raise ValueError(f"{key}: expected text")
+    if key == "auth_password":
+        return str(v)
     return str(v).strip()
 
 

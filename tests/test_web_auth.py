@@ -14,10 +14,23 @@ except (ImportError, RuntimeError):      # web extras or httpx not installed
 class AuthTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
+        from mangarr import health
+        from mangarr.suwayomi import SuwayomiError
+
+        def offline(*a, **k):                  # never reach a real Suwayomi from tests
+            raise SuwayomiError("offline in tests")
         self.patches = [mock.patch("mangarr.config.DATA_DIR", self.tmp.name),
                         mock.patch("mangarr.config.DB_PATH", os.path.join(self.tmp.name, "t.db")),
                         mock.patch("mangarr.config.STAGING_ROOT", self.tmp.name),
-                        mock.patch("mangarr.config.LIBRARY_ROOT", self.tmp.name)]
+                        mock.patch("mangarr.config.LIBRARY_ROOT", self.tmp.name),
+                        mock.patch("mangarr.web.app.client.gq", offline),
+                        mock.patch.object(health, "_ping", lambda name, url, timeout=8: health.Check("ok", name, "x")),
+                        mock.patch.dict(health._cache, {"at": 0.0, "checks": []}),
+                        mock.patch("mangarr.settings.PBKDF2_ITERATIONS", 1000),
+                        # never notify or reach Komga for real, not even from the background health run
+                        mock.patch("mangarr.notify.send", return_value=None),
+                        mock.patch("mangarr.notify.send_detailed", return_value={}),
+                        mock.patch("mangarr.komga.test", return_value=(True, "faked in tests"))]
         for p in self.patches:
             p.start()
         from mangarr import db, settings
@@ -31,6 +44,10 @@ class AuthTest(unittest.TestCase):
 
     def tearDown(self):
         self.client.close()
+        from mangarr import health
+        running = health._running             # a health run still going: let it end while the fakes are in place
+        if running is not None:
+            running.wait(30)
         for p in self.patches:
             p.stop()
         from mangarr import settings
@@ -45,7 +62,9 @@ class AuthTest(unittest.TestCase):
         self.assertEqual(c.get("/api/v1/series").status_code, 401)
         self.assertEqual(c.get("/api/v1/series", headers={"X-Api-Key": self.key}).status_code, 200)
         self.assertIn(c.get("/api/v1/health").status_code, (200, 503))      # open for monitoring (503 = problems)
-        with mock.patch("mangarr.web.app.time.sleep", lambda s: None):
+        async def no_sleep(s):
+            return None
+        with mock.patch("mangarr.web.app.asyncio.sleep", no_sleep):
             self.assertEqual(c.post("/login", data={"username": "andy", "password": "bad"}).status_code, 401)
         r = c.post("/login", data={"username": "andy", "password": "pw", "next": "/wanted"}, follow_redirects=False)
         self.assertEqual((r.status_code, r.headers["location"]), (303, "/wanted"))

@@ -291,9 +291,19 @@ class BackupTest(_Base):
         msg = backup.restore(old)
         self.assertIn("login and API key kept", msg)
         v = settings.all_values()                              # refreshed right away, no TTL wait
-        self.assertEqual((v["auth_user"], v["auth_password"], v["api_key"], v["auth_method"]),
-                         ("andy", "NewPw", "freshkey", "forms"))
+        self.assertEqual((v["auth_user"], v["api_key"], v["auth_method"]), ("andy", "freshkey", "forms"))
+        self.assertTrue(settings.verify_password(v["auth_password"], "NewPw"))      # stored hashed
+        self.assertFalse(settings.verify_password(v["auth_password"], "OldLeakedPw"))
         self.assertEqual(v["komga_url"], "http://old")         # everything else is the backup's
+
+    def test_restore_does_not_revive_revoked_sessions(self):
+        with db.connect() as con:
+            settings.set_many(con, {"revoked_sessions": []}, internal=True)
+        old = backup.create("t")
+        with db.connect() as con:
+            settings.set_many(con, {"revoked_sessions": ["abc:9999999999"]}, internal=True)
+        backup.restore(old)
+        self.assertEqual(settings.all_values()["revoked_sessions"], ["abc:9999999999"])
 
     def test_restore_of_a_backup_with_login_does_not_add_one(self):
         with db.connect() as con:

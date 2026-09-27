@@ -159,7 +159,7 @@ data-checked="{{ r.last_resolved or '' }}" data-added="{{ r.added_at or '' }}" d
   <div class="modal-body">
     {% call m.form_group('Monitored', 'Download new chapters as they are listed by the sources', 'edit-monitored') %}
       <input type="hidden" name="monitored" value="1">
-      {{ m.check(none, true, '1', 'edit-monitored', 'primary', 'data-sync="monitored"') }}
+      {{ m.check(none, true, '1', 'edit-monitored', 'primary', {'data-sync': 'monitored'}) }}
     {% endcall %}
     {% call m.form_group('Path', 'Where chapters are placed in the library. Set by the folder name; not editable.') %}
       <input type="text" class="input read-only" readonly data-field="path" value="">

@@ -5,13 +5,11 @@ Pages:   /  /series/{id}  /add  /import  /lists  /wanted  /activity  /activity/h
          /settings  /system  /system/logs
 API:     /api/v1/...  (mirrors the pages; used by the pages' live updates)
 """
-import base64
+import asyncio
 import dataclasses
-import hashlib
-import hmac
 import logging
 import os
-import secrets
+import sqlite3
 import time
 import urllib.parse
 from collections import deque
@@ -22,6 +20,7 @@ from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, Resp
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel, Field
+from starlette.concurrency import run_in_threadpool
 
 from .. import (
     __version__,
@@ -43,7 +42,7 @@ from .. import (
 )
 from ..resolver import ranges
 from ..suwayomi import BREAKER_SECS, Client, SuwayomiError, SuwayomiUnreachable
-from . import lists_routes, views
+from . import lists_routes, security, views
 
 log = logging.getLogger(__name__)
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -52,7 +51,33 @@ runner = jobs.Runner()
 scheduler: jobs.Scheduler | None = None
 client = Client()
 STARTED = time.time()
-OPEN_PATHS = ("/api/v1/health", "/api/v1/system/status", "/metrics")   # no login: monitoring + nav poller
+PING_PATH = "/api/v1/ping"                   # liveness: no DB, no network, no login, no Host check
+OPEN_PATHS = ("/api/v1/health", "/api/v1/system/status", "/metrics", PING_PATH)  # no login: monitoring + nav poller
+UI_SUWAYOMI_TIMEOUT = 10                     # seconds; request handlers never wait on Suwayomi longer (one try)
+
+
+class _UIClient:
+    """The Suwayomi client as request handlers see it: the same client, but
+    every call made through it has a short timeout and a single try. The job
+    defaults (180 s x 3 tries with 5 s pauses) would let a hung Suwayomi pin a
+    web worker thread for about 9 minutes per page load."""
+
+    def __init__(self, base: Client, timeout: int):
+        self._base, self._timeout = base, timeout
+
+    def gq(self, query: str, variables: dict | None = None, timeout: int | None = None, retries: int = 1) -> dict:
+        t = min(timeout or self._timeout, self._timeout)
+        return self._base.gq(query, variables=variables, timeout=t, retries=1)
+
+    def __getattr__(self, name):
+        attr = getattr(self._base, name)
+        func = getattr(attr, "__func__", None)
+        if func is not None and getattr(type(self._base), name, None) is func:
+            return func.__get__(self)            # a Client method: run it here so it calls our gq
+        return attr                              # plain attributes (and test doubles) as they are
+
+
+ui_client = _UIClient(client, UI_SUWAYOMI_TIMEOUT)
 
 
 @asynccontextmanager
@@ -63,8 +88,7 @@ async def lifespan(app: FastAPI):
         scheduler = jobs.Scheduler(runner, _job_refresh_all)
         scheduler.start()
     try:
-        with db.connect() as con:
-            settings.ensure_api_key(con)
+        _startup_security()
     except Exception as e:
         log.error("could not open the database at %s: %s", config.DB_PATH, e)
     updates.start_background()
@@ -74,6 +98,13 @@ async def lifespan(app: FastAPI):
              config.LIBRARY_ROOT)
     yield
     log.info("web shutting down")
+
+
+def _startup_security() -> None:
+    with db.connect() as con:
+        if os.environ.get("MANGARR_RESET_LOGIN", "").strip().lower() in ("1", "true", "yes"):
+            settings.reset_login(con)            # locked out: the operator restarts with MANGARR_RESET_LOGIN=1
+        settings.ensure_security(con)            # API key, session secret, legacy clear-text password -> hash
 
 
 app = FastAPI(title="mang-arr", version=__version__, docs_url="/api/docs", redoc_url=None, lifespan=lifespan)
@@ -103,7 +134,7 @@ def _ago(ts) -> str:
 
 
 def _flash(path: str, msg: str) -> RedirectResponse:
-    return RedirectResponse(f"{path}?m={urllib.parse.quote(msg)}", 303)
+    return RedirectResponse(f"{path}?{views.flash_query(msg)}", 303)
 
 
 # -- jobs ---------------------------------------------------------------------
@@ -299,98 +330,181 @@ def _job_search_wanted(job: jobs.Job):
 
 
 # -- middleware / errors -------------------------------------------------------
-
-SESSION_COOKIE = "mangarr_session"
-SESSION_DAYS = 30
-
-
-def _session_secret(v: dict) -> bytes:
-    return f"{v['api_key']}|{v['auth_password']}".encode()
-
-
-def _make_session(v: dict) -> str:
-    exp = int(time.time()) + SESSION_DAYS * 86400
-    payload = f"{v['auth_user']}|{exp}"
-    sig = hmac.new(_session_secret(v), payload.encode(), hashlib.sha256).hexdigest()
-    return f"{payload}|{sig}"
-
-
-def _session_ok(v: dict, cookie: str | None) -> bool:
-    if not cookie:
-        return False
-    try:
-        user, exp, sig = cookie.rsplit("|", 2)
-    except ValueError:
-        return False
-    if user != v["auth_user"] or int(exp) < time.time():
-        return False
-    want = hmac.new(_session_secret(v), f"{user}|{exp}".encode(), hashlib.sha256).hexdigest()
-    return secrets.compare_digest(sig, want)
-
-
-def _basic_ok(v: dict, header: str) -> bool:
-    if not header.startswith("Basic "):
-        return False
-    try:
-        given = base64.b64decode(header[6:]).decode("utf-8", "replace")
-        u, _, p = given.partition(":")
-        return secrets.compare_digest(u, v["auth_user"]) and secrets.compare_digest(p, v["auth_password"])
-    except Exception:
-        return False
-
+#
+# Every request passes, in order:
+#   1. the body limit (security.BodyLimit): bodies over MAX_BODY (BODY_LIMITS per path) get 413
+#   2. settings: if they have never been readable, 503 (the login state is unknown: fail closed)
+#   3. the Host check: only IPs, localhost, LAN names and allowed_hosts (DNS rebinding)
+#   4. the CSRF check: a POST/PUT/PATCH/DELETE whose Origin (else Referer) names another
+#      host:port is refused (403); requests with neither header (curl, scripts) go on to
+#      the normal login check, and a valid X-Api-Key header skips this check
+#   5. the login check (when a login is set): X-Api-Key header, ?apikey= (GET under /api/
+#      only), the session cookie, or Basic credentials (auth_method basic only); password
+#      attempts are throttled per client address
+# and every response gets the security headers (CSP: scripts only from /static).
+# The helpers live in security.py.
 
 @app.middleware("http")
 async def authentication(request: Request, call_next):
     """Optional login (Settings -> Security): 'forms' shows a login page and
     keeps a signed session cookie; 'basic' uses the browser prompt. The API
-    key works with either. Monitoring endpoints and static files stay open."""
-    v = settings.all_values()
+    key works with either. Monitoring endpoints and static files stay open.
+    Also the Host and CSRF checks; see the comment at the top of this section."""
     path = request.url.path
-    if v["auth_user"] and path not in OPEN_PATHS and not path.startswith(("/static/", "/login", "/logout")):
-        api_key = request.headers.get("x-api-key") or request.query_params.get("apikey")
-        ok = bool(api_key and v["api_key"] and secrets.compare_digest(api_key, str(v["api_key"])))
-        ok = ok or _basic_ok(v, request.headers.get("authorization", ""))
-        ok = ok or _session_ok(v, request.cookies.get(SESSION_COOKIE))
+    if path == PING_PATH:
+        return await call_next(request)
+    # the settings cache is read inline; only a stale one (every TTL) costs a database read, off the event loop
+    v = await run_in_threadpool(settings.all_values) if settings.stale() else settings.all_values()
+    ip = security.client_ip(request)
+    if not settings.available() and not path.startswith("/static/"):
+        return Response("mang-arr cannot read its settings database, so it does not know whether a login is "
+                        "required: refusing requests until it can (see the log)\n", 503, media_type="text/plain")
+
+    host = request.headers.get("host", "")
+    if not security.host_allowed(host, security.allowed_hosts(v)):
+        if security.log_budget.allow(ip):
+            log.warning("refused request for host %s from %s: not an allowed host name (DNS rebinding protection;"
+                        " add it to MANGARR_ALLOWED_HOSTS or Settings -> Security)", security.clip(host), ip)
+        return Response(f"mang-arr: the host name {security.clip(host)} is not allowed. Open mang-arr by IP address, "
+                        "localhost or a LAN name, or add this name to MANGARR_ALLOWED_HOSTS (or Settings -> "
+                        "Security -> Allowed Host Names).\n", 400, media_type="text/plain")
+
+    via = "apikey" if security.key_ok(v, request.headers.get("x-api-key")) else ""
+    if request.method not in security.SAFE_METHODS and not via:
+        ok, src = security.same_origin(request)
         if not ok:
-            log.warning("unauthenticated request to %s from %s", path,
-                        request.client.host if request.client else "?")
+            if security.log_budget.allow(ip):
+                log.warning("refused cross-site %s %s from %s: Origin/Referer %s does not match Host %s",
+                            request.method, security.clip(path, 200), ip, security.clip(src, 200), security.clip(host))
+            return Response("mang-arr: cross-site request refused (its Origin/Referer is not this server). Behind "
+                            "a reverse proxy, pass the original Host header with its port ($http_host in nginx), "
+                            "or X-Forwarded-Host.\n", 403, media_type="text/plain")
+
+    if not v["auth_user"]:
+        request.state.authed, request.state.via = True, "open"       # no login configured: everyone is admin
+    else:
+        if not via:
+            q = request.query_params.get("apikey")
+            if q and request.method in ("GET", "HEAD") and path.startswith("/api/") and security.key_ok(v, q):
+                via = "apikey"
+        if not via and security.session_ok(v, request.cookies.get(security.SESSION_COOKIE)):
+            via = "session"
+        if not via and v["auth_method"] == "basic":
+            creds = security.basic_credentials(request.headers.get("authorization", ""))
+            if creds:
+                wait = security.throttle.retry_after(ip)
+                if wait:
+                    return security.too_many(wait, "logins from this address")
+                if await run_in_threadpool(security.credentials_ok, v, *creds):
+                    via = "basic"
+                    security.throttle.succeeded(ip)
+                else:
+                    blocked = security.throttle.failed(ip)
+                    log.warning("failed basic auth for %s from %s%s", security.clip(creds[0]), ip,
+                                f"; further attempts refused for {blocked} s" if blocked else "")
+        request.state.authed, request.state.via = bool(via), via
+        if not via and not (path in OPEN_PATHS or path.startswith(("/static/", "/login", "/logout"))):
+            if security.log_budget.allow(ip):
+                log.warning("unauthenticated request to %s from %s", security.clip(path, 200), ip)
             wants_html = "text/html" in request.headers.get("accept", "") and not path.startswith("/api/")
             if v["auth_method"] == "forms" and wants_html:
                 return RedirectResponse(f"/login?next={urllib.parse.quote(str(request.url.path))}", 303)
-            return Response("authentication required", 401, headers={"WWW-Authenticate": 'Basic realm="mang-arr"'})
-    return await call_next(request)
+            prompt = {"WWW-Authenticate": 'Basic realm="mang-arr"'} if v["auth_method"] == "basic" else None
+            return Response("authentication required", 401, headers=prompt)   # forms mode: no Basic prompt
+    response = await call_next(request)
+    security.security_headers(path, response)
+    if via == "basic" and v.get("session_secret"):
+        # Basic credentials checked once: from now on this browser is signed in by its session cookie
+        # (checked before Basic), so other clients' failed passwords from a shared address cannot lock it out
+        security.set_session(request, response, v, persistent=False)
+    return response
+
+
+app.add_middleware(security.BodyLimit)
+
+
+def _login_form(request: Request, target: str, error: str | None, status: int = 200, headers=None):
+    return templates.TemplateResponse(request, "login.html", {"request": request, "next": target,
+                                                              "version": __version__, "error": error},
+                                      status_code=status, headers=headers)
 
 
 @app.get("/login")
 def login_page(request: Request, next: str = "/"):
     v = settings.all_values()
-    if not v["auth_user"] or _session_ok(v, request.cookies.get(SESSION_COOKIE)):
-        return RedirectResponse(next if next.startswith("/") else "/", 303)
-    return templates.TemplateResponse(request, "login.html", {"request": request, "next": next,
-                                                              "version": __version__, "error": None})
+    target = security.safe_next(next)
+    if not v["auth_user"] or security.session_ok(v, request.cookies.get(security.SESSION_COOKIE)):
+        return RedirectResponse(target, 303)
+    return _login_form(request, target, _no_password_note(v))
+
+
+def _no_password_note(v: dict) -> str | None:
+    """A login left without a password (an older version allowed it, or its
+    value is unreadable) cannot be used: say how to get back in."""
+    if v["auth_user"] and not v["auth_password"]:
+        return ("A username is set without a password, so nobody can sign in. Restart mang-arr once with "
+                "MANGARR_RESET_LOGIN=1 to clear the login, or set a password through the API with the X-Api-Key "
+                "header.")
+    return None
 
 
 @app.post("/login")
-def login_submit(request: Request, username: str = Form(""), password: str = Form(""), next: str = Form("/")):
-    v = settings.all_values()
-    if not (secrets.compare_digest(username, v["auth_user"]) and secrets.compare_digest(password, v["auth_password"])):
-        log.warning("failed login for %r from %s", username, request.client.host if request.client else "?")
-        time.sleep(1)                                    # slow down guessing
-        return templates.TemplateResponse(request, "login.html", {"request": request, "next": next,
-                                                                  "version": __version__,
-                                                                  "error": "wrong username or password"},
-                                          status_code=401)
-    resp = RedirectResponse(next if next.startswith("/") else "/", 303)
-    resp.set_cookie(SESSION_COOKIE, _make_session(v), max_age=SESSION_DAYS * 86400, httponly=True,
-                    samesite="lax")
-    log.info("login: %s from %s", username, request.client.host if request.client else "?")
+async def login_submit(request: Request, username: str = Form(""), password: str = Form(""), next: str = Form("/")):
+    """Async on purpose: the failure delay is an asyncio sleep, so a flood of
+    bad logins holds no worker threads; the hash check runs in the pool."""
+    ip, target = security.client_ip(request), security.safe_next(next)
+    wait = security.throttle.retry_after(ip)
+    if wait:
+        if security.log_budget.allow(ip):
+            log.warning("login from %s refused: too many failures, blocked for %d s more", ip, wait)
+        return _login_form(request, target, f"too many failed sign-ins: try again in {wait} s", 429,
+                           {"Retry-After": str(wait)})
+    v = await run_in_threadpool(settings.all_values)
+    if not await run_in_threadpool(security.credentials_ok, v, username, password):
+        blocked = security.throttle.failed(ip)
+        log.warning("failed login for %s from %s%s", security.clip(username), ip,
+                    f"; further attempts refused for {blocked} s" if blocked else "")
+        await asyncio.sleep(1)                   # slow down guessing (without holding a thread)
+        return _login_form(request, target, _no_password_note(v) or "wrong username or password", 401)
+    security.throttle.succeeded(ip)
+    if not v.get("session_secret"):              # startup could not create it (DB was unavailable then)
+        v = await run_in_threadpool(_ensure_security)
+    resp = RedirectResponse(target, 303)
+    security.set_session(request, resp, v)
+    log.info("login: %s from %s", security.clip(username), ip)
     return resp
 
 
+def _ensure_security() -> dict:
+    with db.connect() as con:
+        settings.ensure_security(con)
+    return settings.all_values()
+
+
+def _revoke_session(v: dict, cookie: str | None) -> None:
+    """Sign out the session this cookie belongs to, server side (a copied
+    cookie stops working too)."""
+    s = security.parse_session(v, cookie)
+    if not s:
+        return
+    now = time.time()
+    keep = [r for r in v.get("revoked_sessions") or [] if str(r).split(":", 1)[-1].isdigit()
+            and int(str(r).split(":", 1)[-1]) > now]
+    with db.connect() as con:
+        if len(keep) >= security.MAX_REVOKED:
+            settings.logout_everywhere(con)
+        else:
+            settings.set_many(con, {"revoked_sessions": [*keep, f"{s[0]}:{s[1]}"]}, internal=True)
+
+
 @app.post("/logout")
-def logout():
+def logout(request: Request):
+    try:
+        _revoke_session(settings.all_values(), request.cookies.get(security.SESSION_COOKIE))
+    except Exception as e:
+        log.error("logout: could not record the signed-out session: %s: %s", type(e).__name__, e)
     resp = RedirectResponse("/login", 303)
-    resp.delete_cookie(SESSION_COOKIE)
+    resp.delete_cookie(security.SESSION_COOKIE)
     return resp
 
 
@@ -402,22 +516,60 @@ async def _queue_full(request: Request, exc: jobs.QueueFull):
     return Response(f"mang-arr: job queue is full: {exc}", 429, media_type="text/plain")
 
 
+@app.post("/settings/logout-all")
+def logout_all():
+    with db.connect() as con:
+        settings.logout_everywhere(con)
+    resp = RedirectResponse("/login", 303)
+    resp.delete_cookie(security.SESSION_COOKIE)
+    return resp
+
+
+@app.post("/settings/api-key/regenerate")
+def api_key_regenerate(request: Request):
+    with db.connect() as con:
+        settings.rotate_api_key(con)
+    log.info("API key regenerated; every session signed out")
+    resp = _flash("/settings", "new API key generated: update every script that used the old one")
+    _reissue_session(request, resp)
+    return resp
+
+
+def _reissue_session(request: Request, resp: Response) -> None:
+    """After a change that signs every session out (API key, password), keep
+    the browser that made the change signed in with a fresh cookie."""
+    v = settings.all_values()
+    if v["auth_user"] and getattr(request.state, "via", "") == "session" and v["auth_method"] == "forms":
+        security.set_session(request, resp, v)
+
+
 @app.exception_handler(Exception)
 async def _unhandled(request: Request, exc: Exception):
-    log.exception("unhandled error on %s %s", request.method, request.url.path)
+    log.exception("unhandled error on %s %s", request.method, security.clip(request.url.path, 200))
+    # details only for a signed-in caller, never on the open endpoints
+    if getattr(request.state, "authed", False) and request.url.path not in OPEN_PATHS:
+        detail = f"{type(exc).__name__}: {exc}"
+    else:
+        detail = "internal error"
     if request.url.path.startswith("/api/"):
-        return JSONResponse({"error": f"{type(exc).__name__}: {exc}"}, status_code=500)
-    return Response(f"mang-arr: {type(exc).__name__}: {exc}\n(see the log on the System page)",
-                    500, media_type="text/plain")
+        return JSONResponse({"error": detail}, status_code=500)
+    return Response(f"mang-arr: {detail}\n(see the log on the System page)", 500, media_type="text/plain")
+
+
+@app.get(PING_PATH)
+async def api_ping():
+    """Liveness: answers as long as the event loop runs. No database, no
+    network, no health checks, no login (the Docker HEALTHCHECK uses it)."""
+    return {"ok": True}
 
 
 # -- pages --------------------------------------------------------------------
 
 def page(request: Request, name: str, **ctx):
-    h = health.summary(client)
+    h = health.summary(ui_client)                    # cached; never waits long on a backend
     v = settings.all_values()
     ctx.update(request=request, version=__version__, current=runner.current,
-               flash=request.query_params.get("m"), update=updates.status(),
+               flash=views.flash_from(request.query_params), update=updates.status(),
                health_errors=h["errors"], health_warnings=h["warnings"],
                logged_in=bool(v["auth_user"] and v["auth_method"] == "forms"))
     return templates.TemplateResponse(request, name, ctx)
@@ -539,7 +691,7 @@ def api_chapter_releases(series_id: int, number: float):
     with db.connect() as con:
         if not db.get_series(con, series_id):
             raise HTTPException(404)
-        return core.chapter_releases(con, client, series_id, number)
+        return core.chapter_releases(con, ui_client, series_id, number)    # short Suwayomi timeouts
 
 
 @app.post("/api/v1/series/{series_id}/chapter/{number}/search")
@@ -583,10 +735,19 @@ def series_delete(series_id: int, files: str = Form("0"), exclude: str = Form("0
     return _flash("/", f"deleted {r['title']}")
 
 
+def _cross_site(request: Request) -> bool:
+    """A GET a browser made for another site's page (an <img>, a link):
+    it must not trigger outbound work (lookups at AniList/MangaDex)."""
+    return request.headers.get("sec-fetch-site") in ("cross-site", "same-site")
+
+
 @app.get("/add")
 def add_page(request: Request, term: str = ""):
     pick, cands, error = None, [], None
-    if term:
+    if term and _cross_site(request):
+        log.info("add page: not looking up %s for a request started by another site", security.clip(term))
+        error = "search not run: the link came from another site. Press Search to run it."
+    elif term:
         try:
             pick, cands = metadata.lookup(term)
         except Exception as e:                        # both providers down
@@ -775,7 +936,7 @@ def activity_cancel(job_id: int):
 @app.get("/system")
 def system_page(request: Request):
     try:
-        sources = client.sources()
+        sources = ui_client.sources()
         suwayomi_ok = True
     except SuwayomiError as e:
         sources, suwayomi_ok = [], False
@@ -796,7 +957,7 @@ def system_page(request: Request):
                 uptime=_ago(STARTED), notify_ok=notify.configured(),
                 komga_ok=komga.configured(), metrics_ok=metrics.AVAILABLE, copied=library.COPIED,
                 next_refresh=(scheduler.next_at if scheduler else None),
-                checks=health.run(client, force=True), tasks=tasks, backups=backups)
+                checks=health.run(ui_client, force=True), tasks=tasks, backups=backups)
 
 
 @app.get("/system/logs")
@@ -1004,51 +1165,89 @@ def system_notify_test():
 
 
 @app.get("/settings")
-def settings_page(request: Request, komga_test: str = "", komga_ok: str = ""):
+def settings_page(request: Request):
     try:
-        sources = client.sources()
+        sources = ui_client.sources()
     except SuwayomiError as e:
         sources = []
         log.error("settings page: suwayomi unreachable: %s", e)
     with db.connect() as con:
         stats = db.source_stats(con)
+    komga_ok, _, komga_test = (views.flash_from(request.query_params, "komga_test") or "").partition(":")
     return page(request, "settings.html", v=settings.masked(settings.all_values()), sources=sources,
                 komga_test=komga_test, komga_ok=(komga_ok == "1"), stats=stats, auto_days=db.AUTO_THROTTLE_DAYS)
 
 
 @app.post("/settings")
 async def settings_save(request: Request):
-    form = await request.form()
+    form = await request.form()                    # async (bounded by security.BodyLimit); the rest blocks: in the pool
+    return await run_in_threadpool(_settings_save, request, form)
+
+
+def _settings_save(request: Request, form) -> Response:
     values = {}
     for key in settings.DEFAULTS:
-        if key in ("unusable_sources", "throttled_sources"):
-            continue                                   # handled below / detected automatically
+        if key in ("unusable_sources", "throttled_sources", "api_key") or key in settings.INTERNAL_KEYS:
+            continue                           # handled below / detected / Regenerate button / never from a form
         if isinstance(settings.DEFAULTS[key], list):
-            values[key] = form.getlist(key)
+            if key in form:
+                values[key] = ",".join(str(x) for x in form.getlist(key))
         elif key in form:
             values[key] = form[key]
     if form.get("sources_listed") == "1":              # the Sources table was on the page
         enabled = {str(x).lower().strip() for x in form.getlist("enabled_sources")}
         listed = {str(x).lower().strip() for x in form.getlist("listed_sources")}
         values["unusable_sources"] = sorted(listed - enabled)
+    before = settings.all_values()
+    epoch = before["session_epoch"]
     try:
         with db.connect() as con:
-            settings.set_many(con, values)
+            notices = settings.set_many(con, values)
+            notices += _rotate_key_if_login_enabled(con, before, request, values)
     except (ValueError, KeyError) as e:
-        return _flash("/settings", f"invalid value: {e}")
-    action = form.get("action", "")
+        log.warning("settings not saved: %s", e)
+        return _flash("/settings", f"invalid value, nothing saved: {e}")
+    except sqlite3.OperationalError as e:
+        log.error("settings not saved: %s", e)
+        return _flash("/settings", f"could not save (database busy?): {e}")
+    action = str(form.get("action", ""))
+    resp = _settings_action(action, "; ".join(notices))
+    if settings.all_values()["session_epoch"] != epoch:
+        _reissue_session(request, resp)                # changed the password: keep this browser signed in
+    return resp
+
+
+def _rotate_key_if_login_enabled(con, before: dict, request: Request, submitted: dict) -> list[str]:
+    """When a login is switched on, the API key minted while everything was
+    open must count as disclosed (anyone could read it then), so it is
+    replaced, unless this very request authenticated with it (the installer
+    reads the key, then enables the login and keeps using the key) or set a
+    new key itself. The new key is in the PUT response / on the Settings page."""
+    if before["auth_user"] or not settings.all_values(con)["auth_user"]:
+        return []
+    if security.key_ok(before, request.headers.get("x-api-key")) or \
+            str(submitted.get("api_key", settings.MASK)).strip() != settings.MASK:
+        return []
+    settings.rotate_api_key(con)
+    msg = "login switched on, so the API key was regenerated (the old one was readable while there was no login)"
+    log.warning("settings: %s", msg)
+    return [msg]
+
+
+def _settings_action(action: str, notice: str) -> Response:
+    extra = f" ({notice})" if notice else ""
     if action == "test-komga":
         ok, msg = komga.test()
-        return RedirectResponse(f"/settings?komga_test={urllib.parse.quote(msg)}&komga_ok={int(ok)}", 303)
+        return RedirectResponse(f"/settings?{views.flash_query(f'{int(ok)}:{msg}{extra}', 'komga_test')}", 303)
     if action == "test-notify" or action.startswith("test-notify-"):
         only = action[len("test-notify-"):] if action.startswith("test-notify-") else None
         res = notify.send_detailed("mang-arr test", "If you can read this, notifications work.", "test", only=only,
                                    force=True)
         if not res:
-            return _flash("/settings", "nothing to test: fill in that channel first")
+            return _flash("/settings", "nothing to test: fill in that channel first" + extra)
         parts = [f"{notify.CHANNELS[k][0]}: {'sent' if r is True else r}" for k, r in res.items()]
-        return _flash("/settings", "; ".join(parts))
-    return _flash("/settings", "saved")
+        return _flash("/settings", "; ".join(parts) + extra)
+    return _flash("/settings", "saved" + extra)
 
 
 @app.get("/metrics")
@@ -1059,10 +1258,16 @@ def metrics_endpoint():
 
 
 @app.get("/api/v1/health")
-def api_health():
-    checks = health.run(client, force=True)          # monitoring wants the truth now, not a cached minute
-    problems = [f"{c.name}: {c.detail}" for c in checks if c.level == "error"]
-    warnings = [f"{c.name}: {c.detail}" for c in checks if c.level == "warning"]
+def api_health(request: Request):
+    """Open for monitoring. Served from the health cache (at most one
+    background re-check a minute, whoever asks), so anonymous callers cannot
+    make mang-arr hammer its backends. With a login set, anonymous callers
+    get only the names of failing checks, not their details (internal URLs,
+    paths, error text)."""
+    checks = health.run(ui_client)
+    detail = getattr(request.state, "authed", False)
+    problems = [f"{c.name}: {c.detail}" if detail else c.name for c in checks if c.level == "error"]
+    warnings = [f"{c.name}: {c.detail}" if detail else c.name for c in checks if c.level == "warning"]
     status = 200 if not problems else 503
     return JSONResponse({"ok": not problems, "problems": problems, "warnings": warnings,
                          "version": __version__}, status_code=status)
@@ -1079,8 +1284,13 @@ class AddBody(BaseModel):
 
 
 @app.get("/api/v1/system/status")
-def api_status():
-    h = health.summary(client)
+def api_status(request: Request):
+    h = health.summary(ui_client)
+    if not getattr(request.state, "authed", False):    # login set, anonymous caller: no titles, no job details
+        cur = runner.current
+        return {"version": __version__, "uptime": int(time.time() - STARTED),
+                "job": {"kind": cur.kind, "status": cur.status} if cur else None,
+                "health": {"errors": h["errors"], "warnings": h["warnings"]}}
     return {"version": __version__, "uptime": int(time.time() - STARTED),
             "job": runner.current.as_dict() if runner.current else None,
             "nextRefresh": scheduler.next_at if scheduler else None, "update": updates.status(),
@@ -1138,7 +1348,10 @@ def api_series_delete(series_id: int, files: bool = False):
 
 
 @app.get("/api/v1/lookup")
-def api_lookup(term: str):
+def api_lookup(request: Request, term: str):
+    if _cross_site(request):
+        log.info("lookup of %s refused: request started by another site", security.clip(term))
+        raise HTTPException(403, "cross-site lookup refused")
     try:
         pick, cands = metadata.lookup(term)
     except Exception as e:
@@ -1176,22 +1389,40 @@ def api_command(body: dict):
     raise HTTPException(400, f"unknown command {name!r}; known: RefreshAll, SearchWanted, RefreshMetadata")
 
 
+def _settings_out(request: Request) -> dict:
+    """Settings with secrets masked; the API key itself only for a caller the
+    middleware authenticated (API key, session, Basic; or anyone while no
+    login is set), so scripts and the installer can read it."""
+    v = settings.all_values()
+    out = settings.masked(v)
+    if getattr(request.state, "authed", False):
+        out["api_key"] = v["api_key"]
+    return out
+
+
 @app.get("/api/v1/settings")
-def api_settings_get():
-    """Runtime settings with secrets masked."""
-    return settings.masked(settings.all_values())
+def api_settings_get(request: Request):
+    """Runtime settings with secrets masked (see _settings_out for api_key)."""
+    return _settings_out(request)
 
 
 @app.put("/api/v1/settings")
-def api_settings_put(body: dict):
+def api_settings_put(request: Request, body: dict):
     """Set runtime settings: {key: value}. Lists take arrays or comma-separated
-    strings; a secret given as the mask keeps its value. Unknown keys -> 400."""
+    strings; a secret given as the mask keeps its value. Unknown keys -> 400.
+    A secret cleared because its destination changed is named in the
+    X-Mangarr-Notice header (and the log), and so is a new API key when this
+    call switched the login on without sending X-Api-Key (the response then
+    carries the new key)."""
+    before = settings.all_values()
     try:
         with db.connect() as con:
-            settings.set_many(con, body)
-        return settings.masked(settings.all_values())
+            notices = settings.set_many(con, body)
+            notices += _rotate_key_if_login_enabled(con, before, request, body)
     except (KeyError, ValueError) as e:
         raise HTTPException(400, f"invalid setting: {e}") from e
+    headers = {"X-Mangarr-Notice": "; ".join(notices)} if notices else None
+    return JSONResponse(_settings_out(request), headers=headers)
 
 
 @app.get("/api/v1/log")
@@ -1211,7 +1442,7 @@ def _suwayomi_up() -> bool:
 
 def _suwayomi_queue() -> dict:
     try:
-        d = client.gq("{ downloadStatus { state queue { state progress tries"
+        d = ui_client.gq("{ downloadStatus { state queue { state progress tries"
                       " manga { title } chapter { name } } } }",
                       timeout=20, retries=1)["downloadStatus"]
         return {"state": d["state"], "items": [

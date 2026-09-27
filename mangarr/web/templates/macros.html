@@ -29,21 +29,24 @@
 <span class="label {{ kind }} {{ size }} {% if outline %}outline{% endif %} {{ extra }}"{% if title %} title="{{ title }}"{% endif %}>{{ text }}</span>
 {%- endmacro %}
 
+{# Every `attrs` argument is a dict of extra attributes, rendered with the escaping xmlattr filter
+   (never marked safe: callers put series titles and source names in there). #}
+
 {# PageToolbarButton: an icon over a small label, 60px wide. `form` posts, `href` links, otherwise a plain button. #}
-{% macro toolbar_button(label_text, icon_name, href=none, form=none, hidden=none, disabled=false, attrs='', title=none, kind='') -%}
+{% macro toolbar_button(label_text, icon_name, href=none, form=none, hidden=none, disabled=false, attrs=none, title=none, kind='') -%}
 {% if form %}
 <form method="post" action="{{ form }}" class="toolbar-form">{% for k, v in (hidden or {}).items() %}<input type="hidden" name="{{ k }}" value="{{ v }}">{% endfor %}
-  <button class="toolbar-button {{ kind }}" {% if disabled %}disabled{% endif %} {{ attrs|safe }}{% if title %} title="{{ title }}"{% endif %}>{{ icon(icon_name) }}<span class="toolbar-label">{{ label_text }}</span></button></form>
+  <button class="toolbar-button {{ kind }}" {% if disabled %}disabled{% endif %}{{ (attrs or {})|xmlattr }}{% if title %} title="{{ title }}"{% endif %}>{{ icon(icon_name) }}<span class="toolbar-label">{{ label_text }}</span></button></form>
 {% elif href %}
-<a class="toolbar-button {{ kind }} {% if disabled %}disabled{% endif %}" href="{{ href }}" {{ attrs|safe }}{% if title %} title="{{ title }}"{% endif %}>{{ icon(icon_name) }}<span class="toolbar-label">{{ label_text }}</span></a>
+<a class="toolbar-button {{ kind }} {% if disabled %}disabled{% endif %}" href="{{ href }}"{{ (attrs or {})|xmlattr }}{% if title %} title="{{ title }}"{% endif %}>{{ icon(icon_name) }}<span class="toolbar-label">{{ label_text }}</span></a>
 {% else %}
-<button type="button" class="toolbar-button {{ kind }}" {% if disabled %}disabled{% endif %} {{ attrs|safe }}{% if title %} title="{{ title }}"{% endif %}>{{ icon(icon_name) }}<span class="toolbar-label">{{ label_text }}</span></button>
+<button type="button" class="toolbar-button {{ kind }}" {% if disabled %}disabled{% endif %}{{ (attrs or {})|xmlattr }}{% if title %} title="{{ title }}"{% endif %}>{{ icon(icon_name) }}<span class="toolbar-label">{{ label_text }}</span></button>
 {% endif %}
 {%- endmacro %}
 
 {# ToolbarMenuButton + MenuContent: a dropdown of selectable items. items = [(value, text)] #}
-{% macro toolbar_menu(label_text, icon_name, id, items, selected=none, attrs='') -%}
-<details class="menu" id="{{ id }}" {{ attrs|safe }}>
+{% macro toolbar_menu(label_text, icon_name, id, items, selected=none, attrs=none) -%}
+<details class="menu" id="{{ id }}"{{ (attrs or {})|xmlattr }}>
   <summary class="toolbar-button menu-button">{{ icon(icon_name) }}<span class="toolbar-label">{{ label_text }}</span></summary>
   <div class="menu-content" role="menu">
     {% for value, text in items %}<button type="button" class="menu-item" role="menuitemradio" data-value="{{ value }}" aria-checked="{{ 'true' if value == selected else 'false' }}"><span>{{ text }}</span>{{ icon('check', 'sm') }}</button>{% endfor %}
@@ -74,8 +77,8 @@
 {%- endmacro %}
 
 {# Sonarr CheckInput look: the real checkbox stays for forms, the box is drawn by CSS #}
-{% macro check(name, checked=false, value='1', id=none, kind='primary', attrs='') -%}
-<label class="check-input {{ kind }}"><input type="checkbox" {% if name %}name="{{ name }}"{% endif %} value="{{ value }}" {% if id %}id="{{ id }}"{% endif %} {% if checked %}checked{% endif %} {{ attrs|safe }}><span class="check-box">{{ icon('check', 'sm') }}</span></label>
+{% macro check(name, checked=false, value='1', id=none, kind='primary', attrs=none) -%}
+<label class="check-input {{ kind }}"><input type="checkbox" {% if name %}name="{{ name }}"{% endif %} value="{{ value }}" {% if id %}id="{{ id }}"{% endif %} {% if checked %}checked{% endif %}{{ (attrs or {})|xmlattr }}><span class="check-box">{{ icon('check', 'sm') }}</span></label>
 {%- endmacro %}
 
 {# A link that leaves mang-arr: new tab, no referrer, external-link icon after the text #}

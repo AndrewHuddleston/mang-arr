@@ -10,19 +10,21 @@ helpers.
 import logging
 import threading
 import time
-import urllib.parse
 
 from fastapi import APIRouter, Form, HTTPException, Request
 from fastapi.responses import RedirectResponse
 from pydantic import BaseModel
+from starlette.concurrency import run_in_threadpool
 
 from .. import db, jobs, lists, model
+from . import views
 
 log = logging.getLogger(__name__)
 router = APIRouter()
 _app = None                  # the app module, set by init()
 CHECK_EVERY = 600            # seconds between "is a list due?" checks
 FIRST_CHECK = 120            # let the app come up first
+MIN_SYNC_HOURS = 1.0         # a list is synced at most this often (each sync can add and download series)
 
 
 def init(app_module=None) -> None:
@@ -116,7 +118,16 @@ def _loop() -> None:
 # -- page ---------------------------------------------------------------------
 
 def _flash(msg: str) -> RedirectResponse:
-    return RedirectResponse(f"/lists?m={urllib.parse.quote(msg)}", 303)
+    return RedirectResponse(f"/lists?{views.flash_query(msg)}", 303)
+
+
+def _sync_hours(value) -> float:
+    """The sync interval, raised to MIN_SYNC_HOURS (with a log line) when shorter."""
+    hours = float(value or 24)
+    if 0 < hours < MIN_SYNC_HOURS:
+        log.warning("import list sync interval %g h raised to the minimum of %g h", hours, MIN_SYNC_HOURS)
+        return MIN_SYNC_HOURS
+    return hours
 
 
 def _busy() -> set[str]:
@@ -136,12 +147,16 @@ def lists_page(request: Request):
 @router.post("/lists/add")
 async def lists_add(request: Request):
     form = await request.form()
+    return await run_in_threadpool(_lists_add, form)       # SQLite work off the event loop
+
+
+def _lists_add(form) -> RedirectResponse:
     kind = str(form.get("kind", ""))
     raw = {k: form.get(k) for k in ("username", "sort", "limit", "country", "min_chapters", "url")}
     raw["statuses"] = form.getlist("statuses")
     try:
         params = lists.validate_params(kind, raw)
-        sync_hours = float(form.get("sync_hours") or 24)
+        sync_hours = _sync_hours(form.get("sync_hours"))
         with db.connect() as con:
             list_id = lists.add_list(con, str(form.get("name", "")), kind, params, download=form.get("download") == "1",
                                      monitored=form.get("monitored") == "1", sync_hours=sync_hours)
@@ -233,7 +248,8 @@ def api_lists_add(body: ListBody):
         params = lists.validate_params(body.kind, body.params)
         with db.connect() as con:
             list_id = lists.add_list(con, body.name, body.kind, params, enabled=body.enabled,
-                                     download=body.download, monitored=body.monitored, sync_hours=body.syncHours)
+                                     download=body.download, monitored=body.monitored,
+                                     sync_hours=_sync_hours(body.syncHours))
             row = lists.get_list(con, list_id)
     except ValueError as e:
         raise HTTPException(400, str(e)) from e

@@ -1,12 +1,22 @@
 """Health checks, Sonarr-style: a list of problems and warnings a person
 can act on, with a live test of every backend (Suwayomi, Komga, AniList,
 MangaDex). Results are cached for a minute so the navigation bar can show
-a problem count on every page without hammering the backends."""
+a problem count on every page without hammering the backends.
+
+Only one run happens at a time (single flight), in a background thread:
+callers get the cached result at once when there is one (a stale one
+triggers the re-check), otherwise they wait at most DEADLINE seconds, so a
+hung backend or a hung disk mount can never pile up request threads. A
+run still going after DEADLINE is an error for every caller, so a hang
+shows up (and /api/v1/health fails) instead of the last good result being
+served forever. A forced run (System page) re-checks at most every
+FORCE_MIN_SECS."""
 import logging
 import os
 import shutil
 import threading
 import time
+import urllib.parse
 import urllib.request
 from dataclasses import asdict, dataclass
 
@@ -15,6 +25,8 @@ from .suwayomi import Client, SuwayomiError
 
 log = logging.getLogger(__name__)
 CACHE_SECS = 60
+FORCE_MIN_SECS = 15      # force=True re-checks at most this often, whoever asks
+DEADLINE = 25            # seconds a caller waits for a run; the run itself carries on in the background
 
 
 @dataclass
@@ -26,6 +38,9 @@ class Check:
 
 _cache: dict = {"at": 0.0, "checks": []}
 _lock = threading.Lock()
+_running: threading.Event | None = None      # set when the run in progress finishes
+_started = 0.0                               # when the run in progress started (monotonic)
+_hang_logged: threading.Event | None = None  # the run already reported as hung (log it once, not per caller)
 
 
 def _ping(name: str, url: str, timeout: int = 8) -> Check:
@@ -41,10 +56,80 @@ def _ping(name: str, url: str, timeout: int = 8) -> Check:
         return Check("warning", name, f"unreachable: {type(e).__name__}: {e}")
 
 
-def run(client: Client, force: bool = False) -> list[Check]:
+def run(client: Client, force: bool = False, wait: float = DEADLINE, note_timeout: bool = True) -> list[Check]:
+    """The checks: cached, re-checked by one background run at a time.
+    force wants a fresh result (at most FORCE_MIN_SECS old) and waits for it;
+    otherwise a stale result is returned at once while the re-check runs.
+    With nothing cached, waits up to `wait` s; if the run is still going
+    then, returns what is cached plus (note_timeout) an error saying so.
+    A run going for longer than DEADLINE is reported as an error to every
+    caller (cached or not, note_timeout or not): a hung check must not
+    leave monitoring reading the last good result forever."""
+    global _running, _started
     with _lock:
-        if not force and time.monotonic() - _cache["at"] < CACHE_SECS and _cache["checks"]:
+        now = time.monotonic()
+        have = bool(_cache["checks"])
+        hung = _running is not None and now - _started > DEADLINE
+        if have and not hung and now - _cache["at"] < (FORCE_MIN_SECS if force else CACHE_SECS):
             return list(_cache["checks"])
+        done = _running
+        if done is None:                     # single flight: start the one run
+            done = _running = threading.Event()
+            _started = now
+            threading.Thread(target=_background, args=(client, done), name="mangarr-health", daemon=True).start()
+    finished = done.is_set() if (have and not force) else done.wait(wait)   # stale while revalidating: no wait
+    with _lock:
+        checks = list(_cache["checks"])
+        running_for = time.monotonic() - _started if _running is done and not done.is_set() else 0.0
+    if finished or running_for <= 0:
+        return checks
+    if running_for > DEADLINE or (note_timeout and not (have and not force)):
+        _note_hang(done, running_for)
+        checks.append(Check("error", "Health checks", f"not finished after {running_for:.1f} s: a backend or a disk "
+                                                      "mount is not answering (the check carries on in the "
+                                                      "background)"))
+    return checks
+
+
+def _note_hang(done: threading.Event, secs: float) -> None:
+    """Log a slow or hung run once per run, not once per caller."""
+    global _hang_logged
+    with _lock:
+        if _hang_logged is done:
+            return
+        _hang_logged = done
+    log.warning("health: checks still running after %.1f s: a backend or a disk mount is not answering", secs)
+
+
+def _background(client: Client, done: threading.Event) -> None:
+    global _running
+    try:
+        _compute(client)
+    except Exception as e:                   # never leave callers without an answer
+        log.exception("health: check run failed")
+        with _lock:
+            _cache.update(at=time.monotonic(), checks=[Check("error", "Health checks", f"{type(e).__name__}: {e}")])
+    finally:
+        with _lock:
+            _running = None
+        done.set()
+
+
+def _no_userinfo(url: str) -> str:
+    """A URL for a message: without user:password@."""
+    try:
+        u = urllib.parse.urlsplit(url)
+        if u.username is None and u.password is None:
+            return url
+        host = u.hostname or ""
+        if u.port:
+            host = f"{host}:{u.port}"
+        return urllib.parse.urlunsplit((u.scheme, host, u.path, u.query, u.fragment))
+    except ValueError:
+        return "(unparseable URL)"
+
+
+def _compute(client: Client) -> list[Check]:
     out: list[Check] = []
     v = settings.all_values()
 
@@ -77,7 +162,7 @@ def run(client: Client, force: bool = False) -> list[Check]:
         out.append(Check("warning", "Komga", "not configured: new chapters appear only at Komga's own scan interval"))
     else:
         ok, msg = komga.test()
-        out.append(Check("ok" if ok else "error", "Komga", f"{v['komga_url']}: {msg}"))
+        out.append(Check("ok" if ok else "error", "Komga", f"{_no_userinfo(v['komga_url'])}: {msg}"))
 
     # -- metadata providers --
     out.append(_ping("AniList", config.ANILIST_URL.replace("graphql.anilist.co", "anilist.co")))
@@ -115,6 +200,9 @@ def run(client: Client, force: bool = False) -> list[Check]:
         out.append(Check("ok", "Notifications", ", ".join(notify.CHANNELS[k][0] for k in notify.configured_channels())))
     if not v["auth_user"]:
         out.append(Check("warning", "Security", "no web login set; anyone on the network can use this page"))
+    elif not v["auth_password"]:
+        out.append(Check("error", "Security", "a login username is set without a password: nobody can sign in "
+                                              "with a password (set one, or clear the username)"))
 
     with _lock:
         _cache.update(at=time.monotonic(), checks=list(out))
@@ -125,8 +213,10 @@ def run(client: Client, force: bool = False) -> list[Check]:
     return out
 
 
-def summary(client: Client) -> dict:
-    checks = run(client)
+def summary(client: Client, wait: float = 5) -> dict:
+    """Counts for the navigation bar and the status poller: never waits
+    long (a first run that is slow shows up on the next poll)."""
+    checks = run(client, wait=wait, note_timeout=False)
     return {"errors": sum(1 for c in checks if c.level == "error"),
             "warnings": sum(1 for c in checks if c.level == "warning"),
             "checks": [asdict(c) for c in checks]}
