@@ -10,6 +10,7 @@ import hashlib
 import logging
 import math
 import os
+import threading
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field, replace
@@ -362,7 +363,8 @@ def delete_series(con, client: Client, series_id: int, delete_library: bool = Fa
     them, except one another series uses too (the one kept when a series
     tracked twice is cleaned up); a Suwayomi outage does not block the delete.
     Komga is asked to scan once library files are gone, so the series leaves
-    it now rather than at its next scheduled scan."""
+    it now rather than at its next scheduled scan; the scan request runs on a
+    thread of its own, so the delete does not wait for Komga's answer."""
     row = db.get_series(con, series_id)
     title, folder = row["title"], row["folder"]
     for s in db.sources(con, series_id):
@@ -381,8 +383,9 @@ def delete_series(con, client: Client, series_id: int, delete_library: bool = Fa
     db.event(con, "deleted", f"{title} removed" + (" with library files" if delete_library else ""))
     con.commit()
     log.info("%s: no longer tracked", title)
-    if removed:
-        komga.scan()
+    if removed and komga.configured():
+        # a delete is a web request: it does not wait for Komga's answer (up to 20 s)
+        threading.Thread(target=komga.scan, name="mangarr-komga-scan", daemon=True).start()
 
 
 def _delete_library_files(con, series_id: int, title: str, folder: str) -> bool:

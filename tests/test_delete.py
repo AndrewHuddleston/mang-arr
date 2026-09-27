@@ -2,6 +2,7 @@
 leaves Komga at once instead of at Komga's next scheduled scan. Komga is faked: nothing reaches a real one."""
 import os
 import tempfile
+import threading
 import unittest
 import urllib.error
 from unittest import mock
@@ -48,6 +49,14 @@ class DeleteScanTest(unittest.TestCase):
     def delete(self, files: bool):
         with db.connect() as con:
             core.delete_series(con, mock.Mock(), self.sid, delete_library=files)
+        self.join_scan()
+
+    @staticmethod
+    def join_scan():
+        """The scan request runs on a thread of its own; wait for it while Komga is still faked."""
+        for t in threading.enumerate():
+            if t.name == "mangarr-komga-scan":
+                t.join(10)
 
     def test_scan_once_the_files_are_gone(self):
         self.komga_on()
@@ -74,6 +83,25 @@ class DeleteScanTest(unittest.TestCase):
         self.delete(True)
         self.assertFalse(os.path.exists(self.file))
         self.assertEqual(self.calls, [])
+
+    def test_delete_does_not_wait_for_komga(self):
+        """Review: the scan ran inside the delete request, so a Komga that takes the connection and never answers
+        held the delete (a web request) for the whole 20 s timeout. The delete now returns first."""
+        self.komga_on()
+        answer = threading.Event()
+
+        def slow(method, path, timeout=20):
+            answer.wait(10)                          # a Komga that has not answered yet
+            return self.fake_call(method, path, timeout)
+        with mock.patch.object(komga, "_call", slow), self.assertLogs("mangarr.komga", "INFO") as logs:
+            with db.connect() as con:
+                core.delete_series(con, mock.Mock(), self.sid, delete_library=True)
+                self.assertIsNone(db.get_series(con, self.sid))
+            self.assertEqual(self.calls, [])         # the delete returned while Komga still had not answered
+            answer.set()
+            self.join_scan()
+        self.assertEqual(self.calls, [("POST", "/api/v1/libraries/LIB1/scan", True)])
+        self.assertIn("komga: scan requested for 1 library", logs.output[-1])
 
     def test_komga_failing_does_not_fail_the_delete(self):
         self.komga_on()
