@@ -131,6 +131,38 @@ class PlanCapTest(unittest.TestCase):
         self.assertIn("would make the plan 20000 chapters", note)
         self.assertTrue(any("B: would make the plan" in line for line in cm.output))
 
+    def test_a_dense_source_cannot_take_the_budget(self):
+        # the verifier's repro: 9,900 fractions below the real top number
+        # sorted first by (max, rank), took the whole budget and evicted the
+        # real sources; after 9,900 page probes the plan had 0 chapters
+        a, b, h = Source("1", "A", "en"), Source("2", "B", "en"), Source("3", "H", "en")
+        junk = [i / 100 for i in range(1, 10_000) if i % 100]
+        client = ByIdClient({"1": range(1, 151), "2": range(1, 141), "3": junk})
+        series = Series(anilist_id=1, english="Title", status="RELEASING")
+        for sources in ([a, h], [a, b, h]):
+            probes = []
+            with mock.patch.object(client, "page_count", lambda cid, probes=probes: probes.append(cid) or 20), \
+                    self.assertLogs("mangarr.resolver", "WARNING"):
+                plan = resolve(client, series, sources=sources)
+            notes = {m.source.name: m.note for m in plan.matches}
+            self.assertEqual([notes[s.name] for s in sources[:-1]], [""] * (len(sources) - 1))
+            self.assertIn("would make the plan", notes["H"])
+            self.assertEqual(plan.chapters, [float(n) for n in range(1, 151)])
+            self.assertEqual(probes, [])
+
+    def test_chapters_split_in_parts_do_not_evict_a_plain_source(self):
+        # the milder case: .1/.2 parts topping out just below the plain source
+        plain, parts = Source("1", "Plain", "en"), Source("2", "Parts", "en")
+        split = [n + p for n in range(1, 4000) for p in (0.1, 0.2)]          # 7,998 numbers, top 3999.2
+        client = ByIdClient({"1": range(1, 4001), "2": split})
+        with mock.patch.object(resolver, "_prune_junk", lambda c, p: None), \
+                self.assertLogs("mangarr.resolver", "WARNING"):
+            plan = resolve(client, Series(anilist_id=1, english="Title", status="RELEASING"), sources=[parts, plain])
+        notes = {m.source.name: m.note for m in plan.matches}
+        self.assertEqual(notes["Plain"], "")
+        self.assertIn("would make the plan 11998 chapters", notes["Parts"])
+        self.assertEqual(len(plan.chapters), 4000)
+
     def test_real_sources_are_untouched(self):
         a, b, c = Source("1", "A", "en"), Source("2", "B", "en"), Source("3", "C", "en")
         client = ByIdClient({"1": range(1, 3801), "2": [*range(1, 3790), 12.5], "3": range(1, 3805)})

@@ -31,6 +31,7 @@ OUTLIER_MIN_JUMP = 1000      # ... and this far above it is a typo or a date, no
 OUTLIER_MIN_BELOW = 5        # ... judged only with this many chapters below it (not [1, 1500])
 MAX_CHAPTERS_PER_SOURCE = 10_000
 MAX_PLAN_CHAPTERS = 10_000   # the same bound for the union of the trusted sources
+PLAIN_DENSITY = 1.5          # numbers per unit of a source's top number in a plain listing (1, 2, 2.5, 3 ...)
 MAX_SEARCH_TITLES = 8
 MAX_GAP_SPANS = 40
 MAX_CHAPTER_NAME = 500
@@ -332,18 +333,29 @@ def _trust(series: Series, matches: list[SourceMatch]) -> None:
     _cap_union(matches)
 
 
+def _plausibility(numbers: set[float]) -> tuple[float, float]:
+    """Sort key for _cap_union, most plausible first: a plain listing (at
+    most PLAIN_DENSITY numbers per unit of its top number: 1, 2, 3 with the
+    odd .5) before a dense one - fractions packed below the top, which is
+    padding or chapters split into .1/.2 parts - and among plain ones, the
+    one that reaches least far (a merged-in series only adds numbers
+    above). So a source can only come first by listing about as few
+    numbers as its top number, and cannot take the budget from the others."""
+    top = max(numbers, default=0.0)
+    return max(len(numbers) / max(top, 1.0), PLAIN_DENSITY), top
+
+
 def _cap_union(matches: list[SourceMatch]) -> None:
     """Each source is capped (MAX_CHAPTERS_PER_SOURCE), but two or three
     sources listing different numbers can still add up to a plan no real
     series has - and every number becomes a wanted chapter row. Without a
     known length to judge by (an ongoing series on fewer than three
-    sources), the most plausible set is kept: sources that reach least far
-    first (a merged-in series or padding only ever adds numbers), best-ranked
-    among equals, as long as their union stays within MAX_PLAN_CHAPTERS. The
-    others are not trusted."""
+    sources), the most plausible set is kept: sources in _plausibility()
+    order, best-ranked among equals, as long as their union stays within
+    MAX_PLAN_CHAPTERS. The others are not trusted."""
     union: set[float] = set()
-    for m in sorted((m for m in matches if m.usable), key=lambda m: (m.max, m.rank())):
-        numbers = m.numbers
+    usable = [(m, m.numbers) for m in matches if m.usable]
+    for m, numbers in sorted(usable, key=lambda mn: (*_plausibility(mn[1]), mn[0].rank())):
         total = len(union) + len(numbers - union)
         if total > MAX_PLAN_CHAPTERS:
             m.note = f"would make the plan {total} chapters, more than any real series ({MAX_PLAN_CHAPTERS})"
