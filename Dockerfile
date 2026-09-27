@@ -1,4 +1,6 @@
-FROM python:3.12-slim
+# Base image pinned to an exact release and digest, so every build starts from the same layers;
+# Dependabot (.github/dependabot.yml) proposes the updates, and CI rebuilds the image weekly.
+FROM python:3.12.14-slim-trixie@sha256:f77ac9e44ae96ef2c90b8053ea08c31f8be030f824196b0ae4db6d462c84e51f
 
 # One data mount holds both trees so hard links work (link(2) fails across
 # separate mounts even on the same filesystem):
@@ -21,9 +23,11 @@ RUN pip install --no-cache-dir --no-deps . \
 
 VOLUME ["/config", "/data"]
 EXPOSE 6789
-# liveness only: /api/v1/health (503 on config problems) is for monitoring, not for restarting the container
+# Liveness only: /api/v1/ping answers without touching the database, the network or the health
+# checks, so a slow Suwayomi, Komga, AniList or MangaDex never marks the container unhealthy.
+# /api/v1/health (503 on config problems) is for monitoring, not for restarting the container.
 HEALTHCHECK --interval=60s --timeout=5s --start-period=30s \
-  CMD python -c "import urllib.request;urllib.request.urlopen('http://127.0.0.1:6789/api/v1/system/status',timeout=4)" || exit 1
+  CMD python -c "import urllib.request;urllib.request.urlopen('http://127.0.0.1:6789/api/v1/ping',timeout=4)" || exit 1
 
 # run as an unprivileged user; compose can override with user: "PUID:PGID"
 USER 1000:1000

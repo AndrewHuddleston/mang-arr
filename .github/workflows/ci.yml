@@ -5,24 +5,31 @@ on:
     branches: ["**"]
     tags: ["v*"]
   pull_request:
+  schedule:
+    # weekly rebuild of :latest from main, so fixed Python packages reach the image without a commit
+    - cron: "17 4 * * 1"
 
+# Least privilege: every job gets a read-only token. Only `publish` may write packages.
 permissions:
   contents: read
-  packages: write
 
 env:
   IMAGE: ghcr.io/andrewhuddleston/mang-arr
 
+# Actions are pinned to full commit SHAs (the tag is in the comment); Dependabot keeps them current.
+# CI-only Python tools are pinned to exact versions; bump them by hand.
 jobs:
   lint:
     name: ruff
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
         with:
           python-version: "3.12"
-      - run: pip install ruff
+      - run: pip install ruff==0.16.9
       - run: ruff check mangarr tests
 
   test:
@@ -33,23 +40,27 @@ jobs:
       matrix:
         python: ["3.10", "3.12"]
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
         with:
           python-version: ${{ matrix.python }}
       # The core is stdlib-only; the web tests need the extras (they skip without them).
-      - run: pip install -e ".[web]" httpx
+      - run: pip install -e ".[web]" httpx==0.28.1
       - run: python -m unittest discover -s tests -v
 
   package:
     name: wheel
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
         with:
           python-version: "3.12"
-      - run: pip install build
+      - run: pip install build==1.6.1
       - run: python -m build
       - name: templates and static files are in the wheel
         run: |
@@ -65,9 +76,12 @@ jobs:
     name: docker build
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: docker/setup-buildx-action@v3
-      - uses: docker/build-push-action@v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069  # v4.4.1
+      # The build cache only speeds up this test build; `publish` never reads it.
+      - uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc  # v7.4.0
         with:
           context: .
           push: false
@@ -79,42 +93,75 @@ jobs:
         run: |
           docker run -d --name mangarr -p 6789:6789 ${{ env.IMAGE }}:ci
           for i in $(seq 1 30); do
-            curl -fsS http://127.0.0.1:6789/api/v1/system/status && break
+            curl -fsS http://127.0.0.1:6789/api/v1/ping && break
             sleep 2
           done
           docker logs mangarr
+          curl -fsS http://127.0.0.1:6789/api/v1/ping
           curl -fsS http://127.0.0.1:6789/api/v1/system/status
           docker rm -f mangarr
 
   publish:
     name: push image to ghcr.io
-    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
+    if: >-
+      (github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')))
+      || (github.event_name == 'schedule' && github.ref == 'refs/heads/main')
     needs: [lint, test, package, docker]
     runs-on: ubuntu-latest
     permissions:
       contents: read
       packages: write
+    # One publish per ref at a time, so the head check below and the push cannot interleave with
+    # another run's. The group alone does not order runs by commit (an older commit whose tests
+    # finished later reaches it last), hence the check.
+    concurrency:
+      group: publish-${{ github.ref }}
+      cancel-in-progress: false
     steps:
-      - uses: actions/checkout@v4
-      - uses: docker/setup-buildx-action@v3
-      - uses: docker/login-action@v3
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      # Only the commit that is main's head right now may move :latest; an older one is skipped.
+      - id: head
+        name: is this still the newest commit on main?
+        if: github.ref == 'refs/heads/main'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.sha }}
+        run: |
+          head=$(gh api "repos/$REPO/commits/main" --jq .sha)
+          if [ "$head" = "$SHA" ]; then
+            echo "newest=true" >>"$GITHUB_OUTPUT"
+          else
+            echo "::notice::main has moved on to $head: not publishing $SHA as :latest"
+            echo "newest=false" >>"$GITHUB_OUTPUT"
+          fi
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069  # v4.4.1
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f  # v4.6.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
       - id: meta
-        uses: docker/metadata-action@v5
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302  # v6.2.0
         with:
           images: ${{ env.IMAGE }}
+          # :latest comes only from main, never from a release tag (tagging an old commit cannot roll it back)
+          flavor: |
+            latest=false
           tags: |
-            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
+            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' && steps.head.outputs.newest == 'true' }}
             type=ref,event=tag
             type=semver,pattern={{version}}
-      - uses: docker/build-push-action@v6
+      # Built from scratch with a fresh base pull: no build cache that another job or run could have written.
+      # Nothing to push when the only tag, :latest, was withheld above.
+      - uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc  # v7.4.0
+        if: steps.meta.outputs.tags != ''
         with:
           context: .
           push: true
+          pull: true
+          no-cache: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
