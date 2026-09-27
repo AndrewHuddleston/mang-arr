@@ -46,7 +46,8 @@ WEBTOON_HINT_RATIO = 1.5    # ... or this much, for a series tagged long strip o
 WEBTOON_KEEP = 1.2          # a panel up to this many screens tall stays whole on one (shrunk) page
 WEBTOON_TWO = 2.0           # ... up to this many becomes two overlapping screens; taller is cut ...
 WEBTOON_OVERLAP = 0.04      # ... at screen height, each screen repeating this much of the last
-COLOUR_FRAC = 0.005         # share of tinted pixels that makes a page colour
+COLOUR_FRAC = 0.005         # e-ink: share of tinted pixels that makes a page colour ...
+SCREEN_COLOUR_FRAC = 1e-4   # ... other screens: any tinted spot over about 0.01% of the page
 MAX_PIXELS = 64_000_000     # per image: an 800 x 80000 strip; about 200 MB decoded as RGB
 
 LANCZOS = Image.Resampling.LANCZOS
@@ -205,13 +206,17 @@ def border_colour(img: Image.Image) -> int | tuple[int, ...]:
     return bands[0] if len(bands) == 1 else tuple(bands)
 
 
-def is_colour(img: Image.Image) -> bool:
+def is_colour(img: Image.Image, prof: Profile) -> bool:
+    """Does the page keep its colour? On e-ink only when more than
+    COLOUR_FRAC of it is tinted, so a grey page with a small coloured logo
+    still gets the e-ink tone; on other screens any tinted spot over
+    SCREEN_COLOUR_FRAC (a red sound effect, a drop of blood) keeps it."""
     if img.mode == "L":
         return False
     small = img.reduce(8) if min(img.size) >= 64 else img
     _, cb, cr = small.convert("YCbCr").split()
     tinted = ImageChops.lighter(cb.point(_CHROMA), cr.point(_CHROMA)).histogram()[255]
-    return tinted > small.width * small.height * COLOUR_FRAC
+    return tinted > small.width * small.height * (COLOUR_FRAC if prof.eink else SCREEN_COLOUR_FRAC)
 
 
 def content_box(img: Image.Image, page_numbers: bool = True) -> tuple[int, int, int, int] | None:
@@ -341,7 +346,7 @@ def process_page(img: Image.Image, prof: Profile, opts: Options, rtl: bool, firs
     portrait screen is split at the original fold (right half first when
     reading right to left) and/or rotated, as opts.spreads says; a panorama
     (PANORAMA_RATIO) is only ever rotated."""
-    colour = shows_colour(prof, opts) and is_colour(img)
+    colour = shows_colour(prof, opts) and is_colour(img, prof)
     if not colour:
         img = img.convert("L")
     fold = img.width / 2
@@ -452,7 +457,7 @@ def webtoon_pages(strips, prof: Profile, opts: Options):
 
 
 def webtoon_page(img: Image.Image, prof: Profile, opts: Options) -> Page:
-    if not (shows_colour(prof, opts) and is_colour(img)):
+    if not (shows_colour(prof, opts) and is_colour(img, prof)):
         img = img.convert("L")
     return finish(img, prof, opts, True)
 

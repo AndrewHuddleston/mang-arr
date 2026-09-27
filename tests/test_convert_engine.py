@@ -23,7 +23,7 @@ from mangarr.convert import ConvertError, Options, convert_chapter, profiles
 PILLOW = importlib.util.find_spec("PIL") is not None
 NO_PILLOW = "Pillow is not installed (the convert extra)"
 if PILLOW:
-    from PIL import Image, ImageChops, ImageFile, JpegImagePlugin, PngImagePlugin
+    from PIL import Image, ImageChops, ImageDraw, ImageFile, JpegImagePlugin, PngImagePlugin
 
     from mangarr.convert import engine
 
@@ -170,6 +170,23 @@ class MangaTests(Base):
         eink_dark = self.convert(self.manga, "d.epub", profile="test-grey", gamma=2.0)
         self.assertNotEqual(sha(eink.path), sha(eink_dark.path))
         self.assertGreater(darkness(jpegs(eink_dark.path)[1]), darkness(jpegs(eink.path)[1]))
+
+    def test_generic_keeps_a_small_spot_of_colour(self):
+        rnd = fx.random.Random(7)
+        pages = []
+        for n, share in enumerate((0.02, 0.003, 0.001, 0.0002), 1):     # of the page: a red sound effect, a logo
+            img = fx.manga_page(800, 1200, n, rnd).convert("RGB")
+            side = round((800 * 1200 * share) ** 0.5)
+            ImageDraw.Draw(img).rectangle((300, 400, 300 + side - 1, 400 + side - 1), fill=(230, 20, 20))
+            pages.append((f"{n:03d}.png", fx.encode(img, "png")))
+        grey = fx.manga_page(800, 1200, 5, rnd).convert("RGB")         # a grey page saved as colour
+        pages.append(("005.jpg", fx.encode(grey, "jpg", quality=75)))
+        src = fx.pages_cbz(os.path.join(self.tmp, "spots.cbz"), pages)
+        generic = self.convert(src, "g.cbz", profile="generic", format="cbz", webtoon=False)
+        self.assertEqual([p.mode for p in jpegs(generic.path)], ["RGB", "RGB", "RGB", "RGB", "L"])
+        # colour e-ink: a nearly grey page stays grey, so it gets the e-ink tone
+        eink = self.convert(src, "e.cbz", profile="test-colour", format="cbz", webtoon=False)
+        self.assertEqual([p.mode for p in jpegs(eink.path)], ["RGB", "L", "L", "L", "L"])
 
     def test_colour_grey_makes_every_page_grey(self):
         r = self.convert(self.manga, "grey.epub", profile="test-colour", format="epub", colour="grey")
