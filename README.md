@@ -187,7 +187,10 @@ There are two layers.
 for the two backup ones) set paths, the Suwayomi URL, logging, backups, and
 the defaults for everything else. The Docker image presets the ones marked
 with an asterisk to the container mounts (`/config`, `/data/staging`,
-`/data/library`, `/config/mangarr.log`, `http://suwayomi:4567`).
+`/data/library`, `/config/mangarr.log`, `http://suwayomi:4567`). A numeric
+variable whose value is not a number (a typo like `90d` or `1G`) falls back
+to its default, and one outside a sane range (e.g. `MANGARR_BACKUPS_KEEP=0`)
+is clamped to it; both are logged at start-up.
 
 | Variable | Default | Meaning |
 |---|---|---|
@@ -488,6 +491,18 @@ place; no restart is needed. A file that fails any step is refused and the
 running database keeps working. A restore is refused while any job is
 queued or running (cancel it on the Queue page first), and runs on the job
 worker, so no job can start until it is done.
+
+An uploaded file is written straight into `$MANGARR_DATA/backups` (not the
+container's `/tmp`, which lives on the Docker host's system disk) and moved
+into the restore from there. Only one upload is accepted at a time (a second
+one is refused at once). An upload that sends nothing for 30 seconds, or
+averages less than 128 KB a second (it gets 30 seconds plus one second per
+128 KB received), is cut off, so a stalled or dripping client cannot hold
+the upload for long. An upload is refused, before the first byte and with
+every write while it arrives, when it would leave less free space on that
+disk than its own size, up to 256 MB: a small backup can still be restored
+on a nearly full disk, a big one cannot take the last of it. A refused or
+cut-off upload leaves nothing behind.
 
 ### CLI
 
@@ -950,7 +965,8 @@ What the web server refuses, and what to do if it refuses you:
   names are compared: a port (or a whole URL) typed into the list is
   dropped. `/api/v1/ping` is exempt.
 - **Large requests.** Bodies over 1 MB get 413 (the backup upload takes up
-  to `MANGARR_MAX_UPLOAD_MB`).
+  to `MANGARR_MAX_UPLOAD_MB`, one at a time, and is cut off after 30 s
+  without data or when it averages less than 128 KB/s; see Backups).
 - **Password guessing.** Failed sign-ins (login page and basic auth alike)
   are counted per client address: after 5 failures in 15 minutes each
   further attempt is refused with 429 for 2 s, 4 s, 8 s ... up to 15

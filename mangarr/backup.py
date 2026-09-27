@@ -11,7 +11,8 @@ Safety rules, because a backup file can come from anywhere (an upload):
 - Backups and the database are private to the owner (0600, folder 0700):
   they hold the login password, the API key and notifier tokens.
 - A restore never touches the live database until the replacement is ready:
-  the file is copied aside first (so pruning cannot delete it mid-restore),
+  the file is copied aside first (so pruning cannot delete it mid-restore;
+  an upload is written aside as it arrives, see UploadSpool),
   rebuilt into a fresh database from mang-arr's own schema (only known
   tables and columns are copied, so no triggers, views or extra tables come
   along), upgraded to the current schema, and its stored file paths are
@@ -39,13 +40,17 @@ from . import config, db, library
 log = logging.getLogger(__name__)
 
 NAME_RE = re.compile(r"^mangarr-(\d{8}-\d{6})(?:-(\d+))?\.db$")
-KEEP = int(os.environ.get("MANGARR_BACKUPS_KEEP", "7"))
-INTERVAL_HOURS = float(os.environ.get("MANGARR_BACKUP_HOURS", "24"))
+KEEP = config.env_number("MANGARR_BACKUPS_KEEP", 7, 1, 1000, integer=True)
+INTERVAL_HOURS = config.env_number("MANGARR_BACKUP_HOURS", 24.0, 1.0, 8760.0)
 # Largest backup accepted through the upload form (MB); a bigger live database raises it to twice its size.
-UPLOAD_MAX_MB = float(os.environ.get("MANGARR_BACKUP_UPLOAD_MAX_MB", "512"))
+UPLOAD_MAX_MB = config.env_number("MANGARR_BACKUP_UPLOAD_MAX_MB", 512.0, 1.0, 1048576.0)
+# Free space an upload must leave on the data volume while it is written: as much
+# again as the upload (the restore then builds a database of about that size
+# next to it), up to this many MB (other services often share that disk).
+UPLOAD_FREE_MARGIN_MB = 256
 # Event history kept (Activity/series pages); older events are pruned before each scheduled backup.
-EVENTS_KEEP_DAYS = float(os.environ.get("MANGARR_EVENTS_KEEP_DAYS", "90"))
-EVENTS_KEEP_ROWS = int(os.environ.get("MANGARR_EVENTS_KEEP_ROWS", "100000"))   # a size ceiling, see README
+EVENTS_KEEP_DAYS = config.env_number("MANGARR_EVENTS_KEEP_DAYS", 90.0, 1.0, 36500.0)
+EVENTS_KEEP_ROWS = config.env_number("MANGARR_EVENTS_KEEP_ROWS", 100000, 1000, 100_000_000, integer=True)  # see README
 
 # Security settings a restore keeps from the CURRENT database instead of the
 # backup's (a key the current database does not have is removed from the
@@ -287,12 +292,92 @@ def upload_limit() -> int:
     return int(max(UPLOAD_MAX_MB * 1024 * 1024, 2 * live))
 
 
+def _free_bytes(path: str) -> int:
+    return shutil.disk_usage(path).free
+
+
+def size_text(n: int) -> str:
+    """A size for the upload messages: '8 KB', '300 MB'."""
+    return f"{n >> 20} MB" if n >= 1 << 20 else f"{(n + 1023) >> 10} KB"
+
+
+def _check_room(folder: str, more: int, total: int) -> None:
+    """RestoreError unless writing `more` bytes, for an upload of `total`
+    bytes, leaves free in folder as much again as the upload, up to
+    UPLOAD_FREE_MARGIN_MB. The floor grows with the upload so that a small
+    backup can still be restored on a nearly full disk, while a big one
+    cannot take the last of it."""
+    free = _free_bytes(folder)
+    keep = min(UPLOAD_FREE_MARGIN_MB << 20, total)
+    if free - more < keep:
+        msg = f"not enough free disk space in {folder} ({size_text(free)} free; an upload of {size_text(total)} " \
+              f"must leave {size_text(keep)} free)"
+        log.warning("backup upload refused: %s", msg)
+        raise RestoreError(msg)
+
+
+class UploadSpool:
+    """A backup file while it is uploaded: written straight to a private
+    temporary file in the backups folder (the data volume, not the
+    container's /tmp, which sits on the Docker host's system disk), refused
+    once it passes upload_limit() or the disk gets too full for it (see
+    _check_room: checked before the first byte, with the size the client
+    announced, and again on every write, however slowly the data arrives).
+    restore(spool) moves the file into its work folder; discard() removes
+    whatever is left, so call it on every path."""
+
+    def __init__(self, expected: int = 0):
+        self.limit = upload_limit()
+        if expected > self.limit:
+            log.warning("backup upload refused: %d bytes announced, the limit is %d", expected, self.limit)
+            raise RestoreError(self._too_big())
+        d = backup_dir()
+        _check_room(d, expected, expected)
+        fd, self.path = tempfile.mkstemp(prefix=_TMP_PREFIX + "upload-", suffix=".db", dir=d)   # created 0600
+        self._f = os.fdopen(fd, "wb")
+        self.size = 0
+
+    def _too_big(self) -> str:
+        return f"the file is larger than the upload limit ({self.limit // 1048576} MB)"
+
+    def write(self, data: bytes) -> None:
+        end = self.size + len(data)
+        if end > self.limit:
+            log.warning("backup upload refused: it passed the limit of %d bytes", self.limit)
+            raise RestoreError(self._too_big())
+        _check_room(os.path.dirname(self.path), len(data), end)     # every time: others write to that disk too
+        self._f.write(data)
+        self.size = end
+
+    def take(self, dst: str) -> None:
+        """Move the complete upload to dst (same folder tree: a rename, not a copy)."""
+        self._f.close()
+        os.replace(self.path, dst)
+
+    def discard(self) -> None:
+        """Remove the file unless restore() took it; safe to call more than once."""
+        try:
+            self._f.close()
+        except OSError as e:
+            log.debug("closing upload spool %s: %s", self.path, e)
+        try:
+            os.remove(self.path)
+        except FileNotFoundError:
+            pass
+        except OSError as e:
+            log.warning("cannot remove the partial upload %s: %s", self.path, e)
+
+
 # -- restore ------------------------------------------------------------------
 
 def _stage_copy(source, dst: str, limit: int | None = None) -> None:
     """Copy the file to restore (a path, or an open binary file) to a private
     work file first: the original may be pruned or changed while the restore
-    runs, and reading our copy leaves nothing next to the original."""
+    runs, and reading our copy leaves nothing next to the original. An
+    UploadSpool is already such a copy and is moved instead."""
+    if isinstance(source, UploadSpool):
+        source.take(dst)
+        return
     if isinstance(source, (str, os.PathLike)):
         shutil.copyfile(source, dst)
         return
@@ -517,8 +602,8 @@ def _live_settings() -> dict:
 
 
 def restore(source, keep_auth: bool = True, still_allowed: Callable[[dict], bool] | None = None) -> str:
-    """Replace the live database with a backup: the path of a file, or an
-    open binary file (an upload, limited to upload_limit()). Returns a
+    """Replace the live database with a backup: the path of a file, an
+    UploadSpool, or an open binary file (limited to upload_limit()). Returns a
     description; raises RestoreError (a ValueError) when the file is refused
     or cannot be used, with the live database unchanged. Jobs must not run
     meanwhile: the web layer runs this on the job runner's own thread.
@@ -536,7 +621,8 @@ def restore(source, keep_auth: bool = True, still_allowed: Callable[[dict], bool
             if still_allowed is not None and not still_allowed(_live_settings()):
                 raise RestoreError(SIGN_IN_LOST)  # before any work (and before the safety backup)
             staged, fresh = os.path.join(work, "source.db"), os.path.join(work, "restored.db")
-            _stage_copy(source, staged, None if isinstance(source, (str, os.PathLike)) else upload_limit())
+            stream = not isinstance(source, (str, os.PathLike, UploadSpool))   # a file object: counted as copied
+            _stage_copy(source, staged, upload_limit() if stream else None)
             ok, msg = verify(staged)
             if not ok:
                 raise RestoreError(msg)

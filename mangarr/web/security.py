@@ -23,7 +23,7 @@ from fastapi import HTTPException, Request
 from fastapi.responses import Response
 from starlette.concurrency import run_in_threadpool
 
-from .. import db, settings
+from .. import config, db, settings
 
 log = logging.getLogger(__name__)
 
@@ -32,7 +32,8 @@ SESSION_DAYS = 30
 SAFE_METHODS = ("GET", "HEAD", "OPTIONS")
 MAX_BODY = 1 << 20                           # request bodies above this get 413 (1 MB)
 # bigger bodies for specific routes: the backup upload (MANGARR_MAX_UPLOAD_MB, default 2 GB)
-BODY_LIMITS: dict[str, int] = {"/system/backups/upload": int(os.environ.get("MANGARR_MAX_UPLOAD_MB", "2048")) << 20}
+BODY_LIMITS: dict[str, int] = {
+    "/system/backups/upload": config.env_number("MANGARR_MAX_UPLOAD_MB", 2048, 1, 1048576, integer=True) << 20}
 # names that cannot be an attacker's public DNS name: LAN-only suffixes (RFC 6762 appendix G, RFC 8375),
 # router and container names (FRITZ!Box, Docker) and Tailscale MagicDNS (*.ts.net, controlled by Tailscale)
 LAN_SUFFIXES = (".local", ".lan", ".home.arpa", ".internal", ".localdomain", ".home", ".corp", ".intranet",

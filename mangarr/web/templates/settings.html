@@ -48,7 +48,7 @@
 
 <fieldset class="fieldset" id="komga">
   <legend class="legend">Komga</legend>
-  {% call m.form_group('URL', none, 'komga_url') %}<input class="input" id="komga_url" name="komga_url" value="{{ v.komga_url }}" placeholder="http://komga:25600">{% endcall %}
+  {% call m.form_group('URL', none, 'komga_url') %}<input class="input" id="komga_url" name="komga_url" value="{{ v.komga_url }}" placeholder="http://komga:25600">{{ m.url_warning('komga_url', bad_urls) }}{% endcall %}
   {% call m.form_group('API Key', 'Komga: account menu → API keys', 'komga_api_key') %}<input class="input" id="komga_api_key" name="komga_api_key" type="password" value="{{ v.komga_api_key }}" autocomplete="off">{% endcall %}
   {% call m.form_group('Library Id', 'Optional: scan only this library', 'komga_library_id') %}<input class="input" id="komga_library_id" name="komga_library_id" value="{{ v.komga_library_id }}">{% endcall %}
   {% if komga_test %}<div class="alert {{ 'success' if komga_ok else 'danger' }}">Komga: {{ komga_test }}</div>{% endif %}
@@ -64,21 +64,21 @@
     <input type="hidden" name="notify_on_health" value="0"><label class="inline-check">{{ m.check('notify_on_health', v.notify_on_health, '1') }} health problems</label>
   {% endcall %}
   <h3 class="subhead">Discord</h3>
-  {% call m.form_group('Webhook URL', 'Channel settings, Integrations, Webhooks, New Webhook, Copy URL', 'discord_webhook') %}<input class="input" id="discord_webhook" name="discord_webhook" type="password" value="{{ v.discord_webhook }}" autocomplete="off"> <button class="button small" name="action" value="test-notify-discord" type="submit">Test</button>{% endcall %}
+  {% call m.form_group('Webhook URL', 'Channel settings, Integrations, Webhooks, New Webhook, Copy URL', 'discord_webhook') %}<input class="input" id="discord_webhook" name="discord_webhook" type="password" value="{{ v.discord_webhook }}" autocomplete="off"> <button class="button small" name="action" value="test-notify-discord" type="submit">Test</button>{{ m.url_warning('discord_webhook', bad_urls) }}{% endcall %}
   <h3 class="subhead">Telegram</h3>
   {% call m.form_group('Bot Token', 'From @BotFather', 'telegram_token') %}<input class="input" id="telegram_token" name="telegram_token" type="password" value="{{ v.telegram_token }}" autocomplete="off">{% endcall %}
   {% call m.form_group('Chat ID', 'Your user or group id (message @userinfobot)', 'telegram_chat_id') %}<input class="input" id="telegram_chat_id" name="telegram_chat_id" value="{{ v.telegram_chat_id }}" placeholder=""> <button class="button small" name="action" value="test-notify-telegram" type="submit">Test</button>{% endcall %}
   <h3 class="subhead">ntfy</h3>
-  {% call m.form_group('Topic URL', 'e.g. https://ntfy.sh/my-manga or your own server', 'ntfy_url') %}<input class="input" id="ntfy_url" name="ntfy_url" type="password" value="{{ v.ntfy_url }}" autocomplete="off" placeholder="https://ntfy.sh/your-topic">{% endcall %}
+  {% call m.form_group('Topic URL', 'e.g. https://ntfy.sh/my-manga or your own server', 'ntfy_url') %}<input class="input" id="ntfy_url" name="ntfy_url" type="password" value="{{ v.ntfy_url }}" autocomplete="off" placeholder="https://ntfy.sh/your-topic">{{ m.url_warning('ntfy_url', bad_urls) }}{% endcall %}
   {% call m.form_group('Access Token', 'Only for protected topics', 'ntfy_token') %}<input class="input" id="ntfy_token" name="ntfy_token" type="password" value="{{ v.ntfy_token }}" autocomplete="off"> <button class="button small" name="action" value="test-notify-ntfy" type="submit">Test</button>{% endcall %}
   <h3 class="subhead">Gotify</h3>
-  {% call m.form_group('Server URL', none, 'gotify_url') %}<input class="input" id="gotify_url" name="gotify_url" value="{{ v.gotify_url }}" placeholder="http://gotify:80">{% endcall %}
+  {% call m.form_group('Server URL', none, 'gotify_url') %}<input class="input" id="gotify_url" name="gotify_url" value="{{ v.gotify_url }}" placeholder="http://gotify:80">{{ m.url_warning('gotify_url', bad_urls) }}{% endcall %}
   {% call m.form_group('App Token', 'Apps, Create Application', 'gotify_token') %}<input class="input" id="gotify_token" name="gotify_token" type="password" value="{{ v.gotify_token }}" autocomplete="off"> <button class="button small" name="action" value="test-notify-gotify" type="submit">Test</button>{% endcall %}
   <h3 class="subhead">Pushover</h3>
   {% call m.form_group('App Token', none, 'pushover_token') %}<input class="input" id="pushover_token" name="pushover_token" type="password" value="{{ v.pushover_token }}" autocomplete="off">{% endcall %}
   {% call m.form_group('User Key', none, 'pushover_user') %}<input class="input" id="pushover_user" name="pushover_user" type="password" value="{{ v.pushover_user }}" autocomplete="off"> <button class="button small" name="action" value="test-notify-pushover" type="submit">Test</button>{% endcall %}
   <h3 class="subhead">Slack</h3>
-  {% call m.form_group('Webhook URL', 'An incoming webhook for a channel', 'slack_webhook') %}<input class="input" id="slack_webhook" name="slack_webhook" type="password" value="{{ v.slack_webhook }}" autocomplete="off"> <button class="button small" name="action" value="test-notify-slack" type="submit">Test</button>{% endcall %}
+  {% call m.form_group('Webhook URL', 'An incoming webhook for a channel', 'slack_webhook') %}<input class="input" id="slack_webhook" name="slack_webhook" type="password" value="{{ v.slack_webhook }}" autocomplete="off"> <button class="button small" name="action" value="test-notify-slack" type="submit">Test</button>{{ m.url_warning('slack_webhook', bad_urls) }}{% endcall %}
   <h3 class="subhead">Notifiarr</h3>
   {% call m.form_group('API Key', 'notifiarr.com, Profile, API key', 'notifiarr_api_key') %}<input class="input" id="notifiarr_api_key" name="notifiarr_api_key" type="password" value="{{ v.notifiarr_api_key }}" autocomplete="off">{% endcall %}
   {% call m.form_group('Discord Channel ID', 'Right-click the channel, Copy Channel ID (developer mode)', 'notifiarr_channel') %}<input class="input" id="notifiarr_channel" name="notifiarr_channel" value="{{ v.notifiarr_channel }}" placeholder=""> <button class="button small" name="action" value="test-notify-notifiarr" type="submit">Test</button>{% endcall %}
@@ -91,9 +91,9 @@
   {% call m.form_group('From', 'Defaults to the username', 'smtp_from') %}<input class="input" id="smtp_from" name="smtp_from" value="{{ v.smtp_from }}" placeholder="">{% endcall %}
   {% call m.form_group('To', 'Comma-separated addresses', 'smtp_to') %}<input class="input" id="smtp_to" name="smtp_to" value="{{ v.smtp_to }}" placeholder=""> <button class="button small" name="action" value="test-notify-email" type="submit">Test</button>{% endcall %}
   <h3 class="subhead">Apprise</h3>
-  {% call m.form_group('Apprise API URL', 'An Apprise API notify endpoint, e.g. http://apprise:8000/notify/mangarr - reaches ~100 more services', 'apprise_url') %}<input class="input" id="apprise_url" name="apprise_url" type="password" value="{{ v.apprise_url }}" autocomplete="off" placeholder=""> <button class="button small" name="action" value="test-notify-apprise" type="submit">Test</button>{% endcall %}
+  {% call m.form_group('Apprise API URL', 'An Apprise API notify endpoint, e.g. http://apprise:8000/notify/mangarr - reaches ~100 more services', 'apprise_url') %}<input class="input" id="apprise_url" name="apprise_url" type="password" value="{{ v.apprise_url }}" autocomplete="off" placeholder=""> <button class="button small" name="action" value="test-notify-apprise" type="submit">Test</button>{{ m.url_warning('apprise_url', bad_urls) }}{% endcall %}
   <h3 class="subhead">Webhook</h3>
-  {% call m.form_group('Webhook URL', 'POSTs {title, message, kind} as JSON', 'webhook_url') %}<input class="input" id="webhook_url" name="webhook_url" type="password" value="{{ v.webhook_url }}" autocomplete="off" placeholder=""> <button class="button small" name="action" value="test-notify-webhook" type="submit">Test</button>{% endcall %}
+  {% call m.form_group('Webhook URL', 'POSTs {title, message, kind} as JSON', 'webhook_url') %}<input class="input" id="webhook_url" name="webhook_url" type="password" value="{{ v.webhook_url }}" autocomplete="off" placeholder=""> <button class="button small" name="action" value="test-notify-webhook" type="submit">Test</button>{{ m.url_warning('webhook_url', bad_urls) }}{% endcall %}
 </fieldset>
 
 <fieldset class="fieldset" id="security">

@@ -8,6 +8,7 @@ import http.cookiejar
 import json
 import logging
 import os
+import re
 import sqlite3
 import tempfile
 import threading
@@ -15,6 +16,7 @@ import time
 import unittest
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
+from html.parser import HTMLParser
 from unittest import mock
 
 try:
@@ -1055,6 +1057,83 @@ class SecretDestinationTest(WebBase):
         self.assertEqual(self.settings.all_values()["gotify_token"], "G")
         r = self.client.put("/api/v1/settings", json={"gotify_url": "http://elsewhere"})
         self.assertIn("gotify_token", r.headers.get("x-mangarr-notice", ""))
+
+
+class _FormFields(HTMLParser):
+    """What a browser submits for <form id=form_id>, as {name: [values]}:
+    named inputs (checkboxes only when checked, no buttons) and the selected
+    (else the first) option of each select."""
+
+    def __init__(self, form_id: str):
+        super().__init__()
+        self.form_id, self.inside, self.select, self.fields = form_id, False, None, {}
+
+    def handle_starttag(self, tag, attrs):
+        a = dict(attrs)
+        if tag == "form":
+            self.inside = a.get("id") == self.form_id
+        elif not self.inside:
+            return
+        elif tag == "input" and a.get("name") and a.get("type") not in ("submit", "button", "file") and \
+                (a.get("type") not in ("checkbox", "radio") or "checked" in a):
+            self.fields.setdefault(a["name"], []).append(a.get("value", ""))
+        elif tag == "select":
+            self.select = [a.get("name"), None]
+        elif tag == "option" and self.select and (self.select[1] is None or "selected" in a):
+            self.select[1] = a.get("value", "")
+
+    def handle_endtag(self, tag):
+        if tag == "form":
+            self.inside = False
+        elif tag == "select" and self.select:
+            self.fields.setdefault(self.select[0], []).append(self.select[1] or "")
+            self.select = None
+
+
+class LegacyUrlSettingTest(WebBase):
+    """Round 2 regression: a URL an older version stored without http:// blocked every Settings save."""
+
+    def test_unchanged_legacy_url_does_not_block_saving(self):
+        from mangarr import db
+        with db.connect() as con:
+            con.execute("INSERT INTO setting (key, value) VALUES ('komga_url', '\"192.168.1.213:25600\"'),"
+                        " ('gotify_url', '\"gotify.lan\"')")
+            con.commit()
+            self.settings.refresh(con)
+        html = self.client.get("/settings").text
+        self.assertIn('value="192.168.1.213:25600"', html)                  # still shown as stored ...
+        self.assertEqual(html.count("The stored value is not a valid URL"), 2)   # ... with a hint (and gotify's)
+        parser = _FormFields("settings-form")
+        parser.feed(html)
+        form = dict(parser.fields, refresh_hours=["12"])
+        self.assertEqual(form["komga_url"], ["192.168.1.213:25600"])
+        r = self.client.post("/settings", data=form, headers={"Origin": "http://testserver"}, follow_redirects=False)
+        self.assertEqual(r.status_code, 303)
+        self.assertIn("m=saved", r.headers["location"])
+        self.assertEqual(self.settings.all_values()["refresh_hours"], 12.0)
+        # the API: GET, change one value, PUT the rest back unchanged
+        body = self.client.get("/api/v1/settings").json()
+        body["refresh_hours"] = 3
+        r = self.client.put("/api/v1/settings", json=body)
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(self.settings.all_values()["refresh_hours"], 3.0)
+        # editing the bad value itself is still checked
+        r = self.client.put("/api/v1/settings", json={"komga_url": "192.168.1.214:25600"})
+        self.assertEqual(r.status_code, 400)
+        self.assertEqual(self.settings.all_values()["komga_url"], "192.168.1.213:25600")
+
+    def test_the_hint_is_shown_in_the_warning_colour(self):
+        # round 2: .help-text (defined later, same specificity) turned the hint back into grey help text
+        from mangarr import db
+        with db.connect() as con:
+            con.execute("INSERT INTO setting (key, value) VALUES ('komga_url', '\"192.168.1.213:25600\"')")
+            con.commit()
+            self.settings.refresh(con)
+        self.assertIn('<div class="help-text text-warning">The stored value is not a valid URL',
+                      self.client.get("/settings").text)
+        css = self.client.get("/static/style.css").text
+        rules = {sel.strip(): body for sel, body in re.findall(r"([^{}]+)\{([^{}]*)\}", css)}
+        self.assertIn("color:var(--warning-label)", rules.get(".help-text.text-warning", ""))
 
 
 class FailClosedTest(WebBase):

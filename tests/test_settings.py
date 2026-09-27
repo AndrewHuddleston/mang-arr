@@ -112,6 +112,28 @@ class SettingsTest(unittest.TestCase):
         self.assertTrue(settings.is_hashed(v["auth_password"]))
         self.assertEqual(len(v["session_secret"]), 64)
 
+    def test_legacy_url_without_scheme_does_not_block_other_changes(self):     # round 2 regression
+        # stored unchecked by v0.1.0 (komga_url) and the pre-fix build (gotify_url); the form posts both back
+        with db.connect(self.path) as con:
+            con.execute("INSERT INTO setting (key, value) VALUES ('komga_url', '\"192.168.1.213:25600\"'),"
+                        " ('gotify_url', '\"gotify.lan\"'), ('gotify_token', '\"TOK\"')")
+            con.commit()
+            settings.refresh(con)
+            self.assertEqual(settings.invalid_urls(settings.all_values(con)), {"komga_url", "gotify_url"})
+            form = {k: v for k, v in settings.masked(settings.all_values(con)).items()}
+            form["refresh_hours"] = "12"
+            settings.set_many(con, form)                                      # everything echoed back, one edit
+            settings.set_many(con, {"komga_url": " 192.168.1.213:25600 ", "min_pages": "9"})
+            v = settings.all_values(con)
+            self.assertEqual((v["refresh_hours"], v["min_pages"]), (12.0, 9))
+            self.assertEqual((v["komga_url"], v["gotify_url"], v["gotify_token"]),
+                             ("192.168.1.213:25600", "gotify.lan", "TOK"))   # kept as stored, secret not unbound
+            with self.assertRaises(ValueError):                               # a changed value is still checked
+                settings.set_many(con, {"komga_url": "192.168.1.214:25600", "refresh_hours": "3"})
+            self.assertEqual(settings.all_values(con)["refresh_hours"], 12.0)  # nothing saved
+            settings.set_many(con, {"komga_url": "http://192.168.1.213:25600"})
+            self.assertEqual(settings.invalid_urls(settings.all_values(con)), {"gotify_url"})
+
 
 if __name__ == "__main__":
     unittest.main()
