@@ -41,9 +41,12 @@ Every off-the-shelf "manga *arr" fails on a real library for the same reasons:
 - **Per-chapter search.** *Search* fetches one chapter from the best trusted
   source; *Manual* shows what every source entry has for that chapter and
   lets you pick one, including entries the automatic search would not use.
-- **Paced downloads through Suwayomi**, one source at a time, with batch
-  sizes that shrink and back off when a source throttles. A chapter that
-  fails on one source is retried on the next source that lists it.
+- **Paced downloads through Suwayomi**, from several sources at once
+  (download lanes: one series per source, each source keeping its own
+  pacing), with batch sizes that shrink and back off when a source
+  throttles. A chapter that fails on one source is retried on the next
+  source that lists it. Sources whose image server refuses bursts (Comick)
+  are fetched page by page.
 - **A clean library for Komga.** One folder per series, `Chapter 012.0.cbz`
   (with the source's chapter title appended when it says more than the
   number), built from hard links so Suwayomi's own download tree is never
@@ -233,9 +236,11 @@ applies to the next job.
 
 | Setting | Notes |
 |---|---|
-| Sources: disabled / throttled | One row per Suwayomi source, two checkboxes. Defaults from `MANGARR_UNUSABLE_SOURCES` and `MANGARR_THROTTLED_SOURCES`. |
+| Sources: enabled / one by one | One row per Suwayomi source: *Enabled* (default from `MANGARR_UNUSABLE_SOURCES`), its reliability, the rate limiting detected (default list from `MANGARR_THROTTLED_SOURCES`), and *one by one*: fetch it page by page (default from `MANGARR_PAGE_WARM_SOURCES`; see [How it works](#how-it-works)). A *one by one* entry for a source that is not installed right now is kept. |
 | Refresh every (hours) | The scheduler and the daemon pick a change up within seconds. |
 | Download in order | On by default. Each series downloads strictly in chapter order, one chapter at a time; a chapter that fails is tried on the other sources at once, and if none can deliver it the series waits there (later chapters show "waiting for chapter N") while the pass carries on with the next series. Off: chapters are fetched from whichever source has them, faster but out of order and with possible gaps. |
+| Download lanes | How many sources download at the same time during a refresh pass or *Search all wanted now* (1-8, default 3). Each source serves one series at a time and keeps its pacing, so a slow or rate-limited source holds up only the series that need it. Suwayomi's own *max sources in parallel* must allow as many: a pass uses the lower of the two. The field shows Suwayomi's value and, when it is lower, a *Save and let Suwayomi use N* button that changes it in Suwayomi: the only Suwayomi setting mang-arr ever changes, and only on that button. Adding one series, refreshing one and a chapter search still download from one source at a time. |
+| Page delay (seconds) | Spacing between page requests on sources fetched page by page (default 2.5, 0.5-60). It is the start and the minimum: it widens 1.5× after each busy answer from the image server (up to 30 s) and eases back 0.85× every five pages that arrive. |
 | Re-check complete finished series every (days) | A pass does series with missing chapters first, then the rest; a *finished* series with nothing missing is skipped until this many days (default 7) have passed since its last check. 0 re-checks everything every pass. |
 | Minimum pages for a fractional chapter | A `12.5` with fewer pages than this is treated as a notice image and marked junk. Default 8. |
 | Komga URL, API key, library id | When URL and key are set, every import that linked at least one chapter asks Komga to scan (the given library, or all of them). The key comes from Komga's account menu → API keys. *Save & test Komga* lists the libraries it can see; the health check calls the same API. |
@@ -372,8 +377,8 @@ Every status except *have* comes with a reason, shown in the chapter table:
 | Status | Meaning | Reason texts |
 |---|---|---|
 | `have` | On disk and linked into the library. The reason column shows the library file name instead. | - |
-| `wanted` | Listed by a trusted source, not on disk yet. Downloaded by the next *Search missing*, *Search all wanted now* or scheduled refresh. | *available on Weeb Central (also MangaDex, Bato); not downloaded yet - waiting for a download pass*; *not attempted: the download pass was cancelled or interrupted before this chapter*. A chapter you just took back with *want* shows *waiting for a download pass*. |
-| `failed` | The last download pass tried and could not get it. It is retried on every refresh: the re-resolve puts it back to wanted, then the download runs again. | One entry per source tried, joined with `;`: *Manganato: Suwayomi reported an error on every try, gave up after 300s of backoff*; *MangaDex: download made no progress, gave up after 60s of backoff*; *Bato: Suwayomi finished the batch without this chapter (download error)*; *does not list it* (from a per-chapter search). Prefixed *failed on every source:* when the pass ran out of fallbacks; suffixed *(no other source has this chapter)* when there was only one. *no enabled source lists this chapter* when the only entries that have it are disabled. |
+| `wanted` | Listed by a trusted source, not on disk yet. Downloaded by the next *Search missing*, *Search all wanted now* or scheduled refresh. | *available on Weeb Central (also MangaDex, Bato); not downloaded yet - waiting for a download pass*, with *(rate-limited source: slow)* or *(images fetched page by page: slow)* after the source's name when it is one of those; *not attempted: the download pass was cancelled or interrupted before this chapter*; *not attempted: Suwayomi did not start this chapter within 30 min (its download queue was busy with other downloads)*. A chapter you just took back with *want* shows *waiting for a download pass*. |
+| `failed` | The last download pass tried and could not get it. It is retried on every refresh: the re-resolve puts it back to wanted, then the download runs again. | One entry per source tried, joined with `;`: *Manganato: Suwayomi reported an error on every try, gave up after 300s of backoff*; *MangaDex: download made no progress, gave up after 60s of backoff*; *Bato: Suwayomi finished the batch without this chapter (download error)*; *Comick (Unoriginal) (EN): the image server refused even paced page requests (0 of 20 pages), gave up after 120s of backoff*; *fetching pages one at a time took over 10 min (12 of 30 pages), gave up after 120s of backoff*; *its pages were fetched one by one, but Suwayomi still could not build the chapter (page cache cleared, or a page kept failing)*; *does not list it* (from a per-chapter search). Prefixed *failed on every source:* when the pass ran out of fallbacks; suffixed *(no other source has this chapter)* when there was only one. *no enabled source lists this chapter* when the only entries that have it are disabled. |
 | `unavailable` | It was wanted or failed, but no trusted source lists it any more (the source dropped it, or the entry was distrusted). It becomes wanted again as soon as a source lists it. | *no trusted source lists this chapter any more* |
 | `junk` | A fractional chapter with fewer pages than *Minimum pages for a fractional chapter*: a notice or an ad. Never downloaded; a file for it in staging is not imported. | *3 page(s) on Manganato: a notice image, not a chapter* |
 | `ignored` | You pressed *ignore*. Kept across refreshes; nothing is downloaded until you press *want*. | - |
@@ -433,7 +438,14 @@ The Queue shows the job list (kinds: `add`, `refresh`, `refresh-all`,
 `search-wanted`, `chapter`, `adopt-scan`, `adopt`, `list-sync`) with
 progress, results, and a *cancel* button per queued or running job, a
 *Refresh all now* button, and Suwayomi's own download queue with per-item
-progress; it reloads every ten seconds. History is the last 200 events
+progress; it reloads every ten seconds. For the current (or last) refresh
+pass it lists every series with its state: *queued* (not resolved yet),
+*working*, *waiting* (resolved, waiting for a download lane: the source it
+needs is busy with another series or resting between series, or Suwayomi
+is not answering; the text says which), then *done*, *no match*, *failed*,
+*error* or *cancelled*. While the pass downloads, a *Download lanes* table
+above it shows each lane: the source, the series, what it is doing and
+since when, or *idle*. History is the last 200 events
 across all series.
 
 #### Missing
@@ -458,7 +470,7 @@ instead of linked, if any. Then:
 - **Backups**: the kept backups with size and age, a download link each,
   *restore* and *delete* buttons, *Back up now*, and *Restore from file*
   for an uploaded `.db`. See Backups.
-- **Sources**: every Suwayomi source with its ok / throttled / unusable flag.
+- **Sources**: every Suwayomi source with its ok / page by page / throttled / disabled flag.
 - **Configuration**: the effective `MANGARR_*` values.
 
 **Logs** (`/system/logs`) shows the last 500 lines of the log file (up to
@@ -725,6 +737,7 @@ something.
   |---|---|---|
   | Suwayomi | the GraphQL API does not answer | - (ok shows version, source count and latency) |
   | Sources | Suwayomi has no English sources, or every source is disabled in Settings | - |
+  | Download lanes | - | Download Lanes is more than Suwayomi's *max sources in parallel*, or that could not be read: a pass then uses fewer lanes and sources take turns (Settings has a button to raise it) |
   | Jobs | - | the running job has shown no progress for 30 minutes (every other job waits behind it; cancel it on the Queue page if it is stuck). Every step that can take long counts as progress (a source searched, a download batch moving, a staged folder identified, a series linked); waiting for another process's download run does not. A restore cannot be cancelled |
   | Komga | the configured URL / API key fails a real `GET /api/v1/libraries` | not configured (new chapters appear only at Komga's own scan interval) |
   | AniList, MangaDex | - | the site is unreachable or answers an error |
@@ -762,6 +775,15 @@ something.
   | `mangarr_jobs_total` | `kind`, `status` | jobs by outcome |
   | `mangarr_suwayomi_up` | | 1 when the Suwayomi API answered on this scrape |
   | `mangarr_last_refresh_timestamp` | | unix time of the last completed refresh-all |
+  | `mangarr_download_lanes` | | download lanes of the running pass (0 when no pass downloads) |
+  | `mangarr_download_lanes_busy` | | lanes downloading right now |
+  | `mangarr_series_waiting_for_lane` | | series resolved and waiting for a lane |
+  | `mangarr_lane_seconds_total` | `source` | time the lanes spent on each source; `rate()` near 1 marks the source that sets the pace of a pass |
+  | `mangarr_download_unstarted_total` | `source` | batches Suwayomi did not start within 30 minutes (its queue busy with other downloads) |
+  | `mangarr_page_fetches_total` | `source`, `result` (ok, busy, timeout, gone, error) | page requests on sources fetched page by page |
+  | `mangarr_page_warmups_total` | `source`, `result` (ok, partial, refused, deadline, no_pages, cancelled) | chapters fetched page by page |
+  | `mangarr_page_warm_downloads_total` | `source`, `result` (ok, rewarm, failed_after_warm) | downloads after that; `rewarm` counts chapters whose pages had to be fetched again (Suwayomi's page cache was cleared) |
+  | `mangarr_page_delay_seconds` | `source` | current spacing of page requests on that source |
 
 - **Update check**: once a day `serve` asks GitHub for the latest release
   (first check a minute after start; a failed check is retried hourly and
@@ -788,16 +810,17 @@ are exempt from the login.
    union of chapter numbers across every accepted source, minus what is on disk.
 4. **Each chapter picks its own source**, preferring healthy, unthrottled ones,
    so a series split across three sites is still complete.
-5. **Suwayomi downloads**, paced per source with backoff, so one throttled site
-   does not stall the rest.
+5. **Suwayomi downloads**, from several sources at once and paced per source
+   with backoff, so one throttled site does not stall the rest.
 6. **The library is hard links.** Suwayomi's tree is its record of what it has
    downloaded and is never renamed; the Komga tree is built beside it, one
    folder per series regardless of how many sources the chapters came from.
 
 State lives in one SQLite database (series, the source entries that matched
 them, every chapter's status, reason, title, release date and paths, an
-event log, import lists, settings). Long operations run in a single worker
-thread because Suwayomi has one download queue.
+event log, import lists, settings). Jobs run one at a time on a single
+worker thread; within a refresh pass, download lanes fetch from several
+sources at once, one series per source (below).
 
 A refresh does three things in order. It re-reads the series from AniList
 or MangaDex (status, chapter and volume counts, synonyms, description,
@@ -826,9 +849,43 @@ for the rest of the run; only chapters no source could deliver end up
 the web worker and the CLI; a second one waits. A per-chapter search or
 manual download is the same machinery for one chapter from one entry.
 
+A refresh pass (and *Search all wanted now*) resolves its series one after
+the other and hands every series with chapters due to the download lanes,
+then goes on resolving. A lane downloads one series from one source at a
+time: a free lane takes the first waiting series, in pass order, that wants
+a source no other lane is on. So each source serves one series at a time
+and keeps its pacing, a rate-limited source rests *Throttled delay* seconds
+between series, and a slow source holds up only the series that need it.
+The `(EN)` and `(ALL)` variants of one extension count as one source. The
+lane count is *Download lanes*, but never more than Suwayomi's own *max
+sources in parallel*, which a pass reads and never changes. Download in
+order, fallbacks and every reason work as for a single series; what arrived
+is written and linked as soon as a series is finished. The download lock is
+held from the first series handed over to the end of the pass. A batch that
+Suwayomi never started (its queue busy with other downloads) does not count
+as stalled: after 30 minutes it is taken back out and the series waits for
+the next pass, and the source is not marked as rate-limited.
+
+Some image servers (Comick's) answer the burst of page requests Suwayomi
+makes for a chapter with HTTP 429, yet serve the same pages one at a time.
+For a source ticked *one by one* in Settings → Sources, mang-arr first asks
+Suwayomi for each page of the chapter itself, *Page delay* seconds apart
+(wider after a busy answer), and only then queues the chapter, which
+Suwayomi builds from the pages it just cached. Only page addresses of the
+form Suwayomi itself uses (`/api/v1/manga/<id>/chapter/<n>/page/<k>`) are
+requested; any other answer falls back to a normal download. That takes 2-4
+minutes a chapter, so such a source comes last, after normal and
+rate-limited ones: it is used for chapters no other source lists, and
+searched with at most three titles. A chapter whose pages keep being
+refused is backed off like a rate limit (at most 2 minutes) and never
+queued; one that Suwayomi does not build from its cache gets its pages
+fetched once more, then fails with a reason that says so.
+
 When Suwayomi stops answering, calls to it fail at once for a minute
-instead of each waiting out its timeouts, and a refresh pass stops with one
-error after two series in a row found it down. A source search that times
+instead of each waiting out its timeouts. A refresh pass then holds for
+that minute and goes on; if Suwayomi is down again right after, the pass
+stops with one error. Lanes that run into the same outage together count
+it once. A source search that times
 out is followed by a quick question to Suwayomi itself: a slow website only
 costs that source, a frozen Suwayomi ends the pass within minutes. Cancel
 never waits out a Suwayomi request: a refresh, search, download or
@@ -858,6 +915,8 @@ mangarr/
   suwayomi.py    Suwayomi GraphQL client
   resolver.py    search every source, accept matches, build per-chapter plan
   downloader.py  paced per-source download through Suwayomi, with fallback
+  lanes.py       download lanes: a refresh pass downloads from several sources at once
+  pagewarm.py    fetches a chapter's pages one at a time (sources that refuse bursts)
   library.py     staging tree parsing, hard-link library, file names
   db.py          SQLite: series, sources, chapters, events, lists, settings
   core.py        add / refresh / import / adopt / per-chapter download
@@ -952,8 +1011,11 @@ curl -H "X-Api-Key: $KEY" http://localhost:6789/api/v1/wanted
 | `GET /system/backups/{name}` | download a kept backup |
 
 Jobs are returned as `{"id", "kind", "title", "seriesId", "status",
-"queuedAt", "startedAt", "finishedAt", "progress", "message"}`; poll
-`/api/v1/queue` to follow one.
+"queuedAt", "startedAt", "finishedAt", "progress", "progressAt", "message",
+"items", "lanes"}`; poll `/api/v1/queue` to follow one. A refresh pass lists
+its series in `items` (`series_id`, `title`, `state`, `result`) and, while
+it downloads, every download lane in `lanes` (`lane`, `source`,
+`series_id`, `title`, `text`, `since`; `source` is null for an idle lane).
 
 `GET /api/v1/settings` returns the settings with secrets masked, plus the
 API key itself (the caller is already authenticated, or no login is set);
