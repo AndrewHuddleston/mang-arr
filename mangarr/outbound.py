@@ -18,7 +18,8 @@ and to GitHub for the update check, with the guard rails plain urllib lacks:
   could hold a thread for ever. A watchdog shuts the socket down once the
   deadline passes (or the moment it appears, if connecting took longer);
   the caller gets TimeoutError.
-- Response bodies are capped (max_bytes).
+- Response bodies are capped (max_bytes). drain() reads a body in pieces
+  and throws it away, for a GET whose only purpose is its side effect.
 """
 import http.client
 import logging
@@ -223,3 +224,47 @@ def fetch(url: str, data: bytes | None = None, headers: dict | None = None, meth
         log.warning("answer from %s is larger than %d bytes; not reading it", _host(url), max_bytes)
         raise ValueError(f"answer larger than {max_bytes} bytes")
     return status, body
+
+
+def drain(url: str, timeout: float = 20.0, deadline: float | None = None, max_bytes: int = 1 << 20,
+          chunk: int = 64 << 10, headers: dict | None = None, what: str = "URL") -> tuple[int, int, bool]:
+    """(status, bytes read, truncated) for one GET whose body is read
+    `chunk` bytes at a time and thrown away, at most max_bytes (truncated is
+    True when more followed). The same guard rails and errors as fetch():
+    http(s) only, no redirects, `deadline` bounding the whole call."""
+    check_url(url, what)
+    start = time.monotonic()
+    if deadline is None:
+        deadline = start + timeout
+    left = deadline - start
+    if left <= 0:
+        raise TimeoutError("no time left for this request")
+    req = urllib.request.Request(url, None, headers or {})
+    req.mangarr_deadline = deadline
+    req.mangarr_follow = False
+    req.mangarr_conns = []
+    nbytes, truncated = 0, False
+    try:
+        with _OPENER.open(req, timeout=min(timeout, left)) as r:
+            status = r.status
+            while True:
+                want = min(chunk, max_bytes - nbytes)
+                if want <= 0:
+                    truncated = bool(r.read(1))
+                    break
+                data = r.read(want)
+                if not data:
+                    break
+                nbytes += len(data)
+    except (urllib.error.HTTPError, ValueError):
+        raise
+    except Exception as e:
+        if time.monotonic() >= deadline:
+            raise TimeoutError(f"no complete answer within {deadline - start:.0f} s") from e
+        raise
+    finally:
+        for conn in req.mangarr_conns:
+            conn.disarm()
+    if time.monotonic() >= deadline:          # the watchdog cut the body short
+        raise TimeoutError(f"no complete answer within {deadline - start:.0f} s")
+    return status, nbytes, truncated

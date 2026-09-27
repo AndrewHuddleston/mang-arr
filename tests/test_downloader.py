@@ -254,6 +254,13 @@ class SeriesStepsTest(unittest.TestCase):
             self.assertEqual(steps.wants(set()), [])
             self.assertEqual((reasons.get(2.0), reasons.get(3.0), reasons.get(1.0)), ("not now", "not now", None))
 
+    def test_a_page_by_page_source_takes_one_chapter_at_a_time(self):
+        m = match("Comick (Unoriginal) (EN)", 1, [1, 2, 3])
+        m.source = Source("1", m.source.name, "en", page_warm=True)
+        steps, _ = steps_for([m], [1, 2, 3], in_order=False)
+        run = steps.take("comick (unoriginal)", set())
+        self.assertEqual((run.batch, len(run.todo)), (1, 3))
+
     def test_en_and_all_variants_are_one_site(self):
         self.assertEqual(downloader.lanes_key("Comick (Unoriginal) (EN)"), downloader.lanes_key("Comick (Unoriginal) (ALL)"))
         self.assertEqual(downloader.lanes_key(" Weeb Central "), "weeb central")

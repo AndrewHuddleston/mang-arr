@@ -360,7 +360,8 @@ class SeriesSteps:
         m = next(c for c in plan.candidates[nums[0]] if c.manga_id == g.manga_id)
         chapters = {c.number: c for c in m.chapters}
         todo = [chapters[n] for n in nums if n in chapters]
-        batch = config.BATCH_THROTTLED if m.source.throttled else config.BATCH_DEFAULT
+        # a page-by-page source fetches one chapter at a time
+        batch = 1 if m.source.page_warm else config.BATCH_THROTTLED if m.source.throttled else config.BATCH_DEFAULT
         patient = all(self.attempt[n] + 1 >= len(plan.candidates[n]) for n in nums)
         log.info("%s: downloading %d chapter(s) of %r from %s [%s]%s", self.label, len(todo),
                  m.title, m.source.name, ranges([c.number for c in todo]),
@@ -451,7 +452,7 @@ def download(client: Client, plan: Plan, only: set[float] | None = None,
                 ok, failed, why = _download_source(client, run.match.manga_id, run.todo, run.batch, label,
                                                    run.match.source.name, run.patient, cancel, report, memo,
                                                    stop_on_fail=run.in_order, throttled=run.match.source.throttled,
-                                                   gone=gone)
+                                                   warm=run.match.source.page_warm, gone=gone)
                 steps.record(run, ok, failed, why)
                 if memo.stop:
                     steps.stop(memo.stop)

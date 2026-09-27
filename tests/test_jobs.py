@@ -767,6 +767,86 @@ class BreakerTest(unittest.TestCase):                 # finding 78
         self.assertEqual(suwayomi._down, {})
 
 
+class SourcesStampTest(unittest.TestCase):
+    """Client.sources() stamps the Settings flags, and Suwayomi's own
+    'max sources in parallel' is read, and written only when asked."""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        suwayomi._down.clear()
+        self.addCleanup(suwayomi._down.clear)
+        p = mock.patch("mangarr.config.DB_PATH", tmp.name + "/t.db")
+        p.start()
+        self.addCleanup(p.stop)
+        self.sent = []
+
+    def client(self, answer):
+        c = Client("http://suwayomi.test")
+
+        def gq(query, variables=None, **kw):
+            self.sent.append((query, variables, kw))
+            return answer(query) if callable(answer) else answer
+        c.gq = gq
+        return c
+
+    def test_page_warm_is_stamped_and_disabled_still_wins(self):
+        nodes = [{"id": "1", "displayName": "Comick (Unoriginal) (EN)", "lang": "en"},
+                 {"id": "2", "displayName": "Weeb Central", "lang": "en"},
+                 {"id": "3", "displayName": "MangaFire (ALL)", "lang": "all"}]
+        values = {"unusable_sources": ["mangafire (all)"], "throttled_sources": [],
+                  "page_warm_sources": ["comick (unoriginal) (en)", "mangafire (all)"]}
+        with mock.patch("mangarr.settings.all_values", lambda con=None: values):
+            got = {s.name: s for s in self.client({"sources": {"nodes": nodes}}).sources()}
+        comick, weeb, fire = got["Comick (Unoriginal) (EN)"], got["Weeb Central"], got["MangaFire (ALL)"]
+        self.assertEqual((comick.page_warm, comick.tier, comick.unusable), (True, 2, False))
+        self.assertEqual((weeb.page_warm, weeb.tier), (False, 0))
+        self.assertTrue(fire.unusable and fire.page_warm)
+        searched = []
+
+        class Search:
+            def search(self, src, q):
+                searched.append(src.name)
+                return []
+        resolver.resolve(Search(), Series(english="T"), sources=list(got.values()))
+        self.assertNotIn("MangaFire (ALL)", searched)       # disabled: not searched, page by page or not
+        with mock.patch("mangarr.settings.all_values",
+                        lambda con=None: {"unusable_sources": [], "throttled_sources": [], "page_warm_sources": 8.0}):
+            self.assertFalse(any(s.page_warm for s in self.client({"sources": {"nodes": nodes}}).sources()))
+
+    def test_tier(self):
+        self.assertEqual([Source("1", "A", "en", throttled=t, page_warm=w).tier
+                          for t, w in ((False, False), (True, False), (False, True), (True, True))], [0, 1, 2, 2])
+
+    def test_max_sources_in_parallel_is_read(self):
+        self.assertEqual(self.client({"settings": {"maxSourcesInParallel": 1}}).max_sources_in_parallel(), 1)
+        self.assertEqual(self.sent[0][2], {"timeout": 30, "retries": 1})
+        for odd in ({"settings": None}, {}, {"settings": {"maxSourcesInParallel": "x"}}):
+            self.assertIsNone(self.client(odd).max_sources_in_parallel(), odd)
+
+        def down(query):
+            raise SuwayomiUnreachable("Suwayomi at x unreachable")
+        self.assertIsNone(self.client(down).max_sources_in_parallel())
+        self.assertFalse(any("setSettings" in q for q, _, _ in self.sent))     # reading never writes
+
+    def test_set_max_sources_in_parallel(self):
+        c = self.client({"setSettings": {"settings": {"maxSourcesInParallel": 3}}})
+        self.assertEqual(c.set_max_sources_in_parallel(3), 3)
+        query, variables, kw = self.sent[0]
+        self.assertIn("setSettings", query)
+        self.assertEqual((variables, kw), ({"n": 3}, {"timeout": 30, "retries": 1}))
+        self.assertEqual(suwayomi._OPNAME.search(query).group(1), "setSettings")
+        self.assertEqual(suwayomi._OPNAME.search("{ settings { maxSourcesInParallel } }").group(1), "settings")
+
+    def test_page_urls(self):
+        c = self.client({"fetchChapterPages": {"pages": ["/api/v1/manga/1/chapter/2/page/0"]}})
+        self.assertEqual(c.page_urls(7), ["/api/v1/manga/1/chapter/2/page/0"])
+        self.assertEqual(self.sent[0][1], {"id": 7})
+        for odd in ({"fetchChapterPages": {"pages": None}}, {"fetchChapterPages": None}, {}):
+            with self.assertRaises(SuwayomiError):
+                self.client(odd).page_urls(7)
+
+
 class ResolverErrorsTest(unittest.TestCase):          # finding 94
     def setUp(self):
         resolver._unreachable.clear()
