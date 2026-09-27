@@ -18,6 +18,7 @@ from dataclasses import dataclass, field, replace
 from . import db, downloader, duplicates, komga, library, limits, metadata, metrics
 from .matching import oneline
 from .model import Series
+from .pagecounts import PageCounts
 from .resolver import Plan, primary, resolve
 from .suwayomi import Client, SuwayomiError, with_cancel
 
@@ -58,13 +59,16 @@ def add_series(con, client: Client, series: Series, download: bool = True, do_im
     other reference raises duplicates.AlreadyTracked before any search."""
     if series_id is None:
         duplicates.check_new(con, series)
-    plan = resolve(client, series, reliability=db.reliability(con), should_cancel=should_cancel, progress=progress)
+    counts = PageCounts(con)             # fractional chapters counted in an earlier pass
+    plan = resolve(client, series, reliability=db.reliability(con), should_cancel=should_cancel, progress=progress,
+                   counts=counts)
     lookups = with_cancel(client, should_cancel)
     if series_id is not None and not db.get_series(con, series_id):
         raise Gone(f"{series.title} was deleted during the refresh")
     series_id = db.upsert_series(con, series)
     p = primary(plan)
     expired = db.save_plan(con, series_id, plan, p.manga_id if p else None)
+    counts.save(con, plan)
     if expired:
         log.warning("%s: %s could not be searched for over %d days; its entry is dropped and the chapters "
                     "only it listed count as unavailable", series.title, ", ".join(expired), db.UNREACHABLE_KEEP_DAYS)

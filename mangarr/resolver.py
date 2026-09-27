@@ -20,6 +20,7 @@ from . import config, limits
 from .limits import Cancelled
 from .matching import ACCEPTED, AUTHOR_DIFFER, MAX_TITLE, author_level, match_level, oneline
 from .model import Series
+from .pagecounts import PageCounts
 from .suwayomi import Chapter, Client, Source, SuwayomiError, SuwayomiUnreachable, site_key, with_cancel
 
 log = logging.getLogger(__name__)
@@ -154,12 +155,14 @@ class Plan:
 
 def resolve(client: Client, series: Series, sources: list[Source] | None = None,
             reliability: dict[str, float] | None = None, should_cancel: Callable[[], bool] | None = None,
-            progress: Callable[[str], None] | None = None) -> Plan:
+            progress: Callable[[str], None] | None = None, counts: PageCounts | None = None) -> Plan:
     """The plan for a series. Several sites are searched at once
     (search_parallel; _search_parallel), and the plan is the same whatever
     order they answer in. A cancel (should_cancel) is noticed between
     sources and cuts the Suwayomi calls in flight short, raising Cancelled
-    with nothing decided; `progress` hears how far the search is."""
+    with nothing decided; `progress` hears how far the search is. With
+    `counts`, fractional chapters counted in an earlier pass are not
+    counted again while their count holds (see pagecounts.py)."""
     cancel = should_cancel or (lambda: False)
     report = progress or (lambda m: None)
     raw = client
@@ -204,7 +207,7 @@ def resolve(client: Client, series: Series, sources: list[Source] | None = None,
     candidates = _assign(matches)
     assignment = {n: c[0] for n, c in candidates.items()}
     plan = Plan(series, matches, rejected, unreachable, assignment, candidates=candidates)
-    _prune_junk(client, plan, report)
+    _prune_junk(client, plan, report, counts)
     log.info("%s: %d chapters listed from %d source(s), %d on disk per Suwayomi, %d wanted, %d junk",
              series.title, len(plan.chapters), len({m.manga_id for m in assignment.values()}),
              len(plan.have()), len(plan.wanted()), len(plan.junk))
@@ -540,28 +543,51 @@ def _assign(matches: list[SourceMatch]) -> dict[float, list[SourceMatch]]:
     return out
 
 
-def _prune_junk(client: Client, plan: Plan, progress: Callable[[str], None] | None = None) -> None:
+def _prune_junk(client: Client, plan: Plan, progress: Callable[[str], None] | None = None,
+                counts: PageCounts | None = None) -> None:
     """Drop fractional chapters that turn out to be a handful of pages:
     notices and ads, not chapters. Every fractional chapter is probed, not
     just single-source ones - aggregators (Bato, Manganato) scrape the same
-    upstream and list the same junk, so agreement between them proves nothing."""
+    upstream and list the same junk, so agreement between them proves nothing.
+    With `counts`, a count kept from an earlier pass is used while it holds,
+    and only the other chapters are probed."""
     from . import settings
     min_pages = int(settings.get("min_pages"))
-    suspects = [n for n in plan.assignment if n != int(n)]
+    suspects = sorted(n for n in plan.assignment if n != int(n))
     if not suspects:
         return
-    log.info("probing %d fractional chapter(s) for junk (< %d pages)", len(suspects), min_pages)
-    for i, n in enumerate(sorted(suspects), 1):
-        if progress:
-            progress(f"counting the pages of fractional chapters ({i} of {len(suspects)})")
+    pages: dict[float, int | None] = {}
+    todo: list[tuple[float, SourceMatch, Chapter]] = []
+    for n in suspects:
         m = plan.assignment[n]
         ch = next((c for c in m.chapters if c.number == n), None)
         if ch is None or ch.downloaded:
             continue
-        pages = client.page_count(ch.id)
-        log.debug("%s ch %g: %s pages", m.source.name, n, pages)
-        if pages is not None and pages < min_pages:
-            plan.junk[n] = (m, pages)
+        kept, count = counts.lookup(m.manga_id, ch, min_pages) if counts is not None else (False, None)
+        if kept:
+            pages[n] = count
+        else:
+            todo.append((n, m, ch))
+    if todo or pages:
+        log.info("probing %d fractional chapter(s) for junk (< %d pages)%s", len(todo), min_pages,
+                 f"; {len(pages)} more counted in an earlier pass" if pages else "")
+    for i, (n, m, ch) in enumerate(todo, 1):
+        if progress:
+            progress(f"counting the pages of fractional chapters ({i} of {len(todo)})")
+        try:
+            count = client.page_count(ch.id)
+        except SuwayomiUnreachable as e:           # no verdict on the chapter: kept, and counted next time
+            log.debug("%s ch %g: pages not counted: %s", m.source.name, n, e)
+            count = None
+        else:
+            if counts is not None:
+                count = counts.record(m.manga_id, ch, count)
+        log.debug("%s ch %g: %s pages", m.source.name, n, count)
+        pages[n] = count
+    for n in suspects:
+        count = pages.get(n)
+        if count is not None and count < min_pages:
+            plan.junk[n] = (plan.assignment[n], count)
             del plan.assignment[n]
             plan.candidates.pop(n, None)
     if plan.junk:
