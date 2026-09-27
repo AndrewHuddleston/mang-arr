@@ -46,7 +46,7 @@ def check(force: bool = False) -> dict:
         # no credentials to forward); 15 s in total and a 1 MB cap keep a slow or odd answer harmless
         _, body = outbound.fetch(RELEASES_URL, headers=headers, timeout=15, follow_redirects=True, max_bytes=1 << 20)
         d = json.loads(body)
-        tag = str(d.get("tag_name") or "").lstrip("v")[:40]
+        tag = str(d.get("tag_name") or "").lstrip("v")[:40]      # tags are plain numbers; old "v0.1.0" still reads
         url = d.get("html_url")
         if not (isinstance(url, str) and url.startswith("https://")):     # shown as a link in the UI banner
             url = None

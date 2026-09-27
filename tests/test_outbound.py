@@ -258,6 +258,19 @@ class UpdatesTest(unittest.TestCase):
         self.assertEqual((s["latest"], s["url"], s["error"]), ("99.0.0", None, None))
 
 
+    def test_plain_version_tags(self):
+        # release tags are plain numbers ("0.2.0"); an older "v0.1.0" style tag still compares the same
+        for tag in ("99.0.0", "v99.0.0"):
+            with self.subTest(tag=tag):
+                rel = json.dumps({"tag_name": tag, "html_url": "https://github.com/x/y/releases/tag/99.0.0"}).encode()
+                srv = _Server({"/r": _reply(200, rel)})
+                try:
+                    with mock.patch.object(updates, "RELEASES_URL", srv.url + "/r"):
+                        s = updates.check(force=True)
+                finally:
+                    srv.close()
+                self.assertEqual((s["latest"], s["updateAvailable"]), ("99.0.0", True))
+
 class SettingsValidationTest(unittest.TestCase):
     def test_url_settings_http_only(self):
         for key in settings.URL_KEYS:
