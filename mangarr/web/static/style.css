@@ -507,3 +507,6 @@ body.login{display:flex;align-items:center;justify-content:center;min-height:100
   .toolbar-button{width:52px}
   .poster-controls{opacity:.9}
 }
+
+.subhead{margin:18px 0 6px;font-size:14px;font-weight:600;color:#e1e2e3;border-bottom:1px solid #3a3a3a;padding-bottom:4px}
+.inline-check{display:inline-flex;align-items:center;gap:6px;margin-right:16px}

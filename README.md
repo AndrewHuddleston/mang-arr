@@ -69,8 +69,9 @@ Every off-the-shelf "manga *arr" fails on a real library for the same reasons:
 - **Update check** against GitHub releases, shown as a banner.
 - **CLI** for everything the UI does, plus `resolve`, a dry run that shows
   where every chapter would come from before you commit.
-- **Notifications** via Pushover and/or a generic JSON webhook when new
-  chapters land or a refresh fails.
+- **Notifications** to Discord, Telegram, ntfy, Gotify, Pushover, Slack, Notifiarr, email (SMTP),
+  Apprise (about 100 more services) and a generic JSON webhook, each with its own test button; choose
+  which events notify: new chapters, series added, failed downloads, health problems.
 - **Monitoring**: Prometheus metrics at `/metrics`, a health endpoint that
   says what is wrong, and optional JSON log lines.
 - **Stdlib-only core.** Python 3.10+, SQLite, `urllib`. The web UI is an
@@ -214,12 +215,12 @@ applies to the next job.
 | Re-check complete finished series every (days) | A pass does series with missing chapters first, then the rest; a *finished* series with nothing missing is skipped until this many days (default 7) have passed since its last check. 0 re-checks everything every pass. |
 | Minimum pages for a fractional chapter | A `12.5` with fewer pages than this is treated as a notice image and marked junk. Default 8. |
 | Komga URL, API key, library id | When URL and key are set, every import that linked at least one chapter asks Komga to scan (the given library, or all of them). The key comes from Komga's account menu → API keys. *Save & test Komga* lists the libraries it can see; the health check calls the same API. |
-| Pushover token / user, webhook URL | Notification channels; *Save & send test notification* checks them. |
+| Notifications | Discord webhook, Telegram bot token + chat id, ntfy topic URL (+ token), Gotify URL + app token, Pushover token + user key, Slack webhook, Notifiarr API key + Discord channel id, SMTP email, Apprise API URL, webhook URL. Every configured channel gets each message; each has a *Test* button that sends to that channel only. *Notify on* picks the events: new chapters, series added, failed downloads (after a pass, with the reasons), health problems (when a check turns red). |
 | Login method | *login page* (a form and a signed session cookie that lasts 30 days, with a *Sign out* button in the top bar) or *browser prompt* (HTTP basic auth). Only active once a username is set. |
 | Web username / password | The login for the UI and API. Empty username means no login; the health check then warns that anyone on the network can use the page. |
 | API key | Generated on first start and shown in the clear (it is not a secret field). When a login is set, a request carrying it as an `X-Api-Key` header or `?apikey=` query parameter is accepted without a session or basic auth. Edit it to rotate it; rotating it, or changing the password, also signs every browser out. |
 
-Secrets (the Komga API key, Pushover values, password) are never shown again once
+Secrets (the Komga API key, notification tokens and webhook URLs, password) are never shown again once
 saved: the field shows `********`. Leave that as it is to keep the value,
 type a new one to replace it, or clear the field to remove it.
 
@@ -643,7 +644,7 @@ something.
   | Staging, Library | the path does not exist, or the library is not writable | - |
   | Hard links | - | staging and library are on different filesystems (chapters are copied) |
   | Disk | less than 2 GB free on the library volume | less than 20 GB free |
-  | Notifications | - | neither Pushover nor a webhook is configured |
+  | Notifications | - | no notification channel is configured |
   | Security | - | no web login is set |
 
 - **`GET /api/v1/health`** returns `{"ok": true, "problems": [],
@@ -752,7 +753,7 @@ mangarr/
   backup.py      scheduled and on-demand database backups, restore
   updates.py     GitHub release check
   komga.py       Komga scan trigger and connection test
-  notify.py      Pushover / webhook
+  notify.py      Discord, Telegram, ntfy, Gotify, Pushover, Slack, Notifiarr, email, Apprise, webhook
   metrics.py     Prometheus metrics
   logsetup.py    logging (text or JSON lines)
   __main__.py    CLI

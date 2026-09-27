@@ -110,15 +110,23 @@ def run(client: Client, force: bool = False) -> list[Check]:
 
     # -- configuration --
     if not notify.configured():
-        out.append(Check("warning", "Notifications", "none configured (Pushover or webhook in Settings)"))
+        out.append(Check("warning", "Notifications", "none configured (Settings -> Notifications)"))
+    else:
+        out.append(Check("ok", "Notifications", ", ".join(notify.CHANNELS[k][0] for k in notify.configured_channels())))
     if not v["auth_user"]:
         out.append(Check("warning", "Security", "no web login set; anyone on the network can use this page"))
 
     with _lock:
         _cache.update(at=time.monotonic(), checks=list(out))
+        errors = {f"{c.name}: {c.detail.split(':')[0]}" for c in out if c.level == "error"}
+        new = errors - _cache.get("errors", set())
+        _cache["errors"] = errors
     for c in out:
         if c.level == "error":
             log.warning("health: %s: %s", c.name, c.detail)
+    if new:
+        notify.send("mang-arr: health problem", "\n".join(f"{c.name}: {c.detail}" for c in out
+                                                           if c.level == "error"), "health")
     return out
 
 

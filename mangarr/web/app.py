@@ -137,6 +137,8 @@ def _job_add(series: model.Series, download: bool, monitored: bool = True):
             if not monitored:
                 db.set_monitored(con, o.series_id, False)
         job.series_id = o.series_id
+        notify.send(f"Added: {series.title}", f"{len(o.plan.chapters)} chapters listed, {o.downloaded} downloaded",
+                    "added")
         return f"{len(o.plan.chapters)} listed, {o.downloaded} downloaded, {o.imported} imported" + \
             ("" if monitored else " (unmonitored)")
     return run
@@ -212,7 +214,12 @@ def _job_refresh_all(job: jobs.Job):
     msg = f"{done} series, {downloaded} downloaded, {imported} imported, {errors} errors" + \
         (f", {skipped} complete finished series skipped" if skipped else "")
     if imported:
-        notify.send("mang-arr: new chapters", msg, "new")
+        new = [f"{i['title']}: {i['result']}" for i in job.items if i["state"] == "done" and "downloaded" in i["result"]
+               and not i["result"].startswith("0 downloaded")]
+        notify.send(f"mang-arr: {imported} new chapter(s)", "\n".join(new[:15]) or msg, "new")
+    bad = [f"{i['title']}: {i['result']}" for i in job.items if i["state"] in ("failed", "error")]
+    if bad:
+        notify.send(f"mang-arr: {len(bad)} series with failed downloads", "\n".join(bad[:10]), "failed")
     return msg
 
 
@@ -824,8 +831,11 @@ def api_backups_create():
 
 @app.post("/system/notify-test")
 def system_notify_test():
-    ok = notify.send("mang-arr", "test notification", "test")
-    return _flash("/system", "notification sent" if ok else "notification failed (see log)")
+    res = notify.send_detailed("mang-arr test", "If you can read this, notifications work.", "test", force=True)
+    if not res:
+        return _flash("/system", "no notification channel configured")
+    parts = [f"{notify.CHANNELS[k][0]}: {'sent' if r is True else r}" for k, r in res.items()]
+    return _flash("/system", "; ".join(parts))
 
 
 @app.get("/settings")
@@ -865,9 +875,14 @@ async def settings_save(request: Request):
     if action == "test-komga":
         ok, msg = komga.test()
         return RedirectResponse(f"/settings?komga_test={urllib.parse.quote(msg)}&komga_ok={int(ok)}", 303)
-    if action == "test-notify":
-        ok = notify.send("mang-arr", "test notification", "test")
-        return _flash("/settings", "notification sent" if ok else "notification failed (see log)")
+    if action == "test-notify" or action.startswith("test-notify-"):
+        only = action[len("test-notify-"):] if action.startswith("test-notify-") else None
+        res = notify.send_detailed("mang-arr test", "If you can read this, notifications work.", "test", only=only,
+                                   force=True)
+        if not res:
+            return _flash("/settings", "nothing to test: fill in that channel first")
+        parts = [f"{notify.CHANNELS[k][0]}: {'sent' if r is True else r}" for k, r in res.items()]
+        return _flash("/settings", "; ".join(parts))
     return _flash("/settings", "saved")
 
 

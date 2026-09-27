@@ -37,6 +37,28 @@ DEFAULTS: dict[str, object] = {
     "pushover_token": config.PUSHOVER_TOKEN or "",
     "pushover_user": config.PUSHOVER_USER or "",
     "webhook_url": config.WEBHOOK_URL or "",
+    "discord_webhook": "",
+    "slack_webhook": "",
+    "telegram_token": "",
+    "telegram_chat_id": "",
+    "ntfy_url": "",
+    "ntfy_token": "",
+    "gotify_url": "",
+    "gotify_token": "",
+    "smtp_host": "",
+    "smtp_port": "",
+    "smtp_security": "starttls",   # starttls | ssl | none
+    "smtp_user": "",
+    "smtp_password": "",
+    "smtp_from": "",
+    "smtp_to": "",
+    "notifiarr_api_key": "",
+    "notifiarr_channel": "",
+    "apprise_url": "",
+    "notify_on_new": True,
+    "notify_on_added": False,
+    "notify_on_failed": True,
+    "notify_on_health": True,
     "komga_url": "",
     "komga_api_key": "",
     "komga_library_id": "",
@@ -45,7 +67,8 @@ DEFAULTS: dict[str, object] = {
     "auth_password": "",
     "api_key": "",           # X-Api-Key for the JSON API when a web login is set; generated on first start
 }
-SECRET_KEYS = {"pushover_token", "pushover_user", "komga_api_key", "auth_password"}
+SECRET_KEYS = {"pushover_token", "pushover_user", "komga_api_key", "auth_password", "discord_webhook", "slack_webhook",
+               "telegram_token", "ntfy_token", "gotify_token", "smtp_password", "notifiarr_api_key"}
 MASK = "********"        # what the UI shows for a stored secret; submitting it unchanged keeps the value
 
 
