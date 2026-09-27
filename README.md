@@ -78,7 +78,21 @@ Every off-the-shelf "manga *arr" fails on a real library for the same reasons:
 
 ## Installation
 
-### Docker Compose (recommended)
+mang-arr works together with **Suwayomi** (sources and downloads) and
+**Komga** (reader). The quickest way to get all three running and wired up:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/AndrewHuddleston/mang-arr/main/install.sh -o install.sh
+bash install.sh
+```
+
+It writes a Compose file for the three services, starts them, configures
+Suwayomi (CBZ, extension repository, a default set of sources), creates the
+Komga admin, library and API key, and stores the Komga connection in
+mang-arr. [docs/INSTALL.md](docs/INSTALL.md) explains every step for doing
+it by hand, and what to do with an existing Suwayomi library.
+
+### Docker Compose (mang-arr only, existing Suwayomi and Komga)
 
 Images are published to `ghcr.io/andrewhuddleston/mang-arr` (`latest` from
 `main`, and one tag per release).

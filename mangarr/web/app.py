@@ -981,6 +981,24 @@ def api_command(body: dict):
     raise HTTPException(400, f"unknown command {name!r}; known: RefreshAll, SearchWanted, RefreshMetadata")
 
 
+@app.get("/api/v1/settings")
+def api_settings_get():
+    """Runtime settings with secrets masked."""
+    return settings.masked(settings.all_values())
+
+
+@app.put("/api/v1/settings")
+def api_settings_put(body: dict):
+    """Set runtime settings: {key: value}. Lists take arrays or comma-separated
+    strings; a secret given as the mask keeps its value. Unknown keys -> 400."""
+    try:
+        with db.connect() as con:
+            settings.set_many(con, body)
+        return settings.masked(settings.all_values())
+    except (KeyError, ValueError) as e:
+        raise HTTPException(400, f"invalid setting: {e}") from e
+
+
 @app.get("/api/v1/log")
 def api_log(lines: int = 200):
     return JSONResponse({"lines": _tail_log(max(1, min(lines, 5000)))})
