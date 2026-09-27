@@ -647,6 +647,17 @@ class CoreSplitTest(TmpData):
         self.assertEqual((stats["ok"], stats["failed"], stats["throttled"]), (1, 2, 1))
         self.assertIsNotNone(stats["last_throttled"])
 
+    def test_record_downloads_credits_the_source_that_did_it(self):
+        sid = self.seed({1: "wanted", 2: "wanted", 3: "wanted"})
+        plan = _plan([_match("A", 1, [1, 2, 3]), _match("B", 2, [1, 2, 3])])      # A: every chapter's first choice
+        attempts = [("A", 1.0, "failed"), ("B", 1.0, "ok"), ("B", 2.0, "ok"), ("A", 3.0, "failed"),
+                    ("B", 3.0, "failed")]
+        with db.connect() as con:
+            core.record_downloads(con, sid, plan, [1.0, 2.0, 3.0], {1.0: "ok", 2.0: "ok", 3.0: "failed"},
+                                  {3.0: "broken"}, set(), attempts)
+            stats = {k: (r["ok"], r["failed"]) for k, r in db.source_stats(con).items()}
+        self.assertEqual(stats, {"A": (0, 2), "B": (2, 1)})
+
     def test_download_wanted_still_records_throttling(self):
         sid = self.seed({1: "wanted"})
 

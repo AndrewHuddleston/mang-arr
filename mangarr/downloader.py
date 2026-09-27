@@ -304,8 +304,9 @@ class SeriesSteps:
     """The bookkeeping of one series' download, apart from the loop that runs
     it: which source to ask next for which chapters (wants/take), what came
     of it (record), fallbacks to the next source, sources that delivered
-    nothing (asked last from then on), and the reason for every chapter
-    that did not arrive. No I/O.
+    nothing (asked last from then on), which source delivered or failed
+    each chapter (attempts), and the reason for every chapter that did not
+    arrive. No I/O.
 
     In order, chapters go strictly one after the other, consecutive ones
     from the same source fetched together; a chapter that fails is retried
@@ -330,6 +331,7 @@ class SeriesSteps:
         self.results: dict[float, str] = {}
         self.tried: dict[float, list[str]] = {}            # what happened on each source, per chapter
         self.dead: set[int] = set()                        # manga ids that delivered nothing: asked last
+        self.attempts: list[tuple[str, float, str]] = []   # (source name, chapter, 'ok' | 'failed') per try
         self.held: dict[float, str] = {}                   # its last source did not start it -> reason if none left
         self.finished = False
         pending = {n for n in wanted if plan.candidates.get(n)}
@@ -554,6 +556,7 @@ class SeriesSteps:
         m, plan = run.match, self.plan
         for n in ok:
             self.results[n] = "ok"
+        self.attempts += [(m.source.name, n, "ok") for n in ok] + [(m.source.name, n, "failed") for n in failed]
         if run.in_order:
             if not failed:
                 # all of it arrived: go on after it; cut short (a cancel), wants() goes
@@ -629,10 +632,13 @@ class SeriesSteps:
 def download(client: Client, plan: Plan, only: set[float] | None = None,
              should_cancel: Callable[[], bool] | None = None, reasons: dict | None = None,
              progress: Callable[[str], None] | None = None, throttled: set | None = None,
-             in_order: bool | None = None, dropped: Callable[[], set] | None = None) -> dict:
+             in_order: bool | None = None, dropped: Callable[[], set] | None = None,
+             attempts: list | None = None) -> dict:
     """Returns {chapter_number: 'ok' | 'failed'} for every chapter attempted.
     Chapters not reached before a cancel are simply absent. When `reasons`
-    is given it is filled with a human-readable reason per failed chapter.
+    is given it is filled with a human-readable reason per failed chapter,
+    and `attempts` with (source name, chapter, 'ok' | 'failed') for every
+    chapter a source delivered or failed (SeriesSteps.attempts).
     `dropped()`, when given, is asked before every chunk for chapters that are
     no longer wanted (ignored by the user meanwhile); those are skipped and
     left out of the result."""
@@ -673,6 +679,8 @@ def download(client: Client, plan: Plan, only: set[float] | None = None,
                     memo.unqueued = []
     except Cancelled:
         log.warning("%s: download cancelled; %d done", label, sum(1 for r in steps.results.values() if r == "ok"))
+    if attempts is not None:
+        attempts.extend(steps.attempts)
     return steps.results
 
 

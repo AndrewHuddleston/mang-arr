@@ -627,7 +627,8 @@ class LanePool:
             if not db.get_series(con, sid):
                 item["state"], item["result"] = "cancelled", "series was deleted"
                 return
-            core.record_downloads(con, sid, task.plan, task.wanted, steps.results, steps.reasons, task.seen)
+            core.record_downloads(con, sid, task.plan, task.wanted, steps.results, steps.reasons, task.seen,
+                                  steps.attempts)
             try:
                 core.finish_download(con, with_cancel(self.client, self.cancelled), out)
             except core.Gone:

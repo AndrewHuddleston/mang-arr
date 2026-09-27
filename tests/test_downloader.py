@@ -82,9 +82,13 @@ class FallbackTest(unittest.TestCase):
     def test_falls_back_per_chapter(self):
         a, b = match("A", 1, [1, 2, 3]), match("B", 2, [1, 2, 3])
         client = FakeClient(broken={1020})            # A's chapter 2 is broken
-        res = self.run_download(client, plan_for([a, b]), {1.0, 2.0, 3.0})
+        attempts = []
+        with mock.patch.object(downloader.config, "LOCK_PATH", self.lock):
+            res = downloader.download(client, plan_for([a, b]), only={1.0, 2.0, 3.0}, attempts=attempts)
         self.assertEqual(res, {1.0: "ok", 2.0: "ok", 3.0: "ok"})
         self.assertIn(2020, client.have)              # came from B
+        self.assertEqual(sorted(attempts), [("A", 1.0, "ok"), ("A", 2.0, "failed"), ("A", 3.0, "ok"),
+                                            ("B", 2.0, "ok")])      # who did it, not the first choice
 
     def test_fails_when_every_source_fails(self):
         a, b = match("A", 1, [5]), match("B", 2, [5])
@@ -410,6 +414,7 @@ class SeriesStepsTest(unittest.TestCase):
         self.assertEqual((steps.wants(set()), steps.alternatives(set())), (["c"], []))   # never A instead
         run = steps.take("c", set())
         self.assertTrue(run.patient)                                # only A is left besides it
+        self.assertEqual(steps.attempts, [("A", 1.0, "failed"), ("B", 1.0, "ok"), ("B", 2.0, "failed")])
 
     def test_every_chapter_gets_every_source_whatever_is_switched(self):
         # random series, broken copies and switching choices: a chapter fails only once every source

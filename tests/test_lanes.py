@@ -255,7 +255,7 @@ class PoolTest(PoolBase):
 
     def test_a_switch_that_hits_a_broken_chapter_still_tries_every_source(self):
         # B takes ch 1 from Y while A holds X; Y's ch 1 is broken, X's ch 2 too. Every chapter still
-        # gets both sources
+        # gets both sources, and each source is credited with what it did itself (reliability)
         for switch in (True, False):
             with self.subTest(switch=switch), mock.patch.object(lanes, "TAKE_FREE_SITE", switch):
                 base = 10 if switch else 20
@@ -264,6 +264,9 @@ class PoolTest(PoolBase):
                 plans = {f"A{base}": [entry(fake, X, base + 1, f"A{base}", [1])],
                          f"B{base}": [entry(fake, X, base + 2, f"B{base}", [1, 2]),
                                       entry(fake, Y, base + 3, f"B{base}", [1, 2])]}
+                with db.connect() as con:
+                    con.execute("DELETE FROM source_stats")
+                    con.commit()
                 series = self.run_all(fake, plans)
                 self.assertEqual(self.status(series[1][0]), {1.0: ("have", None), 2.0: ("have", None)})
                 b = [(e[2], number_of(e[4])) for e in fake.kinds("enqueue") if e[3] in (base + 2, base + 3)]
@@ -271,6 +274,9 @@ class PoolTest(PoolBase):
                     self.assertEqual(b, [(Y, 1.0), (X, 1.0), (X, 2.0), (Y, 2.0)])
                 else:
                     self.assertEqual(b, [(X, 1.0), (X, 2.0), (Y, 2.0)])
+                with db.connect() as con:
+                    stats = {k: (r["ok"], r["failed"]) for k, r in db.source_stats(con).items()}
+                self.assertEqual(stats, {X: (2, 1), Y: (1, 1)} if switch else {X: (2, 1), Y: (1, 0)})
                 self.assertEqual(fake.violations, [])
 
     def test_a_site_a_later_series_needs_is_not_taken_as_an_alternative(self):

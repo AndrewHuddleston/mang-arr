@@ -26,6 +26,7 @@ import tempfile
 import threading
 import time
 import unittest
+from collections import Counter
 from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -128,11 +129,14 @@ def simulate(test: PassBase, parallel: int, switch: bool) -> Sim:
             took = (time.perf_counter() - t0) / SCALE
             with db.connect() as con:
                 states = {r["id"]: {c["status"] for c in db.chapters(con, r["id"])} for r in rows}
+                stats = {name: (r["ok"], r["failed"]) for name, r in db.source_stats(con).items()}
         finally:
             settings._cache.clear()
     test.assertEqual(fake.violations, [])
     test.assertEqual(out[1:], (99, 99, 0))                  # 12 x 8 chapters + 3 only Echo has, all arrived
     test.assertEqual(set().union(*states.values()), {"have"})
+    delivered = Counter(e[2] for e in fake.kinds("finish"))
+    test.assertEqual(stats, {name: (n, 0) for name, n in delivered.items()})   # each source's own downloads
     return Sim(took, samples, job.items)
 
 

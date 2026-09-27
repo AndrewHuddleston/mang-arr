@@ -877,7 +877,9 @@ that lists it; a source that delivered nothing of what it was asked for is
 asked last for the rest of the run (its chapters go to the other sources
 first, and it is asked again only for a chapter those fail too, since one
 broken chapter can be all it was asked for); only chapters no source could
-deliver end up `failed`, with the reason from every source tried. A file lock
+deliver end up `failed`, with the reason from every source tried. A
+source's reliability counts what that source itself delivered or failed,
+also when it was a fallback or taken instead of a busy source. A file lock
 (`MANGARR_LOCK`) makes sure only one download run exists at a time across
 the web worker and the CLI; a second one waits. A per-chapter search or
 manual download is the same machinery for one chapter from one entry.
