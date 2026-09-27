@@ -37,7 +37,7 @@ class ListsTest(unittest.TestCase):
 
     def test_url_text_confident_and_review(self):
         picks = {"One Piece": S(30013, "One Piece"), "Berserk": None}
-        with mock.patch.object(lists, "_get_text", lambda url: "One Piece\n\n# c\nBerserk\nanilist:30002\n"), \
+        with mock.patch.object(lists, "_get_text", lambda url, **kw: "One Piece\n\n# c\nBerserk\nanilist:30002\n"), \
                 mock.patch.object(lists.metadata, "lookup", lambda t: (picks[t], [])), \
                 mock.patch.object(lists.metadata, "by_ref", lambda r: S(30002, "Berserk (by ref)")):
             series, review = lists.fetch_url_text({"url": "http://x/list.txt"})
@@ -47,7 +47,7 @@ class ListsTest(unittest.TestCase):
     def test_url_text_lookup_failure_is_review_not_crash(self):
         def boom(t):
             raise RuntimeError("AniList unreachable")
-        with mock.patch.object(lists, "_get_text", lambda url: "Something\n"), \
+        with mock.patch.object(lists, "_get_text", lambda url, **kw: "Something\n"), \
                 mock.patch.object(lists.metadata, "lookup", boom):
             series, review = lists.fetch_url_text({"url": "http://x"})
         self.assertEqual(series, [])

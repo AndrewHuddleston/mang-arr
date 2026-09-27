@@ -8,12 +8,14 @@
 """
 import logging
 import os
+import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
 
 from . import db, downloader, komga, library, metadata, metrics
+from .matching import oneline
 from .model import Series
-from .resolver import Plan, primary, ranges, resolve
+from .resolver import Plan, primary, resolve
 from .suwayomi import Client, SuwayomiError
 
 log = logging.getLogger(__name__)
@@ -150,27 +152,35 @@ def _resolve_summary(plan: Plan) -> str:
     s = f"{len(plan.chapters)} chapters listed from {', '.join(used) or 'no source'}; {len(plan.wanted())} wanted"
     if plan.junk:
         s += f"; {len(plan.junk)} junk skipped"
-    if plan.gaps():
-        s += f"; gaps nobody lists: {ranges(plan.gaps())}"
+    gaps = plan.gap_text()
+    if gaps:
+        s += f"; gaps nobody lists: {gaps}"
     if plan.unreachable:
         s += f"; unreachable: {', '.join(src.name for src, _ in plan.unreachable)}"
     return s
 
 
 def _review_summary(plan: Plan) -> str:
+    """Why nothing matched, for the log, the 'review' event and the Activity
+    page. Source names, notes and rejected titles come from scraped sites, so
+    each is flattened to one line and capped, and so is the whole message."""
     parts = []
     noted = [m for m in plan.matches if m.note]
     if noted:
-        parts.append("not used: " + "; ".join(f"{m.source.name} ({m.note})" for m in noted[:4]))
+        parts.append("not used: " + "; ".join(f"{oneline(m.source.name, 60)} ({oneline(m.note, 160)})"
+                                              for m in noted[:4]))
     if plan.rejected:
         titles = []
         for r in plan.rejected:
-            if r.title not in titles:
-                titles.append(r.title)
-        parts.append("rejected titles: " + " | ".join(titles[:6]))
+            t = oneline(r.title, 120)
+            if t not in titles:
+                titles.append(t)
+            if len(titles) >= 6:
+                break
+        parts.append("rejected titles: " + " | ".join(titles))
     if plan.unreachable:
-        parts.append("unreachable: " + ", ".join(src.name for src, _ in plan.unreachable))
-    return "; ".join(parts) or "no source returned anything"
+        parts.append("unreachable: " + ", ".join(oneline(src.name, 60) for src, _ in plan.unreachable))
+    return oneline("; ".join(parts), 900) or "no source returned anything"
 
 
 def _set_library_entries(client: Client, plan: Plan, primary_manga_id: int) -> None:
@@ -327,27 +337,45 @@ def delete_series(con, client: Client, series_id: int, delete_library: bool = Fa
 def series_staging_dirs(con, series_id: int) -> list[tuple[str, str, int | None]]:
     """[(source name, folder, Suwayomi manga id)] where Suwayomi has written
     this series - only for source entries the plan trusts (an entry noted as
-    'author differs' or 'too long' must not feed the library)."""
+    'author differs' or 'too long' must not feed the library).
+    The source name (Suwayomi's displayName, set by extension code) and the
+    title are sanitised like Suwayomi's own folder names, and a folder whose
+    real path is not inside the staging root (a '..' name, an absolute path
+    stored by adopt or a restored backup, a symlink) is refused and logged."""
     out = []
+    root = library.config.STAGING_ROOT
     for s in db.sources(con, series_id):
         if s["note"]:
             continue
-        folder = s["folder"] or os.path.join(library.config.STAGING_ROOT, s["source_name"],
+        folder = s["folder"] or os.path.join(root, library.safe_title(s["source_name"]),
                                              library.safe_title(s["title"]))
-        if os.path.isdir(folder):
-            out.append((s["source_name"], folder, s["manga_id"]))
+        if not os.path.isdir(folder):
+            continue
+        if os.path.islink(folder) or not library.is_within(folder, root):
+            log.warning("ignoring staging folder %s for %s: it is a symlink or outside %s",
+                        oneline(folder, 300), oneline(s["source_name"], 60), root)
+            continue
+        out.append((s["source_name"], folder, s["manga_id"]))
     return out
+
+
+SETTLE_SECONDS = 120    # a staged file younger than this may still be being written
 
 
 def import_series(con, series_id: int, client: Client | None = None) -> int:
     """Link every staged chapter into <library>/<folder>/. Returns how many
     chapters were newly linked. Files whose name carries no global chapter
-    number (season episodes) are matched through Suwayomi's chapter list."""
+    number (season episodes) are matched through Suwayomi's chapter list.
+    One bad file never stops the others: a failure is recorded on that
+    chapter and the import goes on. A file that fails verification while it
+    is still fresh (Suwayomi may be writing it) is left for the next import
+    instead of being quarantined; old quarantined files are pruned."""
     row = db.get_series(con, series_id)
     title, folder = row["title"], row["folder"]
     known = {r["number"]: dict(r) for r in db.chapters(con, series_id)}
     linked = 0
     for source_name, staging, manga_id in series_staging_dirs(con, series_id):
+        library.prune_quarantine(staging)
         found, unparsed = library.scan_series_dir(staging)
         if unparsed and client is not None and manga_id is not None:
             try:
@@ -376,7 +404,11 @@ def import_series(con, series_id: int, client: Client | None = None) -> int:
                 continue
             ok, detail = library.verify_archive(path)
             if not ok:
-                moved = library.quarantine(path)
+                if _still_being_written(path, title, n, source_name, detail):
+                    continue
+                moved = _quarantine(con, series_id, title, n, source_name, path)
+                if moved is None:
+                    continue
                 db.set_status(con, series_id, n, "failed", f"{source_name}: bad file ({detail}); set aside as "
                               f"{os.path.basename(moved)}, will be fetched again")
                 db.record_source_result(con, source_name, "corrupt")
@@ -385,7 +417,11 @@ def import_series(con, series_id: int, client: Client | None = None) -> int:
             label = prev["name"] if prev and "name" in prev.keys() else None
             expected = os.path.join(library.library_dir(folder), library.chapter_filename(n, label))
             ours = bool(prev and prev["library_path"] == expected)
-            dst = library.link_into_library(path, folder, n, replace=ours, label=label)
+            try:
+                dst = library.link_into_library(path, folder, n, replace=ours, label=label)
+            except OSError as e:
+                _import_failed(con, series_id, title, n, f"{source_name}: cannot link {os.path.basename(path)}", e)
+                continue
             if dst is None:
                 continue
             db.set_have(con, series_id, n, path, dst, source_name)
@@ -399,6 +435,39 @@ def import_series(con, series_id: int, client: Client | None = None) -> int:
     if linked:
         komga.scan()
     return linked
+
+
+def _still_being_written(path: str, title: str, n: float, source_name: str, detail: str) -> bool:
+    """True when a file that failed verification was written less than
+    SETTLE_SECONDS ago: Suwayomi is probably still writing it, so it is left
+    for the next import instead of being quarantined (logged)."""
+    try:
+        age = time.time() - os.lstat(path).st_mtime
+    except OSError:
+        return False
+    if age >= SETTLE_SECONDS:
+        return False
+    log.info("%s: ch %g from %s is not readable yet (%s) and was written %.0fs ago; "
+             "probably still being written, trying again at the next import", title, n, source_name, detail, age)
+    return True
+
+
+def _import_failed(con, series_id: int, title: str, n: float, what: str, e: OSError) -> None:
+    """One file could not be handled: recorded on its chapter and logged; the
+    import goes on with the other files."""
+    why = f"{what}: {type(e).__name__}: {e}"
+    log.error("%s: ch %g: %s", title, n, why)
+    db.set_status(con, series_id, n, "failed", why[:500])
+
+
+def _quarantine(con, series_id: int, title: str, n: float, source_name: str, path: str) -> str | None:
+    """library.quarantine, or None (recorded on the chapter) when the bad file
+    cannot be moved aside, e.g. it was swapped for a symlink."""
+    try:
+        return library.quarantine(path)
+    except OSError as e:
+        _import_failed(con, series_id, title, n, f"{source_name}: bad file {os.path.basename(path)} not set aside", e)
+        return None
 
 
 # -- adopt -------------------------------------------------------------------
@@ -418,7 +487,9 @@ class AdoptItem:
 
 
 def suwayomi_downloaded_entries(client: Client) -> dict[tuple[str, str], int]:
-    """{(source name, folder name): manga id} for every entry with downloads."""
+    """{(source folder name, series folder name): manga id} for every entry
+    with downloads. Both names are sanitised the way Suwayomi names its
+    staging folders, so a source whose displayName has ':' or '/' matches."""
     # downloadCount is not filterable server-side; the list of every cached
     # entry is small text, so filter here.
     d = client.gq("{ mangas { nodes { id title downloadCount source { displayName } } } }", timeout=120)
@@ -426,7 +497,7 @@ def suwayomi_downloaded_entries(client: Client) -> dict[tuple[str, str], int]:
     for m in d["mangas"]["nodes"]:
         if not m.get("downloadCount"):
             continue
-        src = (m.get("source") or {}).get("displayName") or "?"
+        src = library.safe_title((m.get("source") or {}).get("displayName") or "?")
         out[(src, library.safe_title(m["title"]))] = m["id"]
     return out
 

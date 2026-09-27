@@ -15,7 +15,7 @@ Fallbacks, in order, all still requiring an exact title match at the end:
 import logging
 
 from . import anilist, mangadex, model
-from .matching import disambiguator, name_tokens, query_score, strip_disambiguator
+from .matching import MAX_TITLE, disambiguator, name_tokens, oneline, query_score, strip_disambiguator
 from .model import Series
 
 log = logging.getLogger(__name__)
@@ -56,14 +56,19 @@ def _safe(fn, query):
     try:
         return fn(query)
     except Exception as e:
-        log.warning("%s lookup for %r failed: %s: %s", fn.__module__.split(".")[-1], query,
-                    type(e).__name__, e)
+        log.warning("%s lookup for %r failed: %s: %s", fn.__module__.split(".")[-1], query[:200],
+                    type(e).__name__, oneline(e, 300))
         return []
 
 
 def lookup(query: str) -> tuple[Series | None, list[Series]]:
-    """(confident pick or None, candidates shown to the user)."""
-    query = query.strip()
+    """(confident pick or None, candidates shown to the user). The query is
+    typed, or a line of an import list: anything past MAX_TITLE characters
+    is cut (logged) before it is matched or sent to the providers."""
+    query = (query or "").strip()
+    if len(query) > MAX_TITLE:
+        log.info("lookup query cut to %d characters: %s", MAX_TITLE, oneline(query, 80))
+        query = query[:MAX_TITLE].strip()
     hint = disambiguator(query)
     base = strip_disambiguator(query) if hint else query
     queries = [query]

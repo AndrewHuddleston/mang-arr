@@ -17,6 +17,34 @@ from .model import Series
 
 log = logging.getLogger(__name__)
 
+MAX_RETRY_AFTER = 120           # seconds; a longer wait gives up instead of stalling the job thread
+
+
+def retry_after(headers, default: float) -> float:
+    """Seconds to wait before retrying a 429, from its Retry-After header:
+    delta-seconds or an HTTP date, `default` when missing or unreadable,
+    at least 1. Raises RuntimeError when the server asks for more than
+    MAX_RETRY_AFTER, so a pass moves on instead of sleeping for hours."""
+    raw = (headers.get("Retry-After") if headers is not None else None) or ""
+    try:
+        wait = float(raw)
+    except ValueError:
+        wait = None
+        if raw:
+            import email.utils
+            try:
+                when = email.utils.parsedate_to_datetime(raw)
+                wait = when.timestamp() - time.time()
+            except (TypeError, ValueError, OverflowError):
+                log.debug("unreadable Retry-After %r; waiting %gs", raw[:40], default)
+    if wait is None or not wait == wait:                # missing, unreadable or NaN
+        wait = default
+    if wait > MAX_RETRY_AFTER:
+        log.warning("rate limited with Retry-After %s; more than %ds, not waiting", raw[:40], MAX_RETRY_AFTER)
+        raise RuntimeError(f"rate limited for {raw[:40]}s (more than {MAX_RETRY_AFTER}s); try again later")
+    return max(wait, 1.0)
+
+
 _FIELDS = """
   id
   title { romaji english native }
@@ -57,8 +85,8 @@ def _post(query: str, variables: dict, retries: int = 3) -> dict:
             return d
         except urllib.error.HTTPError as e:
             if e.code == 429:            # 30 requests/minute
-                wait = int(e.headers.get("Retry-After", "10"))
-                log.debug("anilist rate limited, waiting %ds", wait)
+                wait = retry_after(e.headers, 10)
+                log.debug("anilist rate limited, waiting %gs", wait)
                 last = e
                 time.sleep(wait)
                 continue

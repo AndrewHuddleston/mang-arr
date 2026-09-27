@@ -2,21 +2,36 @@
 
     series (AniList/MangaDex/manual) -> search every source with every title
                                      -> accept only exact title matches
+                                     -> drop implausible chapter numbers
                                      -> distrust sources whose length is off
                                      -> union the chapter numbers
                                      -> drop fractional "chapters" with no pages
                                      -> pick a source for each chapter
 """
 import logging
+import math
 import statistics
 from dataclasses import dataclass, field
 
 from . import config
-from .matching import ACCEPTED, AUTHOR_DIFFER, author_level, match_level
+from .matching import ACCEPTED, AUTHOR_DIFFER, MAX_TITLE, author_level, match_level, oneline
 from .model import Series
 from .suwayomi import Chapter, Client, Source, SuwayomiError
 
 log = logging.getLogger(__name__)
+
+# What a source lists is scraped from a website, so it is bounded before it
+# is used: no real series has chapter 100000 or 10000 distinct chapters
+# (the longest run to about 4000), and nothing needs more than a handful of
+# search titles per source.
+MAX_CHAPTER_NUMBER = 100_000
+OUTLIER_FACTOR = 10          # a top number this many times the next one ...
+OUTLIER_MIN_JUMP = 1000      # ... and this far above it is a typo or a date, not a chapter,
+OUTLIER_MIN_BELOW = 5        # ... judged only with this many chapters below it (not [1, 1500])
+MAX_CHAPTERS_PER_SOURCE = 10_000
+MAX_SEARCH_TITLES = 8
+MAX_GAP_SPANS = 40
+MAX_CHAPTER_NAME = 500
 
 
 @dataclass
@@ -89,25 +104,40 @@ class Plan:
         have = self.have()
         return [n for n in self.chapters if n not in have]
 
-    def gaps(self) -> list[int]:
-        """Whole chapter numbers below the highest one that no source lists."""
-        if not self.assignment:
-            return []
-        top = int(max(self.assignment))
-        listed = {int(n) for n in self.assignment}
-        return [n for n in range(1, top + 1) if n not in listed]
+    def gaps(self, limit: int = MAX_GAP_SPANS) -> list[tuple[int, int]]:
+        """Runs of whole chapter numbers below the highest one that no source
+        lists, as (first, last) spans, at most `limit` of them. Walks the
+        listed numbers instead of range(1, top): cost follows how many
+        chapters are listed, never how big the top number is."""
+        listed = sorted({int(n) for n in self.assignment if math.isfinite(n) and n >= 1})
+        out: list[tuple[int, int]] = []
+        prev = 0
+        for n in listed:
+            if n > prev + 1:
+                out.append((prev + 1, n - 1))
+                if len(out) >= limit:
+                    break
+            prev = n
+        return out
+
+    def gap_text(self, limit: int = MAX_GAP_SPANS) -> str:
+        """'3-5, 9, 12-40' for the gaps, '' when there are none; '...' when
+        there are more spans than `limit`."""
+        spans = self.gaps(limit + 1)
+        text = ", ".join(str(a) if a == b else f"{a}-{b}" for a, b in spans[:limit])
+        return text + (", ..." if len(spans) > limit else "")
 
 
 def resolve(client: Client, series: Series, sources: list[Source] | None = None,
             reliability: dict[str, float] | None = None) -> Plan:
     sources = sources if sources is not None else client.sources()
     reliability = reliability or {}
-    log.info("resolving %s [%s] across %d sources, titles: %s", series.title, series.ref,
-             len(sources), " | ".join(series.search_titles[:5]))
+    titles = capped_search_titles(series)
+    log.info("resolving %s [%s] across %d sources, titles: %s", oneline(series.title), series.ref[:80],
+             len(sources), oneline(" | ".join(titles[:5]), 400))
     matches: list[SourceMatch] = []
     rejected: list[Rejected] = []
     unreachable: list[tuple[Source, str]] = []
-    titles = series.search_titles
 
     skipped = [s.name for s in sources if s.unusable]
     if skipped:
@@ -135,6 +165,23 @@ def resolve(client: Client, series: Series, sources: list[Source] | None = None,
              series.title, len(plan.chapters), len({m.manga_id for m in assignment.values()}),
              len(plan.have()), len(plan.wanted()), len(plan.junk))
     return plan
+
+
+def capped_search_titles(series: Series) -> list[str]:
+    """At most MAX_SEARCH_TITLES titles to search with, each at most
+    MAX_TITLE characters: every title is one search per source that lacks
+    the series, and aliases can be user-typed or come from a provider. The
+    native title is always kept (last, as in search_titles) even when the
+    Latin titles alone would fill the cap: Korean, Chinese and Japanese
+    sources often index only that one."""
+    titles = series.search_titles
+    if len(titles) > MAX_SEARCH_TITLES:
+        native = series.native if series.native in titles[MAX_SEARCH_TITLES:] else None
+        kept = [t for t in titles if t != native][:MAX_SEARCH_TITLES - (1 if native else 0)]
+        titles = kept + ([native] if native else [])
+        log.debug("%s: %d titles; searching with %d of them", oneline(series.title), len(series.search_titles),
+                  len(titles))
+    return [t[:MAX_TITLE] for t in titles]
 
 
 _unreachable: dict[str, tuple[float, str]] = {}   # source id -> (when, why); skip it for a while
@@ -167,10 +214,10 @@ def _search_source(client, src, series, titles, rejected):
             lvl, matched = match_level(h.get("title"), series.titles)
             if lvl in ACCEPTED:
                 scored.append((lvl, h, matched))
-                log.debug("%s   accept %r == %r", src.name, h.get("title"), matched)
+                log.debug("%s   accept %r == %r", src.name, (h.get("title") or "")[:200], matched)
             else:
-                rejected.append(Rejected(src, h.get("title") or "?", q, "title differs"))
-                log.debug("%s   reject %r", src.name, h.get("title"))
+                rejected.append(Rejected(src, (h.get("title") or "?")[:MAX_TITLE], q, "title differs"))
+                log.debug("%s   reject %r", src.name, (h.get("title") or "")[:200])
         if not scored:
             continue
         scored.sort(key=lambda x: x[0])
@@ -183,19 +230,58 @@ def _search_source(client, src, series, titles, rejected):
             else:
                 return str(e)[:60]
         author = manga.get("author") or manga.get("artist") or hit.get("author")
+        author = author[:MAX_TITLE] if isinstance(author, str) else author
         a_lvl = author_level(author, series.authors)
+        listed = len(chapters)
+        chapters = plausible_chapters(src.name, chapters)
         m = SourceMatch(src, hit["id"], manga.get("title") or hit["title"], author,
                         lvl, matched, a_lvl, chapters, query=q)
         if a_lvl == AUTHOR_DIFFER:
-            m.note = f"author differs ({author!r} vs {series.authors[:2]})"
+            m.note = f"author differs ({oneline(author, 80)!r} vs {series.authors[:2]})"
         elif src.unusable:
             m.note = "source cannot deliver images from here"
         elif not chapters:
-            m.note = "lists no chapters"
-        log.info("%-26s %-34s %4d ch, max %-6g id=%-6d %s", src.name, m.title[:34], len(chapters),
+            m.note = "lists no chapters" if not listed else "lists no plausible chapter numbers"
+        elif len(chapters) > MAX_CHAPTERS_PER_SOURCE:
+            m.note = f"lists {len(chapters)} chapters, more than any real series ({MAX_CHAPTERS_PER_SOURCE})"
+            log.warning("%s: %s - not trusted", src.name, m.note)
+        log.info("%-26s %-34s %4d ch, max %-6g id=%-6d %s", src.name, oneline(m.title, 34), len(chapters),
                  m.max, hit["id"], f"[{m.note}]" if m.note else "")
         return m
     return None
+
+
+def plausible_chapters(source_name: str, chapters: list[Chapter]) -> list[Chapter]:
+    """The chapters of one source entry without numbers no real chapter has:
+    not finite, above MAX_CHAPTER_NUMBER (dates such as 20240115, garbage
+    like 999999999), or a top number that jumps far past the rest of the
+    list. Checked here, whatever _trust decides later, so one bad number can
+    neither flood the plan nor make the gap computation huge. Over-long
+    chapter names are cut. Every drop is logged with the source's name."""
+    ok, dropped = [], []
+    for c in chapters:
+        n = c.number
+        if isinstance(n, (int, float)) and math.isfinite(n) and 0 <= n <= MAX_CHAPTER_NUMBER:
+            ok.append(c)
+        else:
+            dropped.append(n)
+    ok.sort(key=lambda c: c.number)
+    # a source listing only its first chapter and its latest one ([1, 1500])
+    # is normal, so a lone top number is judged only against enough others
+    while len(ok) > OUTLIER_MIN_BELOW:
+        top, below = ok[-1].number, ok[-2].number
+        if top > OUTLIER_FACTOR * max(below, 1) and top - below > OUTLIER_MIN_JUMP:
+            dropped.append(ok.pop().number)
+        else:
+            break
+    if dropped:
+        log.warning("%s: ignoring %d implausible chapter number(s): %s", oneline(source_name, 60), len(dropped),
+                    ", ".join(f"{n:g}" if isinstance(n, float) else oneline(n, 20) for n in dropped[:5])
+                    + (" ..." if len(dropped) > 5 else ""))
+    for c in ok:
+        if isinstance(c.name, str) and len(c.name) > MAX_CHAPTER_NAME:
+            c.name = c.name[:MAX_CHAPTER_NAME]
+    return ok
 
 
 def _trust(series: Series, matches: list[SourceMatch]) -> None:

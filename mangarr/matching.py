@@ -4,12 +4,32 @@ The one lesson from every wrong download so far: fuzzy matching loses to
 anthologies, promos and spin-offs, because those share most of the words.
 So a source's title is accepted only when it equals one of the series'
 known titles after normalisation. Anything looser is reported, never used.
+
+Titles come from scraped sites, metadata providers and user input, so every
+function here is linear in its input and caps it first (MAX_TITLE): a
+50 KB "title" must cost microseconds, not a GIL-holding regex backtrack.
 """
 import re
 import unicodedata
 
 _QUOTES = str.maketrans({"’": "'", "‘": "'", "“": '"', "”": '"', "…": ""})
-_PAREN_SUFFIX = re.compile(r"\s*[\(\[][^\)\]]*[\)\]]\s*$")
+
+MAX_TITLE = 500          # chars; Suwayomi itself truncates titles to 512
+MAX_KNOWN_TITLES = 200   # known titles compared per hit (AniList/MangaDex list ~50 at most)
+_OPENERS, _CLOSERS = "([", ")]"
+_CONTROL = re.compile(r"[\x00-\x1f\x7f\u2028\u2029]+")
+
+
+def oneline(text, limit: int = 200) -> str:
+    """Untrusted text made safe for one log line or event message: control
+    characters (newlines included, so a scraped title cannot forge log
+    lines) become a space, and it is cut to `limit` characters."""
+    t = _CONTROL.sub(" ", str(text if text is not None else "")[:limit * 2 + 16])
+    return t if len(t) <= limit else t[:limit - 1] + "…"
+
+
+def _cap(title: str | None) -> str:
+    return (title or "")[:MAX_TITLE]
 
 
 def norm(text: str | None) -> str:
@@ -23,15 +43,36 @@ def norm(text: str | None) -> str:
     return re.sub(r"\s+", " ", t).strip()
 
 
+def _trailing_group(title: str) -> int | None:
+    r"""Index of the '(' or '[' that opens the title's trailing group, or None.
+    Same result as the regex [([][^)\]]*[)\]]\s*$ (the leftmost opener after
+    the last inner closer), found with rfind/scan so it is linear: the regex
+    backtracks quadratically on long runs of '(' or whitespace."""
+    t = title.rstrip()
+    if not t or t[-1] not in _CLOSERS:
+        return None
+    end = len(t) - 1
+    inner = max(t.rfind(c, 0, end) for c in _CLOSERS)    # the group holds no closer
+    for i in range(inner + 1, end):
+        if t[i] in _OPENERS:
+            return i
+    return None
+
+
 def disambiguator(title: str) -> str | None:
     """The trailing '(...)' of a title, if any: 'Wind Breaker (NII Satoru)' -> 'NII Satoru'."""
-    m = re.search(r"[\(\[]([^\)\]]+)[\)\]]\s*$", title or "")
-    return m.group(1).strip() if m else None
+    t = _cap(title).rstrip()
+    i = _trailing_group(t)
+    if i is None or i + 1 >= len(t) - 1:                  # no group, or an empty '()'
+        return None
+    return t[i + 1:-1].strip()
 
 
 def strip_disambiguator(title: str) -> str:
     """'Perfect World (Rie Aruga)' -> 'Perfect World'. Only a trailing group."""
-    return _PAREN_SUFFIX.sub("", title or "").strip()
+    t = _cap(title)
+    i = _trailing_group(t)
+    return (t[:i] if i is not None else t).strip()
 
 
 # Match levels. Lower is better; only EXACT and EXACT_BASE are accepted.
@@ -43,11 +84,14 @@ ACCEPTED = (EXACT, EXACT_BASE)
 
 
 def match_level(candidate: str | None, known_titles: list[str]) -> tuple[int, str | None]:
-    """How well a source's title matches the series. Returns (level, matched)."""
+    """How well a source's title matches the series. Returns (level, matched).
+    Both sides are capped (MAX_TITLE chars, MAX_KNOWN_TITLES titles): the
+    candidate is scraped, the known titles may be user-typed aliases."""
+    candidate = _cap(candidate)
     c = norm(candidate)
     if not c:
         return NONE, None
-    known = {norm(t): t for t in known_titles if t}
+    known = {norm(_cap(t)): t for t in known_titles[:MAX_KNOWN_TITLES] if t}
     if c in known:
         return EXACT, known[c]
     cb = norm(strip_disambiguator(candidate))
