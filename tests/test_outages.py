@@ -593,11 +593,13 @@ class CancelDuringDownloadTest(Base):
         return ev
 
     def cancel_when_sent(self, op, cancel=None):
-        """Cancel once a request for op has gone out."""
+        """Cancel once a request for op has gone out. The watcher waits in
+        real time: time.sleep only moves the fake clock here, and a loop on it
+        would spin and slow down the very job whose speed is measured."""
         def watch():
             deadline = time.perf_counter() + 5
             while time.perf_counter() < deadline and op not in [o for o, _ in self.fake.timeouts]:
-                time.sleep(0.01)
+                threading.Event().wait(0.01)
             (cancel or (lambda: self.flag.append(1)))()
         t = threading.Thread(target=watch, daemon=True)
         t.start()
