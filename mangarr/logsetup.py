@@ -19,6 +19,8 @@ import os
 import sys
 import time
 
+from . import config
+
 FORMAT = "%(asctime)s %(levelname)-7s %(name)s: %(message)s"
 DATEFMT = "%Y-%m-%d %H:%M:%S"
 
@@ -89,3 +91,4 @@ def setup(level: str | None = None, file: str | None = None, console: bool = Tru
     if file_error:
         logging.getLogger(__name__).warning("cannot write the log file %s (%s); logging to the console only",
                                             file, file_error)
+    config.replay_warnings()                  # bad MANGARR_* numbers read before logging was set up

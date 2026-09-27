@@ -209,6 +209,8 @@ is clamped to it; both are logged at start-up.
 | `MANGARR_BACKUP_HOURS` | `24` | Hours between scheduled database backups (`serve` only). |
 | `MANGARR_BACKUPS_KEEP` | `7` | How many backups to keep in `$MANGARR_DATA/backups`; the oldest are pruned after every backup. |
 | `MANGARR_BACKUP_UPLOAD_MAX_MB` | `512` | Largest backup file accepted by *Restore from file* (raised to twice the current database when that is larger). |
+| `MANGARR_UPLOAD_MIN_KBPS` | `128` | *Restore from file* cuts off an upload that averages fewer KB a second than this (it gets `MANGARR_UPLOAD_IDLE_SECS` plus one second per this many KB). Lower it for a slow link, or copy the file (named `mangarr-<date>-<time>.db`, as downloaded) into the backups folder and restore it from the list. |
+| `MANGARR_UPLOAD_IDLE_SECS` | `30` | ... and one that sends nothing for this many seconds (5 to 3600). |
 | `MANGARR_EVENTS_KEEP_DAYS` | `90` | Days of event history (Activity, series pages) kept; older events are pruned before each scheduled backup. |
 | `MANGARR_EVENTS_KEEP_ROWS` | `100000` | Size ceiling for the event history. Above it the oldest routine *Sources resolved* / *Needs a decision* events go first, so chapter history (downloaded, imported, failed) keeps its full `MANGARR_EVENTS_KEEP_DAYS`; only if that is not enough are older events of any kind removed (logged). A library refreshed often with many hundreds of series may need more. |
 | `MANGARR_PUSHOVER_TOKEN` | unset | Default Pushover application token. Notifications are sent only when both Pushover values are set. |
@@ -511,7 +513,14 @@ into the restore from there. Only one upload is accepted at a time (a second
 one is refused at once). An upload that sends nothing for 30 seconds, or
 averages less than 128 KB a second (it gets 30 seconds plus one second per
 128 KB received), is cut off, so a stalled or dripping client cannot hold
-the upload for long. An upload is refused, before the first byte and with
+the upload for long (`MANGARR_UPLOAD_IDLE_SECS`, `MANGARR_UPLOAD_MIN_KBPS`).
+Over a slower link, copy the file (named `mangarr-<date>-<time>.db`, as
+downloaded) into the backups folder and restore it from the list instead. Besides the file's data a form may hold at most 8 KB
+(boundaries, part headers, fields, line breaks before the first part), and
+nothing after its closing boundary is waited for. A refused upload of up to
+8 MB is read to its end before the answer, so the browser shows the
+message; a bigger one is not read, and the connection is closed after the
+answer. An upload is refused, before the first byte and with
 every write while it arrives, when it would leave less free space on that
 disk than its own size, up to 256 MB: a small backup can still be restored
 on a nearly full disk, a big one cannot take the last of it. A refused or
@@ -1009,7 +1018,8 @@ What the web server refuses, and what to do if it refuses you:
   dropped. `/api/v1/ping` is exempt.
 - **Large requests.** Bodies over 1 MB get 413 (the backup upload takes up
   to `MANGARR_MAX_UPLOAD_MB`, one at a time, and is cut off after 30 s
-  without data or when it averages less than 128 KB/s; see Backups).
+  without data, when it averages less than 128 KB/s, or when the form holds
+  more than 8 KB besides the file; see Backups).
 - **Password guessing.** Failed sign-ins (login page and basic auth alike)
   are counted per client address: after 5 failures in 15 minutes each
   further attempt is refused with 429 for 2 s, 4 s, 8 s ... up to 15

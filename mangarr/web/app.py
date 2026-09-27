@@ -1191,50 +1191,52 @@ def system_backups_restore(request: Request, name: str):
 _upload_slot = threading.Lock()
 
 
-def _upload_refused(msg: str) -> Response:
-    """The flash redirect for a refused upload. The connection is closed
-    afterwards, so the server does not go on reading a body nobody wants."""
+async def _upload_answer(body: uploads.Body, msg: str) -> Response:
+    """The flash redirect for an upload, sent once the rest of a small body
+    has been read (uploads.Body.drain), so a browser still sending gets the
+    message. A bigger one is not read: the connection is closed after the
+    answer instead."""
     resp = _flash("/system", msg)
-    resp.headers["Connection"] = "close"
+    if not await body.drain():
+        resp.headers["Connection"] = "close"
     return resp
 
 
 @app.post("/system/backups/upload")
 async def system_backups_upload(request: Request):
+    body = uploads.Body(request)
     if (why := _restore_guard()):
-        return _upload_refused(why)
+        return await _upload_answer(body, why)
     if not request.headers.get("content-type", "").lower().startswith("multipart/form-data"):
-        return _upload_refused("choose a .db file to restore")
+        return await _upload_answer(body, "choose a .db file to restore")
     if not _upload_slot.acquire(blocking=False):
         log.warning("backup upload from %s refused: another upload is still in progress", security.client_ip(request))
-        return _upload_refused("restore refused: another backup upload is in progress; try again when it has finished")
+        return await _upload_answer(body, "restore refused: another backup upload is in progress; try again when "
+                                          "it has finished")
     spool = None
     try:
-        try:
-            declared = int(request.headers.get("content-length") or 0)
-        except ValueError:
-            declared = 0
         # size and free-space checks, then the file part streams into the backups folder (not /tmp)
-        spool = await run_in_threadpool(backup.UploadSpool, declared)
-        name = await uploads.receive(request, spool)
+        spool = await run_in_threadpool(backup.UploadSpool, max(body.declared, 0))
+        name = await uploads.receive(body, spool)
         if not name:
-            return _upload_refused("choose a .db file to restore")
-        # blocking work (checks, swap) runs off the event loop, on the job worker; the file is moved, not copied
-        msg = await run_in_threadpool(_restore_exclusive, f"uploaded {name}",
-                                      lambda: backup.restore(spool, still_allowed=_still(request)))
+            msg = "choose a .db file to restore"
+        else:
+            # blocking work (checks, swap) runs off the event loop, on the job worker; the file is moved, not copied
+            msg = await run_in_threadpool(_restore_exclusive, f"uploaded {name}",
+                                          lambda: backup.restore(spool, still_allowed=_still(request)))
     except uploads.Disconnected:
         log.info("backup upload cancelled: the client went away after %d bytes", spool.size if spool else 0)
         return Response(status_code=400)
     except uploads.UploadError as e:
         log.warning("backup upload refused after %d bytes: %s", spool.size if spool else 0, e)
-        return _upload_refused(f"restore refused: {e}")
+        msg = f"restore refused: {e}"
     except backup.FAILURES as e:
-        return _upload_refused(f"restore refused: {e}")
+        msg = f"restore refused: {e}"
     finally:
         if spool is not None:
             spool.discard()                       # a partial or refused upload (restore() moved a used one away)
         _upload_slot.release()
-    return _flash("/system", msg)
+    return await _upload_answer(body, msg)       # the slot is free while the rest of a refused body is read
 
 
 @app.get("/api/v1/system/backup")
