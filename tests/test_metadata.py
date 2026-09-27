@@ -1,8 +1,10 @@
 """metadata.lookup with the providers stubbed out - no network."""
+import os
+import tempfile
 import unittest
 from unittest import mock
 
-from mangarr import metadata
+from mangarr import core, metadata
 from mangarr.matching import disambiguator, norm
 from mangarr.model import Series
 
@@ -71,6 +73,43 @@ class LookupTest(unittest.TestCase):
         pick, cands = self.run_lookup("Nothing Like This", [S(anilist_id=1, english="Something Else")])
         self.assertIsNone(pick)
         self.assertEqual(len(cands), 1)
+
+
+ITS_MINE = S(anilist_id=118601, romaji="It's Mine", english="It's Mine", native="이츠마인", country="KR",
+             popularity=6369)
+ITS_MINE_MD = S(mangadex_id="0c1e7a57-4bd4-4c0e-9d5c-6a0f3f7e8b21", english="It’s Mine", country="KR")
+
+
+class TypographicQuotesTest(unittest.TestCase):
+    """The live library adopted the Suwayomi folder "It’s Mine" as a MangaDex series while "It's Mine"
+    (anilist:118601) was tracked: AniList's search finds nothing like it for the curly apostrophe (checked by
+    hand), so MangaDex's was the one exact hit. The query is now searched with plain quotes."""
+
+    @staticmethod
+    def anilist_search(q, limit=8):          # as AniList answers: its series only for the plain apostrophe
+        return [ITS_MINE] if "It's Mine" in q else []
+
+    def providers(self):
+        return (mock.patch.object(metadata.anilist, "search", self.anilist_search),
+                mock.patch.object(metadata.mangadex, "search", lambda q, limit=8: [ITS_MINE_MD]))
+
+    def test_lookup_finds_the_anilist_series(self):
+        for folder in ("It’s Mine", "Itʼs Mine", "It‛s Mine", "It＇s Mine", "It´s Mine", "It`s Mine"):
+            al, md = self.providers()
+            with al, md:
+                pick, cands = metadata.lookup(folder)
+            self.assertIs(pick, ITS_MINE, folder)
+
+    def test_adopt_scan_finds_the_anilist_series(self):
+        class NoEntries:
+            def mangas_page(self, offset, first):
+                return [], False
+        with tempfile.TemporaryDirectory() as tmp:
+            os.makedirs(os.path.join(tmp, "Weeb Central", "It’s Mine"))
+            al, md = self.providers()
+            with al, md, mock.patch("mangarr.config.STAGING_ROOT", tmp):
+                items = core.plan_adopt(NoEntries())
+        self.assertEqual([(i.folder_name, i.series.ref) for i in items], [("It’s Mine", "anilist:118601")])
 
 
 if __name__ == "__main__":

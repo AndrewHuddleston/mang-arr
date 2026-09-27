@@ -15,7 +15,7 @@ Fallbacks, in order, all still requiring an exact title match at the end:
 import logging
 
 from . import anilist, mangadex, model
-from .matching import MAX_TITLE, disambiguator, name_tokens, oneline, query_score, strip_disambiguator
+from .matching import MAX_TITLE, disambiguator, name_tokens, oneline, plain_quotes, query_score, strip_disambiguator
 from .model import Series
 
 log = logging.getLogger(__name__)
@@ -79,6 +79,7 @@ def lookup(query: str, unreached: list[str] | None = None) -> tuple[Series | Non
     if len(query) > MAX_TITLE:
         log.info("lookup query cut to %d characters: %s", MAX_TITLE, oneline(query, 80))
         query = query[:MAX_TITLE].strip()
+    query = plain_quotes(query)       # the providers' search misses "It’s Mine", finds "It's Mine"
     hint = disambiguator(query)
     base = strip_disambiguator(query) if hint else query
     queries = [query]

@@ -13,7 +13,12 @@ import difflib
 import re
 import unicodedata
 
-_QUOTES = str.maketrans({"’": "'", "‘": "'", "“": '"', "”": '"', "…": ""})
+# Typographic apostrophes and quotes, read as their plain forms. Titles come
+# with either: AniList's search finds nothing for "It’s Mine" (a Suwayomi
+# folder name) but its series first for "It's Mine".
+_QUOTE_FORMS = {**dict.fromkeys("’‘‛ʼ′＇´`", "'"), **dict.fromkeys("“”„‟″", '"')}
+_QUOTES = str.maketrans(_QUOTE_FORMS)
+_NORM = str.maketrans({**_QUOTE_FORMS, "…": ""})
 
 MAX_TITLE = 500          # chars; Suwayomi itself truncates titles to 512
 MAX_KNOWN_TITLES = 200   # known titles compared per hit (AniList/MangaDex list ~50 at most)
@@ -34,11 +39,17 @@ def _cap(title: str | None) -> str:
     return (title or "")[:MAX_TITLE]
 
 
+def plain_quotes(text: str) -> str:
+    """Typographic apostrophes and quotes as their plain forms (’ ‘ ‛ ʼ ′ ＇ ´ `
+    as ', “ ” „ ‟ ″ as "): 'It’s Mine' -> "It's Mine". Linear in the text."""
+    return text.translate(_QUOTES)
+
+
 def norm(text: str | None) -> str:
     """Lower-case, fold accents, straighten quotes, drop punctuation.
     '_' counts as punctuation too: Suwayomi writes folder names with ':' and
     '?' replaced by '_'. '&' reads as 'and'."""
-    t = (text or "").translate(_QUOTES).replace("&", " and ")
+    t = (text or "").translate(_NORM).replace("&", " and ")
     t = unicodedata.normalize("NFKD", t)
     t = "".join(c for c in t if not unicodedata.combining(c)).lower()
     t = re.sub(r"[^\w\s]|_", " ", t)

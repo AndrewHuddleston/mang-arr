@@ -11,6 +11,7 @@ from mangarr.matching import (
     author_level,
     match_level,
     norm,
+    plain_quotes,
     query_score,
 )
 
@@ -22,6 +23,16 @@ class NormTest(unittest.TestCase):
 
     def test_accents(self):
         self.assertEqual(norm("Café Liégeois"), "cafe liegeois")
+
+    def test_typographic_quotes(self):
+        # "It’s Mine" (a Suwayomi folder) was adopted beside the tracked "It's Mine"; ʼ is a letter to \w
+        for c in "’‘‛ʼ′＇´`":
+            self.assertEqual(norm(f"It{c}s Mine"), norm("It's Mine"), c)
+            self.assertEqual(match_level(f"It{c}s Mine", ["It's Mine"])[0], EXACT, c)
+            self.assertEqual(query_score(f"It{c}s Mine", "It's Mine"), 0, c)
+        for o, c in ("“”", "„“", "‟”", "″″"):
+            self.assertEqual(norm(f"{o}Oshi{c} no Ko"), norm('"Oshi" no Ko'), o + c)
+        self.assertEqual(plain_quotes("It’s „Mine“ ʼ ´ ` ″…"), 'It\'s "Mine" \' \' \' "…')
 
 
 class MatchTest(unittest.TestCase):
