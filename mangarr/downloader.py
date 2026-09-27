@@ -82,17 +82,21 @@ CANCEL_DEQUEUE_SECS = 10
 # Ids still not dequeued after that (Suwayomi not answering, or an enqueue cut
 # short by a cancel that may still land) are kept in an internal setting, at
 # most MAX_LEFTOVERS (the newest), and taken out at the start of every download
-# run and by a background retry: started at once by every refresh pass, and
-# after a failed dequeue once the breaker lets calls through again (and a
-# request cut short has run into its own timeout), then backing off to
-# LEFTOVER_RETRY_MAX, at most LEFTOVER_RETRY_TRIES times (the next download run
-# or pass tries again).
+# run (in a pass, before every lane step) and by a background retry: started at
+# once by every refresh pass, and after a failed dequeue once the breaker lets
+# calls through again (and a request cut short has run into its own timeout),
+# then backing off to LEFTOVER_RETRY_MAX, at most LEFTOVER_RETRY_TRIES times
+# (the next download run or pass tries again).
 LEFTOVER_KEY = "leftover_queue_ids"
 MAX_LEFTOVERS = 200
 LEFTOVER_RETRY_SECS = BREAKER_SECS + 5
 LEFTOVER_RETRY_MAX = 900
 LEFTOVER_RETRY_TRIES = 12
 _leftover_lock = threading.Lock()             # read-modify-write of the stored list (and _unsaved)
+# clear_leftovers and a chunk that queues an id still on the list take turns:
+# in a pass several lanes download at once, and a chunk may queue again a
+# chapter its own failed dequeue left behind (it is ours again then)
+_clearing = threading.Lock()
 # Changes to the list the database refused (busy past its timeout): (ids added,
 # ids removed) relative to what is stored. leftovers() includes them and every
 # later write, or the background retry, saves them.
@@ -660,7 +664,7 @@ def _download_source(client, manga_id, todo, batch, label, source_name, patient,
             outcome, unsure = "error", False
             try:
                 try:
-                    ops.enqueue(ids)
+                    _enqueue(ops, ids)
                 except CircuitOpen:
                     outcome = "not sent"            # refused before anything reached Suwayomi: nothing to take back
                     raise
@@ -783,6 +787,20 @@ def _download_source(client, manga_id, todo, batch, label, source_name, patient,
     return ok, failed, why
 
 
+def _enqueue(ops, ids: list[int]) -> None:
+    """Queue a chunk. An id still on the leftover list (an earlier dequeue of
+    that chapter failed) is ours again once it is queued: it comes off the
+    list, in turn with clear_leftovers, which would otherwise take it back
+    out of the queue under this chunk."""
+    if not set(ids) & set(leftovers()):
+        ops.enqueue(ids)
+        return
+    with _clearing:
+        ops.enqueue(ids)
+        if not _forget_leftovers(ids):
+            _retry_leftovers_later(ops)             # saves the shorter list once the database takes it
+
+
 def _dequeue(client, ids: list[int], label: str, outcome: str, cancel: Callable[[], bool] | None = None,
              unsure: bool = False) -> None:
     """Take our chapter ids back out of Suwayomi's queue (leave nothing of
@@ -892,9 +910,17 @@ def clear_leftovers(client, should_cancel: Callable[[], bool] | None = None) -> 
     Suwayomi's queue; ids it no longer has queued (downloaded, or removed
     meanwhile) are simply forgotten. Only ever those ids: nothing else in the
     queue is touched. The caller holds the download lock, so none of them is
-    being downloaded right now. Returns True when nothing is left over; a
-    failure is logged at debug level and tried again later. A cancel
-    (should_cancel) raises Cancelled; the ids stay remembered."""
+    being downloaded right now (in a pass, a lane queuing one of them
+    again waits for this: _enqueue). Returns True when nothing is left
+    over; a failure is logged at debug level and tried again later. A
+    cancel (should_cancel) raises Cancelled; the ids stay remembered."""
+    if not leftovers():
+        return True
+    with _clearing:
+        return _clear_leftovers(client, should_cancel)
+
+
+def _clear_leftovers(client, should_cancel: Callable[[], bool] | None) -> bool:
     ids = leftovers()
     if not ids:
         return True
@@ -986,10 +1012,10 @@ def _retry_leftovers(client, first: float | None = None) -> None:
     """Background: save changes the database refused, then clear_leftovers,
     after `first` s (by default once the breaker lets calls through again),
     backing off while that does not work out. Skipped while a download run
-    holds the lock: that run clears them at its start, and every change to
-    the stored list is made under the lock (a restore relies on it). A
-    restore that waits for the lock is let in at once
-    (leftover_retry_held_off)."""
+    holds the lock: that run clears them (at its start; a pass before every
+    lane step), and every change to the stored list is made under the lock
+    (a restore relies on it). A restore that waits for the lock is let in at
+    once (leftover_retry_held_off)."""
     delay = LEFTOVER_RETRY_SECS if first is None else first
     for _ in range(LEFTOVER_RETRY_TRIES):
         threading.Event().wait(delay)               # not time.sleep: tests patch that out

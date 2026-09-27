@@ -226,12 +226,10 @@ class LanePool:
                progress: Callable[[str], None] | None = None) -> None:
         """Hand over a resolved series with chapters due. The first call
         takes the download lock (waiting for another run like any download
-        does: LockBusy, Cancelled) and takes out queue entries an earlier run
-        left behind. Waits while PIPELINE_MAX_WAITING series already wait for
-        a lane; PoolStopped when the lanes stop meanwhile."""
+        does: LockBusy, Cancelled). Waits while PIPELINE_MAX_WAITING series
+        already wait for a lane; PoolStopped when the lanes stop meanwhile."""
         if self._fd is None:
             self._fd = downloader.acquire_download_lock(should_cancel=self.cancelled, progress=progress)
-            downloader.clear_leftovers(self.client, self.cancelled)
         with self._cv:
             while len(self._waiting) >= PIPELINE_MAX_WAITING and not self.cancelled() and self._running:
                 self._resolving = f"waiting: {len(self._waiting)} series queued for download lanes"
@@ -526,9 +524,14 @@ class LanePool:
                                    task.title, told=task.told)
 
     def _step(self, task: SeriesTask, key: str, lane: int) -> tuple[bool, float]:
-        """One run of `task` on site `key` (on the lane's thread). Returns
-        (the series is finished, seconds the site rests before its next
-        series: the rate-limit pause, longer after a source was given up)."""
+        """One run of `task` on site `key` (on the lane's thread). Queue
+        entries a failed dequeue left behind (an earlier run, or a step of
+        this pass during an outage) are taken out first, as a download run
+        does at its start: the background retry cannot while the pass holds
+        the lock, and a stray chapter would sit in Suwayomi's queue on this
+        site ahead of the series. Returns (the series is finished, seconds
+        the site rests before its next series: the rate-limit pause, longer
+        after a source was given up)."""
         if self.cancelled():
             task.cut = True
             return True, 0.0
@@ -547,6 +550,7 @@ class LanePool:
             src = run.match.source
             t0 = self.clock()
             try:
+                downloader.clear_leftovers(self.client, self.cancelled)
                 ok, failed, why = downloader._download_source(
                     self.client, run.match.manga_id, run.todo, run.batch, task.title, src.name, run.patient,
                     self.cancelled, self._reporter(task, lane), memo, stop_on_fail=run.in_order,

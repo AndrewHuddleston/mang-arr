@@ -14,9 +14,10 @@ from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from fake_suwayomi import PassBase, add_series, entry, resolver_for  # noqa: E402
+from fake_suwayomi import PassBase, add_series, chapter_id, entry, resolver_for  # noqa: E402
 
 from mangarr import backup, core, db, downloader, jobs, lanes, settings  # noqa: E402
+from mangarr.suwayomi import SuwayomiUnreachable  # noqa: E402
 
 X, Y, Z = "Site X (EN)", "Site Y", "Site Z"
 
@@ -509,6 +510,49 @@ class PoolTest(PoolBase):
         self.assertEqual(acq.call_count, 1)                 # once for the pass, not per series
         self.assertEqual(refused, ["a download run is in progress (another mang-arr process); try again later"])
         self.assertTrue(self.lock_free())
+
+    def test_a_chapter_left_in_suwayomis_queue_is_taken_out_before_the_next_step(self):
+        # A's chapter errors out and Suwayomi does not answer the dequeue, so its id is
+        # remembered. The background retry cannot take it out while the pass holds the
+        # download lock; the next step does, before B queues on the same site.
+        fake = self.fake(lanes=3)
+        plans = {"A": [entry(fake, X, 1, "A", [1])], "B": [entry(fake, X, 2, "B", [1])]}
+        stale = chapter_id(1, 1)
+        fake.broken = {stale}
+        real, refused = fake.dequeue, []
+
+        def dequeue(ids, timeout=30):
+            if stale in ids and not refused:
+                refused.append(list(ids))
+                raise SuwayomiUnreachable("Suwayomi at http://fake unreachable: timed out")
+            return real(ids, timeout)
+        fake.dequeue = dequeue
+        with mock.patch.object(downloader, "DEQUEUE_TRIES", 1), self.assertLogs("mangarr.downloader", "WARNING"):
+            series = self.run_all(fake, plans)
+        self.assertEqual(refused, [[stale]])
+        self.assertEqual(fake.violations, [])
+        self.assertIn(stale, [e[4] for e in fake.kinds("dequeue")])
+        self.assertEqual(downloader.leftovers(), [])
+        self.assertEqual(fake.items, [])
+        self.assertEqual(self.statuses(series[1][0]), {"have"})
+
+    def test_a_chunk_that_queues_a_leftover_id_again_owns_it(self):
+        fake = self.fake(secs=0.5)
+        a = entry(fake, X, 1, "A", [1])
+        cid = a.chapters[0].id
+        downloader._remember_leftovers([cid])              # an earlier dequeue of it failed
+        memo, out = downloader.RunMemo(), []
+        th = threading.Thread(target=lambda: out.append(downloader._download_source(
+            fake, 1, a.chapters, 1, "T", X, True, lambda: False, lambda m: None, memo)), daemon=True)
+        th.start()
+        deadline = time.perf_counter() + 5
+        while not fake.kinds("start") and time.perf_counter() < deadline:
+            threading.Event().wait(0.005)
+        self.assertEqual(downloader.leftovers(), [])       # ours again: off the list ...
+        self.assertTrue(downloader.clear_leftovers(fake))  # ... so another lane's clear leaves it in the queue
+        th.join(10)
+        self.assertEqual(out[0][:2], ([1.0], []))
+        self.assertEqual(fake.kinds("dequeue"), [])
 
     def test_many_passes_with_random_timing(self):
         rnd = random.Random(7)
