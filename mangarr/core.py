@@ -6,7 +6,9 @@
     adopt    register everything Suwayomi already downloaded
     delete   stop tracking, optionally remove the library folder
 """
+import hashlib
 import logging
+import math
 import os
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -67,6 +69,8 @@ def add_series(con, client: Client, series: Series, download: bool = True, do_im
     if download and p:
         out.results = download_wanted(con, client, series_id, plan, should_cancel, progress)
         if do_import:
+            if not db.get_series(con, series_id):      # deleted while it downloaded: link nothing
+                raise Gone(f"{series.title} was deleted during the download")
             out.imported += import_series(con, series_id, client)
     return out
 
@@ -183,22 +187,42 @@ def _set_library_entries(client: Client, plan: Plan, primary_manga_id: int) -> N
             log.debug("could not set library flag on %d: %s", m.manga_id, e)
 
 
+# statuses a background job may overwrite; anything else ('ignored', 'have')
+# was set by the user or an import meanwhile and is left alone
+_JOB_OWNED = ("wanted", "failed", "unavailable")
+
+
 def download_wanted(con, client: Client, series_id: int, plan: Plan,
                     should_cancel: Callable[[], bool] | None = None,
                     progress: Callable[[str], None] | None = None) -> dict:
+    """Download the plan's wanted chapters. No write transaction is open while
+    the downloader runs (it can take hours); the outcome is written after, and
+    never over a status the user set in the meantime (e.g. 'ignored')."""
     rows = {r["number"]: r for r in db.chapters(con, series_id)}
     have_on_disk = {n for n, r in rows.items() if r["status"] == "have"}
+    ignored = {n for n, r in rows.items() if r["status"] == "ignored"}
     later = {n for n, r in rows.items() if r["status"] == "failed" and r["next_try"] and r["next_try"] > db.now()}
-    wanted = [n for n in plan.wanted() if n not in have_on_disk and n not in later]
+    wanted = [n for n in plan.wanted() if n not in have_on_disk and n not in later and n not in ignored]
     if later:
         log.info("%s: %d failed chapter(s) not due for another attempt yet", plan.series.title, len(later))
+    if ignored & set(plan.wanted()):
+        log.info("%s: %d ignored chapter(s) not downloaded", plan.series.title, len(ignored & set(plan.wanted())))
     if not wanted:
         log.info("%s: nothing to download", plan.series.title)
         return {}
+    if con.in_transaction:                          # never hold a write across the downloads
+        con.commit()
+    wanted_set = set(wanted)
+
+    def dropped() -> set:
+        """Chapters ignored (or linked) since the list was made: asked before each chunk."""
+        return {r["number"] for r in con.execute(
+            "SELECT number, status FROM chapter WHERE series_id=? AND status IN ('ignored','have')", (series_id,))
+            if r["number"] in wanted_set}
     reasons: dict = {}
     seen_throttle: set = set()
-    results = downloader.download(client, plan, only=set(wanted), should_cancel=should_cancel, reasons=reasons,
-                                  progress=progress, throttled=seen_throttle)
+    results = downloader.download(client, plan, only=wanted_set, should_cancel=should_cancel, reasons=reasons,
+                                  progress=progress, throttled=seen_throttle, dropped=dropped)
     for name in seen_throttle:
         db.record_throttle(con, name)
         log.info("%s rate-limited us; it is paced automatically from now on", name)
@@ -207,8 +231,9 @@ def download_wanted(con, client: Client, series_id: int, plan: Plan,
         metrics.record_download(m.source.name if m else "?", r)
         if m:
             db.record_source_result(con, m.source.name, "ok" if r == "ok" else "failed")
-        if r != "ok":
-            db.set_status(con, series_id, n, "failed", reasons.get(n, "download failed"))
+        if r != "ok" and not db.set_status(con, series_id, n, "failed", reasons.get(n, "download failed"),
+                                           only_from=_JOB_OWNED):
+            log.info("%s: ch %g failed, but its status was changed meanwhile; keeping that", plan.series.title, n)
     ok = sum(1 for r in results.values() if r == "ok")
     failed = sorted(n for n, r in results.items() if r != "ok")
     msg = f"{ok} chapter(s) downloaded, {len(failed)} failed"
@@ -220,7 +245,8 @@ def download_wanted(con, client: Client, series_id: int, plan: Plan,
     for n in wanted:
         if n not in results:                      # waiting for an earlier chapter, or the pass was cut short
             db.set_status(con, series_id, n, "wanted", reasons.get(n) or
-                          "not attempted: the download pass was cancelled or interrupted before this chapter")
+                          "not attempted: the download pass was cancelled or interrupted before this chapter",
+                          only_from=_JOB_OWNED)
     con.commit()
     return results
 
@@ -244,10 +270,15 @@ def chapter_releases(con, client: Client, series_id: int, number: float) -> list
     return out
 
 
-def download_chapter(con, client: Client, series_id: int, number: float, manga_id: int | None = None) -> str:
+def download_chapter(con, client: Client, series_id: int, number: float, manga_id: int | None = None,
+                     should_cancel: Callable[[], bool] | None = None,
+                     progress: Callable[[str], None] | None = None) -> str:
     """Fetch one chapter now: from the given source entry (manual search) or
     from the best trusted entry that lists it (automatic search). Returns a
-    message; the chapter row is updated with the outcome."""
+    message; the chapter row is updated with the outcome. Every bookkeeping
+    write is committed at once, so no write is held across a download."""
+    if not math.isfinite(number) or number < 0:
+        raise ValueError(f"not a chapter number: {number!r}")
     row = db.get_series(con, series_id)
     if not row:
         raise Gone(f"series #{series_id} does not exist")
@@ -256,8 +287,11 @@ def download_chapter(con, client: Client, series_id: int, number: float, manga_i
                if (manga_id is None and not s["note"]) or s["manga_id"] == manga_id]
     if not entries:
         raise ValueError("no such source entry for this series")
+    cancel = should_cancel or (lambda: False)
     tried = []
     for s in entries:
+        if cancel():
+            raise downloader.Cancelled()
         chapters = client.chapters(s["manga_id"])
         ch = next((c for c in chapters if c.number == number), None)
         if ch is None:
@@ -265,9 +299,11 @@ def download_chapter(con, client: Client, series_id: int, number: float, manga_i
             continue
         if s["note"] and manga_id is None:
             continue
-        ok, failed, why = downloader.download_one(client, s["manga_id"], ch, title, s["source_name"])
+        ok, failed, why = downloader.download_one(client, s["manga_id"], ch, title, s["source_name"],
+                                                  should_cancel=cancel, progress=progress)
         metrics.record_download(s["source_name"], "ok" if ok else "failed")
         db.record_source_result(con, s["source_name"], "ok" if ok else "failed")
+        con.commit()                                # before the next source's network calls
         if ok:
             db.set_status(con, series_id, number, "wanted", None)     # import_series flips it to have
             con.execute("UPDATE chapter SET manga_id=?, source_name=?, name=COALESCE(?, name),"
@@ -277,11 +313,13 @@ def download_chapter(con, client: Client, series_id: int, number: float, manga_i
             linked = import_series(con, series_id, client)
             msg = f"chapter {number:g} downloaded from {s['source_name']}" + (" and linked" if linked else "")
             db.event(con, "downloaded", msg, series_id)
+            con.commit()
             log.info("%s: %s", title, msg)
             return msg
         tried.append(f"{s['source_name']}: {why.get(number, 'failed')}")
     reason = "; ".join(tried) or "no source lists this chapter"
-    db.set_status(con, series_id, number, "failed", reason)
+    if not db.set_status(con, series_id, number, "failed", reason, only_from=_JOB_OWNED):
+        log.info("%s: chapter %g failed, but its status was changed meanwhile; keeping that", title, number)
     db.event(con, "failed", f"chapter {number:g}: {reason}", series_id)
     con.commit()
     log.warning("%s: chapter %g: %s", title, number, reason)
@@ -381,6 +419,7 @@ def import_series(con, series_id: int, client: Client | None = None) -> int:
                               f"{os.path.basename(moved)}, will be fetched again")
                 db.record_source_result(con, source_name, "corrupt")
                 log.warning("%s: ch %g from %s is unusable (%s); quarantined %s", title, n, source_name, detail, moved)
+                con.commit()                        # never hold a write across the next file check
                 continue
             label = prev["name"] if prev and "name" in prev.keys() else None
             expected = os.path.join(library.library_dir(folder), library.chapter_filename(n, label))
@@ -389,6 +428,7 @@ def import_series(con, series_id: int, client: Client | None = None) -> int:
             if dst is None:
                 continue
             db.set_have(con, series_id, n, path, dst, source_name)
+            con.commit()                            # never hold a write across the next file check
             known[n] = {"number": n, "status": "have", "library_path": dst}
             log.debug("%s: linked ch %g <- %s", title, n, path)
             linked += 1
@@ -416,29 +456,54 @@ class AdoptItem:
     manga_id: int | None = None
     tracked: bool = False
 
+    @property
+    def key(self) -> str:
+        """Stable id for the Import form: the staging path, hashed (list
+        positions shift when a rescan finds a new folder)."""
+        return hashlib.sha1(self.path.encode("utf-8", "surrogateescape")).hexdigest()[:16]
 
-def suwayomi_downloaded_entries(client: Client) -> dict[tuple[str, str], int]:
-    """{(source name, folder name): manga id} for every entry with downloads."""
-    # downloadCount is not filterable server-side; the list of every cached
-    # entry is small text, so filter here.
-    d = client.gq("{ mangas { nodes { id title downloadCount source { displayName } } } }", timeout=120)
-    out = {}
-    for m in d["mangas"]["nodes"]:
-        if not m.get("downloadCount"):
-            continue
-        src = (m.get("source") or {}).get("displayName") or "?"
-        out[(src, library.safe_title(m["title"]))] = m["id"]
+
+ADOPT_PAGE = 500                # entries per request
+ADOPT_MAX_ENTRIES = 200_000     # stop paging after this many (Suwayomi caches every search hit)
+
+
+def suwayomi_downloaded_entries(client: Client, wanted: set[tuple[str, str]] | None = None
+                                ) -> dict[tuple[str, str], int]:
+    """{(source name, folder name): manga id} for every entry with downloads.
+    Suwayomi caches every search hit, so the list is paged (ADOPT_PAGE per
+    request, one try each) and paging stops as soon as every folder in
+    `wanted` is found, or after ADOPT_MAX_ENTRIES."""
+    # downloadCount is not filterable server-side, so filter here
+    out: dict[tuple[str, str], int] = {}
+    offset = 0
+    while True:
+        nodes, more = client.mangas_page(offset, ADOPT_PAGE)
+        for m in nodes:
+            if not m.get("downloadCount"):
+                continue
+            src = (m.get("source") or {}).get("displayName") or "?"
+            out[(src, library.safe_title(m["title"]))] = m["id"]
+        offset += len(nodes)
+        if wanted is not None and wanted <= out.keys():
+            log.debug("adopt: all %d staged folders found after %d entries", len(wanted), offset)
+            break
+        if not more:
+            break
+        if offset >= ADOPT_MAX_ENTRIES:
+            log.warning("adopt: stopped listing Suwayomi entries after %d; folders not matched by then are "
+                        "adopted without a source entry (a refresh finds it)", offset)
+            break
     return out
 
 
 def plan_adopt(client: Client, only: str | None = None) -> list[AdoptItem]:
     """Inspect every staged series folder and work out what it is."""
-    entries = suwayomi_downloaded_entries(client)
+    dirs = [(src, name, path) for src, name, path in library.staging_dirs()
+            if not only or only.lower() in name.lower()]
+    entries = suwayomi_downloaded_entries(client, {(src, name) for src, name, _ in dirs})
     items: list[AdoptItem] = []
     cache: dict[str, tuple[Series | None, list[Series]]] = {}
-    for src, name, path in library.staging_dirs():
-        if only and only.lower() not in name.lower():
-            continue
+    for src, name, path in dirs:
         numbers, unparsed = library.scan_series_dir(path)
         seasons = any(library.parse_season(u) for u in unparsed)
         it = AdoptItem(src, name, path, numbers, unparsed, seasons, manga_id=entries.get((src, name)))

@@ -14,7 +14,7 @@ from dataclasses import dataclass, field
 from . import config
 from .matching import ACCEPTED, AUTHOR_DIFFER, author_level, match_level
 from .model import Series
-from .suwayomi import Chapter, Client, Source, SuwayomiError
+from .suwayomi import Chapter, Client, Source, SuwayomiError, SuwayomiUnreachable
 
 log = logging.getLogger(__name__)
 
@@ -65,6 +65,8 @@ class Plan:
     series: Series
     matches: list[SourceMatch]
     rejected: list[Rejected]
+    # sources that could not be searched this time, with why; their stored
+    # entries and chapter states are kept as they are (see db.save_plan)
     unreachable: list[tuple[Source, str]]
     assignment: dict[float, SourceMatch]     # chapter number -> source that will provide it
     junk: dict[float, tuple[SourceMatch, int]] = field(default_factory=dict)  # dropped: too few pages
@@ -138,13 +140,28 @@ def resolve(client: Client, series: Series, sources: list[Source] | None = None,
 
 
 _unreachable: dict[str, tuple[float, str]] = {}   # source id -> (when, why); skip it for a while
-UNREACHABLE_TTL = 3600
+UNREACHABLE_TTL = 900
+# What a source's own DNS or connection failure looks like when Suwayomi
+# relays it. Only these are remembered across series: any other error (an
+# HTTP 403/429, a parse error for one odd title, a slow answer) concerns that
+# one search, so the next series tries the source again.
+_CONNECTIVITY = ("unable to resolve host", "unknownhost", "no address associated", "nodename nor servname",
+                 "name or service not known", "failed to connect", "connection refused", "no route to host",
+                 "network is unreachable", "connectexception")
+
+
+def _is_connectivity(msg: str) -> bool:
+    m = msg.lower()
+    return any(k in m for k in _CONNECTIVITY)
 
 
 def _search_source(client, src, series, titles, rejected):
     """Best accepted hit on one source, trying each title until one lands.
-    Returns SourceMatch, None (no acceptable hit) or str (unreachable). A
-    source that could not be reached is not asked again for an hour."""
+    Returns SourceMatch, None (no acceptable hit) or str (could not search it
+    this time). A source whose site cannot be reached at all (DNS/connection)
+    is not asked again for UNREACHABLE_TTL. When Suwayomi itself does not
+    answer, SuwayomiUnreachable is raised: that is no verdict on any source,
+    so the caller keeps the plan it has."""
     import time
     seen_ids: set[int] = set()
     known = _unreachable.get(src.id)
@@ -153,11 +170,18 @@ def _search_source(client, src, series, titles, rejected):
     for q in titles:
         try:
             hits = client.search(src, q)
+        except SuwayomiUnreachable:
+            raise
         except SuwayomiError as e:
             msg = str(e)
-            why = "DNS/network" if any(k in msg.lower() for k in ("unreachable", "resolve", "hostname")) else msg[:60]
-            _unreachable[src.id] = (time.monotonic(), why)
-            return why
+            if _is_connectivity(msg):
+                why = "DNS/network: " + msg[:80]
+                _unreachable[src.id] = (time.monotonic(), why)
+                log.warning("%s: site unreachable (%s); not searched again for %d min", src.name, msg[:120],
+                            UNREACHABLE_TTL // 60)
+                return why
+            log.info("%s: search for %r failed (%s); trying it again for the next series", src.name, q, msg[:120])
+            return msg[:80]
         log.debug("%s search %r -> %d hit(s)", src.name, q, len(hits))
         scored = []
         for h in hits:
@@ -177,6 +201,8 @@ def _search_source(client, src, series, titles, rejected):
         lvl, hit, matched = scored[0]
         try:
             manga, chapters = client.manga(hit["id"])
+        except SuwayomiUnreachable:
+            raise
         except SuwayomiError as e:
             if "no chapters" in str(e).lower():       # matched, but the entry is empty
                 manga, chapters = hit, []

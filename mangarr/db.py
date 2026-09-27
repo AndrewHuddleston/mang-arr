@@ -318,7 +318,15 @@ def events(con, limit: int = 50):
 # -- plan / chapters ---------------------------------------------------------
 
 def save_plan(con, series_id: int, plan, primary_manga_id: int | None) -> None:
-    con.execute("DELETE FROM series_source WHERE series_id=?", (series_id,))
+    # A source that could not be searched this time (plan.unreachable) says
+    # nothing about the series: its stored entry (and staging folder) stays,
+    # and the chapters only it lists are not marked unavailable.
+    down = sorted({src.name for src, _ in getattr(plan, "unreachable", None) or []})
+    marks = ",".join("?" * len(down))
+    con.execute(f"DELETE FROM series_source WHERE series_id=? AND source_name NOT IN ({marks})", (series_id, *down))
+    if down and primary_manga_id is not None:
+        con.execute(f"UPDATE series_source SET is_primary=0 WHERE series_id=? AND source_name IN ({marks})",
+                    (series_id, *down))
     for m in plan.matches:
         con.execute(
             "INSERT INTO series_source (series_id, manga_id, source_name, title, author,"
@@ -327,7 +335,7 @@ def save_plan(con, series_id: int, plan, primary_manga_id: int | None) -> None:
             (series_id, m.manga_id, m.source.name, m.title, m.author, m.match, m.author_ok,
              len(m.chapters), m.max, m.note or None, int(m.manga_id == primary_manga_id), now()))
     rows = {r["number"]: r for r in con.execute(
-        "SELECT number, status, library_path, next_try FROM chapter WHERE series_id=?", (series_id,))}
+        "SELECT number, status, library_path, next_try, source_name FROM chapter WHERE series_id=?", (series_id,))}
     keep = {"have", "ignored"}
     for n, m in plan.assignment.items():
         prev = rows.get(n)
@@ -363,7 +371,7 @@ def save_plan(con, series_id: int, plan, primary_manga_id: int | None) -> None:
     # not wanted, it is unavailable - it comes back if a source lists it again
     still = set(plan.assignment) | set(plan.junk)
     for n, prev in rows.items():
-        if prev["status"] in ("wanted", "failed") and n not in still:
+        if prev["status"] in ("wanted", "failed") and n not in still and prev["source_name"] not in down:
             con.execute("UPDATE chapter SET status='unavailable', reason=?, updated_at=?"
                         " WHERE series_id=? AND number=?",
                         ("no trusted source lists this chapter any more", now(), series_id, n))
@@ -385,12 +393,20 @@ def set_have(con, series_id: int, number: float, staging_path: str | None,
 RETRY_HOURS = (0, 24, 72, 168)      # after the 1st failure: next pass; then 1 day, 3 days, a week (cap)
 
 
-def set_status(con, series_id: int, number: float, status: str, reason: str | None = None) -> None:
+def set_status(con, series_id: int, number: float, status: str, reason: str | None = None,
+               only_from: tuple[str, ...] | None = None) -> bool:
     """Change a chapter's status with a reason (cleared for have). A failure
     bumps the try count and schedules the next attempt further out each time;
-    success or a fresh 'wanted' resets the schedule."""
+    success or a fresh 'wanted' resets the schedule. With only_from, the row
+    changes only if its current status is one of those (so a background job
+    never overwrites what the user set meanwhile, e.g. 'ignored'). Returns
+    whether a row changed."""
     if status == "have":
         reason = None
+    guard, gargs = "", ()
+    if only_from:
+        guard = f" AND status IN ({','.join('?' * len(only_from))})"
+        gargs = tuple(only_from)
     if status == "failed":
         row = con.execute("SELECT tries FROM chapter WHERE series_id=? AND number=?", (series_id, number)).fetchone()
         tries = (row["tries"] if row else 0) + 1
@@ -398,13 +414,15 @@ def set_status(con, series_id: int, number: float, status: str, reason: str | No
         next_try = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(time.time() + hours * 3600))
         if hours:
             reason = f"{reason or 'download failed'} (failed {tries}x; next attempt after {next_try[:16]})"
-        con.execute("UPDATE chapter SET status='failed', reason=?, tries=?, next_try=?, updated_at=?"
-                    " WHERE series_id=? AND number=?",
-                    ((reason or None) and reason[:300], tries, next_try if hours else None, now(), series_id, number))
-        return
+        cur = con.execute("UPDATE chapter SET status='failed', reason=?, tries=?, next_try=?, updated_at=?"
+                          " WHERE series_id=? AND number=?" + guard,
+                          ((reason or None) and reason[:300], tries, next_try if hours else None, now(), series_id,
+                           number, *gargs))
+        return cur.rowcount > 0
     reset = ", tries=0, next_try=NULL" if status in ("have", "wanted") else ""
-    con.execute(f"UPDATE chapter SET status=?, reason=?, updated_at=?{reset} WHERE series_id=? AND number=?",
-                (status, (reason or None) and reason[:300], now(), series_id, number))
+    cur = con.execute(f"UPDATE chapter SET status=?, reason=?, updated_at=?{reset} WHERE series_id=? AND number=?"
+                      + guard, (status, (reason or None) and reason[:300], now(), series_id, number, *gargs))
+    return cur.rowcount > 0
 
 
 def chapters(con, series_id: int):

@@ -183,6 +183,7 @@ with an asterisk to the container mounts (`/config`, `/data/staging`,
 | `MANGARR_DATA` * | `/var/lib/mangarr` | Data directory: the database, the `backups/` folder, the download lock and (for `serve`) the log file live here. |
 | `MANGARR_DB` | `$MANGARR_DATA/mangarr.db` | SQLite database path. |
 | `MANGARR_LOCK` | `$MANGARR_DATA/download.lock` | Lock file; only one download run (web worker or CLI) exists at a time, the other waits. |
+| `MANGARR_LOCK_WAIT_SECS` | `21600` | How long a download run waits for the other one (cancellable, shown on Activity) before it gives up with an error. |
 | `MANGARR_STAGING` * | `$MANGARR_DATA/staging` | Suwayomi's download tree, `<Source>/<Series>/*.cbz`. Read only; never renamed. |
 | `MANGARR_LIBRARY` * | `$MANGARR_DATA/library` | The per-series hard-link tree Komga reads, `<Series>/Chapter 012.0.cbz`. Same mount as staging. |
 | `MANGARR_LOG_LEVEL` | `INFO` | `DEBUG`, `INFO`, `WARNING` or `ERROR`. |

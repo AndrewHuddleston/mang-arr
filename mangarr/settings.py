@@ -173,7 +173,15 @@ def _coerce(key: str, v):
     if isinstance(d, bool):
         return str(v).lower() in ("1", "true", "on", "yes")
     if isinstance(d, float):
-        return float(v)
+        import math
+
+        from .limits import RANGES  # imported here: limits imports this module
+        f = float(v)
+        lo, hi = RANGES.get(key, (-math.inf, math.inf))
+        if not math.isfinite(f) or not lo <= f <= hi:
+            log.warning("setting %s = %r rejected: outside %g..%g", key, v, lo, hi)
+            raise ValueError(f"{key} must be a number from {lo:g} to {hi:g}, not {v!r}")
+        return f
     if isinstance(d, int):
         return int(v)
     if isinstance(d, list):

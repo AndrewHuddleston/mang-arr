@@ -6,6 +6,7 @@ Pages:   /  /series/{id}  /add  /import  /lists  /wanted  /activity  /activity/h
 API:     /api/v1/...  (mirrors the pages; used by the pages' live updates)
 """
 import base64
+import dataclasses
 import hashlib
 import hmac
 import logging
@@ -32,6 +33,7 @@ from .. import (
     jobs,
     komga,
     library,
+    limits,
     metadata,
     metrics,
     model,
@@ -40,7 +42,7 @@ from .. import (
     updates,
 )
 from ..resolver import ranges
-from ..suwayomi import Client, SuwayomiError
+from ..suwayomi import BREAKER_SECS, Client, SuwayomiError, SuwayomiUnreachable
 from . import lists_routes, views
 
 log = logging.getLogger(__name__)
@@ -148,7 +150,7 @@ def plan_pass(rows) -> tuple[list, int]:
     """Order a refresh pass: series with missing chapters first (so downloads
     start at once), then the rest; finished series with nothing missing are
     skipped until recheck_finished_days have passed. Returns (rows, skipped)."""
-    days = float(settings.get("recheck_finished_days") or 0)
+    days = limits.clamp("recheck_finished_days", settings.get("recheck_finished_days") or 0)
     cutoff = time.time() - days * 86400
     keep, skipped = [], 0
     for r in rows:
@@ -170,9 +172,14 @@ def plan_pass(rows) -> tuple[list, int]:
 def _run_pass(job: jobs.Job, rows, label: str) -> tuple[int, int, int, int]:
     """Refresh every series in rows, one at a time, keeping job.items current
     so the Activity page shows the whole pass: what is queued, what is running
-    and what happened to each. Returns (done, downloaded, imported, errors)."""
+    and what happened to each. Returns (done, downloaded, imported, errors).
+
+    When Suwayomi itself stops answering, the pass waits one breaker window
+    and tries the next series; if Suwayomi is still down it stops with one
+    clear error (SuwayomiUnreachable) instead of timing out on every series."""
     job.items = [{"series_id": r["id"], "title": r["title"], "state": "queued", "result": ""} for r in rows]
     done = downloaded = imported = errors = 0
+    outages = 0                                    # consecutive series that failed because Suwayomi is down
     for i, (r, item) in enumerate(zip(rows, job.items, strict=True), 1):
         if job.cancel:
             job.progress = f"cancelled after {done} of {len(rows)}"
@@ -182,6 +189,7 @@ def _run_pass(job: jobs.Job, rows, label: str) -> tuple[int, int, int, int]:
         head = f"{i}/{len(rows)}: {r['title']}"
         job.progress = head
         item["state"], item["result"] = "running", "checking sources"
+        job.active_series_id = r["id"]             # pending_for() sees the series this pass is on
 
         def prog(m, head=head, item=item):
             job.progress = f"{head} - {m}"
@@ -193,6 +201,7 @@ def _run_pass(job: jobs.Job, rows, label: str) -> tuple[int, int, int, int]:
                 item["state"], item["result"] = core.describe_outcome(con, r["id"], o)
             downloaded += o.downloaded
             imported += o.imported
+            outages = 0
         except core.Gone:
             item["state"], item["result"] = "cancelled", "series was deleted"
             continue
@@ -200,7 +209,27 @@ def _run_pass(job: jobs.Job, rows, label: str) -> tuple[int, int, int, int]:
             errors += 1
             item["state"], item["result"] = "error", f"{type(e).__name__}: {e}"[:300]
             log.error("%s: %s: %s: %s", label, r["title"], type(e).__name__, e)
-            _record_error(r["id"], e)
+            try:                                   # bookkeeping must never end the pass
+                _record_error(r["id"], e)
+            except Exception as rec:
+                log.warning("%s: could not record the error for %s: %s: %s", label, r["title"],
+                            type(rec).__name__, rec)
+            if isinstance(e, SuwayomiUnreachable):
+                outages += 1
+                if outages >= 2:
+                    rest = job.items[i:]
+                    for it in rest:
+                        it["state"], it["result"] = "cancelled", "pass stopped: Suwayomi is not answering"
+                    log.error("%s: Suwayomi is not answering; stopping the pass after %d of %d series (%d left)",
+                              label, i, len(rows), len(rest))
+                    raise SuwayomiUnreachable(f"pass stopped after {i} of {len(rows)} series, "
+                                              f"{len(rest)} not checked: {e}") from e
+                job.progress = f"{head} - Suwayomi is not answering; waiting {BREAKER_SECS} s before going on"
+                log.warning("%s: Suwayomi is not answering; waiting %d s, the pass stops if it still is",
+                            label, BREAKER_SECS)
+                limits.pause(BREAKER_SECS, lambda: job.cancel)
+        finally:
+            job.active_series_id = None
         done += 1
     return done, downloaded, imported, errors
 
@@ -348,6 +377,14 @@ def logout():
     return resp
 
 
+@app.exception_handler(jobs.QueueFull)
+async def _queue_full(request: Request, exc: jobs.QueueFull):
+    """Too many jobs waiting: 429, as JSON for the API and as a message on the Activity page otherwise."""
+    if request.url.path.startswith("/api/"):
+        return JSONResponse({"error": str(exc)}, status_code=429)
+    return Response(f"mang-arr: job queue is full: {exc}", 429, media_type="text/plain")
+
+
 @app.exception_handler(Exception)
 async def _unhandled(request: Request, exc: Exception):
     log.exception("unhandled error on %s %s", request.method, request.url.path)
@@ -425,8 +462,14 @@ def series_monitor(series_id: int, monitored: str = Form("1")):
 def _job_chapter(series_id: int, number: float, manga_id: int | None):
     def run(job: jobs.Job):
         with db.connect() as con:
-            return core.download_chapter(con, client, series_id, number, manga_id)
+            return core.download_chapter(con, client, series_id, number, manga_id, should_cancel=lambda: job.cancel,
+                                         progress=lambda m: setattr(job, "progress", m))
     return run
+
+
+def _chapter_key(series_id: int, number: float, manga_id: int | None) -> str:
+    """One queued/running job per (series, chapter, source entry)."""
+    return f"chapter:{series_id}:{number:g}:{manga_id or 'auto'}"
 
 
 @app.post("/series/{series_id}/chapter/{number}/search")
@@ -435,7 +478,8 @@ def chapter_search(series_id: int, number: float):
         r = db.get_series(con, series_id)
     if not r:
         raise HTTPException(404)
-    runner.submit("chapter", f"{r['title']} ch {number:g}", _job_chapter(series_id, number, None), series_id)
+    runner.submit("chapter", f"{r['title']} ch {number:g}", _job_chapter(series_id, number, None), series_id,
+                  key=_chapter_key(series_id, number, None))
     return _flash(f"/series/{series_id}", f"search for chapter {number:g} queued")
 
 
@@ -449,7 +493,7 @@ def chapter_download(series_id: int, number: float, manga_id: int = Form(...)):
     if not src:
         return _flash(f"/series/{series_id}", "that source entry does not belong to this series")
     runner.submit("chapter", f"{r['title']} ch {number:g} from {src['source_name']}",
-                  _job_chapter(series_id, number, manga_id), series_id)
+                  _job_chapter(series_id, number, manga_id), series_id, key=_chapter_key(series_id, number, manga_id))
     return _flash(f"/series/{series_id}", f"download of chapter {number:g} from {src['source_name']} queued")
 
 
@@ -488,7 +532,7 @@ def api_chapter_search(series_id: int, number: float, manga_id: int | None = Non
     if not r:
         raise HTTPException(404)
     return runner.submit("chapter", f"{r['title']} ch {number:g}", _job_chapter(series_id, number, manga_id),
-                         series_id).as_dict()
+                         series_id, key=_chapter_key(series_id, number, manga_id)).as_dict()
 
 
 @app.post("/series/{series_id}/chapter/{number}/ignore")
@@ -517,6 +561,7 @@ def series_delete(series_id: int, files: str = Form("0"), exclude: str = Form("0
             return _flash(f"/series/{series_id}", "cannot delete while a job for this series is running")
         if exclude == "1":
             lists_routes.exclude_deleted(con, r)
+            con.commit()                   # never hold a write across delete_series' Suwayomi calls
         core.delete_series(con, client, series_id, delete_library=(files == "1"))
     return _flash("/", f"deleted {r['title']}")
 
@@ -578,7 +623,9 @@ def add_submit(ref: str = Form(...), download: str = Form("1"), title: str = For
     return _flash("/activity", f"{series.title} queued as job #{job.id}")
 
 
-_adopt_scan: dict = {"items": None, "job": None}
+# gen counts finished scans: the Import form carries it, so a submit made
+# against an older scan (the list changed since) is refused
+_adopt_scan: dict = {"items": None, "job": None, "gen": 0}
 
 
 def _job_adopt_scan(job: jobs.Job):
@@ -588,6 +635,7 @@ def _job_adopt_scan(job: jobs.Job):
     for it in items:
         it.tracked = bool(it.series and it.series.ref in tracked)
     _adopt_scan["items"] = items
+    _adopt_scan["gen"] += 1
     n_ok = sum(1 for i in items if i.series and not i.tracked)
     return f"{len(items)} folders, {n_ok} identified, {sum(1 for i in items if not i.series)} need a choice"
 
@@ -597,7 +645,7 @@ def import_page(request: Request):
     items = _adopt_scan["items"]
     job = _adopt_scan["job"]
     scanning = bool(job and job.status in ("queued", "running"))
-    ctx = dict(items=items, scanning=scanning, staging=config.STAGING_ROOT)
+    ctx = dict(items=items, scanning=scanning, staging=config.STAGING_ROOT, gen=_adopt_scan["gen"])
     if items is not None:
         ctx.update(n_ok=sum(1 for i in items if i.series and not i.tracked),
                    n_review=sum(1 for i in items if not i.series),
@@ -615,27 +663,35 @@ def import_scan():
 
 @app.post("/import/apply")
 async def import_apply(request: Request):
+    """Adopt what the Import form selected. Fields are keyed by each folder's
+    stable key (AdoptItem.key), not its position, and the form's scan
+    generation must match the current scan: a rescan in between may have
+    added or removed folders, and a choice must never land on another one."""
     items = _adopt_scan["items"]
     if items is None:
         return _flash("/import", "scan first")
     form = await request.form()
+    if str(form.get("gen", "")) != str(_adopt_scan["gen"]):
+        log.warning("import: form from scan %s submitted, current scan is %s; refused", form.get("gen"),
+                    _adopt_scan["gen"])
+        return _flash("/import", "the folder list changed since this page was loaded; check it and import again")
     chosen = []
-    for i, it in enumerate(items):
+    for it in items:
         if it.tracked:
             continue
         if it.series:
-            if form.get(f"adopt_{i}") == "1":
+            if form.get(f"adopt_{it.key}") == "1":
                 chosen.append(it)
             continue
-        choice = str(form.get(f"choice_{i}", "skip"))
+        choice = str(form.get(f"choice_{it.key}", "skip"))
         if choice == "skip":
             continue
         try:
-            it.series = _series_from_ref("manual" if choice == "manual" else choice, it.folder_name)
+            series = _series_from_ref("manual" if choice == "manual" else choice, it.folder_name)
         except ValueError as e:
             log.error("import: %s for %s: %s", choice, it.folder_name, e)
             continue
-        chosen.append(it)
+        chosen.append(dataclasses.replace(it, series=series))    # a copy: the shared scan result stays as scanned
     if not chosen:
         return _flash("/import", "nothing selected")
 
@@ -665,7 +721,7 @@ def wanted_search():
     for j in runner.jobs():
         if j.kind in ("search-wanted", "refresh-all") and j.status in ("queued", "running"):
             return _flash("/activity", f"a {j.kind} job is already {j.status}")
-    runner.submit("search-wanted", "every series with wanted chapters", _job_search_wanted)
+    runner.submit("search-wanted", "every series with wanted chapters", _job_search_wanted, key="search-wanted")
     return _flash("/activity", "search queued")
 
 
@@ -733,7 +789,7 @@ def system_logs_page(request: Request, lines: int = 500):
 
 @app.post("/system/metadata-refresh")
 def system_metadata_refresh():
-    runner.submit("metadata", "every series", _job_refresh_metadata)
+    runner.submit("metadata", "every series", _job_refresh_metadata, key="metadata")
     return _flash("/activity", "metadata refresh queued")
 
 
@@ -1003,9 +1059,11 @@ def api_command(body: dict):
             raise HTTPException(503, "scheduler not started")
         return scheduler.trigger().as_dict()
     if name == "SearchWanted":
-        return runner.submit("search-wanted", "every series with wanted chapters", _job_search_wanted).as_dict()
+        j = runner.active("search-wanted", "refresh-all")
+        return (j or runner.submit("search-wanted", "every series with wanted chapters", _job_search_wanted,
+                                   key="search-wanted")).as_dict()
     if name == "RefreshMetadata":
-        return runner.submit("metadata", "every series", _job_refresh_metadata).as_dict()
+        return runner.submit("metadata", "every series", _job_refresh_metadata, key="metadata").as_dict()
     raise HTTPException(400, f"unknown command {name!r}; known: RefreshAll, SearchWanted, RefreshMetadata")
 
 

@@ -3,7 +3,9 @@ module that talks to it."""
 import json
 import logging
 import re
+import threading
 import time
+import urllib.error
 import urllib.request
 from dataclasses import dataclass
 
@@ -14,6 +16,39 @@ log = logging.getLogger(__name__)
 
 class SuwayomiError(RuntimeError):
     pass
+
+
+class SuwayomiUnreachable(SuwayomiError):
+    """Suwayomi itself did not answer (connection refused, DNS, or a hung
+    server), as opposed to one source failing behind it. Callers that loop
+    over many series stop early on this instead of paying the timeout again
+    for every series."""
+
+
+# Circuit breaker, shared by every Client pointing at the same Suwayomi: after
+# a transport failure, calls fail at once for BREAKER_SECS instead of each
+# waiting out its own timeouts and retries. The first call after the window
+# goes through again (a successful call closes the breaker).
+BREAKER_SECS = 60
+_down: dict[str, tuple[float, str]] = {}          # api url -> (monotonic time it tripped, why)
+_down_lock = threading.Lock()
+
+# These ask the source website for something, so a timeout means the site is
+# slow, not that Suwayomi is down: they never trip the breaker on a timeout.
+_REMOTE_OPS = {"fetchSourceManga", "fetchMangaAndChapters", "fetchChapterPages"}
+
+
+def _failure_kind(e: BaseException) -> str:
+    """'timeout', 'connect' (refused, reset, DNS), 'http' (Suwayomi answered
+    with an HTTP error) or 'other' (e.g. a response that is not JSON)."""
+    if isinstance(e, urllib.error.HTTPError):
+        return "http"
+    reason = e.reason if isinstance(e, urllib.error.URLError) else e
+    if isinstance(reason, TimeoutError):          # socket.timeout is TimeoutError on 3.10+
+        return "timeout"
+    if isinstance(reason, OSError):
+        return "connect"
+    return "other"
 
 
 _OPNAME = re.compile(r"\b(fetchSourceManga|fetchMangaAndChapters|fetchChapterPages|downloadStatus|"
@@ -54,9 +89,14 @@ class Client:
         body: dict = {"query": query}
         if variables:
             body["variables"] = variables
-        last = None
+        last: BaseException | None = None
         m = _OPNAME.search(query)
         op = m.group(1) if m else "query"
+        with _down_lock:
+            down = _down.get(self.api)
+        if down and time.monotonic() - down[0] < BREAKER_SECS:
+            raise SuwayomiUnreachable(f"Suwayomi at {self.api} unreachable: {down[1]} (not retrying for "
+                                      f"{BREAKER_SECS - (time.monotonic() - down[0]):.0f} s)")
         for attempt in range(1, retries + 1):
             t0 = time.monotonic()
             try:
@@ -64,6 +104,9 @@ class Client:
                                              {"Content-Type": "application/json"})
                 with urllib.request.urlopen(req, timeout=timeout) as r:
                     d = json.load(r)
+                if down:
+                    self._breaker_close()
+                    down = None
                 if "errors" in d:
                     msg = d["errors"][0]["message"].split("\n")[0][:200]
                     log.debug("suwayomi %s %s -> error in %.1fs: %s", op, variables or "",
@@ -79,7 +122,32 @@ class Client:
                           time.monotonic() - t0, e)
                 if attempt < retries:
                     time.sleep(5)
-        raise SuwayomiError(f"Suwayomi at {self.api} unreachable: {last}")
+        kind = _failure_kind(last) if last is not None else "other"
+        if kind == "timeout" and op in _REMOTE_OPS:
+            # the source website is slow; Suwayomi itself answered other calls
+            raise SuwayomiError(f"{op} timed out after {timeout} s (the source did not answer in time)")
+        if kind in ("connect", "timeout"):
+            # A short probe (the health check, a page's status widget) timing
+            # out once does not prove Suwayomi is down, so only calls that
+            # waited a while trip the breaker; refused/DNS always does.
+            if kind == "connect" or timeout >= 30:
+                self._breaker_trip(f"{type(last).__name__}: {last}")
+            raise SuwayomiUnreachable(f"Suwayomi at {self.api} unreachable: {last}")
+        raise SuwayomiError(f"Suwayomi at {self.api} failed: {type(last).__name__}: {last}")
+
+    def _breaker_trip(self, why: str) -> None:
+        with _down_lock:
+            first = self.api not in _down
+            _down[self.api] = (time.monotonic(), why[:200])
+        if first:
+            log.error("Suwayomi at %s is not answering (%s); calls fail fast for %d s", self.api, why[:200],
+                      BREAKER_SECS)
+
+    def _breaker_close(self) -> None:
+        with _down_lock:
+            was = _down.pop(self.api, None)
+        if was:
+            log.info("Suwayomi at %s answers again", self.api)
 
     # -- sources / search -------------------------------------------------
 
@@ -95,7 +163,7 @@ class Client:
                 throttled |= db.auto_throttled(con)
         except Exception as e:
             log.debug("could not read detected rate limits: %s", e)
-        d = self.gq("{ sources { nodes { id displayName lang } } }")
+        d = self.gq("{ sources { nodes { id displayName lang } } }", timeout=30, retries=2)
         out = []
         for s in d["sources"]["nodes"]:
             if s["lang"] not in langs or s["displayName"] == "Local source":
@@ -128,12 +196,13 @@ class Client:
     def chapters(self, manga_id: int) -> list[Chapter]:
         """Chapter list from Suwayomi's cache (no source fetch)."""
         d = self.gq('query($id: Int!) { manga(id: $id) { chapters { nodes'
-                    ' { id name chapterNumber scanlator isDownloaded uploadDate } } } }', {"id": manga_id})
+                    ' { id name chapterNumber scanlator isDownloaded uploadDate } } } }', {"id": manga_id},
+                    timeout=60, retries=2)
         return dedupe(d["manga"]["chapters"]["nodes"])
 
     def downloaded_ids(self, manga_id: int) -> set[int]:
         d = self.gq('query($id: Int!) { manga(id: $id) { chapters { nodes { id isDownloaded } } } }',
-                    {"id": manga_id})
+                    {"id": manga_id}, timeout=60, retries=2)
         return {c["id"] for c in d["manga"]["chapters"]["nodes"] if c["isDownloaded"]}
 
     def page_count(self, chapter_id: int) -> int | None:
@@ -146,6 +215,16 @@ class Client:
         except SuwayomiError:
             return None
 
+    def mangas_page(self, offset: int, first: int = 500) -> tuple[list[dict], bool]:
+        """One page of every entry Suwayomi has cached (every search hit is
+        cached, so the whole list can run to tens of thousands): returns
+        ([{id, title, downloadCount, source: {displayName}}], more pages)."""
+        d = self.gq('query($first: Int!, $offset: Int!) { mangas(first: $first, offset: $offset)'
+                    ' { nodes { id title downloadCount source { displayName } } pageInfo { hasNextPage } } }',
+                    {"first": first, "offset": offset}, timeout=60, retries=1)
+        nodes = d["mangas"]["nodes"]
+        return nodes, bool(nodes) and bool((d["mangas"].get("pageInfo") or {}).get("hasNextPage"))
+
     def set_in_library(self, manga_id: int, in_library: bool, retries: int = 3, timeout: int = 60) -> None:
         self.gq('mutation($id: Int!, $v: Boolean!) {'
                 ' updateManga(input: {id: $id, patch: {inLibrary: $v}}) { manga { id } } }',
@@ -157,22 +236,22 @@ class Client:
 
     def enqueue(self, chapter_ids: list[int]) -> None:
         self.gq('mutation($ids: [Int!]!) { enqueueChapterDownloads(input: {ids: $ids}) { clientMutationId } }',
-                {"ids": chapter_ids})
+                {"ids": chapter_ids}, timeout=60)
 
-    def dequeue(self, chapter_ids: list[int]) -> None:
+    def dequeue(self, chapter_ids: list[int], timeout: int = 30) -> None:
         if chapter_ids:
             self.gq('mutation($ids: [Int!]!) { dequeueChapterDownloads(input: {ids: $ids}) { clientMutationId } }',
-                    {"ids": chapter_ids}, retries=1)
+                    {"ids": chapter_ids}, timeout=timeout, retries=1)
 
     def start(self) -> None:
-        self.gq("mutation { startDownloader(input: {}) { clientMutationId } }")
+        self.gq("mutation { startDownloader(input: {}) { clientMutationId } }", timeout=60)
 
     def stop(self) -> None:
         self.gq("mutation { stopDownloader(input: {}) { clientMutationId } }", retries=1)
 
     def queue(self) -> list[dict]:
         """[{id, state, tries, progress}] for every item in Suwayomi's queue."""
-        d = self.gq("{ downloadStatus { queue { chapter { id } state tries progress } } }")
+        d = self.gq("{ downloadStatus { queue { chapter { id } state tries progress } } }", timeout=30, retries=2)
         return [{"id": x["chapter"]["id"], "state": x["state"], "tries": x["tries"],
                  "progress": x.get("progress") or 0.0} for x in d["downloadStatus"]["queue"]]
 
