@@ -175,7 +175,9 @@ def anilist_links(uuids: list[str]) -> dict[str, int | None]:
 # -- English chapter list --------------------------------------------------
 # Evidence for the "stuck behind chapter N" verdict (verdict.py): which
 # chapter numbers from N to N+1 the MangaDex community lists in English, with
-# their titles and page counts. Read-only and best effort: the requests are
+# their titles and page counts, and where the list goes on after them (a list
+# that ends, or skips ahead, before a chapter says nothing about whether that
+# chapter exists). Read-only and best effort: the requests are
 # paced, never wait long (for their turn, on a timeout or on a rate limit),
 # the answers are kept for a week, and a lookup never raises - a failure only
 # means no evidence.
@@ -204,6 +206,8 @@ class ChapterList:
     manga_id: str | None                        # None: no MangaDex entry found is tied to the series
     count: int = 0                              # English chapters it lists for the whole series
     near: dict = field(default_factory=dict)    # {number: MdChapter} for every one from N up to N+1
+    following: float | None = None              # the first chapter it lists from N+1 on (None: none)
+    highest: float | None = None                # the highest chapter it lists
 
 
 class _Cache:
@@ -277,6 +281,7 @@ def _paced_get(path: str, params: list[tuple[str, str]]) -> dict:
             d = _request(path, params, CHAPTERS_TIMEOUT)
             return d if isinstance(d, dict) else {}
         except urllib.error.HTTPError as e:
+            e.close()                           # the answer's connection: only its status and headers are used
             if e.code == 404:
                 return {}
             if e.code == 429:
@@ -364,12 +369,14 @@ def _chapters_near(s: Series, number: float) -> ChapterList:
     number, whole = round(number, 4), math.floor(number)
     near = sorted((n for n in agg if whole <= n < whole + 1),       # N and the asked-for one first
                   key=lambda n: (n != whole, n != number, abs(n - number)))[:MAX_NEAR]
-    return ChapterList(uuid, len(agg), dict(sorted(_details({n: agg[n] for n in near}).items())))
+    return ChapterList(uuid, len(agg), dict(sorted(_details({n: agg[n] for n in near}).items())),
+                       min((n for n in agg if n >= whole + 1), default=None), max(agg, default=None))
 
 
 def english_chapters(s: Series, number: float, fetch: bool = True) -> ChapterList | None:
     """MangaDex's English chapters of this series numbered from the whole
-    chapter under `number` up to the next one (for 7.2: 7, 7.5 ...), or None
+    chapter under `number` up to the next one (for 7.2: 7, 7.5 ...) and the
+    first one it lists after them (8, or 50 if it skips ahead), or None
     when that cannot be known now: MangaDex unreachable or refusing (tried
     again after FAILED_TTL), a manual series, or - with fetch=False, for a
     caller that must not wait on the network - not looked up yet. A series

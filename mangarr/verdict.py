@@ -8,27 +8,47 @@ split in two. This module judges which from deterministic signals only, and
 gives its evidence as plain sentences the user can check:
 
   * the chapter's name on each source: side story, spin-off, omake,
-    afterword (and romanised or native forms) -> a side story; extra, bonus,
-    special -> the same, but these are ordinary words too, so only for a
-    chapter numbered between the story's (7.5) or after its end; a notice
-    ("Hiatus Notice", "Update Schedule") -> not a chapter, unless its copy
-    has a chapter's page count; "part 2" -> the rest of a chapter
+    afterword, extra (and romanised or native forms) -> a side story; bonus
+    and special -> the same, less surely (ordinary words more often); "part
+    2" -> the rest of a chapter; any other title (but chapter N's own) -> a
+    chapter of its own, which outweighs a side story's name elsewhere. These
+    words decide only for a chapter numbered between the story's (7.5): a
+    whole number is the story's own numbering. Notice words ("Hiatus
+    Notice", 公告) are shown but never decide anything: "The Announcement" is
+    a chapter title too.
   * MangaDex's English chapter list (mangadex.english_chapters): it has the
-    whole chapter N and not this number -> a site's own split or duplicate,
-    already covered when you have N at its normal length; it lists this
-    number under an extra's name -> a side story
+    whole chapter N, goes on with N+1 and lacks this number -> a site's own
+    split or duplicate, already covered when you have N at its length; it
+    lists this number under a title, or at a chapter's length -> a chapter
+    of its own. A list that ends or skips ahead before the number says
+    nothing about it.
   * page counts: your N much shorter than MangaDex's N or the series' usual
-    chapter -> the site split N, and this is probably the rest of it; only
-    about as long as those is the whole chapter
-  * position: after the last chapter of a finished series, or numbered .5 ->
-    hints shown with the other signs that never decide (a last chapter split
-    in two looks just the same)
+    chapter -> the site split N, and this is probably the rest of it; the
+    whole chapter only at 85-115% of those (longer, it may hold more)
+  * position: after the last chapter of a finished series, or numbered .5
+    -> hints shown with the other signs that never decide (a last chapter
+    split in two looks just the same; the last whole chapter itself, even
+    one called Epilogue, is never after the end)
 
 When the signals disagree, or there are too few, the verdict is "unknown".
-Only side_story and covered are ever candidates for skipping.
+Only side_story and covered suggest skipping, as advice with the evidence
+shown, and only a HIGH-confidence one may be skipped automatically:
+
+  * side_story: a fractional chapter that a site listing it names a side
+    story, spin-off, afterword, omake or extra, with no title of its own on
+    any other source or on MangaDex (nor a notice's name, which may be one)
+  * covered: MangaDex has N and goes on with N+1 without this number or
+    another chapter between them you lack; your N (with the pieces of it you
+    have) is 85-115% of MangaDex's N; and your N+1 is from a source that
+    does not list this number either, so the numbering after N is not
+    shifted by it (a site's 7.1 can be MangaDex's 8)
+
+Any other verdict is LOW: advice for the "Skip it" button only, with the
+reasons it is not certain among its evidence.
 
 Chapter names are scraped text: every check here is linear in its input,
-which is capped first (matching.MAX_TITLE).
+which is capped first (matching.MAX_TITLE). Numbers and page counts that are
+not plain finite numbers count as not known.
 """
 import math
 import re
@@ -36,14 +56,17 @@ import statistics
 from dataclasses import dataclass, field
 
 from . import config, mangadex
-from .matching import MAX_TITLE, oneline, plain_quotes
+from .matching import MAX_TITLE, norm, oneline, plain_quotes
 from .model import Series
 
 SHORT = 0.6         # your N at less than this share of the usual chapter length is only part of it
-SAME = 0.85         # ... and at this share of MangaDex's copy of N (or the usual length) or more, the whole one
+SAME = 0.85         # ... from this share of MangaDex's copy of N (or the usual length) the whole one ...
+LONG = 1.15         # ... up to this share; longer, it may hold more than chapter N
 MIN_SAMPLE = 5      # chapters with a known page count needed before "the usual length" means anything
+MAX_NUMBER = 1e6    # chapter numbers and page counts from this on are not plain numbers
 
 KINDS = ("side_story", "covered", "rest_of_chapter", "unknown")
+HIGH, LOW = "high", "low"   # confidence; only a HIGH side_story or covered verdict may be skipped automatically
 
 
 @dataclass
@@ -64,7 +87,9 @@ class Chapter:
 class Blocker:
     """The chapter the series is stuck behind."""
     number: float
-    names: dict[str, str | None] = field(default_factory=dict)  # {source: its name there}, every source listing it
+    # {source: its name there} for every source listing it: "covered" is certain only when the source of
+    # chapter N+1 is not among them
+    names: dict[str, str | None] = field(default_factory=dict)
     reason: str | None = None       # why it failed; for the note, the verdict does not depend on it
 
 
@@ -73,11 +98,18 @@ class Verdict:
     kind: str                       # one of KINDS
     headline: str
     evidence: list[str]
+    confidence: str = LOW           # HIGH or LOW; only ever HIGH for side_story or covered
 
     @property
     def skippable(self) -> bool:
-        """Whether automatic skipping may act on it (never unknown or rest_of_chapter)."""
+        """Whether it suggests skipping (side_story or covered, never unknown
+        or rest_of_chapter): advice, the user decides."""
         return self.kind in ("side_story", "covered")
+
+    @property
+    def auto_skip(self) -> bool:
+        """Whether automatic skipping may act on it: skippable, and HIGH."""
+        return self.skippable and self.confidence == HIGH
 
 
 # -- what a chapter's name says ---------------------------------------------
@@ -86,12 +118,13 @@ class Verdict:
 # (but not the 1 of "1st Anniversary Special")
 _PREFIX = re.compile(r"^\s*(?:vol(?:ume)?\.?\s*\d+\s*[,:.-]?\s*)?(?:(?:ch(?:apter)?|ep(?:isode)?)\.?\s*|#\s*)?"
                      r"\d+(?:\.\d+)?(?!\w)\s*(?:[:.\-–—]\s*)?")
-_JUNK = re.compile(r"お知らせ|休載|공지|휴재|公告")     # notices in the native scripts, never a title's words
+_JUNK = re.compile(r"お知らせ|休載|공지|휴재|公告")     # notices in the native scripts (公告 is in titles too)
 # "Notice", "announcement" and the like are ordinary words too ("Notice Me,
 # Senpai", "The Engagement Announcement"), so a name reads as a notice only
 # when a part of it is made of the words notices use ("Hiatus Notice", "We
 # are recruiting!", "Release postponed") and its other parts are notices,
-# extras or numbers too ("Twitter Extra - Update Schedule").
+# extras or numbers too ("Twitter Extra - Update Schedule"). Even then it
+# only hints: "The Announcement" and "Hiatus" are chapter titles as well.
 _NOTICE = {"notice", "notices", "hiatus", "announcement", "announcements", "recruiting", "recruitment",
            "postponed", "postponement", "schedule"}
 _NOTICE_TOO = {"a", "an", "the", "we", "re", "are", "is", "s", "on", "will", "be", "our", "of", "for", "and", "to",
@@ -141,28 +174,34 @@ def _notice(words: list[str]) -> bool:
     return any(w in _NOTICE for w in words) and all(w in _NOTICE or w in _NOTICE_TOO or w.isdigit() for w in words)
 
 
-def _extra(words: list[str]) -> bool:
-    """Whether one part of a name (its words) marks an extra, bonus or special."""
+def _loose(words: list[str]) -> str | None:
+    """The extra, bonus or special word that marks one part of a name (its
+    words) as one, if any."""
     if words[0] in _LOOSE and (len(words) == 1 or words[1].isdigit() or words[1] in _AFTER_LOOSE):
-        return True
-    return words[-1] in _LOOSE and all(w in _BEFORE_LOOSE or _NUMBER.fullmatch(w) for w in words[:-1])
+        return words[0]
+    if words[-1] in _LOOSE and all(w in _BEFORE_LOOSE or _NUMBER.fullmatch(w) for w in words[:-1]):
+        return words[-1]
+    return None
 
 
 def sign(name: str | None, series: Series) -> str | None:
     """What a chapter's name says it is: 'junk' (a notice), 'side' (a side
-    story, spin-off, omake or afterword), 'extra' (an extra, bonus or
-    special), 'epilogue', 'part' (the next part of a chapter), or None."""
+    story, spin-off, omake or afterword), 'extra', 'bonus' (a bonus or
+    special: more often ordinary words than 'extra' is), 'epilogue', 'part'
+    (the next part of a chapter), or None: a title, or nothing beyond the
+    source's numbering (_clean() is then empty)."""
     t = _clean(name, series)
     if not t:
         return None
     parts = [(p, w) for p in _PARTS.split(t) if (w := _WORDS.findall(p))]
     if _JUNK.search(t) or (any(_notice(w) for _, w in parts) and all(
-            _notice(w) or _extra(w) or _SIDE.search(p) or all(x.isdigit() for x in w) for p, w in parts)):
+            _notice(w) or _loose(w) or _SIDE.search(p) or all(x.isdigit() for x in w) for p, w in parts)):
         return "junk"
     if _SIDE.search(t):
         return "side"
-    if any(_extra(w) for _, w in parts):
-        return "extra"
+    loose = {x for _, w in parts if (x := _loose(w))}
+    if loose:
+        return "extra" if loose & {"extra", "extras"} else "bonus"
     if _EPILOGUE.search(t):
         return "epilogue"
     if _PART.search(t):
@@ -179,8 +218,20 @@ def _says(name: str | None, pages: int | None, series: Series, min_pages: int) -
 
 # -- evidence -----------------------------------------------------------------
 
-def _key(n) -> float:
-    return round(float(n), 4)
+def _num(x) -> float | None:
+    """x as a chapter number (rounded as the database keeps it), or None
+    when it is not a finite number from 0 up to MAX_NUMBER."""
+    if isinstance(x, bool) or not isinstance(x, (int, float)) or not math.isfinite(x):
+        return None
+    return round(float(x), 4) if 0 <= x < MAX_NUMBER else None
+
+
+def _count(x) -> int | None:
+    """x as a page count, or None (not known) when it is not a finite number
+    from 1 up to MAX_NUMBER."""
+    if isinstance(x, bool) or not isinstance(x, (int, float)) or not math.isfinite(x):
+        return None
+    return int(x) if 1 <= x < MAX_NUMBER else None
 
 
 def _g(n: float) -> str:
@@ -208,43 +259,65 @@ def _md_says(c: "mangadex.MdChapter") -> str:
     return out + (f" ({_pages(c.pages)})" if c.pages else "")
 
 
-def _length(whole: float, b: float, rows: dict, md_base) -> tuple[str, str | None]:
+def _md_near(md: "mangadex.ChapterList | None") -> dict:
+    """md.near with its numbers, titles and page counts checked the way the
+    chapter rows are."""
+    out = {}
+    for n, c in (md.near if md is not None and isinstance(md.near, dict) else {}).items():
+        k = _num(n)
+        if k is not None and isinstance(c, mangadex.MdChapter):
+            out[k] = mangadex.MdChapter(k, oneline(c.title, 200) if isinstance(c.title, str) and c.title else None,
+                                        _count(c.pages))
+    return out
+
+
+def _length(whole: float, b: float, rows: dict, md_base) -> tuple[str, str, bool]:
     """Is your copy of chapter N (with any pieces of it you have below the
     blocker, 7 and 7.1 for 7.2) the whole chapter? ('normal' | 'short' |
-    'unclear' | 'unknown', the sentence that says why)."""
+    'long' | 'unclear' | 'unknown', the sentence that says why, whether it
+    was compared with MangaDex's copy of N)."""
     base = rows[whole]
-    pieces = [n for n, c in rows.items() if whole < n < b and c.status == "have" and c.pages]
+    pieces = sorted(n for n, c in rows.items() if whole < n < b and c.status == "have" and c.pages)
     if not base.pages:
-        return "unknown", f"The page count of your chapter {_g(whole)} is not known, so its length cannot be compared."
+        return ("unknown", f"The page count of your chapter {_g(whole)} is not known, so its length cannot be "
+                           f"compared.", False)
     ours = base.pages + sum(rows[n].pages for n in pieces)
     label = (f"Your chapters {_join([whole, *pieces])} have {_pages(ours)} together" if pieces
              else f"Your chapter {_g(whole)} has {_pages(ours)}")
     if md_base is not None and md_base.pages:
         theirs = md_base.pages
+        if ours > LONG * theirs:
+            return "long", (f"{label} but MangaDex's chapter {_g(whole)} has only {theirs}: yours holds more than "
+                            f"chapter {_g(whole)}."), True
         if ours >= SAME * theirs:
-            return "normal", f"{label}, like MangaDex's chapter {_g(whole)} ({theirs})."
+            return "normal", f"{label}, like MangaDex's chapter {_g(whole)} ({theirs}).", True
         if ours < SHORT * theirs:
             return "short", (f"{label} but MangaDex's chapter {_g(whole)} has {theirs}: yours is probably only "
-                             f"part of it.")
-        return "unclear", f"{label} and MangaDex's chapter {_g(whole)} has {theirs}: close, but not clearly the same."
+                             f"part of it."), True
+        return "unclear", (f"{label} and MangaDex's chapter {_g(whole)} has {theirs}: close, but not clearly the "
+                           f"same."), True
     usual = [c.pages for n, c in rows.items() if n == int(n) and n != whole and c.status == "have" and c.pages]
     if len(usual) < MIN_SAMPLE:
         return "unknown", (f"Too few chapters of this series have a known page count to tell whether your chapter "
-                           f"{_g(whole)} is complete.")
+                           f"{_g(whole)} is complete."), False
     median = statistics.median(usual)
+    if ours > LONG * median:
+        return "long", (f"{label} while this series' chapters usually have about {round(median)}: more than one "
+                        f"chapter's length."), False
     if ours >= SAME * median:
-        return "normal", f"{label}, a usual length for this series (about {round(median)})."
+        return "normal", f"{label}, a usual length for this series (about {round(median)}).", False
     if ours < SHORT * median:
         return "short", (f"{label} while this series' chapters usually have about {round(median)}: the site "
-                         f"probably split chapter {_g(whole)} in two.")
+                         f"probably split chapter {_g(whole)} in two."), False
     return "unclear", (f"{label} while this series' chapters usually have about {round(median)}: not clearly "
-                       f"the whole chapter.")
+                       f"the whole chapter."), False
 
 
 def _last_whole(series: Series, rows: dict, b: float) -> float:
-    """The last whole chapter of the series, as far as anything says."""
+    """The last whole chapter of the series, as far as anything but the
+    blocker itself says."""
     wholes = [n for n, c in rows.items() if n == int(n) and n != b and c.status != "junk"]
-    return max([*wholes, float(series.chapters or 0)])
+    return max([*wholes, _num(series.chapters) or 0.0])
 
 
 def classify(series: Series, blocker: Blocker, chapters, md: "mangadex.ChapterList | None" = None,
@@ -252,116 +325,172 @@ def classify(series: Series, blocker: Blocker, chapters, md: "mangadex.ChapterLi
     """The verdict on the chapter `blocker` from the series' chapter rows
     (Chapter, every row of the series) and, when known, MangaDex's English
     chapters around it (mangadex.english_chapters; None: not checked).
-    A copy with fewer than min_pages pages (the setting of that name) reads
-    as a notice, and one with at least that many as a chapter, whatever its
-    name."""
-    b = _key(blocker.number)
+    A copy with at least min_pages pages (the setting of that name) is a
+    chapter whatever its name; one with fewer is not taken for a notice by
+    that alone (a webtoon's stitched strips make few pages too)."""
+    b = _num(blocker.number)
+    if b is None:
+        return Verdict("unknown", "Unknown: its number is not a plain chapter number",
+                       [f"It is numbered {_quote(str(blocker.number))}, which cannot be compared with other "
+                        f"chapters."])
     whole = float(math.floor(b))
     fractional = b != whole
-    rows = {_key(c.number): c for c in chapters}
+    rows: dict[float, Chapter] = {}
+    for c in chapters:
+        n = _num(c.number)
+        if n is not None:
+            rows[n] = Chapter(n, c.status, c.name, c.source, _count(c.pages))
     have = {n for n, c in rows.items() if c.status == "have"}
+    near = _md_near(md)
+    following = _num(md.following) if md is not None else None
+    highest = _num(md.highest) if md is not None else None
 
-    side: list[str] = []        # it is not story: an extra or side story ...
-    junk: list[str] = []        # ... or a notice
+    side: list[str] = []        # it is not story: a side story or extra (decides)
     rest: list[str] = []        # it is (the rest of) story you do not have
-    story: list[str] = []       # it is a chapter of its own elsewhere, so not a site's split or duplicate
+    story: list[str] = []       # it is a chapter of its own, so not a site's split or duplicate, nor an extra
+    listed: list[str] = []      # MangaDex has it as a chapter: not a split or duplicate, but maybe an extra
     support: list[str] = []     # agrees with "not story" but never decides
     notes: list[str] = []       # checked, and says nothing either way
+    doubts: list[str] = []      # why a covered verdict is not certain (it is then LOW) ...
+    titled: list[str] = []      # ... and why neither a covered nor a side_story one is
     covered: list[str] | None = None        # MangaDex's list shows it is covered by N, if N is whole
     lacking: list[float] = []   # chapters from N to N+1 MangaDex lists that you do not have
+    sure = False                # a site listing it names it a side story or extra outright
+    loose = epilogue = md_side = md_story = False
 
     last = _last_whole(series, rows, b)
-    after_final = series.status == "FINISHED" and last > 0 and b > last
-    # extra, bonus and special are ordinary words too ("Special Chapter" can
-    # be story): they decide only off the story's own numbering
-    extra_decides = fractional or after_final
-    numbered = f"but {_g(b)} is numbered as a chapter of the story, so that alone does not decide it"
+    # only a number between the story's can come after its end: the last whole
+    # chapter itself, even one called "Epilogue", is story
+    after_final = series.status == "FINISHED" and fractional and last > 0 and b > last
+    undecided = (f"but {_g(b)} is numbered as a chapter of the story, so that alone does not decide it"
+                 if not fractional else
+                 f"but {_g(b)} does not come after the last chapter of a finished series, so that alone does not "
+                 f"decide it")
 
+    mine = rows.get(b)
+    listing = {k for k in blocker.names if k}
+    if mine is not None and mine.source:
+        listing.add(mine.source)
     names = {k: v for k, v in blocker.names.items() if v}
-    if not names and b in rows and rows[b].name:
-        names = {rows[b].source or "The source": rows[b].name}
-    pages = rows[b].pages if b in rows else None
+    if not names and mine is not None and mine.name:
+        names = {mine.source or "The source": mine.name}
+    pages = mine.pages if mine is not None else None
+    base = rows.get(whole) if fractional else None
+    base_title = norm(_clean(base.name, series)) if base is not None and base.name else ""
     plain = []
     for source, name in names.items():
         who, what = oneline(source, 60), _quote(name)
         s = _says(name, pages, series, min_pages)
-        if s == "junk":
-            junk.append(f"{who} names it {what}, which reads like a notice, not a chapter.")
-        elif s == "side" or (s == "extra" and extra_decides):
+        if s in ("side", "extra", "bonus") and fractional:
             side.append(f"{who} names it {what}, which marks a side story or extra.")
-        elif s == "extra":
-            support.append(f"{who} names it {what}, which may mark an extra, {numbered}.")
+            sure, loose = sure or s != "bonus", loose or s == "bonus"
+        elif s in ("side", "extra", "bonus"):
+            support.append(f"{who} names it {what}, which may mark a side story or extra, {undecided}.")
         elif s == "epilogue" and after_final:
             side.append(f"{who} names it {what}: an epilogue after the last chapter.")
+            epilogue = True
+        elif s == "epilogue":
+            support.append(f"{who} names it {what}, {undecided}.")
         elif s == "part":
             rest.append(f"{who} names it {what}, which reads like the next part of a chapter.")
+        elif s == "junk":
+            support.append(f"{who} names it {what}, which reads like a notice, but notice words are in chapter "
+                           f"titles too, so that never decides it.")
+            titled.append(f"{who}'s notice-like name for it could be a chapter's own title.")
         elif not _clean(name, series):
             plain.append(what)
+        elif base_title and norm(_clean(name, series)) == base_title:
+            support.append(f"{who} names it {what}, as your chapter {_g(whole)} is named.")
         else:
-            notes.append(f"{who} names it {what}, which says nothing either way.")
-    if plain and not (side or junk or rest or notes):
+            story.append(f"{who} names it {what}: a title of its own, so probably a chapter of its own.")
+    if plain and len(plain) == len(names):
         notes.append(f"It has no title of its own, only {plain[0]}.")
 
     if md is None:
-        notes.append("MangaDex's chapter list was not checked (not reachable, or not looked up yet).")
+        notes.append("This series was added by hand, without an AniList or MangaDex entry, so MangaDex's chapter "
+                     "list cannot be looked up." if series.manual else
+                     "MangaDex's chapter list was not checked (not reachable, or not looked up yet).")
     elif md.manga_id is None:
         notes.append("No MangaDex entry found under this series' titles links to its AniList entry, so MangaDex's "
                      "chapter list cannot help.")
     elif not md.count:
         notes.append("MangaDex lists no English chapters of this series, so its chapter list cannot help.")
-    elif b in md.near:
-        mine = md.near[b]
-        s = _says(mine.title, mine.pages, series, min_pages)
-        if s == "junk":
-            junk.append(f"{_md_says(mine)}: a notice, not a chapter.")
-        elif s == "side" or (s == "extra" and extra_decides) or (s == "epilogue" and after_final):
-            side.append(f"{_md_says(mine)}, which marks a side story or extra.")
-        elif mine.pages is not None and mine.pages < min_pages:
-            junk.append(f"{_md_says(mine)}: too few pages for a chapter, so probably a notice.")
-        elif s == "extra":
-            support.append(f"{_md_says(mine)}, which may mark an extra, {numbered}.")
+    elif b in near:
+        c = near[b]
+        s = _says(c.title, c.pages, series, min_pages)
+        if (s in ("side", "extra", "bonus") and fractional) or (s == "epilogue" and after_final):
+            side.append(f"{_md_says(c)}, which marks a side story or extra.")
+            md_side = True
+        elif s in ("side", "extra", "bonus", "epilogue"):
+            support.append(f"{_md_says(c)}, which may mark a side story or extra, {undecided}.")
         elif s == "part":
-            rest.append(f"{_md_says(mine)}, which reads like the next part of a chapter.")
-        elif mine.title:
-            story.append(f"{_md_says(mine)}: a chapter of its own there.")
+            rest.append(f"{_md_says(c)}, which reads like the next part of a chapter.")
+        elif s == "junk":
+            support.append(f"{_md_says(c)}, which reads like a notice, but notice words are in chapter titles too, "
+                           f"so that never decides it.")
+            titled.append("MangaDex's notice-like name for it could be a chapter's own title.")
+        elif c.title:
+            story.append(f"{_md_says(c)}: a chapter of its own there.")
+            md_story = True
+        elif c.pages is not None and c.pages >= min_pages:
+            listed.append(f"{_md_says(c)}: a chapter of its own there.")
+        elif c.pages is not None:
+            support.append(f"{_md_says(c)}, few for a chapter, but a webtoon's stitched strips make few pages too, "
+                           f"so that does not decide it.")
         else:
-            notes.append(f"{_md_says(mine)} too, without a title.")
-    elif fractional and whole in md.near:
-        listed = sorted(md.near)
-        had = [n for n in listed if n in have]
-        line = f"MangaDex's English chapter list has {'chapter ' * (len(listed) == 1)}{_join(listed)} but no {_g(b)}"
-        if len(had) == len(listed):
+            notes.append(f"{_md_says(c)} too, without a title.")
+    elif fractional and whole in near:
+        numbers = sorted(near)
+        had = [n for n in numbers if n in have]
+        line = f"MangaDex's English chapter list has {'chapter ' * (len(numbers) == 1)}{_join(numbers)} but no {_g(b)}"
+        if len(had) == len(numbers):
             line += "; you have " + ("it" if len(had) == 1 else "both" if len(had) == 2 else "all of them")
         elif had:
             line += f"; you have {_join(had)}"
-        lines, missing = [line + "."], []
-        for n in listed:
-            c = md.near[n]
+        lines, missing, unsure = [line + "."], [], []
+        for n in numbers:
+            c = near[n]
             if n == whole or n in have:
                 continue
             s = _says(c.title, c.pages, series, min_pages)
-            if s in ("side", "extra", "junk") or (c.pages is not None and c.pages < min_pages):
-                lines.append(f"{_md_says(c)}, an extra or notice.")
+            if s in ("side", "extra", "bonus"):
+                lines.append(f"{_md_says(c)}, an extra.")
+            elif s == "junk" or (not c.title and c.pages is not None and c.pages < min_pages):
+                lines.append(f"{_md_says(c)}, perhaps a notice.")
+                unsure.append(n)
             else:
                 missing.append(n)
+        # its lack of the number means something only where the list goes on
+        # right after N: one that ends, or skips ahead, may just not have got there
+        goes_on = following is not None and following <= whole + 1
         if missing:
             lacking = missing
             story += [*lines, f"You do not have {_join(missing)} from that list: {_g(b)} may be the same chapter "
                               f"under another number."]
+        elif not goes_on:
+            notes += [*lines, f"It skips from {_g(numbers[-1])} to {_g(following)}, so its lack of {_g(b)} says "
+                              f"nothing." if following is not None else
+                              f"It ends at {_g(highest if highest is not None else numbers[-1])}, so its lack of "
+                              f"{_g(b)} says nothing."]
         elif whole in have:
-            covered = lines
+            covered = [*lines, f"It goes on with chapter {_g(following)}, so it does not simply end before {_g(b)}."]
+            if unsure:
+                doubts.append(f"MangaDex's {_join(unsure)}, which you do not have, could be a chapter rather than a "
+                              f"notice.")
         else:
             notes += lines
     elif fractional:
-        others = sorted(md.near)
+        others = sorted(near)
         notes.append(f"MangaDex's English chapter list has no chapter {_g(whole)}"
                      + (f" (it lists {_join(others)})" if others else "") + ", so it cannot compare.")
+    elif highest is not None and highest < b:
+        notes.append(f"MangaDex's English chapter list ends at {_g(highest)}, before {_g(b)}, so it cannot help.")
     else:
         notes.append(f"MangaDex's English chapter list has no chapter {_g(b)} either.")
 
-    length, length_line = "unknown", None
+    length, length_line, against_md = "unknown", "", False
     if fractional and whole in have:
-        length, length_line = _length(whole, b, rows, md.near.get(whole) if md else None)
+        length, length_line, against_md = _length(whole, b, rows, near.get(whole))
         if length == "short":
             rest.append(length_line)
         elif length != "normal":
@@ -370,38 +499,65 @@ def classify(series: Series, blocker: Blocker, chapters, md: "mangadex.ChapterLi
     if after_final:
         support.append(f"The series is finished and its last chapter is {_g(last)}; {_g(b)} comes after it, "
                        f"where epilogues and extras go.")
-    half = fractional and abs(b - whole - 0.5) < 1e-9
-    if half:
+    if fractional and abs(b - whole - 0.5) < 1e-9:
         support.append("Chapters numbered .5 are often extras, but that alone does not decide it.")
     if length == "normal":
         support.append(length_line)
 
     # Position and a usual length only agree: the second half of a last
     # chapter split in two comes after the end at a usual length too.
-    not_story = bool(side or junk)
     covers = covered is not None and length == "normal"
-    if (not_story or covers) and (rest or story):
+    if (side or covers) and (rest or story):
         return Verdict("unknown", "Unknown: the signs disagree",
-                       [*side, *junk, *(covered or []), *rest, *story, *support, *notes])
+                       [*side, *(covered or []), *rest, *story, *listed, *notes, *support])
     if rest:
         what = f"the rest of chapter {_g(whole)}" if fractional else "part of the story"
         return Verdict("rest_of_chapter", f"Probably {what} (skipping leaves a gap)", rest)
     if story:
         headline = (f"Unknown: MangaDex lists {_join(lacking)}, which you do not have" if lacking
-                    else f"Unknown: MangaDex lists {_g(b)} as a chapter of its own")
-        return Verdict("unknown", headline, [*story, *support, *notes])
-    if not_story:
-        headline = "Probably a notice, not a chapter" if junk and not side else "Probably a side story"
-        return Verdict("side_story", headline, [*side, *junk, *(covered if covers else []), *support])
+                    else f"Unknown: MangaDex lists {_g(b)} as a chapter of its own" if md_story
+                    else "Unknown: it has a title of its own")
+        return Verdict("unknown", headline, [*story, *notes, *support])
+    if side:
+        unsure = [] if sure else [
+            "Only MangaDex's name for it marks it so, not a site that lists it, so that is not certain."
+            if md_side and not (loose or epilogue) else
+            "\"Bonus\" and \"special\" name ordinary chapters too, so that is not certain." if loose else
+            "An epilogue can be the story's own ending, so that is not certain."]
+        return Verdict("side_story", "Probably a side story",
+                       [*side, *listed, *(covered if covers else []), *support, *unsure, *titled],
+                       HIGH if sure and not titled else LOW)
+    if listed:
+        return Verdict("unknown", f"Unknown: MangaDex lists {_g(b)} as a chapter of its own",
+                       [*listed, *notes, *support])
     if covers:
+        after = rows.get(whole + 1)
+        n1 = _g(whole + 1)
+        is_from = "is from" if after is not None and after.status == "have" else "will come from"
+        if after is None or after.status not in ("have", "wanted", "failed"):
+            doubts.append(f"You have no chapter {n1} to check that your numbering after {_g(whole)} is MangaDex's.")
+        elif not after.source:
+            doubts.append(f"Where your chapter {n1} {is_from} is not known, so whether your numbering after "
+                          f"{_g(whole)} is MangaDex's cannot be checked.")
+        elif after.source in listing:
+            doubts.append(f"Your chapter {n1} {is_from} {oneline(after.source, 60)}, which lists {_g(b)} too: if "
+                          f"{_g(b)} is a chapter of its own there, its numbering after {_g(whole)} is one ahead of "
+                          f"MangaDex's.")
+        else:
+            covered.append(f"{oneline(after.source, 60)}, where your chapter {n1} {is_from}, does not list {_g(b)}.")
+        if not against_md:
+            doubts.insert(0, f"MangaDex has no page count for its chapter {_g(whole)}, so yours is only compared "
+                             f"with this series' usual chapter.")
         return Verdict("covered", f"Probably already covered by chapter {_g(whole)} you have",
-                       [*covered, length_line])
-    return Verdict("unknown", "Unknown: no clear sign either way", [*(covered or []), *support, *notes])
+                       [*covered, *support, *doubts, *titled], LOW if doubts or titled else HIGH)
+    return Verdict("unknown", "Unknown: no clear sign either way", [*(covered or []), *notes, *support])
 
 
 def judge(series: Series, blocker: Blocker, chapters, fetch: bool = True,
           min_pages: int = config.MIN_PAGES) -> Verdict:
     """classify() with MangaDex's chapter list looked up; with fetch=False
-    only an answer already cached is used (no network, never waits)."""
-    md = mangadex.english_chapters(series, blocker.number, fetch=fetch)
+    only an answer already cached is used (no network, never waits): the
+    download pass calls it so, and a background job does the lookups."""
+    b = _num(blocker.number)
+    md = mangadex.english_chapters(series, b, fetch=fetch) if b is not None else None
     return classify(series, blocker, chapters, md, min_pages)
