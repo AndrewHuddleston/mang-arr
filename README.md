@@ -90,9 +90,9 @@ bash install.sh
 (`curl ... | bash` works as well; questions are read from the terminal.)
 It writes a Compose file for the three services, starts them, configures
 Suwayomi (CBZ, extension repository, a default set of sources), creates the
-Komga admin, library and API key, turns on mang-arr's login (the generated
-password is shown once, at the end) and stores the Komga connection in
-mang-arr. Suwayomi and Komga are published on `127.0.0.1` only, since
+Komga admin, library and API key, turns on mang-arr's login (a generated
+password is saved to `mangarr-login.txt` in the stack folder, readable only
+by you, never printed) and stores the Komga connection in mang-arr. Suwayomi and Komga are published on `127.0.0.1` only, since
 mang-arr reaches them over the compose network; Suwayomi has no login and
 runs extension code, so keep it that way. Re-running the installer is safe.
 [docs/INSTALL.md](docs/INSTALL.md) lists its settings, explains how to
@@ -141,13 +141,13 @@ The Docker `HEALTHCHECK` calls `/api/v1/ping`, which only says the process
 is up and does no other work. That is deliberate: `/api/v1/health` answers
 503 when Suwayomi is down or a path is missing, and a restart would not fix
 either. The example compose file caps each container's Docker log at
-3 × 10 MB; keep that `logging:` block if you write your own.
+3 × 10 MB; keep that `logging:` block if you write your own. Set a web
+login (the installer sets one for you) before you store any API key or
+token in mang-arr.
 
-Authentication is off until you set a username and password under
-Settings → Security (a login page by default, or the browser's basic auth
-prompt); the installer sets one for you. Set it before you store any API
-key or token in mang-arr. Scripts use the API key shown on the same page
-instead.
+Authentication is optional and off until you set a username and password
+under Settings → Security (a login page by default, or the browser's basic
+auth prompt). Scripts use the API key shown on the same page instead.
 `/api/v1/health`, `/api/v1/system/status` and `/metrics` stay open so
 health checks and scrapers work without credentials.
 
@@ -659,9 +659,15 @@ something.
 
 - **`GET /api/v1/health`** returns `{"ok": true, "problems": [],
   "warnings": [...], "version": "..."}` with 200, or 503 and the problems
-  when any check is an error. Use it for alerting, not for restarting the
-  container: the Docker `HEALTHCHECK` deliberately uses
-  `/api/v1/system/status`, which only proves the process is alive.
+  when any check is an error. It is served from the health cache, so
+  polling it never makes mang-arr hammer Suwayomi, Komga, AniList or
+  MangaDex. With a login set, a caller without credentials gets only the
+  names of the failing checks (no URLs, paths or error text); send the API
+  key for the details. Use it for alerting, not for restarting the
+  container.
+- **`GET /api/v1/ping`** returns `{"ok": true}` as long as the web server
+  runs: no database, no network, no login. That is the liveness probe for
+  the Docker `HEALTHCHECK`.
 - **`GET /api/v1/system/status`** includes `health: {errors, warnings}`
   and `update: {current, latest, url, updateAvailable, checkedAt, error}`.
 - **`GET /metrics`** is a Prometheus exposition (needs `prometheus-client`,

@@ -19,8 +19,9 @@
 #                  only; mang-arr reaches both over the compose network). 0.0.0.0 = every interface.
 #   KOMGA_EMAIL / KOMGA_PASSWORD   Komga admin to create (or to log in with, if Komga is already set up).
 #                  A generated password is saved to <STACK_DIR>/komga-admin.txt (mode 0600).
-#   MANGARR_USER / MANGARR_PASSWORD  the login the installer turns on in mang-arr
-#                  (default admin / generated; a generated password is shown once, at the end)
+#   MANGARR_USER / MANGARR_PASSWORD  the login the installer turns on in mang-arr (the user name
+#                  cannot contain ':'; default admin / generated). A generated password is saved to
+#                  <STACK_DIR>/mangarr-login.txt (mode 0600), never printed.
 #   MANGARR_API_KEY  mang-arr's API key; only needed to re-run against a mang-arr that already has a login
 #   MANGARR_IMAGE  image for mang-arr                                    (default ghcr.io/andrewhuddleston/mang-arr:latest)
 #   CONTAINER_PREFIX  prefix for the three container names (default none)
@@ -40,7 +41,9 @@ MASK="********"                               # how mang-arr's API shows a store
 
 TTY=0            # 1 when questions can be asked on /dev/tty
 WORK=""          # private temp dir (0700) for request bodies and header files that carry secrets
-KOMGA_PENDING=0  # 1 while Komga may be running without an admin (the EXIT trap stops it then)
+KOMGA_PENDING=0  # 1 once Komga is known to have no admin (the EXIT trap stops it then); see komga_unclaimed
+KOMGA_MARK=""    # <STACK_DIR>/.komga-unclaimed: remembers that across runs
+KOMGA_GENERATED=0  # 1 when this run generated the Komga password (not yet saved or applied)
 PUBLISHED_ON=""  # host address of the port host_url last looked up
 
 say()  { printf '\033[1;36m==>\033[0m %s\n' "$*"; }
@@ -100,12 +103,11 @@ ask_secret() {  # ask_secret <prompt>: typed twice, not echoed; empty when there
   printf '%s' "$a"
 }
 
-show_secret() {  # show_secret <text>: to the terminal when there is one, so `| tee install.log` misses it
-  if { true >/dev/tty; } 2>/dev/null; then printf '%s\n' "$1" >/dev/tty; else printf '%s\n' "$1"; fi
-}
-
 # ------------------------------------------------------------------ input checks
 abspath() { python3 -c 'import os,sys;print(os.path.realpath(sys.argv[1]))' "$1"; }  # realpath -m is GNU-only
+# owner <path>: "uid:gid" of a file ("?:?" when it cannot be read). `stat -c` is GNU-only (BSD/macOS
+# use `stat -f`), and a failing command substitution would end the run silently under set -e.
+owner() { python3 -c 'import os,sys;s=os.stat(sys.argv[1]);print("%d:%d"%(s.st_uid,s.st_gid))' "$1" 2>/dev/null || echo '?:?'; }
 
 target_home() {  # home folder of the user who ran sudo, if any
   [[ -n "${SUDO_USER:-}" ]] || return 0
@@ -171,7 +173,10 @@ check_inputs() {
   [[ "$MANGARR_IMAGE" =~ ^[A-Za-z0-9._/:@-]+$ ]] || die "MANGARR_IMAGE '$MANGARR_IMAGE' is not an image reference"
   [[ "$SOURCES" =~ ^[A-Za-z0-9_]+(\.[A-Za-z0-9_]+)*(,[A-Za-z0-9_]+(\.[A-Za-z0-9_]+)*)*$ ]] \
     || die "SOURCES must be comma-separated pkgName suffixes such as en.weebcentral,all.mangadex"
-  [[ "$MANGARR_USER" =~ ^[^[:space:][:cntrl:]]+$ ]] || die "MANGARR_USER must not be empty or contain spaces"
+  # mang-arr refuses a user name with ':' (basic auth splits user:password there): say so now, not
+  # at the very last step after everything else is set up
+  [[ "$MANGARR_USER" =~ ^[^[:space:][:cntrl:]:]+$ ]] \
+    || die "MANGARR_USER '$MANGARR_USER' must not be empty or contain spaces, control characters or ':'"
 }
 
 valid_email() { [[ "$1" =~ ^[^@[:space:][:cntrl:]]+@[^@[:space:][:cntrl:]]+\.[^@[:space:][:cntrl:]]+$ ]]; }
@@ -180,7 +185,7 @@ valid_email() { [[ "$1" =~ ^[^@[:space:][:cntrl:]]+@[^@[:space:][:cntrl:]]+\.[^@
 # make_dirs: create the folders, and chown only the ones this run created, never recursively: --data
 # may point at an existing share that other programs use. Existing folders are reported, not changed.
 make_dirs() {
-  local d owner created=()
+  local d uid created=()
   for d in "$STACK_DIR" "$STACK_DIR/config" "$STACK_DIR/config/mangarr" "$STACK_DIR/config/suwayomi" \
            "$STACK_DIR/config/komga" "$DATA_DIR" "$DATA_DIR/staging" "$DATA_DIR/library"; do
     [[ ! -d "$d" ]] || continue
@@ -188,14 +193,14 @@ make_dirs() {
     created+=("$d")
   done
   for d in "${created[@]}"; do
-    [[ "$(stat -c '%u:%g' -- "$d")" != "$PUID:$PGID" ]] || continue
+    [[ "$(owner "$d")" != "$PUID:$PGID" ]] || continue
     chown -- "$PUID:$PGID" "$d" || warn "could not chown $d to $PUID:$PGID; the containers run as that user and must be able to write it"
   done
   for d in "$STACK_DIR/config/mangarr" "$STACK_DIR/config/suwayomi" "$STACK_DIR/config/komga" \
            "$DATA_DIR/staging" "$DATA_DIR/library"; do
-    owner=$(stat -c '%u' -- "$d")
-    [[ "$owner" == "$PUID" ]] \
-      || warn "$d belongs to uid $owner but the containers run as $PUID; if they cannot write it: sudo chown -R $PUID:$PGID '$d'"
+    uid=$(owner "$d"); uid=${uid%%:*}
+    [[ "$uid" == "$PUID" ]] \
+      || warn "$d belongs to uid $uid but the containers run as $PUID; if they cannot write it: sudo chown -R $PUID:$PGID '$d'"
   done
   (( ${#created[@]} == 0 )) || ok "created ${#created[@]} folder(s) in $STACK_DIR and $DATA_DIR"
 }
@@ -277,7 +282,7 @@ write_compose() {
   fi
   render_compose >"$f.tmp.$$"          # write, then rename: never a half-written compose file
   mv -f -- "$f.tmp.$$" "$f"
-  [[ "$(stat -c '%u' -- "$f")" == "$PUID" ]] || chown -- "$PUID:$PGID" "$f" || true
+  [[ "$(owner "$f")" == "$PUID:"* ]] || chown -- "$PUID:$PGID" "$f" || true
   ok "wrote $f"
 }
 
@@ -304,6 +309,16 @@ hdr() {  # hdr <name> <header line>...: write a header file, print its path
   local f="$WORK/$1.hdr"
   printf '%s\n' "${@:2}" >"$f"
   printf '%s' "$f"
+}
+
+# save_secret <file> <title> <hint> <line>...: a generated login, in a file only its owner can read
+# (mode 0600, owned by PUID), so it is never printed where logs, CI output or scrollback keep it.
+save_secret() {
+  ( umask 077                        # inside the subshell, before the file is created
+    { printf '# %s on %s.\n# %s\n' "$2" "$(date '+%Y-%m-%d %H:%M')" "$3"
+      printf '%s\n' "${@:4}"; } >"$1.tmp.$$" )
+  mv -f -- "$1.tmp.$$" "$1"
+  [[ "$(owner "$1")" == "$PUID:"* ]] || chown -- "$PUID:$PGID" "$1" || true
 }
 
 # req <method> <url> [header-file] [json-body-file]: response body -> $WORK/resp, HTTP status -> stdout
@@ -371,10 +386,14 @@ wait_http() {  # wait_http <label> <tries> <url>...: until one of the urls answe
 
 cleanup() {
   local rc=$?
+  # Only a Komga known to have no admin is stopped. One that merely did not answer (a slow start, a
+  # database migration after an image update, no published port) may be claimed and in use.
   if [[ $KOMGA_PENDING == 1 ]] && ! komga_claimed; then
     warn "the installer stopped before Komga had an admin account; stopping Komga so nobody else can claim it"
     compose stop komga >/dev/null 2>&1 || warn "could not stop Komga: run 'docker compose stop komga' in $STACK_DIR"
     warn "fix the problem above and run the installer again"
+  elif [[ $KOMGA_PENDING == 1 ]]; then
+    komga_has_admin
   fi
   [[ -z "$WORK" ]] || rm -rf -- "$WORK"
   return "$rc"
@@ -394,46 +413,66 @@ komga_fresh() {  # true when this stack's Komga has never run (its config folder
   [[ -z "$(ls -A -- "$STACK_DIR/config/komga" 2>/dev/null)" ]]
 }
 
+# komga_unclaimed / komga_has_admin: what the installer knows about Komga's admin. The marker file
+# carries "no admin yet" to the next run, which then treats Komga as unclaimed even if it cannot
+# reach it; without the marker, a Komga that does not answer is left alone.
+komga_unclaimed() { KOMGA_PENDING=1; : >"$KOMGA_MARK" 2>/dev/null || true; }
+komga_has_admin() { KOMGA_PENDING=0; rm -f -- "$KOMGA_MARK"; }
+
 load_komga_file() {  # reuse the login a previous run generated, unless one was given explicitly
   [[ -f "$KOMGA_SECRET_FILE" ]] || return 0
   [[ -n "${KOMGA_EMAIL:-}" ]] || KOMGA_EMAIL=$(sed -n 's/^email: //p' "$KOMGA_SECRET_FILE" | head -n 1)
   [[ -n "${KOMGA_PASSWORD:-}" ]] || KOMGA_PASSWORD=$(sed -n 's/^password: //p' "$KOMGA_SECRET_FILE" | head -n 1)
 }
 
-# For a new Komga the admin is asked for before anything starts, so the claim goes out the moment
-# Komga answers (until then, whoever reaches it first can make themselves its admin).
+# For a new Komga the admin is asked for (and checked, and generated on Enter) before anything
+# starts, so the claim goes out the moment Komga answers without waiting on anyone at the keyboard
+# (until then, whoever reaches Komga first can make themselves its admin). Once KOMGA_PASSWORD is
+# set, calling it again asks nothing.
 ask_komga_login() {
   [[ -n "${KOMGA_EMAIL:-}" ]] || KOMGA_EMAIL=$(ask "Komga admin email [admin@example.com]: " admin@example.com)
   valid_email "$KOMGA_EMAIL" || die "'$KOMGA_EMAIL' is not an email address (Komga requires one)"
-  [[ -n "${KOMGA_PASSWORD:-}" ]] || KOMGA_PASSWORD=$(ask_secret "Komga admin password (min 8 characters; Enter = generate one): ")
+  while [[ -z "${KOMGA_PASSWORD:-}" && $TTY == 1 ]]; do
+    KOMGA_PASSWORD=$(ask_secret "Komga admin password (min 8 characters; Enter = generate one): ")
+    [[ -n "$KOMGA_PASSWORD" ]] || break
+    if (( ${#KOMGA_PASSWORD} < 8 )); then
+      { printf 'too short: at least 8 characters, or Enter to generate one\n' >/dev/tty; } 2>/dev/null || true
+      KOMGA_PASSWORD=""
+    fi
+  done
+  if [[ -z "${KOMGA_PASSWORD:-}" ]]; then
+    KOMGA_PASSWORD=$(python3 -c 'import secrets;print(secrets.token_urlsafe(18))')
+    KOMGA_GENERATED=1          # saved to $KOMGA_SECRET_FILE right before the claim uses it
+  fi
+  (( ${#KOMGA_PASSWORD} >= 8 )) || die "the Komga admin password (KOMGA_PASSWORD) must have at least 8 characters"
+  [[ "$KOMGA_PASSWORD" != *[$'\r\n']* ]] || die "the Komga admin password must be a single line"
 }
 
 claim_komga() {
   local st f
   st=$(curl -fsS --max-time 10 "$KOMGA/api/v1/claim" | jsonget isClaimed) || die "Komga did not say whether it has an admin"
   if [[ "$st" =~ ^[Tt]rue$ ]]; then
-    KOMGA_PENDING=0
+    komga_has_admin
+    if [[ $KOMGA_GENERATED == 1 ]]; then     # generated for a claim that is not needed: not its password
+      KOMGA_PASSWORD=""; KOMGA_GENERATED=0
+    fi
     ok "Komga already has an admin"
     return 0
   fi
-  ask_komga_login
-  if [[ -z "${KOMGA_PASSWORD:-}" ]]; then
-    KOMGA_PASSWORD=$(python3 -c 'import secrets;print(secrets.token_urlsafe(18))')
+  komga_unclaimed
+  ask_komga_login                             # asks nothing when it already ran before `up`
+  if [[ $KOMGA_GENERATED == 1 ]]; then
     # Komga has no self-service password reset: keep the generated password in a file only its
     # owner can read, instead of printing it where logs and scrollback would keep it.
-    ( umask 077
-      printf '# Komga admin created by mang-arr install.sh on %s.\n# Log in, change the password, then delete this file.\nemail: %s\npassword: %s\n' \
-        "$(date '+%Y-%m-%d %H:%M')" "$KOMGA_EMAIL" "$KOMGA_PASSWORD" >"$KOMGA_SECRET_FILE" )
-    [[ "$(stat -c '%u' -- "$KOMGA_SECRET_FILE")" == "$PUID" ]] || chown -- "$PUID:$PGID" "$KOMGA_SECRET_FILE" || true
+    save_secret "$KOMGA_SECRET_FILE" "Komga admin created by mang-arr install.sh" \
+      "Log in, change the password, then delete this file." "email: $KOMGA_EMAIL" "password: $KOMGA_PASSWORD"
     ok "generated a Komga admin password: it is in $KOMGA_SECRET_FILE (readable only by its owner)"
   fi
-  (( ${#KOMGA_PASSWORD} >= 8 )) || die "the Komga admin password must have at least 8 characters"
-  [[ "$KOMGA_PASSWORD" != *[$'\r\n']* ]] || die "the Komga admin password must be a single line"
   f=$(hdr claim "X-Komga-Email: $KOMGA_EMAIL" "X-Komga-Password: $KOMGA_PASSWORD")
   st=$(req POST "$KOMGA/api/v1/claim" "$f")
   rm -f -- "$f"
   [[ "$st" == 2* ]] || die "could not create the Komga admin user (HTTP $st: $(resp | head -c 300))"
-  KOMGA_PENDING=0
+  komga_has_admin
   ok "Komga admin user created ($KOMGA_EMAIL)"
 }
 
@@ -575,6 +614,7 @@ for suf in wanted:
 
 # ------------------------------------------------------------------ mang-arr
 MA_HDR=""; MA_OK=0; MA_LOGIN_SET=0; MA_HAS_KOMGA=0; MA_NEW_PASSWORD=""
+MANGARR_SECRET_FILE=""
 
 probe_mangarr() {  # may we change mang-arr's settings, and what does it have already?
   local st key
@@ -604,7 +644,13 @@ configure_mangarr() {
   if [[ $MA_LOGIN_SET == 0 ]]; then
     user=$MANGARR_USER
     pass=${MANGARR_PASSWORD:-}
-    if [[ -z "$pass" ]]; then pass=$(python3 -c 'import secrets;print(secrets.token_urlsafe(18))'); MA_NEW_PASSWORD=$pass; fi
+    if [[ -z "$pass" ]]; then
+      pass=$(python3 -c 'import secrets;print(secrets.token_urlsafe(18))'); MA_NEW_PASSWORD=$pass
+      # saved before mang-arr gets it, so a run cut short after the PUT cannot lose it
+      save_secret "$MANGARR_SECRET_FILE" "mang-arr login turned on by install.sh" \
+        "Change the password in mang-arr -> Settings -> Security; forgotten: docs/INSTALL.md, 'Forgotten mang-arr password'." \
+        "user: $user" "password: $pass"
+    fi
   fi
   if [[ -z "$user" && -z "$KOMGA_KEY" ]]; then ok "mang-arr needs no changes"; return 0; fi
   MA_USER="$user" MA_PASS="$pass" MA_KKEY="$KOMGA_KEY" MA_KLIB="$KOMGA_LIB" python3 -c 'import json, os
@@ -617,7 +663,12 @@ if e["MA_KKEY"]:
 print(json.dumps(b))' >"$WORK/mangarr.json"
   st=$(req PUT "$MANGARR/api/v1/settings" "$MA_HDR" "$WORK/mangarr.json")
   rm -f -- "$WORK/mangarr.json"
-  [[ "$st" == 2* ]] || die "mang-arr did not accept its settings (HTTP $st: $(resp | head -c 300))"
+  if [[ "$st" != 2* ]]; then
+    # a 4xx is a refusal (nothing stored): drop the password. After a timeout or a 5xx it may have
+    # been applied, so the file stays rather than lock the user out.
+    [[ -z "$MA_NEW_PASSWORD" || "$st" != 4* ]] || rm -f -- "$MANGARR_SECRET_FILE"
+    die "mang-arr did not accept its settings (HTTP $st: $(resp | head -c 300))"
+  fi
   [[ -z "$user" ]] || ok "mang-arr login turned on (user $user)"
   [[ -z "$KOMGA_KEY" ]] || ok "mang-arr knows Komga (scan after every import)"
 }
@@ -657,6 +708,8 @@ main() {
   pick_ids "$EUID"
   open_tty
   KOMGA_SECRET_FILE="$STACK_DIR/komga-admin.txt"
+  MANGARR_SECRET_FILE="$STACK_DIR/mangarr-login.txt"
+  KOMGA_MARK="$STACK_DIR/.komga-unclaimed"
 
   need docker
   docker compose version >/dev/null 2>&1 || die "docker compose (v2) is required"
@@ -672,13 +725,23 @@ main() {
   check_inputs
 
   say "mang-arr stack -> $STACK_DIR   data -> $DATA_DIR   user $PUID:$PGID   tz $TZ"
-  say "ports: mang-arr $MANGARR_PORT (network, with a login), Suwayomi $SUWAYOMI_BIND:$SUWAYOMI_PORT, Komga $KOMGA_BIND:$KOMGA_PORT"
-  [[ "$SUWAYOMI_BIND" == 127.* ]] \
-    || warn "Suwayomi will be reachable from the network with no login: anyone who reaches it can install extensions (code) in it"
+  if [[ -f "$STACK_DIR/docker-compose.yml" ]]; then    # a re-run: the existing file decides, not the defaults
+    say "ports: as published by the existing $STACK_DIR/docker-compose.yml (listed at the end)"
+  else
+    say "ports: mang-arr $MANGARR_PORT (network, with a login), Suwayomi $SUWAYOMI_BIND:$SUWAYOMI_PORT, Komga $KOMGA_BIND:$KOMGA_PORT"
+    [[ "$SUWAYOMI_BIND" == 127.* ]] \
+      || warn "Suwayomi will be reachable from the network with no login: anyone who reaches it can install extensions (code) in it"
+  fi
   if [[ "$YES" != 1 && ! "$(ask "continue? [Y/n] " y)" =~ ^[Yy] ]]; then exit 1; fi
 
+  # Komga certainly has no admin when this run creates the stack and its config folder is empty, or
+  # when an earlier run left the marker. Then the login is settled now, before `up`, and the EXIT trap
+  # stops Komga should the run end before the claim. Otherwise that is decided only after Komga says
+  # it has no admin: a claimed Komga that is slow to answer is never stopped.
+  local komga_new=0
+  if { [[ ! -f "$STACK_DIR/docker-compose.yml" ]] && komga_fresh; } || [[ -f "$KOMGA_MARK" ]]; then komga_new=1; fi
   load_komga_file
-  if komga_fresh; then ask_komga_login; fi
+  [[ $komga_new == 0 ]] || ask_komga_login
 
   WORK=$(mktemp -d "${TMPDIR:-/tmp}/mang-arr-install.XXXXXX")
   chmod 700 "$WORK"
@@ -692,7 +755,7 @@ main() {
   # ---------------------------------------------------------------- up
   say "pulling images and starting containers"
   compose pull -q --ignore-pull-failures || warn "some images could not be pulled; using local copies if present"
-  KOMGA_PENDING=1
+  [[ $komga_new == 0 ]] || komga_unclaimed
   compose up -d
 
   # Komga first, claimed the moment it answers: until then whoever reaches it first becomes its admin.
@@ -749,9 +812,8 @@ Next:
   * everything lives in $STACK_DIR (compose file, config/) and $DATA_DIR (chapters)
 EOF
   [[ ! -f "$KOMGA_SECRET_FILE" ]] || printf '  * the generated Komga admin password is in %s; change it in Komga, then delete that file\n' "$KOMGA_SECRET_FILE"
-  if [[ -n "$MA_NEW_PASSWORD" ]]; then
-    show_secret "$(printf '\n\033[1;33mmang-arr login (shown once and stored nowhere else; change it in Settings -> Security):\033[0m\n  user:     %s\n  password: %s' "$MANGARR_USER" "$MA_NEW_PASSWORD")"
-  fi
+  # the generated mang-arr password is never printed (cloud-init and CI logs would keep it)
+  [[ ! -f "$MANGARR_SECRET_FILE" ]] || printf '  * the generated mang-arr login is in %s (readable only by its owner); change the password in Settings -> Security, then delete that file\n' "$MANGARR_SECRET_FILE"
 }
 
 # Sourced (the tests do that): define the functions only. Executed or piped: install.

@@ -134,6 +134,8 @@ def respond():
             return 200, {"data": {"extensions": {"nodes": S["catalog"]}}}
         return 200, {"data": {}}
     if path == "/api/v1/claim":
+        if K.get("down"):                               # not answering: slow start, migration
+            return None, None
         if method == "GET":
             return 200, {"isClaimed": K["claimed"]}
         if K["claimed"] or K.get("fail_claim"):
@@ -300,7 +302,8 @@ class FreshInstallTest(InstallerHarness):
             shutil.rmtree(cls.tmp, True)
             raise AssertionError(f"installer failed:\n{cls.out}\n{cls.err}")
         cls.st = InstallerHarness.state(cls)
-        m = re.search(r"(?m)^  password: (\S+)", cls.out)
+        with open(os.path.join(cls.work, "mang-arr-stack", "mangarr-login.txt")) as f:
+            m = re.search(r"(?m)^password: (\S+)$", f.read())
         cls.mangarr_password = m.group(1) if m else None
 
     @classmethod
@@ -320,6 +323,9 @@ class FreshInstallTest(InstallerHarness):
         self.assertGreaterEqual(len(self.st["komga"]["password"]), 16)
         self.assertEqual(stat.S_IMODE(os.stat(self.stack("komga-admin.txt")).st_mode), 0o600)
         self.assertNotIn(self.st["komga"]["password"], self.out + self.err)   # not echoed
+
+    def test_no_unclaimed_marker_is_left_once_komga_has_an_admin(self):
+        self.assertFalse(os.path.exists(self.stack(".komga-unclaimed")))
 
     def test_komga_is_claimed_before_any_suwayomi_work(self):
         # finding 40: claim right after Komga answers, not after minutes of Suwayomi setup
@@ -354,11 +360,18 @@ class FreshInstallTest(InstallerHarness):
         self.assertIn("auth_user", puts[0]["keys"])
         self.assertIn("komga_api_key", puts[0]["keys"])
 
-    def test_mangarr_password_is_shown_once_and_stored_nowhere(self):
-        self.assertEqual(self.out.count(self.mangarr_password), 1)
+    def test_mangarr_password_is_saved_privately_and_never_printed(self):
+        # second pass, 3: a password shown once and kept nowhere meant a lockout, and without a
+        # terminal it went to stdout (cloud-init / CI logs). Now: a 0600 file, like Komga's.
+        f = self.stack("mangarr-login.txt")
+        self.assertEqual(stat.S_IMODE(os.stat(f).st_mode), 0o600)
+        with open(f) as fh:
+            self.assertIn("user: admin\n", fh.read())
+        self.assertNotIn(self.mangarr_password, self.out + self.err)
+        self.assertIn("mangarr-login.txt", self.out)
         for dirpath, _dirs, files in os.walk(self.tmp):
             for name in files:
-                if name == "state.json":            # the fake mang-arr's own database
+                if name in ("state.json", "mangarr-login.txt"):   # the fake mang-arr's database; the file
                     continue
                 with open(os.path.join(dirpath, name), "rb") as f:
                     self.assertNotIn(self.mangarr_password.encode(), f.read(), os.path.join(dirpath, name))
@@ -398,10 +411,18 @@ class RerunTest(InstallerHarness):
         first = self.state()
         with open(self.stack("komga-admin.txt")) as f:
             saved = f.read()
-        rc, out, err = self.run_installer()
+        with open(self.stack("mangarr-login.txt")) as f:
+            mangarr_login = f.read()
+        rc, out, err = self.run_installer(env={"SUWAYOMI_BIND": "0.0.0.0"})
         self.assertInstalled(rc, out, err)
         st = self.state()
         self.assertIn("already has an admin", out)
+        # second pass, 8: the early summary does not claim ports the existing compose file does not have
+        self.assertIn("ports: as published by the existing", out)
+        self.assertNotIn("0.0.0.0:4567", out)
+        self.assertNotIn("will be reachable from the network", err)
+        with open(self.stack("mangarr-login.txt")) as f:
+            self.assertEqual(f.read(), mangarr_login)
         self.assertIn("already has a login", err)
         self.assertNotIn("password:", out)                   # no new, never-applied password
         self.assertEqual(st["komga"]["keys"], first["komga"]["keys"])
@@ -430,6 +451,68 @@ class RerunTest(InstallerHarness):
         self.assertEqual(last_put["api_key_header"], "MANGARR-API-KEY-SECRET")
 
 
+class KomgaStopTest(InstallerHarness):
+    """Second pass, 1: the EXIT trap stops only a Komga known to have no admin."""
+
+    def rerun(self, **env):
+        os.remove(self.log)                                  # this run's commands only
+        return self.run_installer(env=env)
+
+    def stopped(self):
+        return ["docker", "compose", "stop", "komga"] in self.argv_log()
+
+    def test_claimed_komga_that_does_not_answer_is_left_running(self):
+        self.assertInstalled(*self.run_installer())
+        st = self.state()
+        st["komga"]["down"] = True                           # e.g. migrating its database after an update
+        self.save_state(st)
+        rc, out, err = self.rerun()
+        self.assertNotEqual(rc, 0)
+        self.assertIn("did not come up", err)
+        self.assertFalse(self.stopped(), err)
+        self.assertNotIn("before Komga had an admin", err)
+
+    def test_claimed_komga_without_a_published_port_is_left_running(self):
+        self.assertInstalled(*self.run_installer())
+        with open(self.stack("docker-compose.yml")) as f:
+            compose = f.read()
+        compose = compose.replace('    ports:\n      - "127.0.0.1:25600:25600"\n', "")   # behind a reverse proxy
+        with open(self.stack("docker-compose.yml"), "w") as f:
+            f.write(compose)
+        rc, out, err = self.rerun()
+        self.assertNotEqual(rc, 0)
+        self.assertIn("Komga has no published port", err)
+        self.assertFalse(self.stopped(), err)
+
+    def test_a_komga_left_unclaimed_is_remembered_across_runs(self):
+        st = self.state()
+        st["komga"]["fail_claim"] = True
+        self.save_state(st)
+        rc, out, err = self.run_installer()
+        self.assertNotEqual(rc, 0)
+        self.assertTrue(self.stopped())
+        self.assertTrue(os.path.exists(self.stack(".komga-unclaimed")))
+        # the next run cannot reach it: still treated as unclaimed, so stopped again
+        st = self.state()
+        st["komga"].update(fail_claim=False, down=True)
+        self.save_state(st)
+        rc, out, err = self.rerun()
+        self.assertNotEqual(rc, 0)
+        self.assertTrue(self.stopped())
+        # and once it answers, it is claimed with the password saved by the first run
+        st = self.state()
+        st["komga"]["down"] = False
+        self.save_state(st)
+        rc, out, err = self.rerun()
+        self.assertInstalled(rc, out, err)
+        st = self.state()
+        self.assertTrue(st["komga"]["claimed"])
+        with open(self.stack("komga-admin.txt")) as f:
+            self.assertIn("password: {}\n".format(st["komga"]["password"]), f.read())
+        self.assertFalse(os.path.exists(self.stack(".komga-unclaimed")))
+        self.assertFalse(self.stopped())
+
+
 class FailureTest(InstallerHarness):
     def test_komga_is_stopped_when_the_claim_fails(self):
         # finding 40: never leave an unclaimed Komga running after an abort
@@ -451,6 +534,33 @@ class FailureTest(InstallerHarness):
         self.assertInstalled(rc, out, err)
         self.assertNotIn("Traceback", err)
         self.assertTrue(self.state()["komga"]["claimed"])
+
+
+class InputTest(InstallerHarness):
+    def assertRefusedBeforeUp(self, env, msg):
+        rc, out, err = self.run_installer(env=env)
+        self.assertNotEqual(rc, 0, out)
+        self.assertIn(msg, err)
+        self.assertFalse(any(a[:3] == ["docker", "compose", "up"] for a in self.argv_log()))
+        self.assertFalse(self.state()["komga"]["claimed"])
+
+    def test_mangarr_user_with_a_colon_is_refused_up_front(self):
+        # second pass, 6: mang-arr refuses it, which used to stop the run at its very last step
+        self.assertRefusedBeforeUp({"MANGARR_USER": "a:b"}, "MANGARR_USER 'a:b'")
+
+    def test_short_komga_password_is_refused_before_anything_starts(self):
+        # second pass, 2: it used to be rejected only after `up`, leaving Komga to be stopped again
+        self.assertRefusedBeforeUp({"KOMGA_PASSWORD": "short"}, "at least 8 characters")
+
+    def test_no_gnu_stat_needed(self):
+        # second pass, 7: `stat -c` is GNU-only; a BSD stat used to end the run silently
+        with open(os.path.join(self.bin, "stat"), "w") as f:
+            f.write("#!/bin/sh\necho 'stat: illegal option -- c' >&2\nexit 1\n")
+        os.chmod(os.path.join(self.bin, "stat"), 0o755)
+        rc, out, err = self.run_installer()
+        self.assertInstalled(rc, out, err)
+        self.assertNotIn("illegal option", err)
+        self.assertEqual(stat.S_IMODE(os.stat(self.stack("komga-admin.txt")).st_mode), 0o600)
 
 
 class CatalogueTest(InstallerHarness):
@@ -544,6 +654,24 @@ class FunctionTest(unittest.TestCase):
         self.assertEqual((rc, out.strip()), (0, "0:0"))
         self.assertIn("as root", err)
 
+    def test_komga_login_is_settled_by_one_question(self):
+        # second pass, 2: Enter at the password question generates the password right then, so the
+        # claim after `up` never waits on a second prompt; a short one is asked again
+        # ask_secret runs in $(...): it counts its calls in a file, one line per question
+        stubs = ('TTY=1; ask() { printf %s "$2"; }; asked() { wc -l <"$COUNT" | tr -d " "; }; '
+                 'ask_secret() { echo >>"$COUNT"; local a=(${ANSWERS}); printf %s "${a[$(( $(asked) - 1 ))]:-}"; }; ')
+        with tempfile.TemporaryDirectory() as d:
+            count = os.path.join(d, "n")
+            open(count, "w").close()
+            rc, out, err = self.bash(stubs + 'ask_komga_login; ask_komga_login; '
+                                     'echo "$(asked) $KOMGA_GENERATED ${#KOMGA_PASSWORD} $KOMGA_EMAIL"',
+                                     ANSWERS="", COUNT=count)
+            self.assertEqual((rc, out.split()[-4:]), (0, ["1", "1", "24", "admin@example.com"]), err)
+            open(count, "w").close()
+            rc, out, err = self.bash(stubs + 'ask_komga_login; echo "$(asked) $KOMGA_GENERATED $KOMGA_PASSWORD"',
+                                     ANSWERS="short longenough1", COUNT=count)
+            self.assertEqual((rc, out.split()[-3:]), (0, ["2", "0", "longenough1"]), err)
+
     def test_help_does_not_need_the_script_file(self):
         with open(SCRIPT, "rb") as f:
             p = subprocess.run([BASH, "-s", "--", "--help"], input=f.read(), capture_output=True, timeout=60)
@@ -582,6 +710,11 @@ class PackagingTest(unittest.TestCase):
         self.assertNotIn("type=gha", publish)
         self.assertIn("latest=false", publish)
         self.assertIn("concurrency:", publish)
+        # second pass, 9: the concurrency group does not order runs by commit; :latest moves only when
+        # this commit is still main's head
+        self.assertIn("steps.head.outputs.newest == 'true'", publish)
+        self.assertIn('gh api "repos/$REPO/commits/main"', publish)
+        self.assertIn("if: steps.meta.outputs.tags != ''", publish)
         for tool in ("ruff", "build", "httpx"):                 # CI-only tools: exact versions
             self.assertRegex(ci, rf"pip install [^\n]*\b{tool}==\d", tool)
             self.assertNotRegex(ci, rf"pip install [^\n]*\b{tool}(\s|$)", tool)
@@ -605,6 +738,14 @@ class PackagingTest(unittest.TestCase):
         self.assertGreaterEqual(floor("starlette"), (0, 49, 1))
         self.assertGreaterEqual(floor("python-multipart"), (0, 0, 18))
         self.assertGreaterEqual(floor("jinja2"), (3, 1, 6))
+
+    def test_readme_names_the_real_healthcheck(self):
+        # second pass, 4: the Monitoring section still said the HEALTHCHECK used /api/v1/system/status
+        readme = read("README.md")
+        for part in re.split(r"\n\s*\n|\n- ", readme):
+            if "HEALTHCHECK" in part:
+                self.assertNotIn("system/status", part, part)
+        self.assertNotIn("shown once", readme)
 
     def test_compose_example_binds_loopback_and_rotates_logs(self):
         ex = read("docker-compose.example.yml")
