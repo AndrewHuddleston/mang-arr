@@ -8,7 +8,8 @@ rotate -> fit to the screen -> e-ink tone (autocontrast + gamma) -> pad
 -> baseline JPEG. Tall webtoon strips go through a streaming splitter
 instead, which cuts them at blank gaps near screen height. Finished pages
 are handed to the writer in order as they come, so memory holds a few
-pages (or two screens of strip plus the next strip) whatever the length.
+pages (for a webtoon, the next strip joined to the unsent rows, about two
+strips) whatever the length.
 
 Decoding is hardened for pages from anywhere: only the DECODERS formats
 are tried, an image over MAX_PIXELS is refused from its header before it
@@ -48,7 +49,7 @@ WEBTOON_TWO = 2.0           # ... up to this many becomes two overlapping screen
 WEBTOON_OVERLAP = 0.04      # ... at screen height, each screen repeating this much of the last
 COLOUR_FRAC = 0.005         # e-ink: share of tinted pixels that makes a page colour ...
 SCREEN_COLOUR_FRAC = 1e-4   # ... other screens: any tinted spot over about 0.01% of the page
-MAX_PIXELS = 64_000_000     # per image: an 800 x 80000 strip; about 200 MB decoded as RGB
+MAX_PIXELS = 64_000_000     # per image: an 800 x 80000 strip; 256 MB decoded as RGB (4 bytes a pixel)
 
 LANCZOS = Image.Resampling.LANCZOS
 BOX = Image.Resampling.BOX
@@ -370,8 +371,36 @@ def process_page(img: Image.Image, prof: Profile, opts: Options, rtl: bool, firs
     return [finish(p, prof, opts, False, side) for p, side in parts]
 
 
-def webtoon_pages(strips, prof: Profile, opts: Options):
-    """Join strips into one virtual column and cut it into screen-shaped pages.
+def strip_width(sizes: list[tuple[int, int]], prof: Profile, opts: Options) -> int:
+    """The width of a webtoon's column: the width most of the chapter's
+    height has (the median weighted by height), so a narrow title card or
+    one wide banner does not resize every strip; never wider than the
+    screen, and the screen width with opts.upscale."""
+    if opts.upscale:
+        return prof.width
+    half, acc = sum(h for _, h in sizes) / 2, 0
+    for w, h in sorted(sizes):
+        acc += h
+        if acc >= half:
+            return min(w, prof.width)
+    return prof.width                           # no sizes: not reached from convert()
+
+
+def to_width(strip: Image.Image, width: int, upscale: bool) -> Image.Image:
+    """A strip at the column width: a wider one shrunk, a narrower one
+    enlarged with upscale, otherwise centred on its border colour."""
+    if strip.width > width or (upscale and strip.width < width):
+        return strip.resize((width, max(1, round(strip.height * width / strip.width))), LANCZOS)
+    if strip.width < width:
+        canvas = Image.new(strip.mode, (width, strip.height), border_colour(strip))
+        canvas.paste(strip, ((width - strip.width) // 2, 0))
+        return canvas
+    return strip
+
+
+def webtoon_pages(strips, prof: Profile, opts: Options, width: int):
+    """Join strips into one virtual column `width` wide (see strip_width)
+    and cut it into screen-shaped pages.
 
     A page ends at the lowest blank gap within one screen height (ignoring the
     top eighth). A panel taller than the screen is kept whole up to
@@ -379,9 +408,12 @@ def webtoon_pages(strips, prof: Profile, opts: Options):
     overlapping screens up to WEBTOON_TWO, and beyond that cut at screen
     height with a WEBTOON_OVERLAP overlap. Blank rows at the top of a page
     are trimmed to a small margin. Only the unsent rows (about two screens)
-    plus the next strip are held in memory.
+    joined to the next strip are held in memory.
     """
-    buf, top, width = None, 0, 0
+    buf, top = None, 0
+    page_h = round(width * prof.height / prof.width)
+    two = round(page_h * WEBTOON_TWO)
+    margin, min_gap, overlap = page_h // 60, max(4, page_h // 200), round(page_h * WEBTOON_OVERLAP)
 
     def rows(a: int, b: int) -> list[bool]:
         return blank_rows(buf.crop((0, top + a, width, min(top + b, buf.height))))
@@ -429,21 +461,20 @@ def webtoon_pages(strips, prof: Profile, opts: Options):
         return page(page_h), page_h - overlap
 
     for strip in strips:
-        if not width:
-            width = prof.width if opts.upscale else min(strip.width, prof.width)
-            page_h = round(width * prof.height / prof.width)
-            two = round(page_h * WEBTOON_TWO)
-            margin, min_gap, overlap = page_h // 60, max(4, page_h // 200), round(page_h * WEBTOON_OVERLAP)
-        if strip.width != width:
-            strip = strip.resize((width, max(1, round(strip.height * width / strip.width))), LANCZOS)
+        strip = to_width(strip, width, opts.upscale)
         if buf is None:
             buf, top = strip, 0
         else:
-            mode = buf.mode if buf.mode == strip.mode else "RGB"
-            joined = Image.new(mode, (width, buf.height - top + strip.height))
-            joined.paste(buf if buf.mode == mode else buf.convert(mode), (0, -top))
-            joined.paste(strip if strip.mode == mode else strip.convert(mode), (0, buf.height - top))
+            # the unsent rows are copied out first, so the column they were
+            # cut from is freed before the joined one is made
+            rest, buf = buf.crop((0, top, width, buf.height)), None
+            mode = rest.mode if rest.mode == strip.mode else "RGB"
+            joined = Image.new(mode, (width, rest.height + strip.height))
+            joined.paste(rest if rest.mode == mode else rest.convert(mode), (0, 0))
+            joined.paste(strip if strip.mode == mode else strip.convert(mode), (0, rest.height))
             buf, top = joined, 0
+            del rest, joined
+        strip = None                                         # held once, in buf
         while buf.height - top > two + 1:
             out, used = take(final=False)
             top += used
@@ -499,8 +530,9 @@ def convert(src, out, *, options: Options, rtl: bool | None, webtoon: bool | Non
         if not names:
             raise ConvertError("no pages in the archive")
         info = source.read_comicinfo(z)
+        sizes = [image_size(z, n) for n in names] if webtoon is not False else []
         if webtoon is None:
-            webtoon, layout_why = detect_layout([image_size(z, n) for n in names], hints)
+            webtoon, layout_why = detect_layout(sizes, hints)
         else:
             layout_why = "as asked"
         rtl, direction_why = _direction(rtl, webtoon, info)
@@ -519,7 +551,8 @@ def convert(src, out, *, options: Options, rtl: bool | None, webtoon: bool | Non
                         progress(i + 1, total)
 
                 pages = ordered(pool, lambda img: [webtoon_page(img, prof, options)],
-                                webtoon_pages(strips(), prof, options), 2 * threads)
+                                webtoon_pages(strips(), prof, options, strip_width(sizes, prof, options)),
+                                2 * threads)
             else:
                 grey = not shows_colour(prof, options)
                 pages = ordered(pool, lambda i: process_page(load(z, names[i], prof, grey), prof, options, rtl,

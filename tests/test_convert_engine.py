@@ -326,6 +326,22 @@ class WebtoonTests(Base):
                 self.assertEqual(r.webtoon, webtoon)
                 self.assertIn(why, r.decided)
 
+    def test_the_column_takes_the_width_of_most_strips(self):
+        # a narrow title card first: centred on its white, not setting the width of the chapter
+        card, strips = fx.webtoon_strips(200, 1500, 1)[0], fx.webtoon_strips(400, 3000, 3)
+        src = fx.webtoon_cbz(os.path.join(self.tmp, "card.cbz"), [card, *strips])
+        pages = jpegs(self.convert(src, "card.cbz", profile="test-wide", format="cbz").path)
+        self.assertEqual({p.width for p in pages}, {400})
+        self.assertGreater(pages[0].convert("L").crop((0, 0, 90, pages[0].height)).getextrema()[0], 230)
+        # a wide first strip does not enlarge the rest, unless upscale says so
+        wide, narrow = fx.webtoon_strips(480, 3000, 1)[0], fx.webtoon_strips(240, 3000, 3)
+        src = fx.webtoon_cbz(os.path.join(self.tmp, "wide.cbz"), [wide, *narrow])
+        small = self.convert(src, "wide.cbz", profile="test-wide", format="cbz", webtoon=True)
+        self.assertEqual({p.width for p in jpegs(small.path)}, {240})
+        big = self.convert(src, "up.cbz", profile="test-wide", format="cbz", webtoon=True, upscale=True)
+        self.assertEqual(max(p.width for p in jpegs(big.path)), 480)
+        self.assertGreater(big.bytes, small.bytes * 2)
+
     def test_mixed_strips(self):
         s1, s2 = fx.webtoon_strips(400, 3000, 2)
         strips = [s1, s2.resize((600, 4500)).convert("L"), Image.new("RGB", (400, 3000), "white"),
