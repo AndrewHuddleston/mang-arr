@@ -336,13 +336,17 @@ def _job_search_wanted(job: jobs.Job):
 #   2. settings: if they have never been readable, 503 (the login state is unknown: fail closed)
 #   3. the Host check: only IPs, localhost, LAN names and allowed_hosts (DNS rebinding)
 #   4. the CSRF check: a POST/PUT/PATCH/DELETE is refused (403) when the browser's
-#      Sec-Fetch-Site is anything but same-origin/none, or, without it, when its Origin
-#      (else Referer) names another host:port; requests with none of these headers (curl,
-#      scripts) go on to the normal login check, and a valid X-Api-Key header skips this check
+#      Sec-Fetch-Site is anything but same-origin/none, or, without it (plain HTTP, older
+#      browsers), when its Origin (else Referer) is not this server's scheme://host:port;
+#      requests with none of these headers (curl, scripts) go on to the normal login check,
+#      and a valid X-Api-Key header skips this check
 #   5. the login check (when a login is set): X-Api-Key header, ?apikey= (GET under /api/
 #      only), the session cookie, or Basic credentials (auth_method basic only); password
 #      attempts are throttled per client address, each one reserved before its check
+#      (security.check_password)
 # and every response gets the security headers (CSP: scripts only from /static).
+# Handlers that change settings or hand out secrets check the sign-in again against the
+# values they act on (security.still_authorized): it may have changed since step 5.
 # The helpers live in security.py.
 
 @app.middleware("http")
@@ -385,8 +389,9 @@ async def authentication(request: Request, call_next):
                             request.method, security.clip(path, 200), ip, why, security.clip(host))
             return Response("mang-arr: cross-site request refused (it did not come from mang-arr's own pages: "
                             "another site, or another port on this host). Behind a reverse proxy, pass the "
-                            "original Host header with its port ($http_host in nginx), or X-Forwarded-Host / "
-                            "X-Forwarded-Port.\n", 403, media_type="text/plain")
+                            "original Host header with its port ($http_host in nginx) or send X-Forwarded-Host / "
+                            "X-Forwarded-Port, and X-Forwarded-Proto when the proxy serves HTTPS.\n", 403,
+                            media_type="text/plain")
 
     if not v["auth_user"]:
         request.state.authed, request.state.via = True, "open"       # no login configured: everyone is admin
@@ -400,20 +405,16 @@ async def authentication(request: Request, call_next):
         if not via and v["auth_method"] == "basic":
             creds = security.basic_credentials(request.headers.get("authorization", ""))
             if creds:
-                wait = security.throttle.retry_after(ip)
-                if not wait and security.remembered(v, *creds):
-                    via = "basic"                # right a moment ago: no new check, nothing to reserve
-                else:
-                    wait = wait or security.throttle.reserve(ip)       # before the hash: bursts count too
-                    if wait:
-                        return security.too_many(wait, "logins from this address")
-                    if await run_in_threadpool(security.credentials_ok, v, *creds):
-                        via = "basic"
-                        security.throttle.succeeded(ip)
-                    else:
-                        blocked = security.throttle.retry_after(ip)
-                        log.warning("failed basic auth for %s from %s%s", security.clip(creds[0]), ip,
-                                    f"; further attempts refused for {blocked} s" if blocked else "")
+                ok, wait = await security.check_password(v, ip, *creds)
+                if wait:
+                    return security.too_many(wait, "logins from this address")
+                if ok:
+                    via = "basic"
+                    request.state.login = security.login_of(v)      # for security.still_authorized
+                elif security.log_budget.allow(ip):
+                    blocked = security.throttle.retry_after(ip)
+                    log.warning("failed basic auth for %s from %s%s", security.clip(creds[0]), ip,
+                                f"; further attempts refused for {blocked} s" if blocked else "")
         request.state.authed, request.state.via = bool(via), via
         if not via and not (path in OPEN_PATHS or path.startswith(("/static/", "/login", "/logout"))):
             if security.log_budget.allow(ip):
@@ -464,22 +465,23 @@ def _no_password_note(v: dict) -> str | None:
 async def login_submit(request: Request, username: str = Form(""), password: str = Form(""), next: str = Form("/")):
     """Async on purpose: the failure delay is an asyncio sleep, so a flood of
     bad logins holds no worker threads; the hash check runs in the pool. The
-    attempt is reserved before the check, so parallel guesses count at once."""
+    attempt is reserved before the check (security.check_password), so
+    parallel guesses count at once."""
     ip, target = security.client_ip(request), security.safe_next(next)
-    wait = security.throttle.reserve(ip)
+    v = await run_in_threadpool(settings.all_values) if settings.stale() else settings.all_values()
+    ok, wait = await security.check_password(v, ip, username, password)
     if wait:
         if security.log_budget.allow(ip):
             log.warning("login from %s refused: too many failures, blocked for %d s more", ip, wait)
         return _login_form(request, target, f"too many failed sign-ins: try again in {wait} s", 429,
                            {"Retry-After": str(wait)})
-    v = await run_in_threadpool(settings.all_values)
-    if not await run_in_threadpool(security.credentials_ok, v, username, password):
-        blocked = security.throttle.retry_after(ip)             # the failure was counted by reserve()
-        log.warning("failed login for %s from %s%s", security.clip(username), ip,
-                    f"; further attempts refused for {blocked} s" if blocked else "")
+    if not ok:
+        blocked = security.throttle.retry_after(ip)             # the failure was counted when it was reserved
+        if security.log_budget.allow(ip):
+            log.warning("failed login for %s from %s%s", security.clip(username), ip,
+                        f"; further attempts refused for {blocked} s" if blocked else "")
         await asyncio.sleep(1)                   # slow down guessing (without holding a thread)
         return _login_form(request, target, _no_password_note(v) or "wrong username or password", 401)
-    security.throttle.succeeded(ip)
     if not v.get("session_secret"):              # startup could not create it (DB was unavailable then)
         v = await run_in_threadpool(_ensure_security)
     resp = RedirectResponse(target, 303)
@@ -530,9 +532,12 @@ async def _queue_full(request: Request, exc: jobs.QueueFull):
 
 
 @app.post("/settings/logout-all")
-def logout_all():
-    with db.connect() as con:
-        settings.logout_everywhere(con)
+def logout_all(request: Request):
+    try:
+        with db.connect() as con:
+            settings.logout_everywhere(con, still_allowed=_still(request))
+    except settings.NotAllowed:
+        return _sign_in_lost(request)
     resp = RedirectResponse("/login", 303)
     resp.delete_cookie(security.SESSION_COOKIE)
     return resp
@@ -540,12 +545,34 @@ def logout_all():
 
 @app.post("/settings/api-key/regenerate")
 def api_key_regenerate(request: Request):
-    with db.connect() as con:
-        settings.rotate_api_key(con)
+    try:
+        with db.connect() as con:
+            settings.rotate_api_key(con, still_allowed=_still(request))
+    except settings.NotAllowed:
+        return _sign_in_lost(request)
     log.info("API key regenerated; every session signed out")
     resp = _flash("/settings", "new API key generated: update every script that used the old one")
     _reissue_session(request, resp)
     return resp
+
+
+def _still(request: Request):
+    """still_allowed for settings.write / backup.restore: this request's
+    sign-in, checked again against the values stored when it acts."""
+    return lambda v: security.still_authorized(request, v)
+
+
+def _sign_in_lost(request: Request) -> Response:
+    """The answer when a request's sign-in no longer holds by the time its
+    handler acts (see security.still_authorized): nothing was done."""
+    ip = security.client_ip(request)
+    if security.log_budget.allow(ip):
+        log.warning("refused %s %s from %s: its sign-in no longer holds (a login was switched on, or the API key, "
+                    "password or sessions changed, while it waited); nothing done", request.method,
+                    security.clip(request.url.path, 200), ip)
+    return Response("mang-arr: not signed in any more (a login was switched on, or the API key, password or "
+                    "sessions changed, while this request waited); nothing was done. Sign in and try again.\n",
+                    401, media_type="text/plain")
 
 
 def _reissue_session(request: Request, resp: Response) -> None:
@@ -1001,17 +1028,29 @@ def system_update_check():
 
 
 @app.get("/system/backup")
-def system_backup_download():
+def system_backup_download(request: Request):
     """Download a fresh copy of the database. A GET must not change anything
     (links, prefetch and cross-site navigations make GETs), so this streams a
     temporary copy that is deleted once sent: no kept backup is written and
-    none is pruned. Kept backups are made only by POST."""
+    none is pruned. Kept backups are made only by POST. The copy goes out
+    only if the request's sign-in holds for the settings in the copy itself:
+    one let in while there was no login must not carry away the API key and
+    Komga key a login switched on meanwhile brought."""
     from starlette.background import BackgroundTask
     try:
         p, name = backup.snapshot_for_download()
     except backup.FAILURES as e:
         log.error("database download failed: %s", e)
         raise HTTPException(500, f"cannot copy the database: {e}") from e
+    try:
+        allowed = security.still_authorized(request, backup.stored_settings(p))
+    except backup.FAILURES as e:
+        _remove_quietly(p)
+        log.error("database download failed: cannot read the copy's settings: %s", e)
+        raise HTTPException(500, f"cannot read the copy of the database: {e}") from e
+    if not allowed:
+        _remove_quietly(p)
+        return _sign_in_lost(request)
     return FileResponse(p, filename=name, media_type="application/x-sqlite3",
                         background=BackgroundTask(_remove_quietly, p))
 
@@ -1033,11 +1072,13 @@ def system_backups_create():
 
 
 @app.get("/system/backups/{name}")
-def system_backups_download(name: str):
+def system_backups_download(request: Request, name: str):
     try:
         p = backup.path_of(name)
     except (ValueError, FileNotFoundError) as e:
         raise HTTPException(404, str(e)) from e
+    if not security.still_authorized(request, settings.all_values()):
+        return _sign_in_lost(request)           # a backup made after a login was switched on holds its keys
     return FileResponse(p, filename=name, media_type="application/x-sqlite3")
 
 
@@ -1103,10 +1144,10 @@ def _restore_exclusive(title: str, fn) -> str:
 
 
 @app.post("/system/backups/{name}/restore")
-def system_backups_restore(name: str):
+def system_backups_restore(request: Request, name: str):
     try:
         path = backup.path_of(name)
-        msg = _restore_exclusive(name, lambda: backup.restore(path))
+        msg = _restore_exclusive(name, lambda: backup.restore(path, still_allowed=_still(request)))
     except backup.FAILURES as e:
         return _flash("/system", f"restore refused: {e}")
     return _flash("/system", msg)
@@ -1157,7 +1198,8 @@ async def system_backups_upload(request: Request):
         if up is None or not getattr(up, "filename", ""):
             return _flash("/system", "choose a .db file to restore")
         # blocking work (copy, checks, swap) runs off the event loop, on the job worker
-        msg = await run_in_threadpool(_restore_exclusive, f"uploaded {up.filename}", lambda: backup.restore(up.file))
+        msg = await run_in_threadpool(_restore_exclusive, f"uploaded {up.filename}",
+                                      lambda: backup.restore(up.file, still_allowed=_still(request)))
     except backup.FAILURES as e:
         return _flash("/system", f"restore refused: {e}")
     finally:
@@ -1219,12 +1261,12 @@ def _settings_save(request: Request, form) -> Response:
         enabled = {str(x).lower().strip() for x in form.getlist("enabled_sources")}
         listed = {str(x).lower().strip() for x in form.getlist("listed_sources")}
         values["unusable_sources"] = sorted(listed - enabled)
-    before = settings.all_values()
-    epoch = before["session_epoch"]
+    epoch = settings.all_values()["session_epoch"]
     try:
         with db.connect() as con:
-            notices = settings.set_many(con, values)
-            notices += _rotate_key_if_login_enabled(con, before)
+            notices = settings.set_many(con, values, still_allowed=_still(request))
+    except settings.NotAllowed:
+        return _sign_in_lost(request)
     except (ValueError, KeyError) as e:
         log.warning("settings not saved: %s", e)
         return _flash("/settings", f"invalid value, nothing saved: {e}")
@@ -1236,26 +1278,6 @@ def _settings_save(request: Request, form) -> Response:
     if settings.all_values()["session_epoch"] != epoch:
         _reissue_session(request, resp)                # changed the password: keep this browser signed in
     return resp
-
-
-def _rotate_key_if_login_enabled(con, before: dict) -> list[str]:
-    """When a login is switched on, the API key minted while everything was
-    open must count as disclosed (anyone could read it then), so it is
-    replaced, also when this very request authenticated with it: the
-    installer reads the key, then switches the login on, and a copy someone
-    else read in between must not keep working. Only a key this request set
-    itself (a new value, never stored while open) is kept. The new key is in
-    the PUT response, so an API client carries on with it, and on the
-    Settings page."""
-    after = settings.all_values(con)
-    if before["auth_user"] or not after["auth_user"]:
-        return []
-    if after["api_key"] != before["api_key"]:
-        return []
-    settings.rotate_api_key(con)
-    msg = "login switched on, so the API key was regenerated (the old one was readable while there was no login)"
-    log.warning("settings: %s", msg)
-    return [msg]
 
 
 def _settings_action(action: str, notice: str) -> Response:
@@ -1413,21 +1435,23 @@ def api_command(body: dict):
     raise HTTPException(400, f"unknown command {name!r}; known: RefreshAll, SearchWanted, RefreshMetadata")
 
 
-def _settings_out(request: Request) -> dict:
-    """Settings with secrets masked; the API key itself only for a caller the
-    middleware authenticated (API key, session, Basic; or anyone while no
-    login is set), so scripts and the installer can read it."""
-    v = settings.all_values()
+def _settings_out(v: dict) -> dict:
+    """Settings with secrets masked except the API key itself, so scripts and
+    the installer can read it: only ever for values the caller's sign-in was
+    checked against (security.still_authorized), so a request let in while
+    there was no login never sees the key a login switched on since brought."""
     out = settings.masked(v)
-    if getattr(request.state, "authed", False):
-        out["api_key"] = v["api_key"]
+    out["api_key"] = v["api_key"]
     return out
 
 
 @app.get("/api/v1/settings")
 def api_settings_get(request: Request):
     """Runtime settings with secrets masked (see _settings_out for api_key)."""
-    return _settings_out(request)
+    v = settings.all_values()
+    if not security.still_authorized(request, v):
+        return _sign_in_lost(request)
+    return _settings_out(v)
 
 
 @app.put("/api/v1/settings")
@@ -1436,18 +1460,20 @@ def api_settings_put(request: Request, body: dict):
     strings; a secret given as the mask keeps its value. Unknown keys -> 400.
     A secret cleared because its destination changed is named in the
     X-Mangarr-Notice header (and the log), and so is a new API key when this
-    call switched the login on: the response then carries the new key, and
-    the key the call was made with (readable while there was no login) no
-    longer works."""
-    before = settings.all_values()
+    call switched the login on: the response then carries the new key (the
+    values as this call left them), and the key the call was made with
+    (readable while there was no login) no longer works. A call whose sign-in
+    no longer holds when it is stored (a login switched on, or the key
+    changed, while it waited) gets 401 and stores nothing."""
     try:
         with db.connect() as con:
-            notices = settings.set_many(con, body)
-            notices += _rotate_key_if_login_enabled(con, before)
+            notices, after = settings.write(con, body, still_allowed=_still(request))
+    except settings.NotAllowed:
+        return _sign_in_lost(request)
     except (KeyError, ValueError) as e:
         raise HTTPException(400, f"invalid setting: {e}") from e
     headers = {"X-Mangarr-Notice": "; ".join(notices)} if notices else None
-    return JSONResponse(_settings_out(request), headers=headers)
+    return JSONResponse(_settings_out(after), headers=headers)
 
 
 @app.get("/api/v1/log")

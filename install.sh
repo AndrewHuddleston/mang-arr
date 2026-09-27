@@ -645,7 +645,8 @@ probe_mangarr() {  # may we change mang-arr's settings, and what does it have al
 # One PUT turns the login on and stores the Komga key, so the key never sits in a mang-arr that anyone
 # on the network could reconfigure (and point at their own "Komga") or back up without logging in.
 # Turning the login on also makes mang-arr replace its API key: the one read above was readable by
-# anyone while there was no login. The PUT answer carries the new key; later calls use that one.
+# anyone while there was no login. The PUT answer carries the new key; later calls use that one, and
+# check_mangarr confirms that the login and that key are what mang-arr now has.
 configure_mangarr() {
   local st key user="" pass=""
   if [[ $MA_LOGIN_SET == 0 ]]; then
@@ -682,7 +683,25 @@ print(json.dumps(b))' >"$WORK/mangarr.json"
     use_mangarr_key "$key"
     ok "mang-arr replaced its API key now that it has a login (Settings -> Security shows the new one)"
   fi
+  [[ -z "$MA_KEY" ]] || check_mangarr "$user"
   [[ -z "$KOMGA_KEY" ]] || ok "mang-arr knows Komga (scan after every import)"
+}
+
+# After the PUT mang-arr must refuse a request without the key, and show the key this run holds (and the
+# user it set) to one with it. Anything else means something else on the network changed its settings
+# while it had no login: stop rather than report a protected mang-arr, holding the Komga key, that is not.
+check_mangarr() {  # check_mangarr <user this run set, or empty>
+  local st anon
+  anon=$(req GET "$MANGARR/api/v1/settings")
+  st=$(req GET "$MANGARR/api/v1/settings" "$MA_HDR")
+  if [[ "$anon" != 401 || "$st" != 2* || "$(resp | jsonget api_key 2>/dev/null)" != "$MA_KEY" ]] \
+     || [[ -n "$1" && "$(resp | jsonget auth_user 2>/dev/null)" != "$1" ]]; then
+    warn "mang-arr's login or API key is not the one this install set (HTTP $anon without the key, $st with it):"
+    warn "something else on the network changed its settings while it had no login."
+    [[ -z "$KOMGA_KEY" ]] || warn "Delete the Komga API key named '$KOMGA_KEY_COMMENT' in Komga: mang-arr held it."
+    die "Set a new mang-arr login (docs/INSTALL.md, 'Forgotten mang-arr password'), then run the installer again"
+  fi
+  ok "mang-arr refuses requests without its login or API key"
 }
 
 # ------------------------------------------------------------------ main

@@ -187,6 +187,12 @@ def respond():
             if not login_before and s.get("auth_user") and s.get("api_key") == key_before:
                 # like mang-arr: switching the login on replaces the key anyone could read until then
                 s["api_key"] = "MANGARR-API-KEY-%d-ROTATED" % len(M["puts"])
+            shown = dict(s)
+            s.update(M.pop("tamper", {}))    # another client's change landing right after this PUT
+            for k in ("auth_password", "komga_api_key"):
+                if shown.get(k):
+                    shown[k] = "********"
+            return 200, shown
         shown = dict(s)
         for k in ("auth_password", "komga_api_key"):
             if shown.get(k):
@@ -376,6 +382,12 @@ class FreshInstallTest(InstallerHarness):
         self.assertEqual(self.st["mangarr"]["health_keys"], [s["api_key"]])       # later calls: the new key
         self.assertIn("mang-arr replaced its API key", self.out)
         self.assertNotIn(s["api_key"], self.out + self.err)                       # never printed
+        # round 2 follow-up: then it checks that mang-arr refuses a request without the key and shows this
+        # run's key and user to one with it
+        ev = self.st["events"]
+        put = ev.index("PUT /api/v1/settings")
+        self.assertEqual(ev[put + 1:put + 3], ["GET /api/v1/settings"] * 2)
+        self.assertIn("mang-arr refuses requests without its login or API key", self.out)
 
     def test_mangarr_password_is_saved_privately_and_never_printed(self):
         # second pass, 3: a password shown once and kept nowhere meant a lockout, and without a
@@ -476,6 +488,32 @@ class RerunTest(InstallerHarness):
         self.assertNotIn("auth_user", last_put["keys"])                         # login left as it was
         self.assertEqual(last_put["api_key_header"], key)
         self.assertEqual(st["mangarr"]["settings"]["api_key"], key)             # ... and so is the key
+
+
+class MangarrChangedMeanwhileTest(InstallerHarness):
+    """Round 2, installer #9: another client on the network changes mang-arr's settings while it has no
+    login (its key, or the login itself). The installer must notice after its PUT instead of reporting a
+    protected mang-arr that holds the Komga key."""
+
+    def assertStops(self, tamper):
+        st = self.state()
+        st["mangarr"]["tamper"] = tamper
+        self.save_state(st)
+        rc, out, err = self.run_installer()
+        self.assertNotEqual(rc, 0, out)
+        self.assertIn("not the one this install set", err)
+        self.assertIn("Delete the Komga API key named 'mang-arr'", err)
+        self.assertNotIn("Done.", out)
+        self.assertNotIn("ATTACKER-KEY", out + err)
+
+    def test_api_key_changed_after_the_put(self):
+        self.assertStops({"api_key": "ATTACKER-KEY"})
+
+    def test_login_switched_off_after_the_put(self):
+        self.assertStops({"auth_user": ""})
+
+    def test_other_user_after_the_put(self):
+        self.assertStops({"auth_user": "eve"})
 
 
 class KomgaStopTest(InstallerHarness):

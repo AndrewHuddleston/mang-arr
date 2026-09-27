@@ -74,7 +74,10 @@ yourself. The script:
    [Forgotten mang-arr password](#forgotten-mang-arr-password). Turning
    the login on also replaces mang-arr's API key, since anyone on the
    network could read the old one until then; the installer carries on
-   with the new key, which Settings → Security shows.
+   with the new key, which Settings → Security shows. It then checks that
+   mang-arr refuses requests without that key and holds the login it set,
+   and stops with instructions if something else on the network changed
+   mang-arr's settings in the meantime.
 
 Passwords and API keys are never passed on a command line: the installer
 hands them to `curl` through header and body files in a private temporary

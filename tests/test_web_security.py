@@ -2,7 +2,10 @@
 hardening, sessions, fail-closed settings, body limits, open-endpoint
 disclosure, short Suwayomi timeouts and the health cache."""
 import asyncio
+import hashlib
+import hmac
 import http.cookiejar
+import json
 import logging
 import os
 import sqlite3
@@ -209,11 +212,13 @@ class CsrfHostTest(WebBase):
                                 follow_redirects=False).status_code, 303)
         self.assertEqual(c.post("/settings", data={"refresh_hours": "4"}, follow_redirects=False).status_code, 303)
         self.assertEqual(self.settings.all_values()["refresh_hours"], 4.0)
-        # a valid API key header is allowed whatever the Origin; a reverse proxy's X-Forwarded-Host counts
+        # a valid API key header is allowed whatever the Origin; a reverse proxy's X-Forwarded-Host (and
+        # X-Forwarded-Proto, for a proxy that serves HTTPS) count
         self.assertEqual(c.put("/api/v1/settings", json={"refresh_hours": 5},
                                headers={"Origin": "https://evil.example", "X-Api-Key": self.key}).status_code, 200)
         self.assertEqual(c.post("/wanted/search", headers={"Origin": "https://manga.example.com",
-                                                           "X-Forwarded-Host": "manga.example.com"},
+                                                           "X-Forwarded-Host": "manga.example.com",
+                                                           "X-Forwarded-Proto": "https"},
                                 follow_redirects=False).status_code, 303)
 
     def test_series_delete_cross_site_refused(self):
@@ -230,7 +235,8 @@ class CsrfHostTest(WebBase):
         port) works when the proxy names the port (X-Forwarded-Port) or the browser vouches for the
         request (Sec-Fetch-Site); a bare Host no longer stands for any port."""
         c = self.client
-        proxied = {"Origin": "https://manga.lan:8443", "Host": "manga.lan", "X-Forwarded-For": "192.168.1.4"}
+        proxied = {"Origin": "https://manga.lan:8443", "Host": "manga.lan", "X-Forwarded-For": "192.168.1.4",
+                   "X-Forwarded-Proto": "https"}
         for good in ({**proxied, "X-Forwarded-Port": "8443"}, {**proxied, "Sec-Fetch-Site": "same-origin"},
                      {**proxied, "Origin": "https://manga.lan"}):                    # default port: Host says it
             self.assertEqual(c.post("/wanted/search", headers=good, follow_redirects=False).status_code, 303, good)
@@ -241,6 +247,21 @@ class CsrfHostTest(WebBase):
                     {**proxied, "Host": "manga.lan:6789"},                           # Host has a port: strict
                     {**proxied, "X-Forwarded-Port": "8443", "Sec-Fetch-Site": "same-site"}):   # browser says no
             self.assertEqual(c.post("/wanted/search", headers=bad).status_code, 403, bad)
+
+    def test_proxy_on_another_port_without_forwarded_port_is_told_what_to_send(self):
+        """Round 2 #48 follow-up: over plain HTTP browsers send no Sec-Fetch-Site, so behind nginx on :8080
+        with `$host` and no X-Forwarded-Port mang-arr's own page is refused too (the port is unknown). The
+        log says what the proxy has to send, and with it the page works."""
+        c = self.client
+        own_page = {"Host": "nas.lan", "X-Forwarded-For": "192.168.1.4", "Origin": "http://nas.lan:8080"}
+        with self.assertLogs("mangarr.web.app", logging.WARNING) as logs:
+            r = c.post("/wanted/search", headers=own_page)
+        self.assertEqual(r.status_code, 403)
+        self.assertIn("X-Forwarded-Port", r.text)
+        self.assertIn("Host 'nas.lan' has no port, so it stands for port 80", logs.output[0])
+        self.assertIn("must send X-Forwarded-Port", logs.output[0])
+        for fixed in ({**own_page, "X-Forwarded-Port": "8080"}, {**own_page, "Host": "nas.lan:8080"}):
+            self.assertEqual(c.post("/wanted/search", headers=fixed, follow_redirects=False).status_code, 303, fixed)
 
     def test_allowed_host_typed_with_a_port(self):
         """Round 2 regression: an entry typed the way the 400 page quoted the Host (with its port) never
@@ -316,6 +337,37 @@ class SameSiteCsrfTest(WebBase):
         self.assertIn("'http://nas.lan:4567'", logs.output[0])
         self.assertTrue(self.settings.verify_password(self.settings.all_values()["auth_password"], "pw"))
         self.assertEqual(self.client.get("/api/v1/series").status_code, 200)        # still signed in
+
+    def test_other_scheme_of_the_same_host_refused(self):
+        """Round 2 #48, the verifier's variants: over plain HTTP browsers send no Sec-Fetch-Site, and a Host
+        without a port took its default port from the Origin's scheme, so the other scheme of the same host
+        name counted as this server. The Origin must now be this server's own scheme://host:port, the
+        scheme being the request's (X-Forwarded-Proto behind a proxy)."""
+        self.signin()
+        attacks = (
+            # (a) a page on https://nas.lan posting to mang-arr behind nginx `$host` on :80
+            {"Host": "nas.lan", "X-Forwarded-For": "1.2.3.4", "X-Forwarded-Proto": "http", "Origin": "https://nas.lan"},
+            # (b) a page on http://nas.lan posting to mang-arr behind a TLS proxy using `$host`
+            {"Host": "nas.lan", "X-Forwarded-For": "1.2.3.4", "X-Forwarded-Proto": "https", "Origin": "http://nas.lan"},
+            {"Host": "nas.lan", "Origin": "https://nas.lan"},           # (c) mang-arr published directly on :80
+            {"Host": "nas.lan", "Referer": "https://nas.lan/x"},        # (d) the same, Referer only
+            {"Host": "nas.lan", "X-Forwarded-Proto": "https", "X-Forwarded-Port": "443",
+             "Origin": "http://nas.lan:443"},                             # right port, wrong scheme
+        )
+        with self.assertLogs("mangarr.web.app", logging.WARNING) as logs:
+            for headers in attacks:
+                r = self.client.post("/settings", data={"auth_user": "andy", "auth_password": "attacker-pw"},
+                                     headers=headers, follow_redirects=False)
+                self.assertEqual(r.status_code, 403, headers)
+        self.assertIn("it is https, this request came over http", logs.output[0])
+        self.assertTrue(self.settings.verify_password(self.settings.all_values()["auth_password"], "pw"))
+        allowed = ({"Host": "nas.lan", "Origin": "http://nas.lan"},
+                   {"Host": "nas.lan", "X-Forwarded-Proto": "https", "Origin": "https://nas.lan"},
+                   {"Host": "nas.lan", "X-Forwarded-Proto": "https", "Referer": "https://nas.lan/settings"})
+        for i, headers in enumerate(allowed):
+            r = self.client.post("/settings", data={"refresh_hours": str(i + 1)}, headers=headers,
+                                 follow_redirects=False)
+            self.assertEqual(r.status_code, 303, headers)
 
     def test_own_pages_proxies_and_scripts_still_work(self):
         self.signin()
@@ -439,6 +491,18 @@ class LoginTest(WebBase):
         c.cookies.set("mangarr_session", owner_cookie)
         self.assertEqual(c.get("/api/v1/series", auth=("andy", "pw")).status_code, 200)
 
+    def test_renamed_user_is_not_remembered(self):
+        """A right password is remembered for a few minutes (no hash per Basic request). The memo also
+        covers the stored user name: after a rename with the same password, the old name must not pass."""
+        self.set(auth_method="basic")
+        with TestClient(self.web.app) as c:
+            self.assertEqual(c.get("/api/v1/series", auth=("andy", "pw")).status_code, 200)
+        self.set(auth_user="bob")
+        with TestClient(self.web.app) as c:
+            self.assertEqual(c.get("/api/v1/series", auth=("andy", "pw")).status_code, 401)
+        with TestClient(self.web.app) as c:
+            self.assertEqual(c.get("/api/v1/series", auth=("bob", "pw")).status_code, 200)
+
     def test_trusted_proxy_client_address(self):
         """Review 3(c): behind a listed reverse proxy, throttling is per real client."""
         from types import SimpleNamespace
@@ -533,15 +597,15 @@ class ThrottleBurstTest(WebBase):
     address get no more checks than the same guesses one after another."""
     login = ("andy", "pw")
 
-    def burst(self, n: int, send, cookies: bool = True) -> tuple[Counter, int]:
+    def burst(self, n: int, send, cookies: bool = True, delay: float = 0.05) -> tuple[Counter, int]:
         """n requests at once from one address on one event loop (like parallel connections); returns
-        (status codes, passwords checked). The check is slowed down so every request is in flight
-        before the first one fails."""
+        (status codes, passwords checked). send(client, i) sends the i-th. The check is slowed down (delay)
+        so the requests are in flight before the first one fails."""
         import httpx
         checked, lock, real = [], threading.Lock(), self.settings.verify_password
 
         def slow_verify(stored, given):
-            time.sleep(0.05)
+            time.sleep(delay)
             with lock:
                 checked.append(given)
             return real(stored, given)
@@ -550,7 +614,7 @@ class ThrottleBurstTest(WebBase):
             jar = None if cookies else http.cookiejar.CookieJar(http.cookiejar.DefaultCookiePolicy(allowed_domains=[]))
             async with httpx.AsyncClient(transport=httpx.ASGITransport(app=self.web.app, client=("192.168.1.66", 1)),
                                          base_url="http://testserver", cookies=jar) as ac:
-                return await asyncio.gather(*(send(ac) for _ in range(n)))
+                return await asyncio.gather(*(send(ac, i) for i in range(n)))
         with mock.patch.object(self.settings, "verify_password", slow_verify):
             responses = asyncio.run(run())
         return Counter(r.status_code for r in responses), len(checked)
@@ -565,30 +629,59 @@ class ThrottleBurstTest(WebBase):
         self.assertEqual(t.reserve("10.0.0.9"), 0)
 
     def test_parallel_wrong_logins(self):
+        """The verifier's repro: 1000 simultaneous wrong logins from one address, each a different guess
+        (a password list), reach the hash only as often as sequential guesses do."""
         allowed = self.security.Throttle.FREE + 1                  # what sequential guesses get before 429
         with self.assertLogs("mangarr.web.app", logging.WARNING) as logs:
-            codes, checked = self.burst(1000, lambda ac: ac.post("/login", data={"username": "andy",
-                                                                                 "password": "guess"}))
+            codes, checked = self.burst(1000, lambda ac, i: ac.post("/login", data={"username": "andy",
+                                                                                    "password": f"guess{i}"}))
         self.assertEqual(checked, allowed)
         self.assertEqual(codes, Counter({401: allowed, 429: 1000 - allowed}))
-        self.assertLessEqual(len(logs.output), allowed + self.security.LogBudget.PER_MINUTE + 1)
-        codes, checked = self.burst(1, lambda ac: ac.post("/login", data={"username": "andy", "password": "pw"}))
+        self.assertLessEqual(len(logs.output), self.security.LogBudget.PER_MINUTE + 1)
+        codes, checked = self.burst(1, lambda ac, i: ac.post("/login", data={"username": "andy", "password": "pw"}))
         self.assertEqual((codes, checked), (Counter({429: 1}), 0))  # blocked, as after 6 failures in a row
 
     def test_parallel_wrong_basic_auth(self):
         self.set(auth_method="basic")
         allowed = self.security.Throttle.FREE + 1
-        codes, checked = self.burst(300, lambda ac: ac.get("/api/v1/series", auth=("andy", "nope")))
+        codes, checked = self.burst(300, lambda ac, i: ac.get("/api/v1/series", auth=("andy", f"nope{i}")))
         self.assertEqual(checked, allowed)
         self.assertEqual(codes, Counter({401: allowed, 429: 300 - allowed}))
+
+    def test_one_guess_sent_in_parallel_is_one_check(self):
+        """The same credentials in flight together share one check (and one reserved attempt)."""
+        codes, checked = self.burst(20, lambda ac, i: ac.post("/login", data={"username": "andy",
+                                                                               "password": "guess"}), delay=0.3)
+        self.assertEqual((codes, checked), (Counter({401: 20}), 1))
+        self.set(auth_method="basic")
+        self.security.throttle.succeeded("192.168.1.66")
+        codes, checked = self.burst(20, lambda ac, i: ac.get("/api/v1/series", auth=("andy", "nope")), delay=0.3)
+        self.assertEqual((codes, checked), (Counter({401: 20}), 1))
+        codes, checked = self.burst(20, lambda ac, i: ac.get("/api/v1/series", auth=("andy", f"nope{i}")))
+        self.assertEqual(checked, self.security.Throttle.FREE)      # 1 of the 6 attempts was used above
 
     def test_parallel_right_basic_auth_is_not_throttled(self):
         """A Basic client without a cookie jar sends the password with every request: once it has been
         checked, parallel requests need no reservation, so they are never refused."""
         self.set(auth_method="basic")
         self.assertEqual(self.client.get("/api/v1/series", auth=("andy", "pw")).status_code, 200)
-        codes, checked = self.burst(50, lambda ac: ac.get("/api/v1/series", auth=("andy", "pw")), cookies=False)
+        codes, checked = self.burst(50, lambda ac, i: ac.get("/api/v1/series", auth=("andy", "pw")), cookies=False)
         self.assertEqual((codes, checked), (Counter({200: 50}), 0))
+
+    def test_parallel_right_basic_auth_on_first_contact(self):
+        """Round 2 follow-up: before any check had succeeded, parallel right-password Basic requests each
+        reserved an attempt and all past the sixth got 429 (an API client fanning out, or a first page load
+        sending Basic on its files). They now share the one check."""
+        self.set(auth_method="basic")
+        codes, checked = self.burst(20, lambda ac, i: ac.get("/api/v1/series", auth=("andy", "pw")),
+                                    cookies=False, delay=0.3)
+        self.assertEqual((codes, checked), (Counter({200: 20}), 1))
+        self.security._verified.clear()                              # the memo expired: a page load fans out
+        paths = ["/", "/static/app.js", "/static/style.css", "/api/v1/series", "/api/v1/system/status", "/wanted",
+                 "/activity", "/api/v1/queue"]
+        codes, checked = self.burst(len(paths), lambda ac, i: ac.get(paths[i], auth=("andy", "pw")),
+                                    cookies=False, delay=0.3)
+        self.assertEqual((codes, checked), (Counter({200: len(paths)}), 1))
 
 
 class SessionTest(WebBase):
@@ -694,7 +787,7 @@ class ApiKeyRotationTest(WebBase):
         c = self.client
         old = c.get("/api/v1/settings").json()["api_key"]              # anyone could read it: no login yet
         self.assertEqual(old, self.key)
-        with self.assertLogs("mangarr.web.app", logging.WARNING) as logs:
+        with self.assertLogs("mangarr.settings", logging.WARNING) as logs:
             r = c.post("/settings", data={"auth_user": "andy", "auth_password": "pw", "auth_method": "forms"},
                        follow_redirects=False)
         self.assertEqual(r.status_code, 303)
@@ -747,6 +840,195 @@ class ApiKeyRotationTest(WebBase):
                             headers={"X-Api-Key": "c" * 32})
         self.assertNotEqual(r.json()["api_key"], "c" * 32)
         self.assertEqual(self.client.get("/api/v1/series", headers={"X-Api-Key": "c" * 32}).status_code, 401)
+
+
+    def test_session_secret_from_an_open_download_is_useless_after_install(self):
+        """Round 2, installer #9 (1): while there is no login, GET /system/backup hands anyone the database,
+        session_secret included. Switching the login on only bumped the epoch, so a cookie forged with that
+        secret for the installer's default user and a guessed epoch opened the new login and its Komga key.
+        The secret is replaced now."""
+        anon = TestClient(self.web.app)
+        r = anon.get("/system/backup")
+        self.assertEqual(r.status_code, 200)
+        path = os.path.join(self.tmp.name, "stolen.db")
+        with open(path, "wb") as f:
+            f.write(r.content)
+        con = sqlite3.connect(path)
+        stolen = {k: json.loads(v) for k, v in con.execute(
+            "SELECT key, value FROM setting WHERE key IN ('session_secret', 'session_epoch')")}
+        con.close()
+        self.assertTrue(stolen["session_secret"])
+        key = self.client.get("/api/v1/settings").json()["api_key"]
+        r = self.client.put("/api/v1/settings", headers={"X-Api-Key": key},
+                            json={"auth_user": "admin", "auth_password": "pw", "komga_url": "http://komga:25600",
+                                  "komga_api_key": "ADMIN-KEY-FROM-INSTALLER"})
+        self.assertEqual(r.status_code, 200)
+
+        def forged(secret: str, epoch: int) -> str:
+            payload = f"admin|{epoch}|{'ab' * 8}|{int(time.time()) + 3600}"
+            return f"{payload}|{hmac.new(secret.encode(), payload.encode(), hashlib.sha256).hexdigest()}"
+        for epoch in range(int(stolen["session_epoch"] or 0), int(stolen["session_epoch"] or 0) + 10):
+            anon.cookies.set("mangarr_session", forged(stolen["session_secret"], epoch))
+            for path in ("/api/v1/series", "/system/backup", "/api/v1/settings"):
+                self.assertEqual(anon.get(path).status_code, 401, (epoch, path))
+        v = self.settings.all_values()                    # the forgery itself is sound: with today's secret it works
+        self.assertNotEqual(v["session_secret"], stolen["session_secret"])
+        anon.cookies.set("mangarr_session", forged(v["session_secret"], v["session_epoch"]))
+        self.assertEqual(anon.get("/api/v1/series").status_code, 200)
+        anon.close()
+
+    def test_racing_writes_during_install_cannot_keep_access(self):
+        """Round 2, installer #9 (2), run for real: while the installer switches the login on, other clients
+        keep setting the API key to values of their own and reading the settings. Afterwards the key is the
+        one the installer's PUT returned, and none of theirs, nor anything they read, opens mang-arr."""
+        from mangarr import db
+        real_hash, stop, seen = self.settings.hash_password, threading.Event(), []
+
+        def slow_hash(password, iterations=None):
+            time.sleep(0.1)                               # production PBKDF2 takes about this long
+            return real_hash(password, iterations)
+
+        def attacker(n: int):
+            c = TestClient(self.web.app)
+            i = 0
+            while not stop.is_set():
+                c.put("/api/v1/settings", json={"api_key": f"attacker-key-{n}-{i % 2}"})
+                r = c.get("/api/v1/settings")
+                if r.status_code == 200:
+                    seen.append(r.json()["api_key"])
+                i += 1
+            c.close()
+        with mock.patch.object(self.settings, "hash_password", slow_hash):
+            with ThreadPoolExecutor(4) as ex:
+                futures = [ex.submit(attacker, n) for n in range(4)]
+                time.sleep(0.2)
+                key = self.client.get("/api/v1/settings").json()["api_key"]
+                r = self.client.put("/api/v1/settings", headers={"X-Api-Key": key},
+                                    json={"auth_user": "admin", "auth_password": "pw",
+                                          "komga_api_key": "ADMIN-KEY-FROM-INSTALLER"})
+                time.sleep(0.3)                           # let requests let in before the PUT finish
+                stop.set()
+                for f in futures:
+                    f.result()
+        self.assertEqual(r.status_code, 200)
+        final = r.json()["api_key"]
+        with db.connect() as con:
+            self.assertEqual(self.settings.stored(con)["api_key"], final)
+        self.assertNotIn(final, seen)
+        anon = TestClient(self.web.app)
+        for k in {*seen, *(f"attacker-key-{n}-{i}" for n in range(4) for i in range(2))}:
+            self.assertEqual(anon.get("/system/backup", headers={"X-Api-Key": k}).status_code, 401)
+        self.assertEqual(anon.get("/system/backup", headers={"X-Api-Key": final}).status_code, 200)
+        anon.close()
+
+
+class InFlightSignInTest(WebBase):
+    """Round 2, installer #9 (2): the middleware lets a request in, and its handler may run a while later
+    (the worker pool is busy). By then a login may have been switched on, or the key, password or sessions
+    changed. Such a request must not change settings, see the key, restore or download the database."""
+    INSTALL = {"auth_user": "admin", "auth_password": "pw", "komga_url": "http://komga:25600",
+               "komga_api_key": "ADMIN-KEY-FROM-INSTALLER"}
+
+    def meanwhile(self, change):
+        """change() runs after the middleware has let the next request in and before its handler runs."""
+        real, done = self.security.key_ok, []
+
+        def key_ok(v, given):
+            if not done:
+                done.append(True)
+                change()
+            return real(v, given)
+        return mock.patch.object(self.security, "key_ok", key_ok)
+
+    def install(self):
+        self.set(**self.INSTALL)
+
+    def assertLost(self, r):
+        self.assertEqual(r.status_code, 401, r.text[:200])
+        self.assertIn("not signed in any more", r.text)
+        self.assertNotIn(self.settings.all_values()["api_key"], r.text)
+
+    def test_open_writes_refused_once_the_login_is_on(self):
+        anon = TestClient(self.web.app)
+        with self.assertLogs("mangarr.web.app", logging.WARNING) as logs, self.meanwhile(self.install):
+            self.assertLost(anon.put("/api/v1/settings", json={"api_key": "attacker-key-0"}))
+        self.assertIn("its sign-in no longer holds", logs.output[0])
+        v = self.settings.all_values()
+        self.assertEqual((v["auth_user"], v["komga_url"]), ("admin", "http://komga:25600"))
+        self.assertNotEqual(v["api_key"], "attacker-key-0")
+        self.assertEqual(anon.get("/system/backup", headers={"X-Api-Key": "attacker-key-0"}).status_code, 401)
+        self.set(auth_user="")
+        for method, path, kwargs in (
+                ("PUT", "/api/v1/settings", {"json": {"komga_url": "http://attacker.example:8000"}}),
+                ("POST", "/settings", {"data": {"komga_url": "http://attacker.example:8000"}}),
+                ("POST", "/settings/api-key/regenerate", {}),
+                ("POST", "/settings/logout-all", {})):
+            with self.meanwhile(self.install):
+                self.assertLost(anon.request(method, path, follow_redirects=False, **kwargs))
+            v = self.settings.all_values()
+            self.assertEqual((v["auth_user"], v["komga_url"]), ("admin", "http://komga:25600"), path)
+            installed = v["api_key"]
+            self.set(auth_user="")
+            self.assertEqual(self.settings.all_values()["api_key"], installed, path)   # not rotated by it
+        anon.close()
+
+    def test_open_reads_refused_once_the_login_is_on(self):
+        from mangarr import backup
+        anon = TestClient(self.web.app)
+        with self.meanwhile(self.install):
+            self.assertLost(anon.get("/api/v1/settings"))
+        self.set(auth_user="")
+        with self.meanwhile(self.install):
+            self.assertLost(anon.get("/system/backup"))
+        self.assertEqual([n for n in os.listdir(backup.backup_dir()) if n.startswith(".tmp-")], [])  # copy removed
+        made = os.path.basename(backup.create("with a login"))          # holds the installer's keys
+        self.set(auth_user="")
+        with self.meanwhile(self.install):
+            self.assertLost(anon.get(f"/system/backups/{made}"))
+        self.set(auth_user="")
+        self.assertEqual(anon.get(f"/system/backups/{made}").status_code, 200)   # open again: the owner's choice
+        anon.close()
+
+    def test_open_restore_refused_once_the_login_is_on(self):
+        from mangarr import backup
+        old = os.path.basename(backup.create("while open"))
+        anon = TestClient(self.web.app)
+        with self.meanwhile(self.install):
+            r = anon.post(f"/system/backups/{old}/restore", follow_redirects=False)
+        self.assertEqual(r.status_code, 303)
+        self.assertIn("restore%20refused", r.headers["location"])
+        v = self.settings.all_values()
+        self.assertEqual((v["auth_user"], v["komga_api_key"]), ("admin", "ADMIN-KEY-FROM-INSTALLER"))
+        # the check that counts is made under the settings lock, right before the swap
+        with self.assertRaises(backup.RestoreError):
+            backup.restore(backup.path_of(old), still_allowed=lambda cur: not cur["auth_user"])
+        self.assertEqual(self.settings.all_values()["auth_user"], "admin")
+        anon.close()
+
+    def test_replaced_credentials_refused(self):
+        """The same for a request let in with a key, password or session that is replaced meanwhile."""
+        self.install()
+        key = self.settings.all_values()["api_key"]
+        c = TestClient(self.web.app)
+        with self.meanwhile(lambda: self.set(api_key="f" * 32)):              # the owner regenerates the key
+            self.assertLost(c.put("/api/v1/settings", json={"api_key": "attacker-key-1"}, headers={"X-Api-Key": key}))
+        self.assertEqual(self.settings.all_values()["api_key"], "f" * 32)
+        with self.meanwhile(lambda: self.set(api_key="e" * 32)):
+            self.assertLost(c.get("/api/v1/settings", headers={"X-Api-Key": "f" * 32}))
+        self.set(auth_method="basic")
+        with self.meanwhile(lambda: self.set(auth_password="new pw")):         # the owner changes the password
+            self.assertLost(c.put("/api/v1/settings", json={"refresh_hours": 2}, auth=("admin", "pw")))
+        self.set(auth_method="forms")
+        self.signin("admin", "new pw")
+        from mangarr import db
+
+        def sign_out_everyone():
+            with db.connect() as con:
+                self.settings.logout_everywhere(con)
+        with self.meanwhile(sign_out_everyone):
+            self.assertLost(self.client.post("/settings", data={"refresh_hours": "3"}, follow_redirects=False))
+        self.assertNotEqual(self.settings.all_values()["refresh_hours"], 3.0)
+        c.close()
 
 
 class SecretDestinationTest(WebBase):

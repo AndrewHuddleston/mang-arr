@@ -32,6 +32,7 @@ import tempfile
 import threading
 import time
 import urllib.parse
+from collections.abc import Callable
 
 from . import config, db, library
 
@@ -188,6 +189,18 @@ def snapshot_for_download() -> tuple[str, str]:
         _remove(tmp)
         raise
     return tmp, f"mangarr-{time.strftime('%Y%m%d-%H%M%S')}.db"
+
+
+def stored_settings(path: str) -> dict:
+    """The settings in the database file at path (a copy or a backup), read
+    only, over the defaults."""
+    from . import settings
+    c = sqlite3.connect(_ro_uri(path), uri=True)
+    try:
+        c.row_factory = sqlite3.Row
+        return settings.stored(c)
+    finally:
+        c.close()
 
 
 def _sort_key(name: str) -> tuple[str, int]:
@@ -493,41 +506,64 @@ def _page_size() -> int:
         return 4096
 
 
-def restore(source, keep_auth: bool = True) -> str:
+SIGN_IN_LOST = ("a login was switched on, or the API key, password or sessions changed, while this restore "
+                "waited; sign in and try again")
+
+
+def _live_settings() -> dict:
+    from . import settings
+    with db.connect() as con:
+        return settings.stored(con)
+
+
+def restore(source, keep_auth: bool = True, still_allowed: Callable[[dict], bool] | None = None) -> str:
     """Replace the live database with a backup: the path of a file, or an
     open binary file (an upload, limited to upload_limit()). Returns a
     description; raises RestoreError (a ValueError) when the file is refused
     or cannot be used, with the live database unchanged. Jobs must not run
-    meanwhile: the web layer runs this on the job runner's own thread."""
+    meanwhile: the web layer runs this on the job runner's own thread.
+
+    still_allowed(current settings) is the web request's sign-in, asked
+    again right before the swap: a restore let in while there was no login
+    must not replace the database once a login has been switched on. From
+    reading the current login to the swap no settings write can run
+    (settings.write_lock), so none is lost or undone by the swap."""
+    from . import settings
     with _lock:
         _ensure_live()
         work = tempfile.mkdtemp(prefix=_TMP_PREFIX + "restore-", dir=backup_dir())
         try:
+            if still_allowed is not None and not still_allowed(_live_settings()):
+                raise RestoreError(SIGN_IN_LOST)  # before any work (and before the safety backup)
             staged, fresh = os.path.join(work, "source.db"), os.path.join(work, "restored.db")
             _stage_copy(source, staged, None if isinstance(source, (str, os.PathLike)) else upload_limit())
             ok, msg = verify(staged)
             if not ok:
                 raise RestoreError(msg)
             version, notes = _rebuild(staged, fresh, _page_size())
-            if keep_auth:
-                current = _current_settings()
-                if current is None:
-                    notes.append("the current login settings were unreadable, so the backup's are in use")
-                else:
-                    _carry_settings(fresh, current)
-                    notes.append("login and API key kept as they are now")
             with _no_download_run():
                 try:
                     safety = create("before restore", prune_after=False)
-                    live = sqlite3.connect(config.DB_PATH, timeout=30)
-                    try:
-                        src = sqlite3.connect(fresh)
+                    with settings.write_lock:
+                        if still_allowed is not None and not still_allowed(_live_settings()):
+                            raise RestoreError(SIGN_IN_LOST)
+                        if keep_auth:
+                            current = _current_settings()
+                            if current is None:
+                                notes.append("the current login settings were unreadable, so the backup's are "
+                                             "in use")
+                            else:
+                                _carry_settings(fresh, current)
+                                notes.append("login and API key kept as they are now")
+                        live = sqlite3.connect(config.DB_PATH, timeout=30)
                         try:
-                            src.backup(live)              # one step: other connections see old or new, never half
+                            src = sqlite3.connect(fresh)
+                            try:
+                                src.backup(live)          # one step: other connections see old or new, never half
+                            finally:
+                                src.close()
                         finally:
-                            src.close()
-                    finally:
-                        live.close()
+                            live.close()
                 except sqlite3.Error as e:
                     raise RestoreError(f"the current database could not be saved or replaced ({e}); stop "
                                        f"mang-arr and copy a backup over {config.DB_PATH} by hand") from e
@@ -538,7 +574,6 @@ def restore(source, keep_auth: bool = True) -> str:
         finally:
             shutil.rmtree(work, ignore_errors=True)
         db.restrict_permissions(config.DB_PATH)
-        from . import settings
         with db.connect() as con:
             settings.refresh(con)                        # the middleware must see the restored settings now
             n = con.execute("SELECT COUNT(*) FROM series").fetchone()[0]
