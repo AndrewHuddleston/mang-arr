@@ -302,6 +302,58 @@ class LeftoverBackgroundTest(Base):
         with downloader._lock_if_free() as free:
             self.assertTrue(free)
 
+    def test_a_restore_is_let_in_while_the_retry_waits_on_a_hung_suwayomi(self):     # round 3
+        from mangarr import backup
+        downloader._remember_leftovers([7001])
+        self.fake.queue = [7001]
+        self.fake.outage = ("hang", 10**6)
+        self.fake.block = threading.Event()                    # a request really blocks (real time)
+        self.addCleanup(self.fake.block.set)
+        with mock.patch.object(downloader, "LEFTOVER_RETRY_TRIES", 1), \
+             self.assertLogs("mangarr.downloader", "WARNING"):          # "stopped retrying for now"
+            retry = threading.Thread(target=downloader._retry_leftovers, args=(self.client, 0), daemon=True)
+            retry.start()
+            self.addCleanup(retry.join, 15)
+            self.addCleanup(self.fake.block.set)               # before that join: never wait out the hang
+            deadline = time.perf_counter() + 5
+            while not self.fake.timeouts and time.perf_counter() < deadline:
+                threading.Event().wait(0.01)                   # the retry holds the lock, its queue read hangs
+            self.assertTrue(downloader._retry_holds.is_set())
+            t0 = time.perf_counter()
+            with backup._no_download_run():                     # not refused: the retry lets go
+                took = time.perf_counter() - t0
+                with downloader._lock_if_free() as free:
+                    self.assertFalse(free)
+            retry.join(5)
+        self.assertLess(took, 3.0)
+        self.assertFalse(retry.is_alive())
+        self.assertEqual(downloader.leftovers(), [7001])            # still remembered for the next try
+
+    def test_a_restore_says_what_holds_the_lock(self):
+        from mangarr import backup
+        with mock.patch.object(downloader, "RETRY_LET_GO_SECS", 0.3):
+            with downloader._lock_if_free() as free, self.assertRaises(backup.RestoreError) as cm:
+                self.assertTrue(free)                           # the retry, here stuck in this thread
+                with backup._no_download_run():
+                    pass
+            self.assertIn("still taking entries an earlier download left in Suwayomi's queue back out",
+                          str(cm.exception))
+            with downloader.download_lock(), self.assertRaises(backup.RestoreError) as cm:
+                with backup._no_download_run():
+                    pass
+            self.assertIn("a download run is in progress", str(cm.exception))
+        with backup._no_download_run():
+            pass
+
+    def test_the_retry_keeps_off_the_lock_while_a_restore_wants_it(self):
+        downloader._remember_leftovers([7001])
+        self.fake.queue = [7001]
+        with downloader.leftover_retry_held_off(), mock.patch.object(downloader, "LEFTOVER_RETRY_TRIES", 1), \
+             self.assertLogs("mangarr.downloader", "WARNING"):
+            downloader._retry_leftovers(self.client, first=0)
+        self.assertEqual(self.fake.log, [])
+        self.assertEqual(downloader.leftovers(), [7001])
+
 
 class LeftoverUnsavedTest(Base):
     """The database will not take the list (busy past its timeout, round-2

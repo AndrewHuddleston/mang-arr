@@ -583,11 +583,22 @@ def _no_download_run():
                  config.LOCK_PATH, e)
         yield
         return
-    with f:
-        try:
-            fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except OSError as e:
-            raise RestoreError("a download run is in progress (another mang-arr process); try again later") from e
+    from . import downloader
+    with f, downloader.leftover_retry_held_off() as retry_holds:
+        # this process's background retry of leftover queue entries lets go
+        # at once; only wait for that, never for a download run
+        for _ in range(int(downloader.RETRY_LET_GO_SECS / 0.1)):
+            try:
+                fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except OSError as e:
+                if not retry_holds():
+                    raise RestoreError("a download run is in progress (another mang-arr process); try again "
+                                       "later") from e
+            threading.Event().wait(0.1)             # not time.sleep: tests patch that out
+        else:
+            raise RestoreError("mang-arr is still taking entries an earlier download left in Suwayomi's queue "
+                               "back out (Suwayomi is slow to answer); try again in a minute")
         try:
             yield
         finally:

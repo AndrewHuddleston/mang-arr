@@ -95,6 +95,14 @@ _SAVED: tuple[tuple[int, ...], frozenset[int]] = ((), frozenset())
 _unsaved = _SAVED
 _retrier_lock = threading.Lock()
 _retrier: threading.Thread | None = None
+# A restore must not be refused because of the background retry (it only
+# holds the download lock while it takes ids out, but on a hung Suwayomi that
+# is minutes): while one waits (_retry_yield), the retry cuts its Suwayomi
+# calls short, lets go of the lock and does not take it again (the ids stay
+# remembered). _retry_holds is set while the retry holds the lock.
+_retry_yield = threading.Event()
+_retry_holds = threading.Event()
+RETRY_LET_GO_SECS = 15
 
 
 class LockBusy(RuntimeError):
@@ -840,14 +848,17 @@ def clear_leftovers(client, should_cancel: Callable[[], bool] | None = None) -> 
 @contextmanager
 def _lock_if_free(path: str | None = None):
     """The download lock if nobody holds it (yields True); False at once
-    when a download run holds it (never waits)."""
+    when a download run holds it (never waits). For the background retry
+    only: _retry_holds says so meanwhile."""
     path = path or config.LOCK_PATH
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
     fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o644)
+    _retry_holds.set()                  # before the attempt: a restore that finds the lock taken meanwhile waits
     try:
         try:
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except OSError:
+            _retry_holds.clear()
             yield False
             return
         try:
@@ -861,7 +872,21 @@ def _lock_if_free(path: str | None = None):
         finally:
             fcntl.flock(fd, fcntl.LOCK_UN)
     finally:
+        _retry_holds.clear()
         os.close(fd)
+
+
+@contextmanager
+def leftover_retry_held_off():
+    """For a restore, while it takes and holds the download lock: the
+    background retry of clear_leftovers lets go of the lock at once and does
+    not take it again. Yields a function telling whether the retry still
+    holds the lock (the restore waits RETRY_LET_GO_SECS at most for it)."""
+    _retry_yield.set()
+    try:
+        yield _retry_holds.is_set
+    finally:
+        _retry_yield.clear()
 
 
 def retry_leftovers_now(client) -> None:
@@ -889,16 +914,21 @@ def _retry_leftovers(client, first: float | None = None) -> None:
     after `first` s (by default once the breaker lets calls through again),
     backing off while that does not work out. Skipped while a download run
     holds the lock: that run clears them at its start, and every change to
-    the stored list is made under the lock (a restore relies on it)."""
+    the stored list is made under the lock (a restore relies on it). A
+    restore that waits for the lock is let in at once
+    (leftover_retry_held_off)."""
     delay = LEFTOVER_RETRY_SECS if first is None else first
     for _ in range(LEFTOVER_RETRY_TRIES):
         threading.Event().wait(delay)               # not time.sleep: tests patch that out
         try:
-            with _lock_if_free() as free:
-                if free:
-                    if _unsaved != _SAVED:
-                        _store_leftovers(lambda cur: cur)   # cur already includes them: this only writes them
-                    clear_leftovers(client)
+            if not _retry_yield.is_set():           # a restore is waiting for the lock, or holds it
+                with _lock_if_free() as free:
+                    if free and not _retry_yield.is_set():
+                        if _unsaved != _SAVED:
+                            _store_leftovers(lambda cur: cur)   # cur already includes them: this only writes them
+                        clear_leftovers(client, _retry_yield.is_set)
+        except Cancelled:
+            log.debug("a restore needs the download lock; retrying the chapter ids left in Suwayomi's queue later")
         except Exception as e:
             log.debug("retrying the chapter ids left in Suwayomi's queue failed: %s: %s", type(e).__name__, e)
         if not leftovers() and _unsaved == _SAVED:
