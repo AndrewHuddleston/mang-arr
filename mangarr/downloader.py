@@ -58,7 +58,7 @@ def download_lock(path: str | None = None):
 
 def download(client: Client, plan: Plan, only: set[float] | None = None,
              should_cancel: Callable[[], bool] | None = None, reasons: dict | None = None,
-             progress: Callable[[str], None] | None = None) -> dict:
+             progress: Callable[[str], None] | None = None, throttled: set | None = None) -> dict:
     """Returns {chapter_number: 'ok' | 'failed'} for every chapter attempted.
     Chapters not reached before a cancel are simply absent. When `reasons`
     is given it is filled with a human-readable reason per failed chapter."""
@@ -76,6 +76,7 @@ def download(client: Client, plan: Plan, only: set[float] | None = None,
     dead: set[int] = set()                                     # manga ids that failed everything
     cancel = should_cancel or (lambda: False)
     report = progress or (lambda m: None)
+    seen_throttle = throttled if throttled is not None else set()
     try:
         with download_lock():
             while pending:
@@ -104,7 +105,7 @@ def download(client: Client, plan: Plan, only: set[float] | None = None,
                              m.title, m.source.name, ranges([c.number for c in todo]),
                              "" if patient else " (fallbacks available)")
                     ok, failed, why = _download_source(client, manga_id, todo, batch, label, m.source.name,
-                                                       patient, cancel, report)
+                                                       patient, cancel, report, seen_throttle)
                     for n in ok:
                         results[n] = "ok"
                     if failed:
@@ -135,11 +136,11 @@ def download_one(client: Client, manga_id: int, chapter, label: str, source_name
     (ok, failed numbers, {number: why})."""
     with download_lock():
         ok, failed, why = _download_source(client, manga_id, [chapter], 1, label, source_name, False,
-                                           lambda: False, lambda m: None)
+                                           lambda: False, lambda m: None, set())
     return bool(ok), failed, why
 
 
-def _download_source(client, manga_id, todo, batch, label, source_name, patient, cancel, report):
+def _download_source(client, manga_id, todo, batch, label, source_name, patient, cancel, report, seen_throttle):
     """Returns (ok numbers, failed numbers, {number: why it failed}). `report`
     receives one-line progress messages for the Activity page."""
     from . import settings
@@ -182,12 +183,13 @@ def _download_source(client, manga_id, todo, batch, label, source_name, patient,
             time.sleep(2)
             continue
         if outcome in ("stalled", "timeout") and not got:
+            seen_throttle.add(source_name)          # refused after trying for a while: rate limiting
             size = 1
             backoff = min(max_backoff, (backoff or 30) * 2)
             log.warning("%s: %s %s on ch %g - backing off %ds", label, source_name,
                         "made no progress" if outcome == "timeout" else "errored", chunk[0].number, backoff)
             report(f"{source_name} {'made no progress' if outcome == 'timeout' else 'refused the request'}"
-                   f"{' (rate limiting)' if throttled else ''}: waiting {backoff} s before retrying chapter "
+                   f" (rate limiting): waiting {backoff} s before retrying chapter "
                    f"{chunk[0].number:g} ({len(ok)} of {len(todo)} done)")
             time.sleep(backoff)
             if backoff >= max_backoff:

@@ -831,7 +831,7 @@ def settings_page(request: Request, komga_test: str = "", komga_ok: str = ""):
     with db.connect() as con:
         stats = db.source_stats(con)
     return page(request, "settings.html", v=settings.masked(settings.all_values()), sources=sources,
-                komga_test=komga_test, komga_ok=(komga_ok == "1"), stats=stats)
+                komga_test=komga_test, komga_ok=(komga_ok == "1"), stats=stats, auto_days=db.AUTO_THROTTLE_DAYS)
 
 
 @app.post("/settings")
@@ -839,10 +839,16 @@ async def settings_save(request: Request):
     form = await request.form()
     values = {}
     for key in settings.DEFAULTS:
+        if key in ("unusable_sources", "throttled_sources"):
+            continue                                   # handled below / detected automatically
         if isinstance(settings.DEFAULTS[key], list):
             values[key] = form.getlist(key)
         elif key in form:
             values[key] = form[key]
+    if form.get("sources_listed") == "1":              # the Sources table was on the page
+        enabled = {str(x).lower().strip() for x in form.getlist("enabled_sources")}
+        listed = {str(x).lower().strip() for x in form.getlist("listed_sources")}
+        values["unusable_sources"] = sorted(listed - enabled)
     try:
         with db.connect() as con:
             settings.set_many(con, values)

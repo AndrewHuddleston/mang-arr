@@ -22,15 +22,16 @@
 
 <fieldset class="fieldset" id="sources">
   <legend class="legend">Sources</legend>
-  <div class="help-text">From Suwayomi. <b>Disabled</b> sources are still searched (so a series that exists only there is reported) but never downloaded from. <b>Throttled</b> sources get one chapter at a time and lose close calls.</div>
+  <div class="help-text">The sources installed in Suwayomi. Untick one to stop downloading from it (it is still searched, so a series that exists only there is reported). Rate limiting is detected automatically: a source that starts refusing requests is paced (one chapter at a time, a pause between chapters) and loses close calls to other sources for {{ auto_days }} days.</div>
+  <input type="hidden" name="sources_listed" value="{{ '1' if sources else '0' }}">
   <div class="table-container"><table class="table">
-  <thead><tr><th>Source</th><th>Language</th><th>Reliability</th><th class="col-check">Disabled</th><th class="col-check">Throttled</th></tr></thead>
+  <thead><tr><th class="col-check">Enabled</th><th>Source</th><th>Language</th><th>Reliability</th><th>Rate limiting</th></tr></thead>
   <tbody>
   {% for s in sources %}
-  <tr><td>{{ s.name }}</td><td class="muted">{{ s.lang }}</td>
+  <tr><td class="col-check"><input type="hidden" name="listed_sources" value="{{ s.name|lower }}">{{ m.check('enabled_sources', (s.name|lower not in v.unusable_sources), s.name|lower, none, 'primary', 'aria-label="Enable ' ~ s.name ~ '"') }}</td>
+  <td>{{ s.name }}</td><td class="muted">{{ s.lang }}</td>
   {% set st = stats.get(s.name) %}<td class="muted small">{% if st %}{% set tot = st.ok + st.failed + st.corrupt %}{{ ((st.ok / tot) * 100)|round|int if tot else 0 }}% of {{ tot }} chapter{{ 's' if tot != 1 }}{% if st.corrupt %} ({{ st.corrupt }} corrupt){% endif %}{% else %}no downloads yet{% endif %}</td>
-  <td class="col-check">{{ m.check('unusable_sources', (s.name|lower in v.unusable_sources), s.name|lower, none, 'danger', 'aria-label="Disable ' ~ s.name ~ '"') }}</td>
-  <td class="col-check">{{ m.check('throttled_sources', (s.name|lower in v.throttled_sources), s.name|lower, none, 'warning', 'aria-label="Throttle ' ~ s.name ~ '"') }}</td></tr>
+  <td class="small">{% if s.throttled %}<span class="text-warning">paced</span>{% if st and st.last_throttled %} <span class="muted">- limited us {{ st.throttled }}x, last {{ st.last_throttled|ago }}</span>{% endif %}{% else %}<span class="muted">none seen</span>{% endif %}</td></tr>
   {% endfor %}
   {% if not sources %}<tr><td colspan="5" class="text-danger">Suwayomi unreachable - source list unavailable</td></tr>{% endif %}
   </tbody></table></div>

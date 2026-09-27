@@ -163,8 +163,12 @@ def download_wanted(con, client: Client, series_id: int, plan: Plan,
         log.info("%s: nothing to download", plan.series.title)
         return {}
     reasons: dict = {}
+    seen_throttle: set = set()
     results = downloader.download(client, plan, only=set(wanted), should_cancel=should_cancel, reasons=reasons,
-                                  progress=progress)
+                                  progress=progress, throttled=seen_throttle)
+    for name in seen_throttle:
+        db.record_throttle(con, name)
+        log.info("%s rate-limited us; it is paced automatically from now on", name)
     for n, r in results.items():
         m = plan.assignment.get(n)
         metrics.record_download(m.source.name if m else "?", r)

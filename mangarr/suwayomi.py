@@ -89,6 +89,12 @@ class Client:
         from . import settings
         v = settings.all_values()
         unusable, throttled = set(v["unusable_sources"]), set(v["throttled_sources"])
+        try:                                        # plus the ones that rate-limited us recently
+            from . import db
+            with db.connect() as con:
+                throttled |= db.auto_throttled(con)
+        except Exception as e:
+            log.debug("could not read detected rate limits: %s", e)
         d = self.gq("{ sources { nodes { id displayName lang } } }")
         out = []
         for s in d["sources"]["nodes"]:

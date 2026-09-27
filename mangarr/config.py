@@ -44,7 +44,7 @@ UNUSABLE_SOURCES = {
 # get the smallest batches, but chapters nobody else has are still taken.
 THROTTLED_SOURCES = {
     s.strip().lower() for s in os.environ.get(
-        "MANGARR_THROTTLED_SOURCES", "manganato (en)").split(",") if s.strip()}
+        "MANGARR_THROTTLED_SOURCES", "").split(",") if s.strip()}
 
 # If the highest chapter number seen by one source is more than this factor
 # above what the series should have (AniList count, or the median of the other

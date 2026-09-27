@@ -99,5 +99,17 @@ class ReliabilityTest(unittest.TestCase):
             self.assertEqual(db.source_stats(con)["Bad"]["corrupt"], 1)
 
 
+class AutoThrottleTest(unittest.TestCase):
+    def test_detected_rate_limit_expires(self):
+        with tempfile.TemporaryDirectory() as tmp, db.connect(os.path.join(tmp, "t.db")) as con:
+            self.assertEqual(db.auto_throttled(con), set())
+            db.record_throttle(con, "Manganato (EN)")
+            db.record_throttle(con, "Manganato (EN)")
+            self.assertEqual(db.auto_throttled(con), {"manganato (en)"})
+            self.assertEqual(db.source_stats(con)["Manganato (EN)"]["throttled"], 2)
+            con.execute("UPDATE source_stats SET last_throttled='2000-01-01 00:00:00'")
+            self.assertEqual(db.auto_throttled(con), set())
+
+
 if __name__ == "__main__":
     unittest.main()

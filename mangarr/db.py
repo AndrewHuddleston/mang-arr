@@ -140,6 +140,11 @@ MIGRATIONS = [
       updated_at      TEXT NOT NULL
     );
     """,
+    # 11: rate limiting detected per source (sources are paced automatically after this)
+    """
+    ALTER TABLE source_stats ADD COLUMN throttled INTEGER NOT NULL DEFAULT 0;
+    ALTER TABLE source_stats ADD COLUMN last_throttled TEXT;
+    """,
 ]
 
 
@@ -443,3 +448,21 @@ def reliability(con) -> dict[str, float]:
         bad = r["failed"] + r["corrupt"]
         out[name] = (r["ok"] + 2) / (r["ok"] + bad + 4)
     return out
+
+
+AUTO_THROTTLE_DAYS = 14      # a source that rate-limited us is paced for this long after the last time
+
+
+def record_throttle(con, source_name: str) -> None:
+    """The source refused requests (rate limiting): pace it from now on."""
+    con.execute(
+        "INSERT INTO source_stats (source_name, throttled, last_throttled, updated_at) VALUES (?, 1, ?, ?)"
+        " ON CONFLICT(source_name) DO UPDATE SET throttled=throttled+1, last_throttled=excluded.last_throttled,"
+        " updated_at=excluded.updated_at", (source_name, now(), now()))
+
+
+def auto_throttled(con) -> set[str]:
+    """Lower-cased names of sources that rate-limited us recently."""
+    cutoff = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(time.time() - AUTO_THROTTLE_DAYS * 86400))
+    return {r["source_name"].lower().strip() for r in con.execute(
+        "SELECT source_name FROM source_stats WHERE last_throttled IS NOT NULL AND last_throttled >= ?", (cutoff,))}
