@@ -155,7 +155,7 @@ class PlanCapTest(unittest.TestCase):
         plain, parts = Source("1", "Plain", "en"), Source("2", "Parts", "en")
         split = [n + p for n in range(1, 4000) for p in (0.1, 0.2)]          # 7,998 numbers, top 3999.2
         client = ByIdClient({"1": range(1, 4001), "2": split})
-        with mock.patch.object(resolver, "_prune_junk", lambda c, p: None), \
+        with mock.patch.object(resolver, "_prune_junk", lambda c, p, *a: None), \
                 self.assertLogs("mangarr.resolver", "WARNING"):
             plan = resolve(client, Series(anilist_id=1, english="Title", status="RELEASING"), sources=[parts, plain])
         notes = {m.source.name: m.note for m in plan.matches}

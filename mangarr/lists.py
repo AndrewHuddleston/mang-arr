@@ -609,12 +609,14 @@ def _unknown(looked: int, failed: int) -> ListFetchError:
                           "knows" + (f" ({failed} could not be looked up)" if failed else ""))
 
 
-def fetch_url_text(params: dict, should_cancel: Callable[[], bool] | None = None) -> Fetched:
+def fetch_url_text(params: dict, should_cancel: Callable[[], bool] | None = None,
+                   progress: Callable[[str], None] | None = None) -> Fetched:
     """Every line that looks like a title is looked up like a typed title on
     the Add page; only a confident pick is added, the rest are reported for
     review. A line that is already a reference (anilist:123, mangadex:uuid)
-    is used as is. At most MAX_LIST_LINES lines are looked up;
-    should_cancel is checked during the download and between lines.
+    is used as is. At most MAX_LIST_LINES lines are looked up (rate
+    limited: a long list takes a while, and `progress` hears which line it
+    is on); should_cancel is checked during the download and between lines.
 
     The URL may be any server on the LAN, and no look at a line tells a
     title from a line of some other text answer ('host: db' / 'Re:Zero'),
@@ -637,6 +639,8 @@ def fetch_url_text(params: dict, should_cancel: Callable[[], bool] | None = None
             break
         if not known and looked >= PROBE_LINES:
             raise _unknown(looked, failed)
+        if progress:
+            progress(f"looking up line {looked + 1} of {len(lines)}")
         looked += 1
         cands: list[Series] = []
         try:
@@ -675,13 +679,14 @@ FETCHERS: dict[str, Callable[[dict], Fetched]] = {
 }
 
 
-def fetch(kind: str, params: dict, should_cancel: Callable[[], bool] | None = None) -> Fetched:
+def fetch(kind: str, params: dict, should_cancel: Callable[[], bool] | None = None,
+          progress: Callable[[str], None] | None = None) -> Fetched:
     try:
         fn = FETCHERS[kind]
     except KeyError:
         raise ValueError(f"unknown list kind {kind!r}") from None
-    if should_cancel is not None and fn is fetch_url_text:      # the only fetcher that loops for long
-        return fn(params, should_cancel=should_cancel)
+    if fn is fetch_url_text:                                     # the only fetcher that loops for long
+        return fn(params, should_cancel=should_cancel, progress=progress)
     return fn(params)
 
 
@@ -854,18 +859,19 @@ def is_due(row, now: float | None = None) -> bool:
 
 
 def sync(con: sqlite3.Connection, row, submit_add: Callable[[Series, bool, bool], object],
-         should_cancel: Callable[[], bool] | None = None) -> str:
+         should_cancel: Callable[[], bool] | None = None, progress: Callable[[str], None] | None = None) -> str:
     """Fetch one list and hand every new series to submit_add(series,
-    download, monitored) - the caller queues the actual add job. Records
-    last_sync and a one-line last_result, which is also returned. A fetch
-    failure is recorded, logged with the list's name and returned; it never
-    raises. last_sync is stamped before the fetch too, so a sync that
-    crashes the process is not retried right after the restart."""
+    download, monitored) - the caller queues the actual add job; `progress`
+    hears how far a long fetch got. Records last_sync and a one-line
+    last_result, which is also returned. A fetch failure is recorded, logged
+    with the list's name and returned; it never raises. last_sync is stamped
+    before the fetch too, so a sync that crashes the process is not retried
+    right after the restart."""
     name, kind, params = row["name"], row["kind"], params_of(row)
     mark_synced(con, row["id"], "sync in progress (or interrupted)")
     con.commit()
     try:
-        series, review, *more = fetch(kind, params, should_cancel)
+        series, review, *more = fetch(kind, params, should_cancel, progress)
     except Exception as e:
         # a ListFetchError is already plain words (and quotes nothing the server sent)
         msg = (f"error: {e}" if isinstance(e, ListFetchError) else f"error: {type(e).__name__}: {e}")[:300]

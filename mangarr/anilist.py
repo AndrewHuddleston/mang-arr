@@ -7,6 +7,7 @@ Chinese comics well and Western webtoons poorly; see mangadex.py for those.
 """
 import json
 import logging
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -18,6 +19,17 @@ from .model import Series
 log = logging.getLogger(__name__)
 
 MAX_RETRY_AFTER = 120           # seconds; a longer wait gives up instead of stalling the job thread
+
+# After BREAKER_AFTER lookups in a row get no usable answer (AniList down or
+# hung, or asking us to wait longer than MAX_RETRY_AFTER), lookups fail at
+# once for BREAKER_SECS instead of each paying up to 3 x 30 s: callers fall
+# back as for any failure (a refresh keeps the stored record, a search tries
+# MangaDex). The first lookup after the window goes through again.
+BREAKER_AFTER = 2
+BREAKER_SECS = 300
+_failures = 0                   # lookups in a row that got no usable answer
+_skip_until = 0.0               # monotonic time until which lookups fail at once
+_breaker_lock = threading.Lock()
 
 
 def retry_after(headers, default: float) -> float:
@@ -70,6 +82,47 @@ _BY_ID = "query($id: Int) { Media(id: $id, type: MANGA) { %s } }" % _FIELDS  # n
 
 
 def _post(query: str, variables: dict, retries: int = 3) -> dict:
+    """One AniList query, behind the breaker (see BREAKER_AFTER)."""
+    with _breaker_lock:
+        left, failures = _skip_until - time.monotonic(), _failures
+    if left > 0:
+        raise RuntimeError(f"AniList unreachable: {failures} lookups in a row failed, not asked again for "
+                           f"{left:.0f} s")
+    try:
+        d = _send(query, variables, retries)
+    except urllib.error.HTTPError:      # it answered (a 4xx): up, whatever was wrong with this query
+        _answered()
+        raise
+    except Exception as e:
+        _failed(e)
+        raise
+    _answered()
+    return d
+
+
+def _failed(e: Exception) -> None:
+    global _failures, _skip_until
+    with _breaker_lock:
+        _failures += 1
+        n = _failures
+        if n >= BREAKER_AFTER:
+            _skip_until = time.monotonic() + BREAKER_SECS
+    if n == BREAKER_AFTER:
+        log.warning("AniList failed %d lookups in a row (%s); not asking it again for %d min (refreshes keep "
+                    "the stored details, searches use MangaDex)", n, e, BREAKER_SECS // 60)
+    elif n > BREAKER_AFTER:
+        log.debug("AniList still failing (%s); not asking it again for %d min", e, BREAKER_SECS // 60)
+
+
+def _answered() -> None:
+    global _failures, _skip_until
+    with _breaker_lock:
+        was, _failures, _skip_until = _failures, 0, 0.0
+    if was >= BREAKER_AFTER:
+        log.info("AniList answers again")
+
+
+def _send(query: str, variables: dict, retries: int = 3) -> dict:
     body = json.dumps({"query": query, "variables": variables}).encode()
     last: Exception | None = None
     for _ in range(retries):

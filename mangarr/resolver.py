@@ -12,12 +12,14 @@
 import logging
 import math
 import statistics
+from collections.abc import Callable
 from dataclasses import dataclass, field
 
 from . import config
+from .limits import Cancelled
 from .matching import ACCEPTED, AUTHOR_DIFFER, MAX_TITLE, author_level, match_level, oneline
 from .model import Series
-from .suwayomi import Chapter, Client, Source, SuwayomiError, SuwayomiUnreachable
+from .suwayomi import Chapter, Client, Source, SuwayomiError, SuwayomiUnreachable, with_cancel
 
 log = logging.getLogger(__name__)
 
@@ -134,7 +136,14 @@ class Plan:
 
 
 def resolve(client: Client, series: Series, sources: list[Source] | None = None,
-            reliability: dict[str, float] | None = None) -> Plan:
+            reliability: dict[str, float] | None = None, should_cancel: Callable[[], bool] | None = None,
+            progress: Callable[[str], None] | None = None) -> Plan:
+    """The plan for a series. A cancel (should_cancel) is noticed between
+    sources and cuts the Suwayomi call in flight short, raising Cancelled
+    with nothing decided; `progress` hears which source is being searched."""
+    cancel = should_cancel or (lambda: False)
+    report = progress or (lambda m: None)
+    client = with_cancel(client, should_cancel)   # each search title, each chapter list: never a full timeout
     sources = sources if sources is not None else client.sources()
     reliability = reliability or {}
     titles = capped_search_titles(series)
@@ -147,9 +156,11 @@ def resolve(client: Client, series: Series, sources: list[Source] | None = None,
     skipped = [s.name for s in sources if s.unusable]
     if skipped:
         log.debug("not searching disabled source(s): %s", ", ".join(skipped))
-    for src in sources:
-        if src.unusable:                      # disabled in Settings: not searched, not downloaded from
-            continue
+    searched = [s for s in sources if not s.unusable]   # disabled in Settings: not searched, not downloaded from
+    for i, src in enumerate(searched, 1):
+        if cancel():
+            raise Cancelled()
+        report(f"searching {src.name} ({i} of {len(searched)} sources)")
         found = _search_source(client, src, series, titles, rejected)
         if isinstance(found, str):
             unreachable.append((src, found))
@@ -165,7 +176,7 @@ def resolve(client: Client, series: Series, sources: list[Source] | None = None,
     candidates = _assign(matches)
     assignment = {n: c[0] for n, c in candidates.items()}
     plan = Plan(series, matches, rejected, unreachable, assignment, candidates=candidates)
-    _prune_junk(client, plan)
+    _prune_junk(client, plan, report)
     log.info("%s: %d chapters listed from %d source(s), %d on disk per Suwayomi, %d wanted, %d junk",
              series.title, len(plan.chapters), len({m.manga_id for m in assignment.values()}),
              len(plan.have()), len(plan.wanted()), len(plan.junk))
@@ -375,7 +386,7 @@ def _assign(matches: list[SourceMatch]) -> dict[float, list[SourceMatch]]:
     return out
 
 
-def _prune_junk(client: Client, plan: Plan) -> None:
+def _prune_junk(client: Client, plan: Plan, progress: Callable[[str], None] | None = None) -> None:
     """Drop fractional chapters that turn out to be a handful of pages:
     notices and ads, not chapters. Every fractional chapter is probed, not
     just single-source ones - aggregators (Bato, Manganato) scrape the same
@@ -386,7 +397,9 @@ def _prune_junk(client: Client, plan: Plan) -> None:
     if not suspects:
         return
     log.info("probing %d fractional chapter(s) for junk (< %d pages)", len(suspects), min_pages)
-    for n in sorted(suspects):
+    for i, n in enumerate(sorted(suspects), 1):
+        if progress:
+            progress(f"counting the pages of fractional chapters ({i} of {len(suspects)})")
         m = plan.assignment[n]
         ch = next((c for c in m.chapters if c.number == n), None)
         if ch is None or ch.downloaded:

@@ -88,12 +88,14 @@ DEFAULTS: dict[str, object] = {
     "session_secret": "",    # signs login cookies; random per install
     "session_epoch": 0,      # bumped to sign every session out (logout-all, password / user / API key change)
     "revoked_sessions": [],  # "sid:expiry" of sessions signed out one by one
+    "leftover_queue_ids": [],  # chapter ids mang-arr may have left in Suwayomi's queue (downloader.leftovers)
 }
 SECRET_KEYS = {"pushover_token", "pushover_user", "komga_api_key", "auth_password", "discord_webhook", "slack_webhook",
                "telegram_token", "ntfy_token", "gotify_token", "smtp_password", "notifiarr_api_key",
                # the key itself and URLs whose path is the credential (webhook ids, ntfy topics, Apprise keys)
                "api_key", "webhook_url", "apprise_url", "ntfy_url", "session_secret"}
-INTERNAL_KEYS = {"session_secret", "session_epoch", "revoked_sessions"}
+INTERNAL_KEYS = {"session_secret", "session_epoch", "revoked_sessions", "leftover_queue_ids"}
+ID_LIST_KEYS = {"leftover_queue_ids"}      # lists of integer ids, kept in the order given
 MASK = "********"        # what the UI shows for a stored secret; submitting it unchanged keeps the value
 # a secret belongs to the destination it was entered for: change the destination
 # without re-entering the secret and the secret is cleared, never sent on
@@ -555,6 +557,10 @@ def _coerce(key: str, v):
         return f
     if isinstance(d, int):
         return int(v)
+    if key in ID_LIST_KEYS:
+        if not isinstance(v, (list, tuple)):
+            raise ValueError(f"{key}: expected a list of ids")
+        return list(dict.fromkeys(int(i) for i in v))
     if isinstance(d, list):
         if isinstance(v, str):
             v = [s for s in v.replace("\n", ",").split(",")]

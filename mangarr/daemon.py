@@ -4,7 +4,7 @@ import logging
 import signal
 import time
 
-from . import config, core, db, limits, notify
+from . import config, core, db, downloader, limits, notify
 from .suwayomi import BREAKER_SECS, Client, SuwayomiError, SuwayomiUnreachable
 
 log = logging.getLogger(__name__)
@@ -24,6 +24,7 @@ def cycle(client: Client) -> dict:
     with db.connect() as con:
         rows = [r for r in db.series_rows(con) if r["monitored"]]
     log.info("cycle start: %d monitored series", len(rows))
+    downloader.retry_leftovers_now(client)      # queue entries an earlier run could not take back out
     outages = 0                     # consecutive series that failed because Suwayomi is not answering
     for n, r in enumerate(rows, 1):
         if _stop:

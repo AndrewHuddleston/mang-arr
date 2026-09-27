@@ -26,7 +26,7 @@ class FakeClient:
         self.calls: list[str] = []
 
     def enqueue(self, ids): self.queued = list(ids)
-    def dequeue(self, ids): self.queued = [c for c in self.queued if c not in ids]
+    def dequeue(self, ids, timeout=30): self.queued = [c for c in self.queued if c not in ids]
     def start(self):
         self.calls.append(f"start {sorted(self.queued)}")
         for cid in self.queued:
@@ -119,6 +119,7 @@ class DownloadOneTest(unittest.TestCase):
     def test_download_one(self):
         with tempfile.TemporaryDirectory() as tmp, \
              mock.patch("mangarr.downloader.time.sleep", lambda s: None), \
+             mock.patch("mangarr.config.DB_PATH", tmp + "/test.db"), \
              mock.patch("mangarr.config.LOCK_PATH", tmp + "/lock"):
             a = match("A", 1, [3, 4])
             ok, failed, why = downloader.download_one(FakeClient(), 1, a.chapters[0], "T", "A")

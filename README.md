@@ -496,7 +496,9 @@ current schema. Stored file paths that point outside `MANGARR_LIBRARY` /
 `MANGARR_STAGING` are cleared and series folders that are not plain folder
 names are renamed (the message says so). The current login, auth method and
 API key are kept: a restore never brings back old credentials or turns the
-login off. Only then is a safety backup of the current database taken
+login off. So is the list of chapter ids mang-arr may have left in
+Suwayomi's download queue, which is about Suwayomi now, not the data being
+rolled back. Only then is a safety backup of the current database taken
 (named in the confirmation message) and the live database replaced in
 place; no restart is needed. A file that fails any step is refused and the
 running database keeps working. A restore is refused while any job is
@@ -722,6 +724,7 @@ something.
   |---|---|---|
   | Suwayomi | the GraphQL API does not answer | - (ok shows version, source count and latency) |
   | Sources | Suwayomi has no English sources, or every source is disabled in Settings | - |
+  | Jobs | - | the running job has shown no progress for 30 minutes (every other job waits behind it; cancel it on the Queue page if it is stuck). Every step that can take long counts as progress (a source searched, a download batch moving, a staged folder identified, a series linked); waiting for another process's download run does not. A restore cannot be cancelled |
   | Komga | the configured URL / API key fails a real `GET /api/v1/libraries` | not configured (new chapters appear only at Komga's own scan interval) |
   | AniList, MangaDex | - | the site is unreachable or answers an error |
   | Staging, Library | the path does not exist, or the library is not writable | - |
@@ -821,6 +824,26 @@ for the rest of the run; only chapters no source could deliver end up
 (`MANGARR_LOCK`) makes sure only one download run exists at a time across
 the web worker and the CLI; a second one waits. A per-chapter search or
 manual download is the same machinery for one chapter from one entry.
+
+When Suwayomi stops answering, calls to it fail at once for a minute
+instead of each waiting out its timeouts, and a refresh pass stops with one
+error after two series in a row found it down. A source search that times
+out is followed by a quick question to Suwayomi itself: a slow website only
+costs that source, a frozen Suwayomi ends the pass within minutes. Cancel
+never waits out a Suwayomi request: a refresh, search, download or
+chapter job stops waiting for the answer within about a second (a running
+download batch is looked at every few seconds), and a cancelled batch gets
+one short try, 10 s at most, at taking its chapters back out of Suwayomi's
+queue. Chapter ids that may still be in that queue (Suwayomi did not
+answer, or a queue request cut short by the cancel can still arrive) are
+remembered, and removed once it answers again (by a background retry, or at
+the start of the next download run); only mang-arr's own ids are ever
+removed, and ids Suwayomi no longer has queued are just forgotten. If the
+database cannot store that list for the moment, it is kept in memory and
+saved as soon as it can be. A restore keeps the current list: it describes
+Suwayomi now, not the backed-up data. AniList gets the same treatment as
+Suwayomi: after two failed lookups in a row it is left alone for five
+minutes, and refreshes keep the stored series details meanwhile.
 
 ```
 mangarr/

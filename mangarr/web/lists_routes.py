@@ -77,7 +77,8 @@ def _job_sync(list_id: int):
                 r = _submit_add(series, download, monitored, row["name"])
                 if isinstance(r, str):
                     log.debug("list %s: %s: %s", row["name"], series.title, r)
-            return lists.sync(con, row, submit, should_cancel=lambda: job.cancel)
+            return lists.sync(con, row, submit, should_cancel=lambda: job.cancel,
+                              progress=lambda m: setattr(job, "progress", m))
     return run
 
 

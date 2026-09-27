@@ -657,8 +657,15 @@ class BreakerTest(unittest.TestCase):                 # finding 78
         self.assertNotIn("http://suwayomi.test/api/graphql", suwayomi._down)
 
     def test_slow_source_search_is_not_an_outage(self):
-        def slow(req, timeout):
-            raise urllib.error.URLError(TimeoutError("timed out"))
+        class Ok:
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
+            def read(self, *a): return b'{"data": {"aboutServer": {"version": "v2"}}}'
+
+        def slow(req, timeout):                             # the website is slow; Suwayomi itself answers
+            if b"fetchSourceManga" in req.data:
+                raise urllib.error.URLError(TimeoutError("timed out"))
+            return Ok()
         c = Client("http://suwayomi.test")
         with mock.patch("urllib.request.urlopen", slow):
             with self.assertRaises(SuwayomiError) as cm:

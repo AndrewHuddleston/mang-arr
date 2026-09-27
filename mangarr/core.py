@@ -14,11 +14,11 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
 
-from . import db, downloader, komga, library, metadata, metrics
+from . import db, downloader, komga, library, limits, metadata, metrics
 from .matching import oneline
 from .model import Series
 from .resolver import Plan, primary, resolve
-from .suwayomi import Client, SuwayomiError
+from .suwayomi import Client, SuwayomiError, with_cancel
 
 log = logging.getLogger(__name__)
 
@@ -50,8 +50,12 @@ def add_series(con, client: Client, series: Series, download: bool = True, do_im
                progress: Callable[[str], None] | None = None) -> Outcome:
     """Track a series: resolve it, remember the plan, fetch what is missing,
     link the results into the library. With series_id (a refresh) the row
-    must still exist afterwards, or the work is abandoned."""
-    plan = resolve(client, series, reliability=db.reliability(con))
+    must still exist afterwards, or the work is abandoned. A cancel cuts the
+    Suwayomi call in flight short: while sources are searched it raises
+    limits.Cancelled with nothing saved, afterwards what was saved stays (a
+    download returns what arrived)."""
+    plan = resolve(client, series, reliability=db.reliability(con), should_cancel=should_cancel, progress=progress)
+    lookups = with_cancel(client, should_cancel)
     if series_id is not None and not db.get_series(con, series_id):
         raise Gone(f"{series.title} was deleted during the refresh")
     series_id = db.upsert_series(con, series)
@@ -71,15 +75,15 @@ def add_series(con, client: Client, series: Series, download: bool = True, do_im
     con.commit()
     out = Outcome(series_id, plan)
     if p:
-        _set_library_entries(client, plan, p.manga_id, stale)
+        _set_library_entries(lookups, plan, p.manga_id, stale)
     if do_import:
-        out.imported += import_series(con, series_id, client)
+        out.imported += import_series(con, series_id, lookups)
     if download and p:
         out.results = download_wanted(con, client, series_id, plan, should_cancel, progress)
         if do_import:
             if not db.get_series(con, series_id):      # deleted while it downloaded: link nothing
                 raise Gone(f"{series.title} was deleted during the download")
-            out.imported += import_series(con, series_id, client)
+            out.imported += import_series(con, series_id, lookups)
     return out
 
 
@@ -88,14 +92,14 @@ def refresh_series(con, client: Client, series_id: int, download: bool = True,
                    progress: Callable[[str], None] | None = None) -> Outcome:
     """Re-check a tracked series. Metadata is refreshed first (status,
     chapter count, new synonyms) and falls back to the stored row when the
-    provider is unavailable."""
+    provider is unavailable. A cancel cuts a slow provider lookup short."""
     row = db.get_series(con, series_id)
     if not row:
         raise Gone(f"series #{series_id} does not exist")
     series = db.series_to_model(row)
     if not series.manual:
         try:
-            fresh = metadata.by_ref(row["ref"])
+            fresh = limits.interruptible(lambda: metadata.by_ref(row["ref"]), should_cancel)
             if fresh:
                 series = fresh
                 log.debug("%s: metadata refreshed (%s, %s ch)", series.title, series.status, series.chapters)
@@ -309,11 +313,12 @@ def download_chapter(con, client: Client, series_id: int, number: float, manga_i
     if not entries:
         raise ValueError("no such source entry for this series")
     cancel = should_cancel or (lambda: False)
+    ask = with_cancel(client, should_cancel)       # a cancel cuts a hung chapter list short
     tried = []
     for s in entries:
         if cancel():
             raise downloader.Cancelled()
-        chapters = client.chapters(s["manga_id"])
+        chapters = ask.chapters(s["manga_id"])
         ch = next((c for c in chapters if c.number == number), None)
         if ch is None:
             tried.append(f"{s['source_name']}: does not list it")
@@ -331,7 +336,7 @@ def download_chapter(con, client: Client, series_id: int, number: float, manga_i
                         " uploaded=COALESCE(?, uploaded) WHERE series_id=? AND number=?",
                         (s["manga_id"], s["source_name"], ch.name, ch.uploaded, series_id, number))
             con.commit()
-            linked = import_series(con, series_id, client)
+            linked = import_series(con, series_id, ask)
             msg = f"chapter {number:g} downloaded from {s['source_name']}" + (" and linked" if linked else "")
             db.event(con, "downloaded", msg, series_id)
             con.commit()
@@ -451,7 +456,9 @@ def import_series(con, series_id: int, client: Client | None = None) -> int:
     set aside and linked through that open folder (library.StagingFolder),
     so a folder swapped for a symlink mid-import cannot point any of it at
     other files. Every write is committed at once, so no database write is
-    held across a Suwayomi call or an archive check."""
+    held across a Suwayomi call or an archive check. A cancel during the
+    chapter-list lookup (a cancellable client) only leaves the unnumbered
+    files for the next import; the rest is linked as usual."""
     row = db.get_series(con, series_id)
     title, folder = row["title"], row["folder"]
     known = {r["number"]: dict(r) for r in db.chapters(con, series_id)}
@@ -480,22 +487,27 @@ def _import_folder(con, client: Client | None, series_id: int, title: str, folde
     sf.prune_quarantine()
     found, unparsed = sf.scan()
     if unparsed and client is not None and manga_id is not None:
+        names: dict | None = None
         try:
             names = library.suwayomi_name_map(client.chapters(manga_id))
+        except limits.Cancelled:
+            log.info("%s: cancelled before %d unnumbered file(s) in %s were matched; the next import does it",
+                     title, len(unparsed), sf.path)
         except SuwayomiError as e:
             names = {}
             log.warning("%s: cannot list chapters of %s entry to match %d unnamed file(s): %s",
                         title, source_name, len(unparsed), e)
-        matched = 0
-        for name in unparsed:
-            n = library.match_unparsed(name, names)
-            if n is not None and n not in found:
-                found[n] = name
-                matched += 1
-            else:
-                log.debug("%s: no chapter matches file %s", title, name)
-        log.info("%s: %d of %d unnumbered file(s) in %s matched through Suwayomi's chapter list",
-                 title, matched, len(unparsed), sf.path)
+        if names is not None:
+            matched = 0
+            for name in unparsed:
+                n = library.match_unparsed(name, names)
+                if n is not None and n not in found:
+                    found[n] = name
+                    matched += 1
+                else:
+                    log.debug("%s: no chapter matches file %s", title, name)
+            log.info("%s: %d of %d unnumbered file(s) in %s matched through Suwayomi's chapter list",
+                     title, matched, len(unparsed), sf.path)
     elif unparsed:
         log.debug("%s: %d file(s) in %s without a chapter number", title, len(unparsed), sf.path)
     linked = 0
@@ -613,18 +625,24 @@ ADOPT_PAGE = 500                # entries per request
 ADOPT_MAX_ENTRIES = 200_000     # stop paging after this many (Suwayomi caches every search hit)
 
 
-def suwayomi_downloaded_entries(client: Client, wanted: set[tuple[str, str]] | None = None
-                                ) -> dict[tuple[str, str], int]:
+def suwayomi_downloaded_entries(client: Client, wanted: set[tuple[str, str]] | None = None,
+                                progress: Callable[[str], None] | None = None,
+                                should_cancel: Callable[[], bool] | None = None) -> dict[tuple[str, str], int]:
     """{(source folder name, series folder name): manga id} for every entry
     with downloads. Both names are sanitised the way Suwayomi names its
     staging folders, so a source whose displayName has ':' or '/' matches.
     Suwayomi caches every search hit, so the list is paged (ADOPT_PAGE per
     request, one try each) and paging stops as soon as every folder in
-    `wanted` is found, or after ADOPT_MAX_ENTRIES."""
+    `wanted` is found, or after ADOPT_MAX_ENTRIES. `progress` hears how far
+    it got; a cancel raises limits.Cancelled between pages."""
     # downloadCount is not filterable server-side, so filter here
     out: dict[tuple[str, str], int] = {}
     offset = 0
     while True:
+        if should_cancel and should_cancel():
+            raise limits.Cancelled()
+        if progress:
+            progress(f"listing what Suwayomi has downloaded ({offset} entries so far)")
         nodes, more = client.mangas_page(offset, ADOPT_PAGE)
         for m in nodes:
             if not m.get("downloadCount"):
@@ -644,14 +662,22 @@ def suwayomi_downloaded_entries(client: Client, wanted: set[tuple[str, str]] | N
     return out
 
 
-def plan_adopt(client: Client, only: str | None = None) -> list[AdoptItem]:
-    """Inspect every staged series folder and work out what it is."""
+def plan_adopt(client: Client, only: str | None = None, progress: Callable[[str], None] | None = None,
+               should_cancel: Callable[[], bool] | None = None) -> list[AdoptItem]:
+    """Inspect every staged series folder and work out what it is. Each one
+    costs a metadata lookup (rate limited), so a big staging tree takes a
+    while: `progress` hears which folder is being identified, and a cancel
+    raises limits.Cancelled between folders."""
     dirs = [(src, name, path) for src, name, path in library.staging_dirs()
             if not only or only.lower() in name.lower()]
-    entries = suwayomi_downloaded_entries(client, {(src, name) for src, name, _ in dirs})
+    entries = suwayomi_downloaded_entries(client, {(src, name) for src, name, _ in dirs}, progress, should_cancel)
     items: list[AdoptItem] = []
     cache: dict[str, tuple[Series | None, list[Series]]] = {}
-    for src, name, path in dirs:
+    for i, (src, name, path) in enumerate(dirs, 1):
+        if should_cancel and should_cancel():
+            raise limits.Cancelled()
+        if progress:
+            progress(f"identifying folder {i} of {len(dirs)}: {oneline(name, 80)}")
         numbers, unparsed = library.scan_series_dir(path)
         seasons = any(library.parse_season(u) for u in unparsed)
         it = AdoptItem(src, name, path, numbers, unparsed, seasons, manga_id=entries.get((src, name)))

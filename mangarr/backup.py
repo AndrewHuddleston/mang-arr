@@ -20,7 +20,8 @@ Safety rules, because a backup file can come from anywhere (an upload):
   database swapped, after a safety backup of it.
 - The current login, API key and session settings are kept across a
   restore: rolling data back must not revive old credentials or turn the
-  login off.
+  login off. So is what mang-arr knows about Suwayomi's queue right now
+  (LIVE_SETTINGS): that describes the live Suwayomi, not the backed-up data.
 """
 import contextlib
 import fcntl
@@ -57,6 +58,14 @@ EVENTS_KEEP_ROWS = config.env_number("MANGARR_EVENTS_KEEP_ROWS", 100000, 1000, 1
 # restored one too, so an old login cannot come back).
 PRESERVED_SETTINGS = ("auth_method", "auth_user", "auth_password", "api_key", "session_epoch", "session_secret",
                       "revoked_sessions", "allowed_hosts")
+# Settings about the world outside the database, which a restore does not roll
+# back: the chapter ids a failed download may have left in Suwayomi's queue
+# (downloader.LEFTOVER_KEY). The current value is always kept, whatever
+# keep_auth says, and the backup's is never used: its ids would be taken out
+# of Suwayomi's queue even when they are somebody else's entries by now, and
+# ids really left there would be forgotten. When the current value cannot be
+# read, the restored database starts without one.
+LIVE_SETTINGS = ("leftover_queue_ids",)
 
 _TMP_PREFIX = ".tmp-"            # work in progress inside the backups folder (never listed as a backup)
 _lock = threading.RLock()        # one backup, prune or restore at a time in this process
@@ -528,26 +537,31 @@ def _sanitise_paths(con) -> list[str]:
     return notes
 
 
-def _current_settings() -> dict[str, str] | None:
-    """The preserved settings rows of the live database, or None when it
-    cannot be read."""
+def _current_settings(keys: tuple[str, ...] = PRESERVED_SETTINGS) -> dict[str, str] | None:
+    """These settings rows of the live database, or None when it cannot be
+    read (logged)."""
     try:
         c = sqlite3.connect(config.DB_PATH, timeout=30)
         try:
-            marks = ",".join("?" for _ in PRESERVED_SETTINGS)
-            return dict(c.execute(f"SELECT key, value FROM setting WHERE key IN ({marks})", PRESERVED_SETTINGS))
+            marks = ",".join("?" for _ in keys)
+            return dict(c.execute(f"SELECT key, value FROM setting WHERE key IN ({marks})", keys))
         finally:
             c.close()
     except sqlite3.Error as e:
-        log.warning("restore: cannot read the current login/API key settings (%s); the backup's are used", e)
+        if keys == PRESERVED_SETTINGS:
+            log.warning("restore: cannot read the current login/API key settings (%s); the backup's are used", e)
+        else:
+            log.warning("restore: cannot read the current %s (%s); the restored database starts without them",
+                        ", ".join(keys), e)
         return None
 
 
-def _carry_settings(path: str, current: dict[str, str]) -> None:
-    """Put the current security settings into the database about to be restored."""
+def _carry_settings(path: str, current: dict[str, str], keys: tuple[str, ...] = PRESERVED_SETTINGS) -> None:
+    """Put the current values of these settings into the database about to be
+    restored; a key the current database does not have is removed."""
     con = sqlite3.connect(path)
     try:
-        for k in PRESERVED_SETTINGS:
+        for k in keys:
             if k in current:
                 con.execute("INSERT INTO setting (key, value) VALUES (?, ?)"
                             " ON CONFLICT(key) DO UPDATE SET value=excluded.value", (k, current[k]))
@@ -628,6 +642,8 @@ def restore(source, keep_auth: bool = True, still_allowed: Callable[[dict], bool
                 raise RestoreError(msg)
             version, notes = _rebuild(staged, fresh, _page_size())
             with _no_download_run():
+                # read only now: every change to them happens under the download lock
+                _carry_settings(fresh, _current_settings(LIVE_SETTINGS) or {}, LIVE_SETTINGS)
                 try:
                     safety = create("before restore", prune_after=False)
                     with settings.write_lock:

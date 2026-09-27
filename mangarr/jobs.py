@@ -46,12 +46,19 @@ class Job:
     # a multi-series job (refresh pass) lists every series it covers:
     # {series_id, title, state: queued|running|done|nomatch|failed|error|cancelled, result}
     items: list = field(default_factory=list)
+    # when `progress` last changed (None: not yet); health warns about a running job that stops moving
+    progress_at: float | None = None
+
+    def __setattr__(self, name, value):
+        if name == "progress" and value != self.__dict__.get("progress"):
+            object.__setattr__(self, "progress_at", time.time())
+        object.__setattr__(self, name, value)
 
     def as_dict(self) -> dict:
         return {"id": self.id, "kind": self.kind, "title": self.title, "seriesId": self.series_id,
                 "status": self.status, "queuedAt": self.queued_at, "startedAt": self.started_at,
-                "finishedAt": self.finished_at, "progress": self.progress, "message": self.message,
-                "items": self.items}
+                "finishedAt": self.finished_at, "progress": self.progress, "progressAt": self.progress_at,
+                "message": self.message, "items": self.items}
 
 
 class Runner:

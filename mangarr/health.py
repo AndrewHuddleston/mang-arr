@@ -21,12 +21,15 @@ import urllib.request
 from dataclasses import asdict, dataclass
 
 from . import config, komga, notify, settings
+from .matching import oneline
 from .suwayomi import Client, SuwayomiError
 
 log = logging.getLogger(__name__)
 CACHE_SECS = 60
 FORCE_MIN_SECS = 15      # force=True re-checks at most this often, whoever asks
 DEADLINE = 25            # seconds a caller waits for a run; the run itself carries on in the background
+STALLED_JOB_SECS = 30 * 60   # a running job whose progress has not changed for this long is reported
+NOT_CANCELLABLE = {"restore"}  # job kinds that finish what they started, whatever the Queue page asks
 
 
 @dataclass
@@ -41,6 +44,15 @@ _lock = threading.Lock()
 _running: threading.Event | None = None      # set when the run in progress finishes
 _started = 0.0                               # when the run in progress started (monotonic)
 _hang_logged: threading.Event | None = None  # the run already reported as hung (log it once, not per caller)
+_runner = None                               # the job runner to watch (see watch_jobs)
+_stall_logged: int | None = None             # id of the job last logged as stalled (log it once per job)
+
+
+def watch_jobs(runner) -> None:
+    """Report a running job of this runner that stops making progress (the
+    single job thread would be stuck behind it)."""
+    global _runner
+    _runner = runner
 
 
 def _ping(name: str, url: str, timeout: int = 8) -> Check:
@@ -157,6 +169,11 @@ def _compute(client: Client) -> list[Check]:
     except SuwayomiError as e:
         out.append(Check("error", "Suwayomi", f"unreachable at {config.SUWAYOMI_URL}: {e}"))
 
+    # -- the job runner --
+    stalled = stalled_job()
+    if stalled:
+        out.append(stalled)
+
     # -- Komga (the reader) --
     if not komga.configured():
         out.append(Check("warning", "Komga", "not configured: new chapters appear only at Komga's own scan interval"))
@@ -211,6 +228,31 @@ def _compute(client: Client) -> list[Check]:
             log.warning("health: %s: %s", c.name, c.detail)
     _alert(out)
     return out
+
+
+def stalled_job(now: float | None = None) -> Check | None:
+    """A warning when the running job's progress has not changed for
+    STALLED_JOB_SECS: every other job waits behind it. Every job kind reports
+    each step that can take long (a source, a chapter batch, a staged
+    folder, a series); a wait (for another process's download run) reports
+    the same words throughout, so it counts as no progress."""
+    global _stall_logged
+    job = _runner.current if _runner is not None else None
+    if job is None or job.started_at is None:
+        return None
+    now = time.time() if now is None else now
+    idle = now - (job.progress_at or job.started_at)
+    if idle < STALLED_JOB_SECS:
+        return None
+    what = f"job #{job.id} ({job.kind} {oneline(job.title, 80)})"
+    last = f"; last step: {oneline(job.progress, 160)}" if job.progress else ""
+    if _stall_logged != job.id:
+        _stall_logged = job.id
+        log.warning("health: %s has made no progress for %.0f min%s", what, idle / 60, last)
+    hint = ("it cannot be cancelled" if job.kind in NOT_CANCELLABLE
+            else "cancel it on the Queue page if it is stuck")
+    return Check("warning", "Jobs", f"{what} has made no progress for {idle / 60:.0f} min{last}. Other jobs "
+                                    f"wait until it ends; {hint}")
 
 
 def summary(client: Client, wait: float = 5) -> dict:
