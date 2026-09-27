@@ -26,7 +26,8 @@ log = logging.getLogger(__name__)
 # search titles per source.
 MAX_CHAPTER_NUMBER = 100_000
 OUTLIER_FACTOR = 10          # a top number this many times the next one ...
-OUTLIER_MIN_JUMP = 1000      # ... and this far above it is a typo or a date, not a chapter
+OUTLIER_MIN_JUMP = 1000      # ... and this far above it is a typo or a date, not a chapter,
+OUTLIER_MIN_BELOW = 5        # ... judged only with this many chapters below it (not [1, 1500])
 MAX_CHAPTERS_PER_SOURCE = 10_000
 MAX_SEARCH_TITLES = 8
 MAX_GAP_SPANS = 40
@@ -131,8 +132,7 @@ def resolve(client: Client, series: Series, sources: list[Source] | None = None,
             reliability: dict[str, float] | None = None) -> Plan:
     sources = sources if sources is not None else client.sources()
     reliability = reliability or {}
-    # every title is one search per source that lacks the series: capped
-    titles = [t[:MAX_TITLE] for t in series.search_titles[:MAX_SEARCH_TITLES]]
+    titles = capped_search_titles(series)
     log.info("resolving %s [%s] across %d sources, titles: %s", oneline(series.title), series.ref[:80],
              len(sources), oneline(" | ".join(titles[:5]), 400))
     matches: list[SourceMatch] = []
@@ -165,6 +165,23 @@ def resolve(client: Client, series: Series, sources: list[Source] | None = None,
              series.title, len(plan.chapters), len({m.manga_id for m in assignment.values()}),
              len(plan.have()), len(plan.wanted()), len(plan.junk))
     return plan
+
+
+def capped_search_titles(series: Series) -> list[str]:
+    """At most MAX_SEARCH_TITLES titles to search with, each at most
+    MAX_TITLE characters: every title is one search per source that lacks
+    the series, and aliases can be user-typed or come from a provider. The
+    native title is always kept (last, as in search_titles) even when the
+    Latin titles alone would fill the cap: Korean, Chinese and Japanese
+    sources often index only that one."""
+    titles = series.search_titles
+    if len(titles) > MAX_SEARCH_TITLES:
+        native = series.native if series.native in titles[MAX_SEARCH_TITLES:] else None
+        kept = [t for t in titles if t != native][:MAX_SEARCH_TITLES - (1 if native else 0)]
+        titles = kept + ([native] if native else [])
+        log.debug("%s: %d titles; searching with %d of them", oneline(series.title), len(series.search_titles),
+                  len(titles))
+    return [t[:MAX_TITLE] for t in titles]
 
 
 _unreachable: dict[str, tuple[float, str]] = {}   # source id -> (when, why); skip it for a while
@@ -249,7 +266,9 @@ def plausible_chapters(source_name: str, chapters: list[Chapter]) -> list[Chapte
         else:
             dropped.append(n)
     ok.sort(key=lambda c: c.number)
-    while len(ok) >= 2:
+    # a source listing only its first chapter and its latest one ([1, 1500])
+    # is normal, so a lone top number is judged only against enough others
+    while len(ok) > OUTLIER_MIN_BELOW:
         top, below = ok[-1].number, ok[-2].number
         if top > OUTLIER_FACTOR * max(below, 1) and top - below > OUTLIER_MIN_JUMP:
             dropped.append(ok.pop().number)

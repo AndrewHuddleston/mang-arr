@@ -348,5 +348,38 @@ class ImportTest(unittest.TestCase):
             self.assertEqual([f for _, f, _ in core.series_staging_dirs(con, sid)], [folder])
 
 
+    def test_bad_file_that_cannot_be_set_aside_does_not_block_the_rest(self):
+        with open(os.path.join(self.folder, "Chapter 1.cbz"), "wb") as f:     # corrupt and old
+            f.write(b"PK" + b"x" * 3000)
+        age(os.path.join(self.folder, "Chapter 1.cbz"), 3600)
+        age(make_cbz(os.path.join(self.folder, "Chapter 2.cbz")), 3600)
+
+        def refuse(path):
+            raise OSError(errno.EACCES, "Permission denied", path)
+        with db.connect(self.dbpath) as con, mock.patch.object(library, "quarantine", refuse), \
+                self.assertLogs("mangarr.core", "ERROR"):
+            sid = self._series(con)
+            for n in (1, 2):
+                con.execute("INSERT INTO chapter (series_id, number, status, updated_at) VALUES (?,?,'wanted',?)",
+                            (sid, n, db.now()))
+            self.assertEqual(core.import_series(con, sid), 1)
+            rows = {r["number"]: r for r in db.chapters(con, sid)}
+        self.assertEqual(rows[1.0]["status"], "failed")
+        self.assertIn("not set aside", rows[1.0]["reason"])
+        self.assertEqual(rows[2.0]["status"], "have")
+
+
+class AdoptEntriesTest(unittest.TestCase):
+    def test_source_display_name_is_keyed_like_its_staging_folder(self):
+        # Suwayomi writes "Src: Scans (EN)" downloads to a "Src_ Scans (EN)" folder
+        class Client:
+            def gq(self, query, timeout=None):
+                return {"mangas": {"nodes": [
+                    {"id": 7, "title": "Title: Two", "downloadCount": 3, "source": {"displayName": "Src: Scans (EN)"}},
+                    {"id": 8, "title": "Other", "downloadCount": 0, "source": {"displayName": "Src (EN)"}}]}}
+        entries = core.suwayomi_downloaded_entries(Client())
+        self.assertEqual(entries, {("Src_ Scans (EN)", "Title_ Two"): 7})
+
+
 if __name__ == "__main__":
     unittest.main()

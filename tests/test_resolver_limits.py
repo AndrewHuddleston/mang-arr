@@ -72,8 +72,14 @@ class PlausibleTest(unittest.TestCase):
 
     def test_outlier_far_above_the_rest_is_dropped(self):
         with self.assertLogs("mangarr.resolver", "WARNING"):
-            ok = plausible_chapters("S", chapters([1, 2, 3, 50_000]))
-        self.assertEqual([c.number for c in ok], [1, 2, 3])
+            ok = plausible_chapters("S", chapters([1, 2, 3, 4, 5, 50_000]))
+        self.assertEqual([c.number for c in ok], [1, 2, 3, 4, 5])
+
+    def test_first_and_latest_only_is_kept(self):
+        # some sources list chapter 0/1 and the latest chapter only: too few
+        # numbers to call the top one an outlier
+        for nums in ([1, 1500], [0, 1, 1500], [0, 1, 2, 3, 2500]):
+            self.assertEqual([c.number for c in plausible_chapters("S", chapters(nums))], nums)
 
     def test_real_lists_are_kept(self):
         for nums in ([1, 2, 3, 150, 151, 152], [0, 1, 1.5, 2], list(range(1, 4001)), [1, 500], [5000]):
@@ -132,6 +138,22 @@ class ResolveTest(unittest.TestCase):
         self.assertEqual(len(client.searches), resolver.MAX_SEARCH_TITLES)
         self.assertTrue(all(len(q) <= resolver.MAX_TITLE for q in client.searches))
         self.assertEqual(plan.matches, [])
+
+    def test_native_title_survives_the_cap(self):
+        # Latin titles come first in search_titles; with many of them the
+        # native one (all some Korean/Chinese/Japanese sources index) must
+        # still be searched
+        series = Series(anilist_id=1, romaji="Na Honjaman Level Up", english="Solo Leveling", native="나 혼자만 레벨업",
+                        synonyms=[f"Solo Leveling alias {i}" for i in range(10)])
+        titles = resolver.capped_search_titles(series)
+        self.assertEqual(len(titles), resolver.MAX_SEARCH_TITLES)
+        self.assertEqual(titles[-1], "나 혼자만 레벨업")
+        self.assertEqual(titles[:2], ["Na Honjaman Level Up", "Solo Leveling"])
+        client = FakeClient([1], hit_title="Other")
+        resolve(client, series, sources=[SRC])
+        self.assertIn("나 혼자만 레벨업", client.searches)
+        few = Series(anilist_id=2, english="A", native="あ")
+        self.assertEqual(resolver.capped_search_titles(few), ["A", "あ"])
 
 
 class ReviewSummaryTest(unittest.TestCase):

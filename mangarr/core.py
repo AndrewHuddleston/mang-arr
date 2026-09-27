@@ -402,12 +402,25 @@ def import_series(con, series_id: int, client: Client | None = None) -> int:
                 continue
             if prev and prev["library_path"] and os.path.exists(prev["library_path"]):
                 continue
+            ok, detail = library.verify_archive(path)
+            if not ok:
+                if _still_being_written(path, title, n, source_name, detail):
+                    continue
+                moved = _quarantine(con, series_id, title, n, source_name, path)
+                if moved is None:
+                    continue
+                db.set_status(con, series_id, n, "failed", f"{source_name}: bad file ({detail}); set aside as "
+                              f"{os.path.basename(moved)}, will be fetched again")
+                db.record_source_result(con, source_name, "corrupt")
+                log.warning("%s: ch %g from %s is unusable (%s); quarantined %s", title, n, source_name, detail, moved)
+                continue
+            label = prev["name"] if prev and "name" in prev.keys() else None
+            expected = os.path.join(library.library_dir(folder), library.chapter_filename(n, label))
+            ours = bool(prev and prev["library_path"] == expected)
             try:
-                dst = _import_one(con, series_id, title, folder, source_name, n, path, prev)
+                dst = library.link_into_library(path, folder, n, replace=ours, label=label)
             except OSError as e:
-                why = f"{source_name}: cannot link {os.path.basename(path)}: {type(e).__name__}: {e}"
-                log.error("%s: ch %g: %s", title, n, why)
-                db.set_status(con, series_id, n, "failed", why[:500])
+                _import_failed(con, series_id, title, n, f"{source_name}: cannot link {os.path.basename(path)}", e)
                 continue
             if dst is None:
                 continue
@@ -424,31 +437,37 @@ def import_series(con, series_id: int, client: Client | None = None) -> int:
     return linked
 
 
-def _import_one(con, series_id: int, title: str, folder: str, source_name: str, n: float, path: str,
-                prev: dict | None) -> str | None:
-    """Verify one staged file and link it into the library. Returns the
-    library path, or None when it was not linked (bad, fresh or blocked)."""
-    ok, detail = library.verify_archive(path)
-    if not ok:
-        try:
-            age = time.time() - os.lstat(path).st_mtime
-        except OSError:
-            age = SETTLE_SECONDS
-        if age < SETTLE_SECONDS:
-            log.info("%s: ch %g from %s is not readable yet (%s) and was written %.0fs ago; "
-                     "probably still being written, trying again at the next import", title, n, source_name,
-                     detail, age)
-            return None
-        moved = library.quarantine(path)
-        db.set_status(con, series_id, n, "failed", f"{source_name}: bad file ({detail}); set aside as "
-                      f"{os.path.basename(moved)}, will be fetched again")
-        db.record_source_result(con, source_name, "corrupt")
-        log.warning("%s: ch %g from %s is unusable (%s); quarantined %s", title, n, source_name, detail, moved)
+def _still_being_written(path: str, title: str, n: float, source_name: str, detail: str) -> bool:
+    """True when a file that failed verification was written less than
+    SETTLE_SECONDS ago: Suwayomi is probably still writing it, so it is left
+    for the next import instead of being quarantined (logged)."""
+    try:
+        age = time.time() - os.lstat(path).st_mtime
+    except OSError:
+        return False
+    if age >= SETTLE_SECONDS:
+        return False
+    log.info("%s: ch %g from %s is not readable yet (%s) and was written %.0fs ago; "
+             "probably still being written, trying again at the next import", title, n, source_name, detail, age)
+    return True
+
+
+def _import_failed(con, series_id: int, title: str, n: float, what: str, e: OSError) -> None:
+    """One file could not be handled: recorded on its chapter and logged; the
+    import goes on with the other files."""
+    why = f"{what}: {type(e).__name__}: {e}"
+    log.error("%s: ch %g: %s", title, n, why)
+    db.set_status(con, series_id, n, "failed", why[:500])
+
+
+def _quarantine(con, series_id: int, title: str, n: float, source_name: str, path: str) -> str | None:
+    """library.quarantine, or None (recorded on the chapter) when the bad file
+    cannot be moved aside, e.g. it was swapped for a symlink."""
+    try:
+        return library.quarantine(path)
+    except OSError as e:
+        _import_failed(con, series_id, title, n, f"{source_name}: bad file {os.path.basename(path)} not set aside", e)
         return None
-    label = prev["name"] if prev and "name" in prev.keys() else None
-    expected = os.path.join(library.library_dir(folder), library.chapter_filename(n, label))
-    ours = bool(prev and prev["library_path"] == expected)
-    return library.link_into_library(path, folder, n, replace=ours, label=label)
 
 
 # -- adopt -------------------------------------------------------------------
@@ -468,7 +487,9 @@ class AdoptItem:
 
 
 def suwayomi_downloaded_entries(client: Client) -> dict[tuple[str, str], int]:
-    """{(source name, folder name): manga id} for every entry with downloads."""
+    """{(source folder name, series folder name): manga id} for every entry
+    with downloads. Both names are sanitised the way Suwayomi names its
+    staging folders, so a source whose displayName has ':' or '/' matches."""
     # downloadCount is not filterable server-side; the list of every cached
     # entry is small text, so filter here.
     d = client.gq("{ mangas { nodes { id title downloadCount source { displayName } } } }", timeout=120)
@@ -476,7 +497,7 @@ def suwayomi_downloaded_entries(client: Client) -> dict[tuple[str, str], int]:
     for m in d["mangas"]["nodes"]:
         if not m.get("downloadCount"):
             continue
-        src = (m.get("source") or {}).get("displayName") or "?"
+        src = library.safe_title((m.get("source") or {}).get("displayName") or "?")
         out[(src, library.safe_title(m["title"]))] = m["id"]
     return out
 

@@ -13,11 +13,14 @@ Each list kind is a fetch(params) -> (series, review_titles) function in
 FETCHERS; review_titles are lines a text list could not identify with
 confidence and that the user has to add by hand.
 """
+import functools
 import http.client
 import ipaddress
 import json
 import logging
+import socket
 import sqlite3
+import threading
 import time
 import urllib.parse
 import urllib.request
@@ -143,26 +146,131 @@ def _check_peer(sock) -> None:
         raise ListFetchError(f"refusing to fetch a list from {ip} (link-local, multicast or unspecified address)")
 
 
-class _GuardedHTTPConnection(http.client.HTTPConnection):
+class _Watchdog:
+    """Enforces a wall-clock deadline (and Cancel) on a whole fetch: connect,
+    TLS handshake, status line, headers and body. The per-operation socket
+    timeout alone does not do that - a server sending one header byte every
+    few seconds never trips it - so a helper thread watches the clock and
+    should_cancel and, when either fires, shuts down every socket the fetch
+    opened; the blocked read then fails at once and _get_text reports why."""
+    POLL = 0.25                 # seconds between should_cancel checks
+
+    def __init__(self, deadline: float, should_cancel: Callable[[], bool] | None = None):
+        self.end = time.monotonic() + deadline
+        self.should_cancel = should_cancel
+        self.reason = ""        # set once fired: "deadline" or "cancelled"
+        self._socks: list = []
+        self._lock = threading.Lock()
+        self._done = threading.Event()
+        self._thread = threading.Thread(target=self._run, name="list-fetch-watchdog", daemon=True)
+
+    def __enter__(self):
+        self._thread.start()
+        return self
+
+    def __exit__(self, *exc):
+        self._done.set()
+        self._thread.join()
+        self._close_all()
+
+    def _run(self) -> None:
+        while not self._done.wait(min(self.POLL, max(0.0, self.end - time.monotonic()))):
+            if time.monotonic() >= self.end:
+                self.fire("deadline")
+                return
+            if self.should_cancel is not None and self.should_cancel():
+                self.fire("cancelled")
+                return
+
+    def fire(self, reason: str) -> None:
+        with self._lock:
+            if self.reason:
+                return
+            self.reason = reason
+            socks = list(self._socks)
+        for sock in socks:
+            self._kill(sock)
+
+    def register(self, sock) -> None:
+        """Called with each freshly connected TCP socket, before any TLS
+        handshake. A dup of it is kept: TLS wrapping detaches the original
+        socket object, but shutting down the dup still ends the connection
+        (shutdown acts on the connection, not on one descriptor), and the dup
+        cannot be closed and its number reused before __exit__. A socket
+        connected after the watchdog fired (connect is bounded by
+        FETCH_TIMEOUT) is shut at once."""
+        try:
+            dup = sock.dup()
+        except OSError:
+            return
+        with self._lock:
+            self._socks.append(dup)
+            fired = bool(self.reason)
+        if fired:
+            self._kill(dup)
+
+    @staticmethod
+    def _kill(sock) -> None:
+        try:
+            sock.shutdown(socket.SHUT_RDWR)     # a blocked recv on the connection returns at once
+        except OSError:
+            pass
+
+    def _close_all(self) -> None:
+        with self._lock:
+            socks, self._socks = self._socks, []
+        for sock in socks:
+            try:
+                sock.close()
+            except OSError:
+                pass
+
+
+class _WatchedConnection:
+    """Mixin: hands every socket the connection opens to its _Watchdog.
+    http.client sets _create_connection per instance in __init__, so it is
+    wrapped there rather than overridden."""
+    def __init__(self, *a, watchdog: _Watchdog | None = None, **kw):
+        super().__init__(*a, **kw)
+        if watchdog is not None:
+            create = self._create_connection
+
+            def create_watched(*ca, **ckw):
+                sock = create(*ca, **ckw)
+                watchdog.register(sock)
+                return sock
+            self._create_connection = create_watched
+
+
+class _GuardedHTTPConnection(_WatchedConnection, http.client.HTTPConnection):
     def connect(self):
         super().connect()
         _check_peer(self.sock)
 
 
-class _GuardedHTTPSConnection(http.client.HTTPSConnection):
+class _GuardedHTTPSConnection(_WatchedConnection, http.client.HTTPSConnection):
     def connect(self):
         super().connect()
         _check_peer(self.sock)
 
 
 class _GuardedHTTPHandler(urllib.request.HTTPHandler):
+    def __init__(self, watchdog: _Watchdog | None = None):
+        super().__init__()
+        self._watchdog = watchdog
+
     def http_open(self, req):
-        return self.do_open(_GuardedHTTPConnection, req)
+        return self.do_open(functools.partial(_GuardedHTTPConnection, watchdog=self._watchdog), req)
 
 
 class _GuardedHTTPSHandler(urllib.request.HTTPSHandler):
+    def __init__(self, watchdog: _Watchdog | None = None):
+        super().__init__()
+        self._watchdog = watchdog
+
     def https_open(self, req):
-        return self.do_open(_GuardedHTTPSConnection, req, context=self._context)
+        return self.do_open(functools.partial(_GuardedHTTPSConnection, watchdog=self._watchdog), req,
+                            context=self._context)
 
 
 class _SameHostRedirects(urllib.request.HTTPRedirectHandler):
@@ -175,32 +283,49 @@ class _SameHostRedirects(urllib.request.HTTPRedirectHandler):
         return super().redirect_request(req, fp, code, msg, headers, newurl)
 
 
-def _opener():
-    return urllib.request.build_opener(_GuardedHTTPHandler, _GuardedHTTPSHandler, _SameHostRedirects)
+def _opener(watchdog: _Watchdog | None = None):
+    return urllib.request.build_opener(_GuardedHTTPHandler(watchdog), _GuardedHTTPSHandler(watchdog),
+                                       _SameHostRedirects)
 
 
-def _get_text(url: str, max_bytes: int = MAX_LIST_BYTES, deadline: float = FETCH_DEADLINE) -> str:
+def _get_text(url: str, max_bytes: int = MAX_LIST_BYTES, deadline: float = FETCH_DEADLINE,
+              should_cancel: Callable[[], bool] | None = None) -> str:
     """The body at an http(s) URL as text, read in chunks: more than
-    max_bytes, or longer than `deadline` seconds in total, is an error, so a
-    huge or trickling response can neither exhaust memory nor hold the job
-    thread."""
+    max_bytes is an error, and so is taking longer than `deadline` seconds
+    for the whole fetch - connect, headers and body - or should_cancel()
+    turning true (checked a few times a second throughout, see _Watchdog).
+    So a huge or trickling response can neither exhaust memory nor hold the
+    job thread, and Cancel works while the list downloads."""
     if urllib.parse.urlsplit(url).scheme.lower() not in ("http", "https"):
         raise ListFetchError("the URL must start with http:// or https://")
     req = urllib.request.Request(url, headers={"User-Agent": config.USER_AGENT})
-    end = time.monotonic() + deadline
     buf = bytearray()
-    with _opener().open(req, timeout=FETCH_TIMEOUT) as r:
-        while True:
-            chunk = r.read1(65536) if hasattr(r, "read1") else r.read(65536)
-            if not chunk:
-                break
-            buf += chunk
-            if len(buf) > max_bytes:
-                log.warning("list %s: response larger than %d bytes; refused", oneline(url, 120), max_bytes)
-                raise ListFetchError(f"list is larger than {max_bytes // 1000} KB")
-            if time.monotonic() > end:
-                log.warning("list %s: download took longer than %ds; abandoned", oneline(url, 120), deadline)
-                raise ListFetchError(f"list download took longer than {deadline}s")
+    with _Watchdog(deadline, should_cancel) as wd:
+        try:
+            with _opener(wd).open(req, timeout=FETCH_TIMEOUT) as r:
+                while True:
+                    chunk = r.read1(65536) if hasattr(r, "read1") else r.read(65536)
+                    if wd.reason:           # fired between reads, or the read ended because it fired
+                        break
+                    if not chunk:
+                        break
+                    buf += chunk
+                    if len(buf) > max_bytes:
+                        log.warning("list %s: response larger than %d bytes; refused", oneline(url, 120), max_bytes)
+                        raise ListFetchError(f"list is larger than {max_bytes // 1000} KB")
+        except ListFetchError:
+            raise
+        except Exception:
+            if not wd.reason:
+                raise
+            # the watchdog shut the socket: whatever the read raised is a symptom
+        if wd.reason == "cancelled":
+            log.info("list %s: download cancelled", oneline(url, 120))
+            raise ListFetchError("list download cancelled")
+        if wd.reason:
+            log.warning("list %s: download took longer than %ss (connect, headers and body); abandoned",
+                        oneline(url, 120), deadline)
+            raise ListFetchError(f"list download took longer than {deadline}s")
     return buf.decode("utf-8", "replace")
 
 
@@ -235,8 +360,8 @@ def fetch_url_text(params: dict, should_cancel: Callable[[], bool] | None = None
     confident pick is added, the rest are reported for review. A line that
     is already a reference (anilist:123, mangadex:uuid) is used as is. At
     most MAX_LIST_LINES lines are looked up; should_cancel is checked
-    between lines."""
-    titles = parse_titles(_get_text(params["url"]), MAX_LIST_LINES)
+    during the download and between lines."""
+    titles = parse_titles(_get_text(params["url"], should_cancel=should_cancel), MAX_LIST_LINES)
     series: dict[str, Series] = {}
     review: list[str] = []
     for i, t in enumerate(titles):

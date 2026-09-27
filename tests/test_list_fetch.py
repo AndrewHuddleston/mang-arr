@@ -3,6 +3,7 @@ is bounded in size and time, redirects stay on the same host, the lines are
 capped, the sync can be cancelled, and the result quotes only a little."""
 import http.server
 import os
+import socket
 import tempfile
 import threading
 import time
@@ -50,6 +51,21 @@ def trickle(h):
         pass
 
 
+def trickle_headers(h):
+    """The status line and then a header one byte at a time, never ending:
+    the body loop is never reached, so only a whole-fetch deadline helps."""
+    try:
+        h.wfile.write(b"HTTP/1.1 200 OK\r\nX-Slow: ")
+        h.wfile.flush()
+        for _ in range(1200):                     # up to ~60 s
+            h.wfile.write(b"a")
+            h.wfile.flush()
+            time.sleep(0.05)
+    except (BrokenPipeError, ConnectionResetError):
+        pass
+    h.close_connection = True
+
+
 def small(h):
     body = b"One Piece\nBerserk\n"
     h.send_response(200)
@@ -74,7 +90,7 @@ class FetchTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         Handler.routes = {"/big": big, "/trickle": trickle, "/small": small, "/away": redirect_away,
-                          "/same": redirect_same}
+                          "/same": redirect_same, "/slow-headers": trickle_headers}
         cls.server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
         cls.server.daemon_threads = True
         cls.base = f"http://127.0.0.1:{cls.server.server_address[1]}"
@@ -99,6 +115,37 @@ class FetchTest(unittest.TestCase):
             lists._get_text(self.base + "/trickle", deadline=1)
         self.assertLess(time.monotonic() - t0, 5)
         self.assertIn("longer than", str(cm.exception))
+
+    def test_trickling_headers_hit_the_deadline(self):
+        # the per-read timeout never trips (a byte every 0.05 s); before the
+        # watchdog this blocked in http.client's header readline for a minute
+        t0 = time.monotonic()
+        with self.assertRaises(lists.ListFetchError) as cm, self.assertLogs("mangarr.lists", "WARNING"):
+            lists._get_text(self.base + "/slow-headers", deadline=1)
+        self.assertLess(time.monotonic() - t0, 5)
+        self.assertIn("longer than", str(cm.exception))
+
+    def test_cancel_stops_a_trickling_fetch(self):
+        t0 = time.monotonic()
+        with self.assertRaises(lists.ListFetchError) as cm, self.assertLogs("mangarr.lists", "INFO"):
+            lists._get_text(self.base + "/slow-headers", deadline=60, should_cancel=lambda: time.monotonic() - t0 > 0.5)
+        self.assertLess(time.monotonic() - t0, 5)
+        self.assertIn("cancelled", str(cm.exception))
+
+    def test_silent_tls_handshake_hits_the_deadline(self):
+        # a server that accepts and never answers the TLS ClientHello
+        srv = socket.create_server(("127.0.0.1", 0))
+        conns = []
+        threading.Thread(target=lambda: conns.append(srv.accept()), daemon=True).start()
+        try:
+            t0 = time.monotonic()
+            with self.assertRaises(lists.ListFetchError), self.assertLogs("mangarr.lists", "WARNING"):
+                lists._get_text(f"https://127.0.0.1:{srv.getsockname()[1]}/list.txt", deadline=1)
+            self.assertLess(time.monotonic() - t0, 5)
+        finally:
+            for c, _ in conns:
+                c.close()
+            srv.close()
 
     def test_redirects(self):
         self.assertEqual(lists._get_text(self.base + "/same"), "One Piece\nBerserk\n")
@@ -148,12 +195,12 @@ class LinesTest(unittest.TestCase):
         def lookup(t):
             calls.append(t)
             return None, []
-        with mock.patch.object(lists, "_get_text", lambda url: text), \
+        with mock.patch.object(lists, "_get_text", lambda url, **kw: text), \
                 mock.patch.object(lists.metadata, "lookup", lookup), self.assertLogs("mangarr.lists", "WARNING"):
             lists.fetch_url_text({"url": "http://x"})
         self.assertEqual(len(calls), lists.MAX_LIST_LINES)
         calls.clear()
-        with mock.patch.object(lists, "_get_text", lambda url: text), \
+        with mock.patch.object(lists, "_get_text", lambda url, **kw: text), \
                 mock.patch.object(lists.metadata, "lookup", lookup), self.assertLogs("mangarr.lists", "INFO"):
             lists.fetch("url_text", {"url": "http://x"}, should_cancel=lambda: len(calls) >= 3)
         self.assertEqual(len(calls), 3)
