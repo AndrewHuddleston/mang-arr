@@ -304,8 +304,15 @@ def _run_pass(job: jobs.Job, rows, label: str, skippable=()) -> tuple[int, int, 
             pool.resolving(text)
 
     def not_checked(rest: list, why: str) -> None:
+        """The series the pass does not get to: the complete finished ones
+        are skipped as planned (the stop did not cut them: they would have
+        been, unless their status changed, and the next pass asks again)."""
         for it in rest:
-            it["state"], it["result"] = "cancelled", why
+            if it["series_id"] in later:
+                r, left = later[it["series_id"]]
+                it["state"], it["result"] = "skipped", _skip_text(r, left)
+            else:
+                it["state"], it["result"] = "cancelled", why
     try:
         for i, (r, item) in enumerate(zip(rows, job.items, strict=True), 1):
             head = f"{i}/{len(rows)}: {r['title']}"
@@ -448,10 +455,14 @@ def _pass_stopped_text(items: list, reached: int, why: str) -> str:
     series it never checked, and the checked ones the stop cut (the download
     lanes stop with it): before any of their chapters arrived, or after some
     did. A series that finished, failed or was deleted meanwhile is none of
-    these."""
+    these, nor is a complete finished one it did not get to (skipped as
+    planned: not_checked in _run_pass)."""
     parts = []
-    if len(items) > reached:
-        parts.append(f"{len(items) - reached} not checked")
+    later = items[reached:]
+    if unchecked := sum(1 for it in later if it["state"] != "skipped"):
+        parts.append(f"{unchecked} not checked")
+    if skipped := len(later) - unchecked:
+        parts.append(f"{skipped} complete finished series skipped")
     cut = [m for it in items[:reached] if it["state"] == "cancelled" and (m := _CUT.match(it.get("result") or ""))]
     if none := sum(1 for m in cut if not m.group(1)):
         parts.append(f"{none} not downloaded")

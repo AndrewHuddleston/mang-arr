@@ -108,6 +108,29 @@ class RunPassTest(unittest.TestCase):
         self.assertEqual(job.items[2]["result"], "no match: rejected titles: X")
         self.assertEqual((done, errors), (3, 1))          # done = processed, errors included
 
+    def test_complete_finished_series_a_stop_did_not_get_to_are_skipped_not_cut(self):
+        from mangarr import core, jobs, lanes
+        from mangarr.suwayomi import SuwayomiUnreachable
+        now = time.strftime("%Y-%m-%d %H:%M:%S")
+        rows = [row("A", sid=1), row("B", sid=2)]
+        later = [(dict(row(f"Done {k}", "FINISHED", last=now, sid=10 + k), ref=f"manual:{k}", expected=10), 3)
+                 for k in range(5)]
+
+        def down(con, client, sid, **kw):
+            raise SuwayomiUnreachable("connection refused")
+        job = jobs.Job(1, "refresh-all", "all")
+        with mock.patch.object(core, "refresh_series", down), mock.patch.object(lanes, "HOLD_SECS", 0.01), \
+                mock.patch.object(web, "_record_error", lambda sid, e: None), \
+                mock.patch.object(web.db, "connect", mock.MagicMock()), \
+                mock.patch.object(web.metadata, "statuses", side_effect=AssertionError("not asked")), \
+                self.assertLogs("mangarr.web.app", "WARNING"), self.assertRaises(web.PassStopped) as cm:
+            web._run_pass(job, rows, "test", later)
+        self.assertEqual([i["state"] for i in job.items], ["error", "error"] + ["skipped"] * 5)
+        self.assertEqual(job.items[2]["result"], "skipped: complete and finished; next check in about 3 day(s)")
+        self.assertEqual(str(cm.exception), "pass stopped after 2 of 7 series, 5 complete finished series skipped: "
+                                            "Suwayomi is not answering (connection refused)")
+        self.assertEqual(cm.exception.counts, (2, 0, 0, 2))
+
     def test_the_stop_text_counts_only_what_the_stop_cut(self):
         items = [{"state": "cancelled", "result": "series was deleted"},
                  {"state": "cancelled", "result": "pass stopped: Suwayomi is not answering after 2 chapter(s) "
@@ -121,6 +144,10 @@ class RunPassTest(unittest.TestCase):
                          "Suwayomi is not answering (why)")
         self.assertEqual(web._pass_stopped_text(items[:1], 1, "why"),
                          "pass stopped after 1 of 1 series: Suwayomi is not answering (why)")
+        skipped = {"state": "skipped", "result": "skipped: complete and finished; next check in about 3 day(s)"}
+        self.assertEqual(web._pass_stopped_text(items[:1] + [dict(skipped) for _ in range(5)], 1, "why"),
+                         "pass stopped after 1 of 6 series, 5 complete finished series skipped: Suwayomi is not "
+                         "answering (why)")
 
 
 if __name__ == "__main__":
