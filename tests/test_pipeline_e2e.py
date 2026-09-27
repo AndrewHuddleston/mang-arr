@@ -175,7 +175,9 @@ class PageByPageTest(PipelineBase):
         self.assertEqual(len([e for e in fake.kinds("enqueue") if e[4] == ch2]), 1)
         st = self.status(rows[0]["id"])
         self.assertEqual(st[2.0][0], "failed")
-        self.assertIn("the source has no working pages for this chapter", st[2.0][1])
+        self.assertIn(f"{COMICK}: not fetched page by page (its page list has a URL that is not a Suwayomi page "
+                      "path); the normal download failed instantly on every try", st[2.0][1])
+        self.assertNotIn("no working pages", st[2.0][1])               # it does have them: page by page did not run
         self.assertTrue(st[3.0][1].startswith("waiting for chapter 2"))
 
 

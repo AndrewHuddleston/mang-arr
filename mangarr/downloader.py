@@ -63,6 +63,8 @@ UNSTARTED_REASON = (f"not attempted: Suwayomi did not start this chapter within 
 UNSTARTED_TRIED = f"not started by Suwayomi within {QUEUED_CAP_SECS // 60} min (its download queue was busy)"
 # A page-by-page source whose image server refuses even paced page requests is
 # backed off like a rate limit, but at most this long: its lane waits meanwhile.
+# Once the backoff reaches it the chapter is given up at once (another warm-up
+# would not follow the wait).
 WARM_BACKOFF_MAX = 120
 WARM_BUILD_FAILED = ("its pages were fetched one by one, but Suwayomi still could not build the chapter "
                      "(page cache cleared, or a page kept failing)")
@@ -620,6 +622,7 @@ def _download_source(client, manga_id, todo, batch, label, source_name, patient,
     ok, failed, why = [], [], {}
     ops = with_cancel(client, cancel)
     i, size, backoff = 0, batch, 0
+    waited = 0                                      # the longest backoff waited since the last success
     max_backoff = config.BACKOFF_MAX if patient else config.BACKOFF_MAX_WITH_FALLBACK
     if warm:
         size = batch = 1                            # one chapter at a time, its pages first
@@ -657,6 +660,9 @@ def _download_source(client, manga_id, todo, batch, label, source_name, patient,
             elif warmed.usable:
                 report(f"{source_name}: chapter {n0:g} - {warmed.fetched} of {warmed.pages} pages cached; "
                        f"Suwayomi is building the chapter ({len(ok)} of {len(todo)} done)")
+        fell_back = ""                              # page by page was skipped: the chapter's reasons say so
+        if warmed is not None and warmed.state == "no_pages":
+            fell_back = f"not fetched page by page ({warmed.why}); "
         if warmed is not None and warmed.state in ("refused", "deadline"):
             outcome, got = warmed.state, []         # never queued: straight to the backoff below
         else:
@@ -722,7 +728,9 @@ def _download_source(client, manga_id, todo, batch, label, source_name, patient,
                 # which no amount of waiting fixes. Do not back off; fail them.
                 for c in chunk:
                     failed.append(c.number)
-                    why[c.number] = "the source has no working pages for this chapter (failed instantly on every try)"
+                    why[c.number] = (fell_back + "the normal download failed instantly on every try" if fell_back
+                                     else "the source has no working pages for this chapter (failed instantly on "
+                                          "every try)")
                 log.warning("%s: %s has no working pages for ch %s - not retrying this run", label, source_name,
                             ranges([c.number for c in chunk]))
                 i += span
@@ -736,12 +744,17 @@ def _download_source(client, manga_id, todo, batch, label, source_name, patient,
             did = {"timeout": "made no progress", "stalled": "errored",
                    "refused": "refused even paced page requests",
                    "deadline": "was too slow even page by page"}[outcome]
-            log.warning("%s: %s %s on ch %g - backing off %ds", label, source_name, did, chunk[0].number, backoff)
-            said = "refused the request" if outcome == "stalled" else did
-            report(f"{source_name} {said} (rate limiting): waiting {backoff} s before retrying chapter "
-                   f"{chunk[0].number:g} ({len(ok)} of {len(todo)} done)")
-            if limits.pause(backoff, cancel):
-                break                               # cancelled: these chapters were simply not reached
+            # a warm-up would not follow the longest backoff: give up at once (a lane
+            # rests the site instead of holding it)
+            if not (outcome in ("refused", "deadline") and backoff >= max_backoff):
+                log.warning("%s: %s %s on ch %g - backing off %ds", label, source_name, did, chunk[0].number,
+                            backoff)
+                said = "refused the request" if outcome == "stalled" else did
+                report(f"{source_name} {said} (rate limiting): waiting {backoff} s before retrying chapter "
+                       f"{chunk[0].number:g} ({len(ok)} of {len(todo)} done)")
+                if limits.pause(backoff, cancel):
+                    break                           # cancelled: these chapters were simply not reached
+                waited = backoff
             if backoff >= max_backoff:
                 rest = [c for c in todo[i:] if c.number not in skip]
                 log.error("%s: giving up on %s at ch %g (%d done, %d left)", label, source_name,
@@ -757,20 +770,21 @@ def _download_source(client, manga_id, todo, batch, label, source_name, patient,
                 else:
                     what = ("Suwayomi reported an error on every try" if outcome == "stalled"
                             else "download made no progress")
+                after = f", gave up after {waited}s of backoff" if waited else ""
                 for c in rest:
-                    why[c.number] = f"{what}, gave up after {backoff}s of backoff"
+                    why[c.number] = (fell_back if c in chunk else "") + what + after
                 break
             continue
         ok.extend(c.number for c in got)
         missed = [c.number for c in chunk if c.id not in have]
         failed.extend(missed)
         for n in missed:
-            why[n] = "Suwayomi finished the batch without this chapter (download error)"
+            why[n] = fell_back + "Suwayomi finished the batch without this chapter (download error)"
         if missed:
             log.warning("%s: %s failed ch %s", label, source_name, ranges(missed))
             if stop_on_fail:
                 break
-        backoff = 0
+        backoff = waited = 0
         if len(got) == len(chunk) and size < batch:
             size = min(batch, size * 2)
         i += span

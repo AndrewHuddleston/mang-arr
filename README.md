@@ -378,7 +378,7 @@ Every status except *have* comes with a reason, shown in the chapter table:
 |---|---|---|
 | `have` | On disk and linked into the library. The reason column shows the library file name instead. | - |
 | `wanted` | Listed by a trusted source, not on disk yet. Downloaded by the next *Search missing*, *Search all wanted now* or scheduled refresh. | *available on Weeb Central (also MangaDex, Bato); not downloaded yet - waiting for a download pass*, with *(rate-limited source: slow)* or *(images fetched page by page: slow)* after the source's name when it is one of those; *not attempted: the download pass was cancelled or interrupted before this chapter*; *not attempted: Suwayomi did not start this chapter within 30 min (its download queue was busy with other downloads)*. A chapter you just took back with *want* shows *waiting for a download pass*. |
-| `failed` | The last download pass tried and could not get it. It is retried on every refresh: the re-resolve puts it back to wanted, then the download runs again. | One entry per source tried, joined with `;`: *Manganato: Suwayomi reported an error on every try, gave up after 300s of backoff*; *MangaDex: download made no progress, gave up after 60s of backoff*; *Bato: Suwayomi finished the batch without this chapter (download error)*; *Comick (Unoriginal) (EN): the image server refused even paced page requests (0 of 20 pages), gave up after 120s of backoff*; *fetching pages one at a time took over 10 min (12 of 30 pages), gave up after 120s of backoff*; *its pages were fetched one by one, but Suwayomi still could not build the chapter (page cache cleared, or a page kept failing)*; *does not list it* (from a per-chapter search). Prefixed *failed on every source:* when the pass ran out of fallbacks; suffixed *(no other source has this chapter)* when there was only one. *no enabled source lists this chapter* when the only entries that have it are disabled. |
+| `failed` | The last download pass tried and could not get it. It is retried on every refresh: the re-resolve puts it back to wanted, then the download runs again. | One entry per source tried, joined with `;`: *Manganato: Suwayomi reported an error on every try, gave up after 300s of backoff*; *MangaDex: download made no progress, gave up after 60s of backoff*; *Bato: Suwayomi finished the batch without this chapter (download error)*; *Comick (Unoriginal) (EN): the image server refused even paced page requests (0 of 20 pages), gave up after 60s of backoff*; *fetching pages one at a time took over 10 min (12 of 30 pages)* (no backoff suffix when another source lists the chapter: it is not tried again there); *not fetched page by page (its page list has a URL that is not a Suwayomi page path); the normal download failed instantly on every try*; *its pages were fetched one by one, but Suwayomi still could not build the chapter (page cache cleared, or a page kept failing)*; *does not list it* (from a per-chapter search). Prefixed *failed on every source:* when the pass ran out of fallbacks; suffixed *(no other source has this chapter)* when there was only one. *no enabled source lists this chapter* when the only entries that have it are disabled. |
 | `unavailable` | It was wanted or failed, but no trusted source lists it any more (the source dropped it, or the entry was distrusted). It becomes wanted again as soon as a source lists it. | *no trusted source lists this chapter any more* |
 | `junk` | A fractional chapter with fewer pages than *Minimum pages for a fractional chapter*: a notice or an ad. Never downloaded; a file for it in staging is not imported. | *3 page(s) on Manganato: a notice image, not a chapter* |
 | `ignored` | You pressed *ignore*. Kept across refreshes; nothing is downloaded until you press *want*. | - |
@@ -884,9 +884,13 @@ requested; any other answer falls back to a normal download. That takes 2-4
 minutes a chapter, so such a source comes last, after normal and
 rate-limited ones: it is used for chapters no other source lists, and
 searched with at most three titles. A chapter whose pages keep being
-refused is backed off like a rate limit (at most 2 minutes) and never
-queued; one that Suwayomi does not build from its cache gets its pages
-fetched once more, then fails with a reason that says so.
+refused is never queued: a warm-up stops when its time is up (20 s a page,
+at least 10 minutes), and the chapter is tried once more after a minute, or
+given up at once when another source lists it. One that Suwayomi does not
+build from its cache gets its pages fetched once more, then fails with a
+reason that says so. A page request that times out is followed by a quick
+question to Suwayomi itself, as a source search is below, so a frozen
+Suwayomi is not taken for a refusing image server.
 
 When Suwayomi stops answering, calls to it fail at once for a minute
 instead of each waiting out its timeouts. A refresh pass then holds for

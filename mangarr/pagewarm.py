@@ -215,20 +215,14 @@ def _fetch_pages(client, chapter, source_name: str, cancel, report, suffix: str,
                 res.state = "cancelled"
                 return
             if _now() > deadline:
-                # Out of time. Mostly on busy answers, that is the image server
-                # refusing (a page busy on every try takes minutes of retries, so
-                # this comes before the count below on all but short chapters).
-                mins = f"{res.limit / 60:.0f} min"
-                if res.busy > res.fetched:
-                    res.state = "refused"
-                    res.why = (f"the image server answered busy {res.busy} times in {mins} "
-                               f"(stopped at page {k} of {total})")
-                else:
-                    res.state, res.why = "deadline", f"stopped at page {k} of {total} after {mins}"
+                _out_of_time(res, k, total)
                 return
             report(f"{source_name}: chapter {n:g} - fetching page {k} of {total} one at a time{suffix}")
             if pace.wait(cancel):
                 res.state = "cancelled"
+                return
+            if _now() > deadline:               # the spacing took it past the chapter's time
+                _out_of_time(res, k, total)
                 return
             r = client.fetch_page(path, timeout=PAGE_TIMEOUT_SECS)
             pace.done(r.status)
@@ -247,6 +241,9 @@ def _fetch_pages(client, chapter, source_name: str, cancel, report, suffix: str,
             res.busy += 1                       # busy or timeout: the image server's, try again later
             if t < PAGE_TRIES:
                 w = min(RETRY_MAX_SECS, max(RETRY_FIRST_SECS, pace.gap()) * 2 ** (t - 1))
+                if _now() + w > deadline:       # the retry would come after the chapter's time is up
+                    _out_of_time(res, k, total)
+                    return
                 report(f"{source_name}: chapter {n:g} - page {k} of {total}: image server busy, retry {t} of "
                        f"{PAGE_TRIES - 1} in {w:.0f} s{suffix}")
                 if _pause(w, cancel):
@@ -261,6 +258,19 @@ def _fetch_pages(client, chapter, source_name: str, cancel, report, suffix: str,
                 res.why = f"{res.failed} pages stayed busy after {PAGE_TRIES} tries each"
                 return
     res.state = "partial" if res.failed else "ok"
+
+
+def _out_of_time(res: WarmResult, k: int, total: int) -> None:
+    """The chapter's time is up at page k. Mostly on busy answers, that is
+    the image server refusing (a page busy on every try takes minutes of
+    retries, so this comes before the failed-page count on all but short
+    chapters)."""
+    mins = f"{res.limit / 60:.0f} min"
+    if res.busy > res.fetched:
+        res.state = "refused"
+        res.why = f"the image server answered busy {res.busy} times in {mins} (stopped at page {k} of {total})"
+    else:
+        res.state, res.why = "deadline", f"stopped at page {k} of {total} after {mins}"
 
 
 def _note_bad_url(source_name: str, n: float, url) -> None:

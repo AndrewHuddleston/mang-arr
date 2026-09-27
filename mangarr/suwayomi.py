@@ -314,11 +314,14 @@ class Client:
         """GET one page image through Suwayomi, which fetches it from the
         source and keeps it in its cache; the bytes are read in pieces and
         thrown away. Only a PAGE_PATH is requested (ValueError otherwise),
-        never through gq. Busy answers (429, 5xx) and timeouts are the image
-        server's, not Suwayomi being down, so they neither trip the breaker
-        nor raise; a refused connection trips it and raises
-        SuwayomiUnreachable, and an open breaker fails at once. A cancel
-        (cancellable copy) cuts the request short with limits.Cancelled."""
+        never through gq. Busy answers (429, 5xx) are the image server's, not
+        Suwayomi being down, so they neither trip the breaker nor raise. So is
+        a timeout, unless Suwayomi then does not answer a status query either
+        (as after a source request in gq): SuwayomiUnreachable, so a hung
+        Suwayomi is not taken for a refusing image server. A refused
+        connection trips the breaker and raises SuwayomiUnreachable, and an
+        open breaker fails at once. A cancel (cancellable copy) cuts the
+        request short with limits.Cancelled."""
         if not isinstance(path, str) or not PAGE_PATH.match(path):
             raise ValueError(f"not a Suwayomi page path: {str(path)[:100]!r}")
         down = self._check_breaker()
@@ -347,6 +350,8 @@ class Client:
                 self._breaker_trip(f"{type(e).__name__}: {e}")
                 raise SuwayomiUnreachable(f"Suwayomi at {self.base} unreachable: {e}") from e
             log.debug("suwayomi page %s -> %s after %.1fs: %s", path, kind, secs, e)
+            if kind == "timeout" and timeout >= PROBE_SECS:     # a short one proves nothing either way
+                self._check_answers("a page request", timeout)
             return PageFetch("timeout" if kind == "timeout" else "error", None, 0, secs)
         secs = time.monotonic() - t0
         if down:

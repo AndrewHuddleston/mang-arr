@@ -4,6 +4,7 @@ between requests to one source (limits.Spacer, pagewarm.PagePacer), a
 chapter's warm-up (pagewarm.warm_chapter) and how the downloader queues a
 chapter only after it, on a fake clock. Only 127.0.0.1 servers and fakes;
 nothing reaches a real Suwayomi."""
+import json
 import logging
 import socket
 import tempfile
@@ -48,6 +49,49 @@ class _PageServer:
         threading.Thread(target=self.httpd.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True).start()
 
     def close(self):
+        self.httpd.shutdown()
+        self.httpd.server_close()
+
+
+class _HungSuwayomi:
+    """A local Suwayomi that answers the page list, then hangs on every page
+    GET; a status query hangs too, unless `answers` (then only the image
+    server behind it is slow)."""
+
+    def __init__(self, answers: bool):
+        self.stop = threading.Event()
+        srv = self
+
+        class H(BaseHTTPRequestHandler):
+            def log_message(self, *a):
+                pass
+
+            def do_POST(self):
+                body = self.rfile.read(int(self.headers.get("Content-Length") or 0))
+                if b"fetchChapterPages" in body:
+                    data = {"fetchChapterPages": {"pages": [PAGE.format(k) for k in range(4)]}}
+                elif b"aboutServer" in body and answers:
+                    data = {"aboutServer": {"version": "v2.0"}}
+                else:
+                    srv.stop.wait(30)
+                    return
+                out = json.dumps({"data": data}).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(out)))
+                self.end_headers()
+                self.wfile.write(out)
+
+            def do_GET(self):
+                srv.stop.wait(30)
+
+        self.httpd = ThreadingHTTPServer(("127.0.0.1", 0), H)
+        self.httpd.daemon_threads = True
+        self.url = f"http://127.0.0.1:{self.httpd.server_address[1]}"
+        threading.Thread(target=self.httpd.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True).start()
+
+    def close(self):
+        self.stop.set()
         self.httpd.shutdown()
         self.httpd.server_close()
 
@@ -156,6 +200,20 @@ class ClientPageTest(unittest.TestCase):
         self.assertEqual(r.status, "timeout")
         self.assertLess(time.monotonic() - t0, 5)
         self.assertEqual(suwayomi._down, {})
+
+    def test_a_page_timeout_asks_whether_suwayomi_itself_answers(self):
+        for answers in (True, False):
+            with self.subTest(answers=answers):
+                srv = _HungSuwayomi(answers)
+                self.addCleanup(srv.close)
+                with mock.patch.object(suwayomi, "PROBE_SECS", 1):
+                    if answers:                                 # only the image server is slow
+                        self.assertEqual(Client(srv.url).fetch_page(PAGE.format(0), timeout=1).status, "timeout")
+                    else:                                       # Suwayomi hangs: not a refusing image server
+                        with self.assertRaises(SuwayomiUnreachable) as cm:
+                            Client(srv.url).fetch_page(PAGE.format(0), timeout=1)
+                        self.assertIn("a page request got no answer in 1 s, and neither did a status query",
+                                      str(cm.exception))
 
     def test_refused_trips_the_shared_breaker(self):
         url = _closed_port_url()
@@ -470,17 +528,17 @@ class WarmUpTest(WarmBase):
         busy = {page_path(1010, p): -1 for p in range(3)}              # 3 of 20 pages always busy
         client = FakePageClient(self.clock, pages=20, busy=busy)
         with self.assertLogs("mangarr", "WARNING") as cm:
-            ok, failed, why = self.run_source(client)                   # no fallback: backs off 60, then 120
+            ok, failed, why = self.run_source(client)                   # no fallback: backs off 60, once
         self.assertEqual(client.kinds().count("enqueue"), 0)            # never queued
         self.assertEqual((ok, failed), ([], [1.0]))
         self.assertEqual(why[1.0], "the image server refused even paced page requests (0 of 20 pages), gave up "
-                                   "after 120s of backoff")
-        self.assertEqual([s for s in self.dl_waits if s >= 60], [60, 120])
+                                   "after 60s of backoff")
+        self.assertEqual([s for s in self.dl_waits if s >= 60], [60])  # no wait before giving up: no try follows
         self.assertEqual((self.memo.throttle, self.memo.gave_up), ({COMICK}, {COMICK}))
         self.assertIn("refused even paced page requests on ch 1 - backing off 60s", "\n".join(cm.output))
         self.assertIn("the image server answered busy 15 times in 10 min (stopped at page 3 of 20)",
                       "\n".join(cm.output))
-        self.assertLess(self.clock.now() - 100.0, 2 * 900 + 180)       # two warm-ups of at most ~15 min each
+        self.assertLess(self.clock.now() - 100.0, 2 * (600 + pagewarm.DELAY_MAX_SECS) + 60)   # two warm-ups
         self.assertTrue(any("(rate limiting): waiting 60 s before retrying chapter 1" in m for m in self.said))
 
     def test_refused_once_more_pages_than_allowed_failed(self):
@@ -495,17 +553,39 @@ class WarmUpTest(WarmBase):
     def test_a_chapter_that_takes_too_long(self):
         client = FakePageClient(self.clock, pages=20, fetch_secs=50.0)  # pages arrive, but slowly
         with self.assertLogs("mangarr", "WARNING"):
-            ok, failed, why = self.run_source(client, patient=False)   # with a fallback: one backoff of 60
+            ok, failed, why = self.run_source(client, patient=False)   # with a fallback: given up at once
         self.assertEqual(client.kinds().count("enqueue"), 0)
         self.assertEqual(failed, [1.0])
-        self.assertRegex(why[1.0], r"^fetching pages one at a time took over 10 min \(1[12] of 20 pages\), gave up "
-                                   r"after 60s of backoff$")
-        self.assertEqual([s for s in self.dl_waits if s >= 60], [60])
+        self.assertRegex(why[1.0], r"^fetching pages one at a time took over 10 min \(1[12] of 20 pages\)$")
+        self.assertEqual([s for s in self.dl_waits if s >= 60], [])
         client = FakePageClient(self.clock, pages=20, fetch_secs=50.0)
         with self.assertLogs("mangarr.pagewarm", "WARNING") as cm:
             r = self.warm(client)
         self.assertEqual((r.state, r.why, r.limit), ("deadline", "stopped at page 13 of 20 after 10 min", 600))
         self.assertIn("12/20 pages fetched in 6", cm.output[0])
+
+    def test_retries_never_run_past_the_chapters_time(self):
+        busy = {page_path(1010, p): -1 for p in range(3)}              # 3 of 4 pages always busy
+        client = FakePageClient(self.clock, pages=4, busy=busy)
+        with self.assertLogs("mangarr.pagewarm", "WARNING"):
+            r = self.warm(client)
+        self.assertEqual((r.state, r.limit), ("refused", 600))
+        self.assertLessEqual(r.secs, r.limit + client.fetch_secs)       # at most the page in flight at the end
+        self.assertLessEqual(self.starts(client)[-1], 100.0 + r.limit)  # no page asked for after it
+
+    def test_a_refused_chapter_holds_its_lane_about_ten_minutes_a_try(self):
+        busy = {page_path(1010, p): -1 for p in range(3)}
+        for patient, tries in ((False, 1), (True, 2)):
+            with self.subTest(patient=patient):
+                self.clock = FakeClock()
+                pagewarm._pacers.clear()
+                client = FakePageClient(self.clock, pages=4, busy=dict(busy))
+                with mock.patch.object(pagewarm, "_now", self.clock.now), self.assertLogs("mangarr", "WARNING"):
+                    ok, failed, why = self.run_source(client, patient=patient)
+                self.assertEqual(failed, [1.0])
+                held = self.clock.now() - 100.0
+                self.assertLess(held, tries * 610 + (tries - 1) * 60)     # was 11.8 and 24.3 min
+                self.assertGreater(held, (tries - 1) * 600)
 
     def test_a_cancel_between_pages(self):
         client = FakePageClient(self.clock, pages=6)
@@ -644,6 +724,18 @@ class WarmUpTest(WarmBase):
         pages = [i for i, e in enumerate(client.events) if e[1] == "page"]
         self.assertEqual(len(pages), 3)
         self.assertLess(max(pages), client.kinds().index("enqueue", 2))  # every page before ch 2 is queued
+
+
+class HungSuwayomiWarmTest(WarmBase):
+    def test_a_hung_suwayomi_is_not_taken_for_a_refusing_image_server(self):
+        suwayomi._down.clear()
+        self.addCleanup(suwayomi._down.clear)
+        srv = _HungSuwayomi(answers=False)
+        self.addCleanup(srv.close)
+        with mock.patch.object(pagewarm, "PAGE_TIMEOUT_SECS", 1), mock.patch.object(suwayomi, "PROBE_SECS", 1), \
+             self.assertRaises(SuwayomiUnreachable):
+            self.run_source(Client(srv.url))
+        self.assertEqual((self.memo.throttle, self.memo.gave_up), (set(), set()))   # no false rate-limit mark
 
 
 class DownloadOneWarmTest(WarmBase):
