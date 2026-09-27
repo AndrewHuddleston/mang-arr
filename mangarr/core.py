@@ -360,7 +360,9 @@ def delete_series(con, client: Client, series_id: int, delete_library: bool = Fa
     this series recorded; Suwayomi's staging files are never touched). The
     Suwayomi entries are taken out of its library so it stops auto-updating
     them, except one another series uses too (the one kept when a series
-    tracked twice is cleaned up); a Suwayomi outage does not block the delete."""
+    tracked twice is cleaned up); a Suwayomi outage does not block the delete.
+    Komga is asked to scan once library files are gone, so the series leaves
+    it now rather than at its next scheduled scan."""
     row = db.get_series(con, series_id)
     title, folder = row["title"], row["folder"]
     for s in db.sources(con, series_id):
@@ -372,26 +374,30 @@ def delete_series(con, client: Client, series_id: int, delete_library: bool = Fa
             client.set_in_library(s["manga_id"], False, retries=1, timeout=10)
         except SuwayomiError as e:
             log.warning("%s: could not unset library flag on %s entry: %s", title, s["source_name"], e)
+    removed = False
     if delete_library and folder:
-        _delete_library_files(con, series_id, title, folder)
+        removed = _delete_library_files(con, series_id, title, folder)
     db.delete_series(con, series_id)
     db.event(con, "deleted", f"{title} removed" + (" with library files" if delete_library else ""))
     con.commit()
     log.info("%s: no longer tracked", title)
+    if removed:
+        komga.scan()
 
 
-def _delete_library_files(con, series_id: int, title: str, folder: str) -> None:
+def _delete_library_files(con, series_id: int, title: str, folder: str) -> bool:
     """Remove the library files this series recorded, then its folder if it is
     empty. Paths come from the database, which a restored backup can fill
     with anything, so only regular files inside this series' own library
     folder (itself inside LIBRARY_ROOT, symlinks resolved) are touched;
-    anything else is skipped with a warning."""
+    anything else is skipped with a warning. Returns whether a file or the
+    folder was removed."""
     import stat
     root = library.config.LIBRARY_ROOT
     d = library.library_dir(folder) if db.valid_folder(folder) else None
     if d is None or not library.is_within(d, root) or os.path.realpath(d) == os.path.realpath(root):
         log.warning("%s: library folder %r is not a folder inside %s; no files deleted", title, folder, root)
-        return
+        return False
     removed = 0
     for c in db.chapters(con, series_id):
         p = c["library_path"]
@@ -415,11 +421,14 @@ def _delete_library_files(con, series_id: int, title: str, folder: str) -> None:
             removed += 1
         except OSError as e:
             log.warning("%s: could not remove %s: %s", title, p, e)
+    gone = False
     try:
         os.rmdir(d)
+        gone = True
     except OSError as e:
         log.info("%s: library folder %s kept: %s", title, d, e)
     log.info("%s: removed %d file(s) from %s", title, removed, d)
+    return bool(removed) or gone
 
 
 # -- import ------------------------------------------------------------------
