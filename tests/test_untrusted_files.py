@@ -3,12 +3,18 @@ come from scraped sites: names fit the filesystem, symlinks are never
 followed, bad archives are set aside instead of breaking the import, and
 one bad chapter never blocks the rest of the series."""
 import errno
+import logging
 import os
 import random
+import struct
+import subprocess
+import sys
 import tempfile
+import threading
 import time
 import unittest
 import zipfile
+import zlib
 from unittest import mock
 
 from mangarr import core, db, library
@@ -47,6 +53,44 @@ def write(path: str, data: bytes) -> None:
 def age(path: str, seconds: float) -> None:
     t = time.time() - seconds
     os.utime(path, (t, t), follow_symlinks=False)
+
+
+def stored(data: bytes) -> tuple:
+    return data, zipfile.ZIP_STORED, zlib.crc32(data), len(data)
+
+
+def deflated(data: bytes) -> tuple:
+    c = zlib.compressobj(9, zlib.DEFLATED, -15)
+    return c.compress(data) + c.flush(), zipfile.ZIP_DEFLATED, zlib.crc32(data), len(data)
+
+
+def build_zip(path: str, entries, zip64: bool = False, count: int | None = None, repeat: int = 1) -> str:
+    """Write a zip by hand, for archives zipfile will not write: entries are
+    (name, stored bytes, method, crc, size). zip64 adds zip64 end records,
+    count overrides the entry count in the end records, and repeat writes
+    the central directory that many times over (the same entries again)."""
+    local, central = bytearray(), bytearray()
+    for name, data, method, crc, size in entries:
+        n = name.encode()
+        central += struct.pack("<4s6H3L5H2L", b"PK\x01\x02", 20, 20, 0, method, 0, 0x21, crc, len(data), size,
+                               len(n), 0, 0, 0, 0, 0, len(local)) + n
+        local += struct.pack("<4s5H3L2H", b"PK\x03\x04", 20, 0, method, 0, 0x21, crc, len(data), size, len(n), 0)
+        local += n + data
+    total = len(entries) * repeat if count is None else count
+    with open(path, "wb") as f:
+        f.write(local)
+        cd_at = f.tell()
+        for i in range(0, repeat, 10000):
+            f.write(bytes(central) * min(10000, repeat - i))
+        cd_size = f.tell() - cd_at
+        if zip64:
+            rec_at = f.tell()
+            f.write(struct.pack("<4sQ2H2L4Q", b"PK\x06\x06", 44, 45, 45, 0, 0, total, total, cd_size, cd_at))
+            f.write(struct.pack("<4sLQL", b"PK\x06\x07", 0, rec_at, 1))
+            f.write(struct.pack("<4s4H2LH", b"PK\x05\x06", 0, 0, 0xFFFF, 0xFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0))
+        else:
+            f.write(struct.pack("<4s4H2LH", b"PK\x05\x06", 0, 0, total, total, cd_size, cd_at, 0))
+    return path
 
 
 class NameLengthTest(unittest.TestCase):
@@ -208,6 +252,109 @@ class VerifyArchiveTest(unittest.TestCase):
         self.assertEqual(verify_archive(make_cbz(os.path.join(self.d, "g.cbz"), 3)), (True, "3 pages"))
 
 
+class ZipBombTest(unittest.TestCase):
+    """verify_archive against archives made to cost time and memory (finding
+    114): refused from the end records or the directory, before zipfile
+    parses the directory or decompresses anything, while real chapters
+    (incompressible pages, a ComicInfo.xml) still pass."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.d = self.tmp.name
+        self.parsed: list = []
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _no_parse(self):
+        """zipfile.ZipFile must not even be constructed."""
+        return mock.patch.object(zipfile, "ZipFile", side_effect=lambda *a, **k: self.parsed.append(a))
+
+    def test_million_entries_refused_fast_and_small(self):
+        p = build_zip(os.path.join(self.d, "million.cbz"), [("0.jpg", *stored(b""))], zip64=True, repeat=1_000_000)
+        self.assertGreater(os.path.getsize(p), 50_000_000)             # a real 1,000,000-entry directory
+        code = ("import resource, sys, time\n"
+                "from mangarr import library\n"
+                "base = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss\n"
+                "t = time.monotonic()\n"
+                "ok, detail = library.verify_archive(sys.argv[1])\n"
+                "grew = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss - base\n"
+                "print(ok, time.monotonic() - t, grew, detail, sep='|')\n")
+        root = os.path.dirname(os.path.dirname(os.path.abspath(library.__file__)))
+        out = subprocess.run([sys.executable, "-c", code, p], capture_output=True, text=True, timeout=120,
+                             env=dict(os.environ, PYTHONPATH=root))
+        ok, secs, grew_kib, detail = out.stdout.strip().split("|", 3)
+        self.assertEqual((ok, detail), ("False", "1000000 entries (limit 5000)"), out.stderr)
+        self.assertLess(float(secs), 1.0)                       # was 19.6 s
+        self.assertLess(int(grew_kib), 16 << 10)                # was 519 MB of peak RSS
+        with self._no_parse(), self.assertLogs("mangarr.library", "WARNING"):
+            self.assertFalse(verify_archive(p)[0])
+        self.assertEqual(self.parsed, [])
+
+    def test_directory_bigger_than_its_end_record_says(self):
+        p = build_zip(os.path.join(self.d, "lying.cbz"), [("0.jpg", *stored(os.urandom(2000)))],
+                      repeat=library.MAX_ENTRIES + 1, count=3)
+        with self._no_parse(), self.assertLogs("mangarr.library", "WARNING"):
+            self.assertEqual(verify_archive(p), (False, "more than 5000 entries (limit 5000)"))
+        p = build_zip(os.path.join(self.d, "names.cbz"), [("x" * 5000 + ".jpg", *stored(os.urandom(2000)))],
+                      repeat=1000)
+        with self._no_parse(), self.assertLogs("mangarr.library", "WARNING"):
+            self.assertIn("bytes of directory", verify_archive(p)[1])
+        self.assertEqual(self.parsed, [])
+
+    def test_zero_pages_refused_before_decompressing(self):
+        page = deflated(b"\0" * (1 << 20))
+        small = deflated(b"\0" * (250 << 10))                  # under the per-entry ratio floor
+        cases = [(2047, page, "uncompressed"),                  # the evidence: 2 GiB, passed after 14 s
+                 (900, page, "expands"),                        # under 1 GiB, but each page expands ~1000x
+                 (4000, small, "byte file")]                    # small pages: the whole file expands ~800x
+        for pages, entry, why in cases:
+            p = build_zip(os.path.join(self.d, f"zeros{pages}.cbz"), [(f"{i:04d}.jpg", *entry) for i in range(pages)])
+            t = time.monotonic()
+            with mock.patch.object(zipfile.ZipFile, "open", side_effect=AssertionError("decompressed")) as opened, \
+                    self.assertLogs("mangarr.library", "WARNING"):
+                ok, detail = verify_archive(p)
+            self.assertFalse(ok, pages)
+            self.assertIn(why, detail)
+            opened.assert_not_called()
+            self.assertLess(time.monotonic() - t, 2.0)
+
+    def test_real_chapters_still_pass(self):
+        rnd = random.Random(1)
+        info = (b'<?xml version="1.0" encoding="utf-8"?><ComicInfo><Series>Title</Series><Number>12</Number>'
+                b"<Summary>" + b"a few words " * 300 + b"</Summary></ComicInfo>")
+        for method in (zipfile.ZIP_DEFLATED, zipfile.ZIP_STORED):
+            p = os.path.join(self.d, f"real{method}.cbz")
+            with zipfile.ZipFile(p, "w", method) as z:
+                for i in range(20):                             # incompressible pages, some over 256 KiB
+                    z.writestr(f"{i:03d}.jpg", rnd.randbytes(rnd.randint(20_000, 400_000)))
+                z.writestr("ComicInfo.xml", info)
+                z.comment = b"scanned by someone"               # the end record is not the last 22 bytes
+            self.assertEqual(verify_archive(p), (True, "20 pages"))
+        p = build_zip(os.path.join(self.d, "zip64.cbz"),       # zip64 end records, which some tools always write
+                      [(f"{i:03d}.png", *deflated(rnd.randbytes(3000))) for i in range(3)]
+                      + [("ComicInfo.xml", *deflated(info))], zip64=True)
+        self.assertEqual(verify_archive(p), (True, "3 pages"))
+
+    def test_unusual_zip64_layout_is_refused(self):
+        p = build_zip(os.path.join(self.d, "z.cbz"), [("0.jpg", *stored(os.urandom(2000)))], zip64=True)
+        data = bytearray(read(p))
+        loc = data.rfind(b"PK\x06\x07")
+        data[loc + 8:loc + 16] = (0).to_bytes(8, "little")     # the locator points somewhere else
+        write(p, bytes(data))
+        with self._no_parse():
+            ok, detail = verify_archive(p)
+        self.assertFalse(ok)
+        self.assertIn("zip64", detail)
+
+    def test_checking_is_time_bounded(self):
+        p = make_cbz(os.path.join(self.d, "g.cbz"), 3)
+        with mock.patch.object(library, "VERIFY_SECONDS", -1), self.assertLogs("mangarr.library", "WARNING"):
+            ok, detail = verify_archive(p)
+        self.assertFalse(ok)
+        self.assertIn("longer than", detail)
+
+
 class CopyFallbackTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -221,7 +368,7 @@ class CopyFallbackTest(unittest.TestCase):
         real = os.link
 
         def fake(src, dst, **kw):
-            if src == self.src:
+            if src in (self.src, os.path.basename(self.src)):     # a path, or a name in its open folder
                 raise OSError(err, os.strerror(err))
             return real(src, dst, **kw)
         return mock.patch.object(library.os, "link", fake)
@@ -261,8 +408,8 @@ class QuarantinePruneTest(unittest.TestCase):
             self.assertTrue(os.path.exists(fresh) and os.path.exists(keep) and not os.path.exists(old))
 
 
-class ImportTest(unittest.TestCase):
-    """core.import_series against a real staging and library tree."""
+class ImportBase(unittest.TestCase):
+    """A real staging and library tree, and a database, for core.import_series."""
 
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -288,6 +435,15 @@ class ImportTest(unittest.TestCase):
                     " chapter_count, max_chapter, folder, seen_at) VALUES (?,?,?,?,0,1,1,1,?,?)",
                     (sid, 7, source_name, title, folder, db.now()))
         return sid
+
+    def _wanted(self, con, sid, *numbers):
+        for n in numbers:
+            con.execute("INSERT INTO chapter (series_id, number, status, updated_at) VALUES (?,?,'wanted',?)",
+                        (sid, n, db.now()))
+
+
+class ImportTest(ImportBase):
+    """core.import_series against a real staging and library tree."""
 
     def test_one_bad_chapter_does_not_block_the_rest(self):
         for n in (1, 2, 3):
@@ -367,6 +523,216 @@ class ImportTest(unittest.TestCase):
         self.assertEqual(rows[1.0]["status"], "failed")
         self.assertIn("not set aside", rows[1.0]["reason"])
         self.assertEqual(rows[2.0]["status"], "have")
+
+
+class StagingSwapTest(ImportBase):
+    """A staging writer swaps the series folder, or a file in it, for a symlink
+    while import runs (finding 113). Import works through the folder it
+    opened, so nothing outside it is ever checked, set aside or linked, and a
+    swap costs at most that one chapter, never the series."""
+
+    def setUp(self):
+        super().setUp()
+        self.victim = os.path.join(self.lib, "Victim")          # another series' library folder
+        os.makedirs(self.victim)
+        age(make_cbz(os.path.join(self.victim, "Chapter 001.0.cbz")), 3600)
+        bad = os.path.join(self.victim, "Chapter 002.0.cbz")    # would be set aside if it were ever checked
+        write(bad, b"PK" + b"x" * 3000)
+        age(bad, 3600)
+        self.before = self._victim()
+
+    def _victim(self):
+        return sorted((e.name, e.inode(), e.stat(follow_symlinks=False).st_size) for e in os.scandir(self.victim))
+
+    def _bad_staged(self, name="Chapter 001.0.cbz"):
+        p = os.path.join(self.folder, name)
+        write(p, b"PK" + b"x" * 3000)                          # corrupt and old: set aside when checked
+        age(p, 3600)
+        return p
+
+    def _swap_folder(self):
+        os.rename(self.folder, self.folder + ".real")
+        os.symlink(self.victim, self.folder)
+
+    def test_folder_swapped_after_the_check(self):
+        self._bad_staged()
+        real = library.verify_archive
+
+        def verify_then_swap(f):
+            res = real(f)
+            self._swap_folder()                                 # the evidence repro, made deterministic
+            return res
+        with db.connect(self.dbpath) as con, mock.patch.object(library, "verify_archive", verify_then_swap), \
+                self.assertLogs("mangarr.core", "WARNING"):
+            sid = self._series(con)
+            self.assertEqual(core.import_series(con, sid), 0)
+        self.assertEqual(self._victim(), self.before)
+        self.assertTrue(os.path.exists(os.path.join(self.folder + ".real", "Chapter 001.0.cbz.corrupt")))
+
+    def test_folder_swapped_before_it_is_opened(self):
+        self._bad_staged()
+        real_dirs = core.series_staging_dirs
+
+        def listed_then_swapped(con, sid):
+            dirs = real_dirs(con, sid)
+            self._swap_folder()
+            return dirs
+        with db.connect(self.dbpath) as con, mock.patch.object(core, "series_staging_dirs", listed_then_swapped), \
+                self.assertLogs("mangarr.core", "WARNING") as cm:
+            sid = self._series(con)
+            self.assertEqual(core.import_series(con, sid), 0)
+        self.assertEqual(self._victim(), self.before)
+        self.assertIn("skipping staging folder", "\n".join(cm.output))
+        self.assertEqual(os.listdir(self.lib), ["Victim"])
+
+    def test_folder_above_swapped_is_refused(self):
+        os.rename(os.path.join(self.staging, "Src (EN)"), os.path.join(self.staging, "moved"))
+        os.symlink(os.path.join(self.staging, "moved"), os.path.join(self.staging, "Src (EN)"))
+        with self.assertRaises(OSError):
+            library.StagingFolder(self.folder)
+        with self.assertRaises(OSError):                        # '..' never leaves the root either
+            library.StagingFolder(os.path.join(self.staging, "..", "library", "Victim"))
+
+    def test_file_swapped_for_a_symlink_fails_that_chapter_only(self):
+        age(make_cbz(os.path.join(self.folder, "Chapter 1.cbz")), 3600)
+        age(make_cbz(os.path.join(self.folder, "Chapter 2.cbz")), 3600)
+        real_scan = library.StagingFolder.scan
+
+        def scan_then_swap(sf):
+            found = real_scan(sf)
+            os.remove(os.path.join(self.folder, "Chapter 1.cbz"))
+            os.symlink(os.path.join(self.victim, "Chapter 001.0.cbz"), os.path.join(self.folder, "Chapter 1.cbz"))
+            return found
+        with db.connect(self.dbpath) as con, mock.patch.object(library.StagingFolder, "scan", scan_then_swap), \
+                self.assertLogs("mangarr.core", "ERROR"):
+            sid = self._series(con)
+            self._wanted(con, sid, 1, 2)
+            self.assertEqual(core.import_series(con, sid), 1)
+            rows = {r["number"]: r for r in db.chapters(con, sid)}
+        self.assertEqual(rows[1.0]["status"], "failed")
+        self.assertIn("symlink", rows[1.0]["reason"])
+        self.assertEqual(rows[2.0]["status"], "have")
+        self.assertEqual(self._victim(), self.before)
+        self.assertTrue(os.path.islink(os.path.join(self.folder, "Chapter 1.cbz")))     # not set aside either
+
+    def test_file_swapped_after_the_check_is_not_linked(self):
+        p = os.path.join(self.folder, "Chapter 1.cbz")
+        age(make_cbz(p), 3600)
+        other = make_cbz(os.path.join(self.tmp.name, "other.cbz"))
+        real = library.verify_archive
+
+        def verify_then_swap(f):
+            res = real(f)
+            os.replace(other, p)                                # a different, unchecked file under the name
+            return res
+        with db.connect(self.dbpath) as con, mock.patch.object(library, "verify_archive", verify_then_swap), \
+                self.assertLogs("mangarr.core", "ERROR"):
+            sid = self._series(con)
+            self._wanted(con, sid, 1)
+            self.assertEqual(core.import_series(con, sid), 0)
+            row = db.chapters(con, sid)[0]
+        self.assertEqual(row["status"], "failed")
+        self.assertIn("replaced", row["reason"])
+        self.assertEqual(os.listdir(os.path.join(self.lib, "Title")), [])      # nothing linked, no temp file left
+
+    def test_file_renamed_away_mid_import_skips_that_chapter(self):
+        self._bad_staged("Chapter 1.cbz")
+        age(make_cbz(os.path.join(self.folder, "Chapter 2.cbz")), 3600)
+        real = library.verify_archive
+
+        def verify_then_rename(f):
+            res = real(f)
+            if f.name == "Chapter 1.cbz":
+                os.rename(f.path, f.path + ".gone")
+            return res
+        with db.connect(self.dbpath) as con, mock.patch.object(library, "verify_archive", verify_then_rename), \
+                self.assertLogs("mangarr.core", "WARNING") as cm:
+            sid = self._series(con)
+            self._wanted(con, sid, 1, 2)
+            self.assertEqual(core.import_series(con, sid), 1)
+            rows = {r["number"]: r for r in db.chapters(con, sid)}
+        self.assertIn("disappeared", "\n".join(cm.output))
+        self.assertEqual((rows[1.0]["status"], rows[2.0]["status"]), ("wanted", "have"))
+
+    def test_is_within_does_not_raise_when_a_link_changes_under_it(self):
+        with mock.patch.object(library.os.path, "realpath", side_effect=FileNotFoundError(2, "gone")):
+            self.assertFalse(library.is_within(self.folder, self.staging))
+
+    def test_folder_flipped_while_importing_in_a_loop(self):
+        """The evidence repro: a thread flips the folder between the real one
+        and a symlink into the library while import runs over and over."""
+        template = os.path.join(self.tmp.name, "bad.cbz")
+        write(template, b"PK" + b"x" * 3000)
+        name = "Chapter 001.0.cbz"
+        real_fd = os.open(self.folder, os.O_RDONLY | os.O_DIRECTORY)     # the real folder, wherever it is
+        self.addCleanup(os.close, real_fd)
+
+        def restage():                                          # put the bad file back once it was set aside
+            try:
+                os.stat(name, dir_fd=real_fd, follow_symlinks=False)
+                return
+            except FileNotFoundError:
+                pass
+            try:
+                os.unlink(name + ".corrupt", dir_fd=real_fd)
+            except FileNotFoundError:
+                pass
+            os.link(template, name, dst_dir_fd=real_fd)       # a link, not a rewrite: keeps each round cheap
+            age(template, 3600)                                 # quarantine touched it
+        restage()
+        real, link = self.folder + ".real", self.folder + ".link"
+        os.symlink(self.victim, link)
+        stop = threading.Event()
+
+        def flip():
+            while not stop.is_set():
+                for a, b in ((self.folder, real), (link, self.folder), (self.folder, link), (real, self.folder)):
+                    try:
+                        os.rename(a, b)
+                    except OSError:
+                        pass
+        counts = {"opened": 0, "refused": 0}
+        real_cls = library.StagingFolder
+
+        class Counting(real_cls):
+            def __init__(self, *a, **kw):
+                try:
+                    super().__init__(*a, **kw)
+                except OSError:
+                    counts["refused"] += 1
+                    raise
+                counts["opened"] += 1
+        logger = logging.getLogger("mangarr")
+        level, interval = logger.level, sys.getswitchinterval()
+        errors: list = []
+        names = [n for n, _, _ in self.before]
+        with db.connect(self.dbpath) as con, mock.patch.object(library, "StagingFolder", Counting):
+            sid = self._series(con, folder=self.folder)
+            con.commit()
+            t = threading.Thread(target=flip, daemon=True)
+            logger.setLevel(logging.CRITICAL)                   # thousands of expected warnings
+            sys.setswitchinterval(1e-5)                         # switch threads often, so the race is hit
+            t.start()
+            try:
+                for i in range(20000):
+                    try:
+                        core.import_series(con, sid)
+                    except Exception as e:                      # was: FileNotFoundError out of realpath
+                        errors.append(f"round {i}: {type(e).__name__}: {e}")
+                    if sorted(os.listdir(self.victim)) != names:
+                        break
+                    restage()
+            finally:
+                stop.set()
+                t.join(10)
+                sys.setswitchinterval(interval)
+                logger.setLevel(level)
+            corrupt = con.execute("SELECT corrupt FROM source_stats").fetchone()
+        self.assertFalse(t.is_alive())
+        self.assertEqual(self._victim(), self.before, f"library files changed in round {i}")
+        self.assertEqual(errors[:3], [])
+        self.assertEqual(sorted(os.listdir(self.lib)), ["Victim"])                 # nothing linked from it
+        self.assertTrue(corrupt and corrupt[0] > 0 and counts["opened"] > 0, (corrupt, counts))
 
 
 class AdoptEntriesTest(unittest.TestCase):
