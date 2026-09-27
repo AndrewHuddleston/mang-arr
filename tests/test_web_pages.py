@@ -3,7 +3,9 @@ Suwayomi and no network; plus the chapter grouping the series page uses."""
 import os
 import re
 import tempfile
+import time
 import unittest
+import urllib.parse
 from unittest import mock
 
 try:
@@ -12,6 +14,7 @@ except (ImportError, RuntimeError):      # web extras or httpx not installed
     TestClient = None
 
 from mangarr import model
+from mangarr.suwayomi import SuwayomiError
 from mangarr.web import views
 
 
@@ -151,7 +154,16 @@ def _fake_gq(query, **kw):
     if "downloadStatus" in query:
         return {"downloadStatus": {"state": "STARTED", "queue": [
             {"state": "DOWNLOADING", "progress": 0.4, "tries": 1, "manga": {"title": "T"}, "chapter": {"name": "Ch 3"}}]}}
+    if "setSettings" in query:
+        raise AssertionError("a page load must never change Suwayomi's settings")
+    if "maxSourcesInParallel" in query:
+        return {"settings": {"maxSourcesInParallel": 1}}
     return {"aboutServer": {"version": "test"}, "sources": {"totalCount": 1}}
+
+
+def _flash(r) -> str:
+    """The flash text a redirect carries."""
+    return urllib.parse.parse_qs(urllib.parse.urlsplit(r.headers["location"]).query)["m"][0]
 
 
 @unittest.skipIf(TestClient is None, "web extras not installed")
@@ -336,6 +348,116 @@ class PagesTest(unittest.TestCase):
         html = self._ok("/system/logs", 'id="log"', "careful", 'class="ln WARNING"', 'id="log-level"', 'id="log-auto"')
         self.assertIn('class="ln INFO"', html)
         self._ok("/login?next=/")                              # no login configured: redirects home (followed)
+
+    def test_settings_download_lanes_and_page_by_page(self):
+        html = self._ok("/settings", "Download Lanes", 'name="download_lanes" value="3"',
+                        "Suwayomi currently allows 1 source in parallel.", "<th>Pages</th>", "one by one",
+                        "Page Delay", 'name="page_delay_seconds" value="2.5"', "fetched page by page")
+        self.assertRegex(html, r'<button class="button small" name="action" value="suwayomi-parallel" '
+                               r'type="submit">Save and let Suwayomi use 3</button>')
+        self.assertRegex(html, r'<input type="checkbox" name="warm_sources" value="weeb central"\s+'
+                               r'aria-label="Fetch Weeb Central page by page">')          # not ticked
+        with mock.patch("mangarr.web.app.client.gq",
+                        lambda q, **kw: {"settings": {"maxSourcesInParallel": 3}} if "maxSources" in q
+                        else _fake_gq(q, **kw)):
+            html = self._ok("/settings", "Suwayomi currently allows 3 sources in parallel.")
+        self.assertNotIn('value="suwayomi-parallel"', html)                   # enough: no button
+        with mock.patch("mangarr.web.app.client.sources", side_effect=SuwayomiError("down")):
+            html = self._ok("/settings", "Suwayomi currently allows - sources in parallel (it did not answer).",
+                            'colspan="6"')
+        self.assertNotIn('value="suwayomi-parallel"', html)
+
+    def test_one_by_one_ticks_round_trip(self):
+        from mangarr import settings
+        default = settings.DEFAULTS["page_warm_sources"]
+        form = {"sources_listed": "1", "listed_sources": ["weeb central", "mangadex"],
+                "enabled_sources": ["weeb central", "mangadex"],
+                "warm_sources": ["weeb central", "not listed (en)"]}
+        r = self.client.post("/settings", data=form, follow_redirects=False)
+        self.assertEqual((r.status_code, _flash(r)), (303, "saved"))
+        # ticks only count for the sources on the page; sources not installed now keep their entry
+        self.assertEqual(settings.all_values()["page_warm_sources"], sorted({*default, "weeb central"}))
+        self.assertRegex(self.client.get("/settings").text,
+                         r'name="warm_sources" value="weeb central"\s+checked')
+        r = self.client.post("/settings", data={**form, "warm_sources": []}, follow_redirects=False)
+        self.assertEqual(settings.all_values()["page_warm_sources"], sorted(default))
+        self.client.post("/settings", data={**form, "warm_sources": ["weeb central"]})
+        r = self.client.post("/settings", data={"refresh_hours": "5"}, follow_redirects=False)   # no Sources table
+        self.assertEqual(r.status_code, 303)
+        self.assertEqual(settings.all_values()["page_warm_sources"], sorted({*default, "weeb central"}))
+        self.assertEqual(settings.all_values()["refresh_hours"], 5.0)
+
+    def test_let_suwayomi_use_the_lanes(self):
+        from mangarr import settings
+        sent = []
+
+        def gq(query, variables=None, **kw):
+            if "setSettings" in query:
+                sent.append((query, variables))
+                return {"setSettings": {"settings": {"maxSourcesInParallel": variables["n"]}}}
+            return _fake_gq(query, **kw)
+        with mock.patch("mangarr.web.app.client.gq", gq):
+            r = self.client.post("/settings", data={"download_lanes": "4", "action": "suwayomi-parallel"},
+                                 follow_redirects=False)
+            self.assertEqual(r.status_code, 303)
+            self.assertEqual(_flash(r), "Suwayomi now downloads from up to 4 sources at once")
+            self.assertEqual(settings.all_values()["download_lanes"], 4)                 # saved first
+            self.assertEqual(len(sent), 1)
+            self.assertIn("setSettings(input: {settings: {maxSourcesInParallel: $n}})", sent[0][0])
+            self.assertEqual(sent[0][1], {"n": 4})
+            r = self.client.post("/settings", data={"download_lanes": "99"}, follow_redirects=False)
+            self.assertEqual(len(sent), 1)                                               # only on the button
+            self.assertEqual(settings.all_values()["download_lanes"], 8)                 # clamped
+            r = self.client.post("/settings", data={"download_lanes": "many", "action": "suwayomi-parallel"},
+                                 follow_redirects=False)
+            self.assertTrue(_flash(r).startswith("invalid value, nothing saved"))
+            self.assertEqual(len(sent), 1)                                               # nothing saved: not sent
+
+        def down(query, variables=None, **kw):
+            raise SuwayomiError("unreachable in tests")
+        with mock.patch("mangarr.web.app.client.gq", down):
+            r = self.client.post("/settings", data={"action": "suwayomi-parallel"}, follow_redirects=False)
+        self.assertEqual(_flash(r), "could not change Suwayomi's setting: unreachable in tests")
+        with mock.patch("mangarr.web.app.client.gq", lambda q, **kw: {"setSettings": None}):
+            r = self.client.post("/settings", data={"action": "suwayomi-parallel"}, follow_redirects=False)
+        self.assertEqual(_flash(r), "could not change Suwayomi's setting: unexpected answer (TypeError)")
+
+    def test_activity_shows_the_lanes_and_series_waiting_for_one(self):
+        from mangarr import jobs
+        job = jobs.Job(7, "refresh-all", "every monitored series", status="running")
+        job.items = [{"series_id": self.sid, "title": "Alpha Manga", "state": "running",
+                      "result": "Weeb Central: chapter 3 - downloading"},
+                     {"series_id": self.season_id, "title": "Season Webtoon", "state": "waiting",
+                      "result": "waiting for Weeb Central: busy with Alpha Manga"},
+                     {"series_id": 99, "title": "Not Yet", "state": "queued", "result": ""}]
+        job.lanes = [{"lane": 1, "source": "Weeb Central", "series_id": self.sid, "title": "Alpha Manga",
+                      "text": "Weeb Central: chapter 3 - downloading", "since": time.time() - 90},
+                     {"lane": 2, "source": None, "series_id": None, "title": None, "text": "", "since": None}]
+        with mock.patch.object(self.web.runner, "jobs", lambda: [job]):
+            html = self._ok("/activity", "Download lanes: 1 of 2 busy", "Current refresh-all pass: 0 of 3 series",
+                            "1 queued", "1 waiting", "waiting for Weeb Central: busy with Alpha Manga")
+        lanes = html[html.index('id="lanes"'):html.index('id="pass"')]
+        self.assertRegex(lanes, rf'<td>Weeb Central</td>\s*<td><a href="/series/{self.sid}">Alpha Manga</a></td>\s*'
+                                r'<td class="small message">Weeb Central: chapter 3 - downloading</td>\s*'
+                                r'<td class="col-date nowrap">1m ago</td>')
+        self.assertRegex(lanes, r'<td class="num muted">2</td>\s*<td class="muted" colspan="4">idle</td>')
+        m = re.search(r'<tr class="queue-row pass-waiting" data-status="(\w+)">\s*<td class="col-icon">'
+                      r'<svg class="ic sm" aria-hidden="true"><use href="#i-(\w+)"/>', html)
+        self.assertEqual(m.groups(), ("active", "clock"))
+        self.assertRegex(html[m.end():], r'^(?:(?!</tr>)[\s\S])*<span class="label default medium[^"]*">waiting</span>')
+        job.lanes = []                                                              # the pass ended
+        with mock.patch.object(self.web.runner, "jobs", lambda: [job]):
+            self.assertNotIn("Download lanes", self._ok("/activity"))
+
+    def test_system_page_marks_page_by_page_sources(self):
+        comick = _FakeSource("Comick (Unoriginal) (EN)")
+        comick.page_warm, comick.tier = True, 2
+        with mock.patch("mangarr.web.app.client.sources", lambda *a, **k: [comick, _FakeSource("Weeb Central")]):
+            html = self._ok("/system", "Comick (Unoriginal) (EN)")
+        self.assertRegex(html, r'<td>Comick \(Unoriginal\) \(EN\)</td><td class="muted">en</td>\s*'
+                               r'<td><span class="label warning medium[^"]*">page by page</span></td>')
+        self.assertRegex(html, r'<td>Weeb Central</td><td class="muted">en</td>\s*'
+                               r'<td><span class="label success medium[^"]*">ok</span></td>')
 
     def test_shell(self):
         html = self._ok("/wanted", 'id="health"', 'id="status"', 'id="sidebar"', "/static/app.js",

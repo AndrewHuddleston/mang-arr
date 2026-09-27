@@ -86,7 +86,7 @@
   <thead><tr><th>Source</th><th>Language</th><th>State</th></tr></thead>
   <tbody>
   {% for s in sources %}<tr><td>{{ s.name }}</td><td class="muted">{{ s.lang }}</td>
-  <td>{% if s.unusable %}{{ m.label('disabled', 'danger') }}{% elif s.throttled %}{{ m.label('throttled', 'warning') }}{% else %}{{ m.label('ok', 'success') }}{% endif %}</td></tr>{% endfor %}
+  <td>{% if s.unusable %}{{ m.label('disabled', 'danger') }}{% elif s.page_warm %}{{ m.label('page by page', 'warning') }}{% elif s.throttled %}{{ m.label('throttled', 'warning') }}{% else %}{{ m.label('ok', 'success') }}{% endif %}</td></tr>{% endfor %}
   {% if not sources %}<tr><td colspan="3" class="muted">Suwayomi unreachable - source list unavailable</td></tr>{% endif %}
   </tbody></table></div>
 </fieldset>

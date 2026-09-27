@@ -1336,13 +1336,15 @@ def settings_page(request: Request):
     except SuwayomiError as e:
         sources = []
         log.error("settings page: suwayomi unreachable: %s", e)
+    # Suwayomi's 'max sources in parallel', next to Download Lanes; not asked when it just failed to answer
+    cap = ui_client.max_sources_in_parallel() if sources else None
     with db.connect() as con:
         stats = db.source_stats(con)
     komga_ok, _, komga_test = (views.flash_from(request.query_params, "komga_test") or "").partition(":")
     values = settings.all_values()
     return page(request, "settings.html", v=settings.masked(values), bad_urls=settings.invalid_urls(values),
                 sources=sources, komga_test=komga_test, komga_ok=(komga_ok == "1"), stats=stats,
-                auto_days=db.AUTO_THROTTLE_DAYS)
+                auto_days=db.AUTO_THROTTLE_DAYS, suwayomi_cap=cap, lanes=int(limits.setting("download_lanes")))
 
 
 @app.post("/settings")
@@ -1354,7 +1356,8 @@ async def settings_save(request: Request):
 def _settings_save(request: Request, form) -> Response:
     values = {}
     for key in settings.DEFAULTS:
-        if key in ("unusable_sources", "throttled_sources", "api_key") or key in settings.INTERNAL_KEYS:
+        if key in ("unusable_sources", "throttled_sources", "page_warm_sources", "api_key") \
+                or key in settings.INTERNAL_KEYS:
             continue                           # handled below / detected / Regenerate button / never from a form
         if isinstance(settings.DEFAULTS[key], list):
             if key in form:
@@ -1365,6 +1368,10 @@ def _settings_save(request: Request, form) -> Response:
         enabled = {str(x).lower().strip() for x in form.getlist("enabled_sources")}
         listed = {str(x).lower().strip() for x in form.getlist("listed_sources")}
         values["unusable_sources"] = sorted(listed - enabled)
+        # "one by one": the ticks for the sources on the page; entries for sources not installed now are kept
+        warm = {str(x).lower().strip() for x in form.getlist("warm_sources")}
+        stored = set(settings.all_values()["page_warm_sources"])
+        values["page_warm_sources"] = sorted((stored - listed) | (warm & listed))
     epoch = settings.all_values()["session_epoch"]
     try:
         with db.connect() as con:
@@ -1397,6 +1404,17 @@ def _settings_action(action: str, notice: str) -> Response:
             return _flash("/settings", "nothing to test: fill in that channel first" + extra)
         parts = [f"{notify.CHANNELS[k][0]}: {'sent' if r is True else r}" for k, r in res.items()]
         return _flash("/settings", "; ".join(parts) + extra)
+    if action == "suwayomi-parallel":
+        # the one place mang-arr changes Suwayomi's own 'max sources in parallel': a button the user presses
+        n = int(limits.setting("download_lanes"))
+        try:
+            m = ui_client.set_max_sources_in_parallel(n)
+        except (SuwayomiError, KeyError, TypeError, ValueError) as e:
+            why = str(e) if isinstance(e, SuwayomiError) else f"unexpected answer ({type(e).__name__})"
+            log.warning("could not set Suwayomi's max sources in parallel to %d: %s", n, why)
+            return _flash("/settings", f"could not change Suwayomi's setting: {why}{extra}")
+        log.info("Suwayomi's max sources in parallel set to %d from the Settings page", m)
+        return _flash("/settings", f"Suwayomi now downloads from up to {m} sources at once{extra}")
     return _flash("/settings", "saved" + extra)
 
 

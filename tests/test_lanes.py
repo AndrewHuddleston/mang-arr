@@ -176,6 +176,29 @@ class PoolTest(PoolBase):
         self.assertEqual({i["state"] for i in self.job.items}, {"done"})
         self.assertEqual((self.job.lanes, self.job.active_series_ids), ([], frozenset()))
 
+    def test_the_activity_page_sees_every_lane(self):
+        # job.lanes lists every lane of the running pass, idle ones with source None (Activity: "1 of 3 busy")
+        fake = self.fake(lanes=3)
+        plans = {"S1": [entry(fake, "Site A", 1, "S1", [1, 2, 3, 4])]}
+        seen = []
+
+        def sample(pool, series):
+            deadline = time.monotonic() + 10
+            while time.monotonic() < deadline and not seen:
+                if any(ln["source"] for ln in self.job.lanes):
+                    seen.append(self.job.lanes)
+                threading.Event().wait(0.001)
+        series = self.run_all(fake, plans, before_close=sample)
+        self.assertTrue(seen, "no lane was ever seen busy")
+        self.assertEqual([ln["lane"] for ln in seen[0]], [1, 2, 3])
+        busy = [ln for ln in seen[0] if ln["source"]]
+        self.assertEqual([(ln["source"], ln["series_id"], ln["title"]) for ln in busy], [("Site A", series[0][0], "S1")])
+        self.assertIsInstance(busy[0]["since"], float)
+        self.assertEqual([ln for ln in seen[0] if not ln["source"]],
+                         [{"lane": k, "source": None, "series_id": None, "title": None, "text": "", "since": None}
+                          for k in (1, 2, 3) if k != busy[0]["lane"]])
+        self.assertEqual(self.job.lanes, [])                                 # the pass ended
+
     def test_the_lane_count_caps_the_sites_at_once(self):
         fake = self.fake(lanes=2)
         plans = {f"S{k}": [entry(fake, f"Site {k}", k, f"S{k}", [1, 2, 3])] for k in range(1, 6)}

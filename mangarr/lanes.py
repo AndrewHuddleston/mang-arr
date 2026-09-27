@@ -48,6 +48,8 @@ PIPELINE_MAX_WAITING = 50
 # how long the end of a pass waits for the lanes to finish their step
 SHUTDOWN_JOIN_SECS = 100
 LANE_DIED = "download worker stopped unexpectedly"
+# job.lanes entry of a lane between steps
+_IDLE = {"source": None, "series_id": None, "title": None, "text": "", "since": None}
 # item states of a series the pass is done with
 FINISHED = ("done", "nomatch", "failed", "error")
 
@@ -560,7 +562,7 @@ class LanePool:
         line, the series being downloaded) and the lane gauges. Replaced,
         never changed in place, so a page render never sees half of it."""
         job = self.job
-        job.lanes = [{"lane": k, **v} for k, v in sorted(self._lane_state.items())]
+        job.lanes = [{"lane": k, **self._lane_state.get(k, _IDLE)} for k in range(1, self.lanes + 1)]
         job.active_series_ids = frozenset([t.series_id for t in self._busy.values()] + list(self._finishing))
         done = sum(1 for it in job.items if it.get("state") in FINISHED)
         parts = [f"{done}/{len(job.items)} done"]

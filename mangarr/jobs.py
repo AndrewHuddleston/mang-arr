@@ -47,7 +47,8 @@ class Job:
     # the one it resolves, and the ones its download lanes download or write
     active_series_id: int | None = None
     active_series_ids: frozenset = frozenset()
-    # a pass's download lanes at work: [{lane, source, series_id, title, text, since}]
+    # every download lane of a running pass: [{lane, source, series_id, title, text, since}]
+    # (source None: the lane is idle between steps)
     lanes: list = field(default_factory=list)
     # a multi-series job (refresh pass) lists every series it covers:
     # {series_id, title, state: queued|running|done|nomatch|failed|error|cancelled, result}

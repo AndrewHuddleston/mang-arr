@@ -400,6 +400,36 @@ class SameSiteCsrfTest(WebBase):
         anon.close()
 
 
+class SuwayomiSettingButtonTest(WebBase):
+    """Settings -> Download Lanes: 'Save and let Suwayomi use N' is the one place mang-arr changes a
+    Suwayomi setting. It sits behind the login and the cross-site check like every other settings POST."""
+    login = ("andy", "pw")
+
+    def test_needs_the_login_and_a_same_origin_post(self):
+        sent = []
+
+        def gq(query, variables=None, **kw):
+            sent.append(variables)
+            return {"setSettings": {"settings": {"maxSourcesInParallel": variables["n"]}}}
+        with mock.patch.object(self.web.client, "gq", gq):
+            form = {"download_lanes": "5", "action": "suwayomi-parallel"}
+            with self.assertLogs("mangarr.web.app", logging.WARNING):
+                r = self.client.post("/settings", data=form, follow_redirects=False)   # not signed in
+            self.assertEqual(r.status_code, 401)
+            self.signin()
+            for headers in ({"Origin": "https://evil.example"}, {"Origin": "http://testserver:4567",
+                                                                  "Sec-Fetch-Site": "same-site"}):
+                with self.assertLogs("mangarr.web.app", logging.WARNING):
+                    r = self.client.post("/settings", data=form, headers=headers, follow_redirects=False)
+                self.assertEqual(r.status_code, 403, headers)
+            self.assertEqual(sent, [])
+            self.assertEqual(self.settings.all_values()["download_lanes"], 3)
+            r = self.client.post("/settings", data=form, headers={"Origin": "http://testserver"},
+                                 follow_redirects=False)
+            self.assertEqual(r.status_code, 303)
+            self.assertEqual(sent, [{"n": 5}])
+
+
 class LoginTest(WebBase):
     login = ("andy", "pw")
 

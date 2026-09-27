@@ -721,10 +721,11 @@ class PacerTest(WarmBase):
 
 
 class _HealthSources:
-    """health._compute's view of Suwayomi: a version and these sources."""
+    """health._compute's view of Suwayomi: a version, these sources and its
+    'max sources in parallel' (None: cannot be read)."""
 
-    def __init__(self, sources):
-        self._sources = sources
+    def __init__(self, sources, cap=3):
+        self._sources, self.cap, self.asked = sources, cap, 0
 
     def gq(self, query, *a, **k):
         return {"aboutServer": {"version": "v2"}, "sources": {"totalCount": len(self._sources)}}
@@ -732,9 +733,16 @@ class _HealthSources:
     def sources(self):
         return list(self._sources)
 
+    def max_sources_in_parallel(self):
+        self.asked += 1
+        return self.cap
 
-class PageWarmHealthTest(unittest.TestCase):
-    def checks(self, sources):
+    def set_max_sources_in_parallel(self, n):
+        raise AssertionError("a health check must never change Suwayomi's settings")
+
+
+class _HealthBase(unittest.TestCase):
+    def checks(self, sources, cap=3, lanes=None):
         with tempfile.TemporaryDirectory() as tmp, \
              mock.patch("mangarr.config.DB_PATH", tmp + "/t.db"), \
              mock.patch("mangarr.config.STAGING_ROOT", tmp), mock.patch("mangarr.config.LIBRARY_ROOT", tmp), \
@@ -744,10 +752,17 @@ class PageWarmHealthTest(unittest.TestCase):
              mock.patch.dict(health._cache, {"at": 0.0, "checks": []}):
             settings._cache.clear()
             try:
-                return {c.name: c for c in health._compute(_HealthSources(sources))}
+                if lanes is not None:
+                    from mangarr import db
+                    with db.connect() as con:
+                        settings.set_many(con, {"download_lanes": lanes})
+                self.client = _HealthSources(sources, cap)
+                return {c.name: c for c in health._compute(self.client)}
             finally:
                 settings._cache.clear()
 
+
+class PageWarmHealthTest(_HealthBase):
     def test_a_usable_page_by_page_source(self):
         c = self.checks([Source("1", COMICK, "en", page_warm=True), Source("2", "Weeb Central", "en")])
         self.assertEqual(c["Page-by-page sources"].level, "ok")
@@ -761,6 +776,40 @@ class PageWarmHealthTest(unittest.TestCase):
                          f"{COMICK} is set to page by page but disabled in Settings -> Sources; tick it to use it "
                          "for chapters no other source has.")
         self.assertNotIn("Page-by-page sources", self.checks([Source("2", "Weeb Central", "en")]))
+
+
+class LanesHealthTest(_HealthBase):
+    """The "Download lanes" check: Download Lanes against Suwayomi's 'max sources in parallel'. A warning
+    at most (only an error pages), and Suwayomi's setting is only read."""
+    SOURCES = [Source("2", "Weeb Central", "en")]
+
+    def test_enough(self):
+        c = self.checks(self.SOURCES, cap=6)["Download lanes"]
+        self.assertEqual((c.level, c.detail), ("ok", "3 lanes; Suwayomi allows 6"))
+
+    def test_suwayomi_allows_fewer(self):
+        c = self.checks(self.SOURCES, cap=1)["Download lanes"]
+        self.assertEqual(c.level, "warning")
+        self.assertEqual(c.detail, "Suwayomi allows 1 source in parallel but Download Lanes is 3: downloads from "
+                                   "different sources take turns. Raise it on the Settings page.")
+        c = self.checks(self.SOURCES, cap=2, lanes=5)["Download lanes"]
+        self.assertIn("Suwayomi allows 2 sources in parallel but Download Lanes is 5", c.detail)
+
+    def test_cannot_be_read(self):
+        c = self.checks(self.SOURCES, cap=None)["Download lanes"]
+        self.assertEqual(c.level, "warning")
+        self.assertIn("could not be read, so a pass downloads from one source at a time", c.detail)
+
+    def test_one_lane_does_not_ask(self):
+        c = self.checks(self.SOURCES, cap=None, lanes=1)["Download lanes"]
+        self.assertEqual(c.level, "ok")
+        self.assertEqual(self.client.asked, 0)
+
+    def test_never_an_error(self):
+        for cap in (None, 1, 2, 3, 8):
+            for lanes in (1, 3, 8):
+                self.assertNotEqual(self.checks(self.SOURCES, cap=cap, lanes=lanes)["Download lanes"].level,
+                                    "error", (cap, lanes))
 
 
 if __name__ == "__main__":
