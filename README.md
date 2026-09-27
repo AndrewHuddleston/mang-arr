@@ -210,6 +210,7 @@ applies to the next job.
 |---|---|
 | Sources: disabled / throttled | One row per Suwayomi source, two checkboxes. Defaults from `MANGARR_UNUSABLE_SOURCES` and `MANGARR_THROTTLED_SOURCES`. |
 | Refresh every (hours) | The scheduler and the daemon pick a change up within seconds. |
+| Download in order | On by default. Each series downloads strictly in chapter order, one chapter at a time; a chapter that fails is tried on the other sources at once, and if none can deliver it the series waits there (later chapters show "waiting for chapter N") while the pass carries on with the next series. Off: chapters are fetched from whichever source has them, faster but out of order and with possible gaps. |
 | Re-check complete finished series every (days) | A pass does series with missing chapters first, then the rest; a *finished* series with nothing missing is skipped until this many days (default 7) have passed since its last check. 0 re-checks everything every pass. |
 | Minimum pages for a fractional chapter | A `12.5` with fewer pages than this is treated as a notice image and marked junk. Default 8. |
 | Komga URL, API key, library id | When URL and key are set, every import that linked at least one chapter asks Komga to scan (the given library, or all of them). The key comes from Komga's account menu → API keys. *Save & test Komga* lists the libraries it can see; the health check calls the same API. |

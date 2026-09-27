@@ -28,6 +28,7 @@ log = logging.getLogger(__name__)
 
 DEFAULTS: dict[str, object] = {
     "refresh_hours": config.REFRESH_HOURS,
+    "download_in_order": True,       # per series, strictly in chapter order; a stuck chapter holds only its series
     "recheck_finished_days": 7.0,   # a finished series with nothing missing is re-checked this often
     "min_pages": config.MIN_PAGES,
     "throttled_delay_seconds": 8.0,  # pause between chapters on a rate-limited source (avoids 429 -> long backoff)

@@ -114,9 +114,6 @@ class FallbackTest(unittest.TestCase):
         self.assertEqual(res[1.0], "ok")
 
 
-if __name__ == "__main__":
-    unittest.main()
-
 
 class DownloadOneTest(unittest.TestCase):
     def test_download_one(self):
@@ -130,3 +127,51 @@ class DownloadOneTest(unittest.TestCase):
             self.assertFalse(ok)
             self.assertEqual(failed, [4.0])
             self.assertIn(4.0, why)
+
+
+class InOrderTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.patches = [mock.patch("mangarr.downloader.time.sleep", lambda s: None),
+                        mock.patch("mangarr.config.DB_PATH", self.tmp.name + "/test.db"),
+                        mock.patch("mangarr.config.LOCK_PATH", self.tmp.name + "/lock")]
+        for p in self.patches:
+            p.start()
+
+    def tearDown(self):
+        for p in self.patches:
+            p.stop()
+        self.tmp.cleanup()
+
+    def run_in_order(self, client, plan, only):
+        reasons = {}
+        res = downloader.download(client, plan, only=only, reasons=reasons, in_order=True)
+        return res, reasons
+
+    def test_stops_at_a_chapter_no_source_has(self):
+        a = match("A", 1, [1, 2, 3, 4, 5])
+        client = FakeClient(broken={1030})                      # ch 3 is dead on the only source
+        res, reasons = self.run_in_order(client, plan_for([a]), {1.0, 2.0, 3.0, 4.0, 5.0})
+        self.assertEqual(res, {1.0: "ok", 2.0: "ok", 3.0: "failed"})
+        self.assertNotIn(4.0, res)                              # never downloaded past the gap
+        self.assertIn("waiting for chapter 3", reasons[4.0])
+        self.assertIn("waiting for chapter 3", reasons[5.0])
+        self.assertNotIn(1040, client.have)
+
+    def test_fallback_keeps_the_order(self):
+        a, b = match("A", 1, [1, 2, 3, 4]), match("B", 2, [1, 2, 3, 4])
+        client = FakeClient(broken={1030})                      # ch 3 dead on A, fine on B
+        res, _ = self.run_in_order(client, plan_for([a, b]), {1.0, 2.0, 3.0, 4.0})
+        self.assertEqual(res, {1.0: "ok", 2.0: "ok", 3.0: "ok", 4.0: "ok"})
+        self.assertIn(2030, client.have)
+
+    def test_off_downloads_past_the_gap(self):
+        a = match("A", 1, [1, 2, 3, 4])
+        client = FakeClient(broken={1030})
+        res = downloader.download(client, plan_for([a]), only={1.0, 2.0, 3.0, 4.0}, in_order=False)
+        self.assertEqual(res[4.0], "ok")
+        self.assertEqual(res[3.0], "failed")
+
+
+if __name__ == "__main__":
+    unittest.main()

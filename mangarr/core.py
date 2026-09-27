@@ -218,8 +218,8 @@ def download_wanted(con, client: Client, series_id: int, plan: Plan,
             msg += f"; ... {len(failed) - 5} more"
     db.event(con, "downloaded", msg[:900], series_id)
     for n in wanted:
-        if n not in results:                      # the pass ended (cancelled/interrupted) before this one
-            db.set_status(con, series_id, n, "wanted",
+        if n not in results:                      # waiting for an earlier chapter, or the pass was cut short
+            db.set_status(con, series_id, n, "wanted", reasons.get(n) or
                           "not attempted: the download pass was cancelled or interrupted before this chapter")
     con.commit()
     return results

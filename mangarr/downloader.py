@@ -58,7 +58,8 @@ def download_lock(path: str | None = None):
 
 def download(client: Client, plan: Plan, only: set[float] | None = None,
              should_cancel: Callable[[], bool] | None = None, reasons: dict | None = None,
-             progress: Callable[[str], None] | None = None, throttled: set | None = None) -> dict:
+             progress: Callable[[str], None] | None = None, throttled: set | None = None,
+             in_order: bool | None = None) -> dict:
     """Returns {chapter_number: 'ok' | 'failed'} for every chapter attempted.
     Chapters not reached before a cancel are simply absent. When `reasons`
     is given it is filled with a human-readable reason per failed chapter."""
@@ -77,6 +78,17 @@ def download(client: Client, plan: Plan, only: set[float] | None = None,
     cancel = should_cancel or (lambda: False)
     report = progress or (lambda m: None)
     seen_throttle = throttled if throttled is not None else set()
+    from . import settings
+    if in_order is None:
+        in_order = bool(settings.get("download_in_order"))
+    if in_order:
+        try:
+            with download_lock():
+                _download_in_order(client, plan, sorted(pending), attempt, dead, tried, results, reasons,
+                                   cancel, report, seen_throttle, label)
+        except Cancelled:
+            log.warning("%s: download cancelled; %d done", label, sum(1 for r in results.values() if r == "ok"))
+        return results
     try:
         with download_lock():
             while pending:
@@ -131,6 +143,71 @@ def download(client: Client, plan: Plan, only: set[float] | None = None,
     return results
 
 
+def _download_in_order(client, plan, order, attempt, dead, tried, results, reasons, cancel, report,
+                       seen_throttle, label) -> None:
+    """Strictly in chapter order. Consecutive chapters that come from the same
+    source are fetched together; a chapter that fails is retried on its other
+    sources at once; a chapter no source can deliver stops the series there,
+    and the later chapters wait for it (their reason says so)."""
+    def next_source(n):
+        cands = plan.candidates[n]
+        while attempt[n] < len(cands) and cands[attempt[n]].manga_id in dead:
+            attempt[n] += 1
+        return cands[attempt[n]] if attempt[n] < len(cands) else None
+
+    idx = 0
+    while idx < len(order):
+        if cancel():
+            raise Cancelled()
+        n = order[idx]
+        if results.get(n) == "ok":
+            idx += 1
+            continue
+        m = next_source(n)
+        if m is None:
+            cands = plan.candidates[n]
+            results[n] = "failed"
+            only_one = len(cands) == 1
+            reasons[n] = "; ".join(tried.get(n) or [c.source.name for c in cands]) + \
+                (" (no other source has this chapter)" if only_one else "")
+            waiting = [x for x in order[idx + 1:] if results.get(x) != "ok"]
+            for x in waiting:
+                reasons[x] = (f"waiting for chapter {n:g}: chapters download in order and {n:g} failed on every "
+                              "source (it is retried on schedule; turn off 'download in order' to skip ahead)")
+            log.warning("%s: ch %g failed on every source; stopping here, %d later chapter(s) wait for it",
+                        label, n, len(waiting))
+            return
+        batch = 1                                # one at a time: a failure never lets a later chapter in
+        run, j = [n], idx + 1
+        while j < len(order) and len(run) < 20:
+            x = order[j]
+            if results.get(x) != "ok":
+                nx = next_source(x)
+                if nx is None or nx.manga_id != m.manga_id:
+                    break
+                run.append(x)
+            j += 1
+        chapters = {c.number: c for c in m.chapters}
+        todo = [chapters[x] for x in run if x in chapters]
+        patient = all(attempt[x] + 1 >= len(plan.candidates[x]) for x in run)
+        log.info("%s: downloading %d chapter(s) of %r from %s in order [%s]%s", label, len(todo), m.title,
+                 m.source.name, ranges(run), "" if patient else " (fallbacks available)")
+        ok, failed, why = _download_source(client, m.manga_id, todo, batch, label, m.source.name, patient, cancel,
+                                           report, seen_throttle, stop_on_fail=True)
+        for x in ok:
+            results[x] = "ok"
+        if not failed:
+            idx = j
+            continue
+        if not ok:
+            dead.add(m.manga_id)
+            log.warning("%s: %s delivered nothing this run; not retrying it", label, m.source.name)
+        for x in failed:
+            attempt[x] += 1
+            tried.setdefault(x, []).append(f"{m.source.name}: {why.get(x, 'failed')}")
+        idx = order.index(min(failed))          # resume at the first chapter that did not arrive
+
+
 def download_one(client: Client, manga_id: int, chapter, label: str, source_name: str) -> tuple[bool, list, dict]:
     """One chapter from one source entry, under the download lock. Returns
     (ok, failed numbers, {number: why})."""
@@ -140,7 +217,8 @@ def download_one(client: Client, manga_id: int, chapter, label: str, source_name
     return bool(ok), failed, why
 
 
-def _download_source(client, manga_id, todo, batch, label, source_name, patient, cancel, report, seen_throttle):
+def _download_source(client, manga_id, todo, batch, label, source_name, patient, cancel, report, seen_throttle,
+                     stop_on_fail: bool = False):
     """Returns (ok numbers, failed numbers, {number: why it failed}). `report`
     receives one-line progress messages for the Activity page."""
     from . import settings
@@ -159,7 +237,7 @@ def _download_source(client, manga_id, todo, batch, label, source_name, patient,
         client.enqueue(ids)
         client.start()
         t_start = time.monotonic()
-        outcome = _wait(client, ids, cancel)
+        outcome = _wait(client, ids, cancel, every=2 if len(ids) == 1 else 5)
         instant = outcome == "stalled" and time.monotonic() - t_start < INSTANT_FAIL_SECS
         if outcome in ("stalled", "timeout", "cancelled"):
             try:
@@ -180,6 +258,8 @@ def _download_source(client, manga_id, todo, batch, label, source_name, patient,
             log.warning("%s: %s has no working pages for ch %s - not retrying this run", label, source_name,
                         ranges([c.number for c in chunk]))
             i += len(chunk)
+            if stop_on_fail:
+                break
             time.sleep(2)
             continue
         if outcome in ("stalled", "timeout") and not got:
@@ -210,6 +290,8 @@ def _download_source(client, manga_id, todo, batch, label, source_name, patient,
             why[n] = "Suwayomi finished the batch without this chapter (download error)"
         if missed:
             log.warning("%s: %s failed ch %s", label, source_name, ranges(missed))
+            if stop_on_fail:
+                break
         backoff = 0
         if len(got) == len(chunk) and size < batch:
             size = min(batch, size * 2)
