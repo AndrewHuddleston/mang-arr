@@ -9,9 +9,10 @@ except ImportError:                      # web extras not installed
     web = None
 
 
-def row(title, status="RELEASING", wanted=0, monitored=1, last=None, sid=None):
+def row(title, status="RELEASING", wanted=0, monitored=1, last=None, sid=None, have=10, error=None, listed=None):
     return {"id": sid, "title": title, "status": status, "wanted": wanted, "monitored": monitored,
-            "last_resolved": last}
+            "last_resolved": last, "have": have, "last_error": error,
+            "listed": have + wanted if listed is None else listed}
 
 
 def ago(days):
@@ -58,9 +59,26 @@ class PassTest(unittest.TestCase):
         self.assertTrue(all(line.startswith("DEBUG:") for line in cm.output))
 
     def test_skip_text(self):
-        self.assertEqual(web._skip_text("FINISHED", 3), "skipped: complete and finished; next check in about 3 day(s)")
-        self.assertEqual(web._skip_text("CANCELLED", 1),
+        self.assertEqual(web._skip_text(row("A", "FINISHED"), 3),
+                         "skipped: complete and finished; next check in about 3 day(s)")
+        self.assertEqual(web._skip_text(row("A", "CANCELLED"), 1),
                          "skipped: complete and cancelled; next check in about 1 day(s)")
+        self.assertEqual(web._skip_text(row("A", "FINISHED", have=38, listed=40), 2),      # 2 unavailable
+                         "skipped: finished, nothing to download (2 chapter(s) no source lists); next check in "
+                         "about 2 day(s)")
+
+    def test_a_series_with_nothing_on_disk_is_never_complete(self):
+        now = ago(0.1)
+        rows = [row("A no source matched", "CANCELLED", last=now, sid=1, have=0, listed=0,
+                    error="no usable source has this series"),
+                row("B every chapter unavailable", "FINISHED", last=now, sid=2, have=0, listed=40),
+                row("C matched before, not this time", "FINISHED", last=now, sid=3, error="no usable source has "
+                                                                                           "this series"),
+                row("D complete", "FINISHED", last=now, sid=4)]
+        with mock.patch("mangarr.web.app.settings.get", lambda k: 7.0):
+            keep, skippable = web.plan_pass(rows, {})
+        self.assertEqual([r["title"] for r in keep], [r["title"] for r in rows[:3]])
+        self.assertEqual([r["title"] for r, _ in skippable], ["D complete"])
 
 
 @unittest.skipIf(web is None, "web extras not installed")

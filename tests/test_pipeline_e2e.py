@@ -224,7 +224,9 @@ class CompleteSeriesTest(PipelineBase):
     def test_the_status_check_failing_skips_them_as_planned(self):
         fake = self.fake()
         with db.connect() as con:
-            db.upsert_series(con, Series(english="Done", status="CANCELLED"))
+            sid = db.upsert_series(con, Series(english="Done", status="CANCELLED"))
+            con.execute("INSERT INTO chapter (series_id, number, status, updated_at) VALUES (?, 1, 'have', ?)",
+                        (sid, db.now()))
             con.execute("UPDATE series SET last_resolved=?", (db.now(),))
             con.commit()
 
@@ -236,6 +238,20 @@ class CompleteSeriesTest(PipelineBase):
             web._job_refresh_all(job)
         self.assertEqual([(i["state"], i["result"]) for i in job.items],
                          [("skipped", "skipped: complete and cancelled; next check in about 7 day(s)")])
+
+
+    def test_a_series_no_source_has_is_not_complete(self):
+        # nothing matched: the resolve still stamps last_resolved, but the series has nothing, so every
+        # pass looks again instead of calling it complete for a week
+        fake = self.fake()
+        with db.connect() as con:
+            db.upsert_series(con, Series(english="Nobody Has It", status="CANCELLED", chapters=40))
+        for _ in range(2):
+            job = jobs.Job(1, "refresh-all", "all")
+            with mock.patch.object(web, "client", fake), mock.patch.object(core, "resolve", resolver_for(fake, {})), \
+                    mock.patch.object(web.metadata, "statuses", lambda refs: {}):
+                web._job_refresh_all(job)
+            self.assertEqual([i["state"] for i in job.items], ["nomatch"])
 
 
 class DueFirstTest(PipelineBase):

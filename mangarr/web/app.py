@@ -203,12 +203,12 @@ def plan_pass(rows, due: dict | None = None) -> tuple[list, list]:
     chapters and failed ones whose next attempt is due, db.chapters_due;
     without it, any wanted or failed chapter counts), then continuing
     (RELEASING) series, then the rest, each group in the order given.
-    Unmonitored series are left out. A finished or cancelled series with no
-    wanted or failed chapter that was checked less than
-    recheck_finished_days ago is in none of these: those come back
-    separately as (row, days until its next check), for the end of the pass
-    (_run_pass skips them unless their status changed). Returns (rows,
-    skippable)."""
+    Unmonitored series are left out. A finished or cancelled series that is
+    complete (_complete: chapters on disk, nothing wanted or failed, no
+    error) and was checked less than recheck_finished_days ago is in none
+    of these: those come back separately as (row, days until its next
+    check), for the end of the pass (_run_pass skips them unless their
+    status changed). Returns (rows, skippable)."""
     days = limits.clamp("recheck_finished_days", settings.get("recheck_finished_days") or 0)
     now_ = time.time()
     groups: tuple[list, list, list] = ([], [], [])
@@ -217,7 +217,7 @@ def plan_pass(rows, due: dict | None = None) -> tuple[list, list]:
         if not r["monitored"]:
             continue
         n_due = due.get(r["id"], 0) if due is not None else r["wanted"]
-        if days and r["status"] in COMPLETE_STATUSES and not r["wanted"] and r["last_resolved"]:
+        if days and _complete(r) and r["last_resolved"]:
             try:
                 left = time.mktime(time.strptime(r["last_resolved"], "%Y-%m-%d %H:%M:%S")) + days * 86400 - now_
             except ValueError:
@@ -234,9 +234,21 @@ def plan_pass(rows, due: dict | None = None) -> tuple[list, list]:
     return groups[0] + groups[1] + groups[2], skippable
 
 
-def _skip_text(status: str, days_left: int) -> str:
-    return (f"skipped: complete and {'cancelled' if status == 'CANCELLED' else 'finished'}; next check in about "
-            f"{days_left} day(s)")
+def _complete(r) -> bool:
+    """A finished or cancelled series with chapters on disk and nothing
+    wanted or failed (failed ones keep their retry schedule), whose last
+    check went through: not one no source matched, nor one whose chapters
+    all went unavailable."""
+    return r["status"] in COMPLETE_STATUSES and not r["wanted"] and bool(r["have"]) and not r["last_error"]
+
+
+def _skip_text(r, days_left: int) -> str:
+    """The item text of a complete finished series the pass skips."""
+    status = "cancelled" if r["status"] == "CANCELLED" else "finished"
+    gone = (r["listed"] or 0) - (r["have"] or 0)            # nothing wanted or failed: unavailable ones
+    what = f"{status}, nothing to download ({gone} chapter(s) no source lists)" if gone > 0 else \
+        f"complete and {status}"
+    return f"skipped: {what}; next check in about {days_left} day(s)"
 
 
 class PassStopped(SuwayomiUnreachable):
@@ -320,7 +332,7 @@ def _run_pass(job: jobs.Job, rows, label: str, skippable=()) -> tuple[int, int, 
                         item["state"], item["result"] = "cancelled", "pass cancelled"
                         continue
                 if not _goes_on(r, status_now.get(r["ref"])):
-                    item["state"], item["result"] = "skipped", _skip_text(r["status"], later[r["id"]][1])
+                    item["state"], item["result"] = "skipped", _skip_text(r, later[r["id"]][1])
                     continue
             say(head)
             item["state"], item["result"] = "running", "checking sources"
