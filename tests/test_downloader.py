@@ -447,17 +447,46 @@ class RateLimitTest(unittest.TestCase):
         def run(chapter):
             memo = downloader.RunMemo(shared=shared)                   # each series of the pass has its own
             downloader._download_source(client, 1, [chapter], 1, "T", "A", True, lambda: False, lambda m: None, memo)
-            return memo.unstarted
+            return memo.unstarted, memo.unqueued
         with self.assertLogs("mangarr.downloader", "WARNING"):
-            self.assertEqual(run(a.chapters[0]), [1.0])
+            self.assertEqual(run(a.chapters[0]), ([1.0], []))          # queued, not started
         with self.assertLogs("mangarr.downloader", "INFO") as cm:
-            self.assertEqual(run(a.chapters[1]), [2.0])
+            self.assertEqual(run(a.chapters[1]), ([], [2.0]))          # not even queued
         self.assertIn("not queueing ch 2 there now", "\n".join(cm.output))
         self.assertEqual(client.enqueued, [[1010]])
         self.clock.advance(downloader.QUEUED_BUSY_SECS)
         with self.assertLogs("mangarr.downloader", "WARNING"):
-            self.assertEqual(run(a.chapters[2]), [3.0])                # tried again after a while
+            self.assertEqual(run(a.chapters[2]), ([3.0], []))          # tried again after a while
         self.assertEqual(client.enqueued, [[1010], [1030]])
+
+    def test_a_chapter_never_queued_says_so(self):
+        # the second series of a pass does not queue on the busy source at all: its reason must not
+        # claim Suwayomi was given the chapter and did not start it
+        shared, client = downloader.PassShared(), BusyForOneSource()
+        shared.note_unstarted("A", self.clock.now())
+        for in_order in (True, False):
+            with self.subTest(in_order=in_order):
+                reasons = {}
+                plan = plan_for([match("A", 1, [1, 2, 3]), match("B", 2, [1, 2])])
+                steps = downloader.SeriesSteps(plan, {1.0, 2.0, 3.0}, in_order, "T", reasons)
+                memo = downloader.RunMemo(shared=shared)
+                run = steps.take("a", set())
+                with self.assertLogs("mangarr.downloader", "INFO"):
+                    ok, failed, why = downloader._download_source(client, 1, run.todo, run.batch, "T", "A",
+                                                                  run.patient, lambda: False, lambda m: None, memo)
+                self.assertEqual((ok, failed, memo.unstarted, memo.unqueued), ([], [], [], [1.0, 2.0, 3.0]))
+                steps.record(run, ok, failed, why)
+                steps.not_started(run, memo.unqueued, queued=False)
+                while keys := steps.wants(set()):
+                    run = steps.take(keys[0], set())
+                    self.assertEqual(run.match.source.name, "B")
+                    steps.record(run, [c.number for c in run.todo], [], {})
+                self.assertEqual(steps.results, {1.0: "ok", 2.0: "ok"})
+                self.assertEqual(reasons[3.0], "not attempted: A is busy with other downloads; tried again next pass")
+                self.assertEqual(downloader.busy_source(reasons[3.0]), "A")
+                self.assertEqual(steps.tried[3.0], ["A: not queued: its download queue was busy with other downloads"])
+        self.assertEqual(client.enqueued, [])
+        self.assertIsNone(downloader.busy_source(downloader.UNSTARTED_REASON))
 
     def test_download_one_says_it_was_not_started(self):
         a = match("A", 1, [4])

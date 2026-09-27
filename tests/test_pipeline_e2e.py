@@ -335,12 +335,19 @@ class StopTest(PipelineBase):
         for r in rows:
             st = self.status(r["id"])
             self.assertEqual({n: s for n, (s, _) in st.items()}, {1.0: "have", 2.0: "have", 3.0: "wanted"})
-            self.assertEqual(st[3.0][1], downloader.UNSTARTED_REASON)
+        first, *others = rows
+        self.assertEqual(self.status(first["id"])[3.0][1], downloader.UNSTARTED_REASON)
+        for r in others:                                    # never queued: the reason says just that
+            self.assertEqual(self.status(r["id"])[3.0][1],
+                             f"not attempted: {X} is busy with other downloads; tried again next pass")
         self.assertEqual(out, (3, 6, 6, 0))
-        for it in job.items:
+        self.assertEqual((job.items[0]["state"], job.items[0]["result"]),
+                         ("done", "2 downloaded; 1 not started (Suwayomi's download queue was busy with other "
+                                  "downloads)"))
+        for it in job.items[1:]:
             self.assertEqual((it["state"], it["result"]),
-                             ("done", "2 downloaded; 1 not started (Suwayomi's download queue was busy with other "
-                                      "downloads)"))
+                             ("done", f"2 downloaded; 1 not attempted ({X} busy with other downloads; tried again "
+                                      "next pass)"))
         with db.connect() as con:
             self.assertEqual(db.auto_throttled(con), set())
         self.assertEqual(fake.items, [])

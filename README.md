@@ -901,7 +901,9 @@ their next source, like a failure but without marking the source as
 rate-limited; a chapter no other source lists waits for the next pass, and
 the pass shows the series as *failed* (*N not started*) when nothing of it
 arrived. For 30 minutes after that nothing more of the pass is queued on
-that source.
+that source: chapters that were due there go on to their next source, and
+one no other source lists says *not attempted: (source) is busy with other
+downloads; tried again next pass*.
 
 Some image servers (Comick's) answer the burst of page requests Suwayomi
 makes for a chapter with HTTP 429, yet serve the same pages one at a time.

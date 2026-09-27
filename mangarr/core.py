@@ -141,6 +141,8 @@ def describe_outcome(con, series_id: int, o: Outcome) -> tuple[str, str]:
     later = [r for r in rows if r["status"] == "failed" and r["next_try"] and r["next_try"] > now_]
     unavailable = sum(1 for r in rows if r["status"] == "unavailable")
     unstarted = sum(1 for r in rows if r["status"] == "wanted" and r["reason"] == downloader.UNSTARTED_REASON)
+    # left for the next pass without being queued: the source's queue was busy with other downloads
+    busy = [b for r in rows if r["status"] == "wanted" and (b := downloader.busy_source(r["reason"]))]
     parts = []
     state = "done"
     if o.results:
@@ -157,8 +159,11 @@ def describe_outcome(con, series_id: int, o: Outcome) -> tuple[str, str]:
     if unstarted:
         # Suwayomi's queue did not get to them: nothing arrived, which the user must hear about
         parts.append(f"{unstarted} not started (Suwayomi's download queue was busy with other downloads)")
-        if not o.downloaded:
-            state = "failed"
+    if busy:
+        parts.append(f"{len(busy)} not attempted ({', '.join(sorted(set(busy))[:3])} busy with other downloads; "
+                     "tried again next pass)")
+    if (unstarted or busy) and not o.downloaded:
+        state = "failed"
     if later:
         nxt = min(r["next_try"] for r in later)[:16]
         parts.append(f"{len(later)} failed chapter(s) waiting for retry (next {nxt})")

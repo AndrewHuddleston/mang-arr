@@ -569,6 +569,8 @@ class LanePool:
             task.steps.record(run, ok, failed, why)
             if memo.unstarted:
                 task.steps.not_started(run, memo.unstarted)
+            if memo.unqueued:
+                task.steps.not_started(run, memo.unqueued, queued=False)
             self.outages.ok()
             rest = limits.setting("throttled_delay_seconds") if src.throttled or self.shared.seen(src.name) else 0.0
             if src.name in memo.gave_up:

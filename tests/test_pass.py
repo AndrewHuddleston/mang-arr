@@ -62,6 +62,20 @@ class RunPassTest(unittest.TestCase):
         self.assertEqual(job.items[2]["result"], "no match: rejected titles: X")
         self.assertEqual((done, errors), (3, 1))          # done = processed, errors included
 
+    def test_the_stop_text_counts_only_what_the_stop_cut(self):
+        items = [{"state": "cancelled", "result": "series was deleted"},
+                 {"state": "cancelled", "result": "pass stopped: Suwayomi is not answering after 2 chapter(s) "
+                                                  "downloaded"},
+                 {"state": "error", "result": "x"},
+                 {"state": "cancelled", "result": "pass stopped: Suwayomi is not answering"},
+                 {"state": "done", "result": "1 downloaded"},
+                 {"state": "cancelled", "result": "pass stopped: Suwayomi is not answering"}]
+        self.assertEqual(web._pass_stopped_text(items, 5, "why"),
+                         "pass stopped after 5 of 6 series, 1 not checked, 1 not downloaded, 1 downloaded in part: "
+                         "Suwayomi is not answering (why)")
+        self.assertEqual(web._pass_stopped_text(items[:1], 1, "why"),
+                         "pass stopped after 1 of 1 series: Suwayomi is not answering (why)")
+
 
 if __name__ == "__main__":
     unittest.main()

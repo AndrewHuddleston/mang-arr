@@ -9,6 +9,7 @@ import asyncio
 import dataclasses
 import logging
 import os
+import re
 import sqlite3
 import threading
 import time
@@ -356,16 +357,23 @@ def _run_pass(job: jobs.Job, rows, label: str) -> tuple[int, int, int, int]:
     return done, downloaded, imported, errors
 
 
+_CUT = re.compile(r"pass (?:cancelled|stopped: .*?)(?: after (\d+) chapter\(s\) downloaded)?\Z", re.S)
+
+
 def _pass_stopped_text(items: list, reached: int, why: str) -> str:
     """The message of a pass Suwayomi stopped: how far the resolve got, the
-    series it never checked, and the checked ones that were stopped before
-    their chapters were downloaded (the download lanes stop with it)."""
+    series it never checked, and the checked ones the stop cut (the download
+    lanes stop with it): before any of their chapters arrived, or after some
+    did. A series that finished, failed or was deleted meanwhile is none of
+    these."""
     parts = []
     if len(items) > reached:
         parts.append(f"{len(items) - reached} not checked")
-    cut = sum(1 for it in items[:reached] if it["state"] == "cancelled")
-    if cut:
-        parts.append(f"{cut} not downloaded")
+    cut = [m for it in items[:reached] if it["state"] == "cancelled" and (m := _CUT.match(it.get("result") or ""))]
+    if none := sum(1 for m in cut if not m.group(1)):
+        parts.append(f"{none} not downloaded")
+    if partly := len(cut) - none:
+        parts.append(f"{partly} downloaded in part")
     return (f"pass stopped after {reached} of {len(items)} series" + "".join(f", {p}" for p in parts)
             + f": Suwayomi is not answering ({why})")
 
