@@ -492,6 +492,14 @@ running database keeps working. A restore is refused while any job is
 queued or running (cancel it on the Queue page first), and runs on the job
 worker, so no job can start until it is done.
 
+An uploaded file is written straight into `$MANGARR_DATA/backups` (not the
+container's `/tmp`, which lives on the Docker host's system disk) and moved
+into the restore from there. Only one upload is accepted at a time (a second
+one is refused at once), an upload that sends nothing for 30 seconds is cut
+off, and an upload is refused, before the first byte and while it arrives,
+when it would leave less than 256 MB free on that disk. A refused or cut-off
+upload leaves nothing behind.
+
 ### CLI
 
 ```
@@ -942,7 +950,8 @@ What the web server refuses, and what to do if it refuses you:
   anything else (for example a public name like `manga.example.com` behind
   a reverse proxy) gets 400 with that hint. `/api/v1/ping` is exempt.
 - **Large requests.** Bodies over 1 MB get 413 (the backup upload takes up
-  to `MANGARR_MAX_UPLOAD_MB`).
+  to `MANGARR_MAX_UPLOAD_MB`, one at a time, and is cut off after 30 s
+  without data; see Backups).
 - **Password guessing.** Failed sign-ins (login page and basic auth alike)
   are counted per client address: after 5 failures in 15 minutes each
   further attempt is refused with 429 for 2 s, 4 s, 8 s ... up to 15

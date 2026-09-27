@@ -10,6 +10,7 @@ import dataclasses
 import logging
 import os
 import sqlite3
+import threading
 import time
 import urllib.parse
 from collections import deque
@@ -42,7 +43,7 @@ from .. import (
 )
 from ..resolver import ranges
 from ..suwayomi import BREAKER_SECS, Client, SuwayomiError, SuwayomiUnreachable
-from . import lists_routes, security, views
+from . import lists_routes, security, uploads, views
 
 log = logging.getLogger(__name__)
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -1053,7 +1054,6 @@ def _restore_exclusive(title: str, fn) -> str:
     restore (checking only before the restore left a window in which a
     scheduled refresh could start and write into the restored database).
     Raises backup.RestoreError when refused."""
-    import threading
     if (why := _restore_guard()):
         raise backup.RestoreError(why)
     if not runner._thread.is_alive():               # no worker (not started): nothing can run alongside
@@ -1099,56 +1099,53 @@ def system_backups_restore(name: str):
     return _flash("/system", msg)
 
 
-class _UploadTooLarge(Exception):
-    pass
+# One restore upload at a time: each one holds up to backup.upload_limit() on the data volume while it
+# arrives, so parallel (or stalled) uploads could fill the disk that Suwayomi, Komga and the database share.
+_upload_slot = threading.Lock()
 
 
-async def _limited_body(request: Request, limit: int):
-    """The request body, aborted once it passes `limit` bytes (also for a
-    chunked upload that sends no Content-Length)."""
-    n = 0
-    async for chunk in request.stream():
-        n += len(chunk)
-        if n > limit:
-            raise _UploadTooLarge()
-        yield chunk
+def _upload_refused(msg: str) -> Response:
+    """The flash redirect for a refused upload. The connection is closed
+    afterwards, so the server does not go on reading a body nobody wants."""
+    resp = _flash("/system", msg)
+    resp.headers["Connection"] = "close"
+    return resp
 
 
 @app.post("/system/backups/upload")
 async def system_backups_upload(request: Request):
     if (why := _restore_guard()):
-        return _flash("/system", why)
-    limit = backup.upload_limit()
-    too_big = f"restore refused: the file is larger than the upload limit ({limit // 1048576} MB)"
+        return _upload_refused(why)
+    if not request.headers.get("content-type", "").lower().startswith("multipart/form-data"):
+        return _upload_refused("choose a .db file to restore")
+    if not _upload_slot.acquire(blocking=False):
+        log.warning("backup upload from %s refused: another upload is still in progress", security.client_ip(request))
+        return _upload_refused("restore refused: another backup upload is in progress; try again when it has finished")
+    spool = None
     try:
-        declared = int(request.headers.get("content-length") or 0)
-    except ValueError:
-        declared = 0
-    if declared > limit:
-        log.warning("backup upload refused: %d bytes declared, the limit is %d", declared, limit)
-        return _flash("/system", too_big)
-    if not request.headers.get("content-type", "").startswith("multipart/form-data"):
-        return _flash("/system", "choose a .db file to restore")
-    from starlette.concurrency import run_in_threadpool
-    from starlette.formparsers import MultiPartException, MultiPartParser
-    parser = MultiPartParser(request.headers, _limited_body(request, limit), max_files=1, max_fields=5)
-    try:
-        form = await parser.parse()                 # the file part is spooled once, to a temporary file
-    except _UploadTooLarge:
-        log.warning("backup upload refused: the body passed the limit of %d bytes", limit)
-        return _flash("/system", too_big)
-    except MultiPartException as e:
-        return _flash("/system", f"restore refused: {e}")
-    try:
-        up = form.get("file")
-        if up is None or not getattr(up, "filename", ""):
-            return _flash("/system", "choose a .db file to restore")
-        # blocking work (copy, checks, swap) runs off the event loop, on the job worker
-        msg = await run_in_threadpool(_restore_exclusive, f"uploaded {up.filename}", lambda: backup.restore(up.file))
+        try:
+            declared = int(request.headers.get("content-length") or 0)
+        except ValueError:
+            declared = 0
+        # size and free-space checks, then the file part streams into the backups folder (not /tmp)
+        spool = await run_in_threadpool(backup.UploadSpool, declared)
+        name = await uploads.receive(request, spool)
+        if not name:
+            return _upload_refused("choose a .db file to restore")
+        # blocking work (checks, swap) runs off the event loop, on the job worker; the file is moved, not copied
+        msg = await run_in_threadpool(_restore_exclusive, f"uploaded {name}", lambda: backup.restore(spool))
+    except uploads.Disconnected:
+        log.info("backup upload cancelled: the client went away after %d bytes", spool.size if spool else 0)
+        return Response(status_code=400)
+    except uploads.UploadError as e:
+        log.warning("backup upload refused after %d bytes: %s", spool.size if spool else 0, e)
+        return _upload_refused(f"restore refused: {e}")
     except backup.FAILURES as e:
-        return _flash("/system", f"restore refused: {e}")
+        return _upload_refused(f"restore refused: {e}")
     finally:
-        await form.close()
+        if spool is not None:
+            spool.discard()                       # a partial or refused upload (restore() moved a used one away)
+        _upload_slot.release()
     return _flash("/system", msg)
 
 
