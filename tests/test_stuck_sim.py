@@ -401,7 +401,7 @@ class Sim:
         self.stats["fractional chapters with a short copy"] += len({n for _, n in self.model.short})
         return plan
 
-    def import_series(self, con, series_id, client=None):
+    def import_series(self, con, series_id, client=None, downloaded=None):
         """What arrived is linked, unless the library already has another file under its name, or checking the
         file runs out of time this once (core.not_linked: the next import tries again)."""
         rows = {r["number"]: r for r in db.chapters(con, series_id)}

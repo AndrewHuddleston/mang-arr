@@ -232,6 +232,19 @@ MIGRATIONS = [
                                                                           --   had listed it answered in
     ALTER TABLE stuck ADD COLUMN high_since TEXT;
     """,
+    # 17: one-time maintenance tasks an upgrade schedules, run once on the
+    #     next start (see maintenance_due): the check of the library links
+    #     0.3.0 made under misread chapter numbers (relink.py), for a
+    #     database that has library links (a new one has nothing to check)
+    """
+    CREATE TABLE IF NOT EXISTS maintenance (
+      name            TEXT PRIMARY KEY,       -- the task (relink.TASK)
+      due_at          TEXT NOT NULL,          -- when an upgrade scheduled it
+      done_at         TEXT                    -- when it last ran to the end; NULL: still due
+    );
+    INSERT OR IGNORE INTO maintenance (name, due_at) SELECT 'check-library-links', datetime('now', 'localtime')
+      WHERE EXISTS (SELECT 1 FROM chapter WHERE status = 'have' AND library_path IS NOT NULL);
+    """,
 ]
 
 
@@ -350,6 +363,25 @@ def _backfill_listing(con) -> None:
         missed = (1 if when >= cutoff else LISTING_GRACE_RESOLVES) if gone else 0
         con.execute("UPDATE chapter SET listed=?, listed_at=?, unlisted=?, missed=? WHERE series_id=? AND number=?",
                     (listed, when, int(gone), missed, sid, n))
+
+
+def maintenance_due(con) -> set[str]:
+    """The one-time tasks an upgrade scheduled (migration 17) that have not
+    run to the end yet."""
+    return {r[0] for r in con.execute("SELECT name FROM maintenance WHERE done_at IS NULL")}
+
+
+def maintenance_done(con, name: str) -> None:
+    """A one-time task (or the same task run by hand) ran to the end."""
+    con.execute("INSERT INTO maintenance (name, due_at, done_at) VALUES (?,?,?)"
+                " ON CONFLICT(name) DO UPDATE SET done_at=excluded.done_at", (name, now(), now()))
+
+
+def maintenance_due_again(con, name: str) -> None:
+    """A task that could not do all of its work (a service it needs did not
+    answer) is due again: the next start or pass runs it (maintenance_due)."""
+    con.execute("INSERT INTO maintenance (name, due_at) VALUES (?,?)"
+                " ON CONFLICT(name) DO UPDATE SET done_at=NULL", (name, now()))
 
 
 def valid_folder(folder) -> bool:

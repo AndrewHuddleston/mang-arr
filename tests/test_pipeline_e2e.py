@@ -505,12 +505,12 @@ class EndTest(PipelineBase):
                                             if t.name.startswith("mangarr-lane-")]))
             go.set()
 
-        def slow_import(con, sid, client=None):
+        def slow_import(con, sid, client=None, downloaded=None):
             if threading.current_thread().name.startswith("mangarr-lane-") and not importing.is_set():
                 importing.set()
                 threading.Timer(1.0, release).start()
                 go.wait(10)
-            return real_import(con, sid, client)
+            return real_import(con, sid, client, downloaded=downloaded)
 
         def resolve(client, series, **kw):
             if series.title == "S1":

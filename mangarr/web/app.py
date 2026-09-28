@@ -43,6 +43,7 @@ from .. import (
     metrics,
     model,
     notify,
+    relink,
     settings,
     stuck,
     updates,
@@ -98,6 +99,7 @@ async def lifespan(app: FastAPI):
         _startup_security()
     except Exception as e:
         log.error("could not open the database at %s: %s", config.DB_PATH, e)
+    _queue_maintenance()
     updates.start_background()
     backup.start_background()
     stuck.fetcher.start()                    # MangaDex lookups for the chapters series are stuck behind
@@ -106,6 +108,21 @@ async def lifespan(app: FastAPI):
              config.LIBRARY_ROOT)
     yield
     log.info("web shutting down")
+
+
+def _queue_maintenance() -> None:
+    """Queue the one-time tasks an upgrade scheduled (db.maintenance_due):
+    at start they run before the first refresh pass; after each pass, one
+    that could not finish runs again."""
+    try:
+        with db.connect() as con:
+            due = db.maintenance_due(con)
+    except Exception as e:
+        log.error("cannot read the one-time tasks an upgrade scheduled: %s: %s", type(e).__name__, e)
+        return
+    if relink.TASK in due:
+        runner.submit("check-links", "check library links (once, after the upgrade)", _job_check_links,
+                      key="check-links")
 
 
 def _startup_security() -> None:
@@ -475,6 +492,13 @@ def _pass_stopped_text(items: list, reached: int, why: str) -> str:
 
 
 def _job_refresh_all(job: jobs.Job):
+    try:
+        return _refresh_all(job)
+    finally:
+        _queue_maintenance()        # a one-time task Suwayomi did not answer (relink.finish) runs again after a pass
+
+
+def _refresh_all(job: jobs.Job):
     with db.connect() as con:
         duplicates.read_links(con)                 # the AniList links of MangaDex series, skipped ones too
         due = db.chapters_due(con, bool(settings.get("download_in_order")))
@@ -521,6 +545,19 @@ def _job_refresh_metadata(job: jobs.Job):
             errors += 1
             log.warning("metadata refresh: %s: %s: %s", r["title"], type(e).__name__, e)
     return f"{ok} series refreshed, {errors} failed"
+
+
+def _job_check_links(job: jobs.Job):
+    """Repair links made under a misread chapter number and set back
+    chapters whose library file is gone, importing every series
+    (relink.check_links); done, the one-time run is not due again, unless
+    Suwayomi did not answer (then it runs again after the next refresh
+    pass: _job_refresh_all)."""
+    with db.connect() as con:
+        result = relink.check_links(con, with_cancel(client, lambda: job.cancel),
+                                    progress=lambda m: setattr(job, "progress", m), should_cancel=lambda: job.cancel)
+        relink.finish(con, result)
+    return result.message
 
 
 def _job_search_wanted(job: jobs.Job):
@@ -1375,6 +1412,8 @@ def system_page(request: Request):
         {"name": "Database backup", "every": f"{backup.INTERVAL_HOURS:g} h (keep {backup.KEEP})",
          "action": "/system/backups/create",
          "next": (backups[0]["mtime"] + backup.INTERVAL_HOURS * 3600) if backups else None},
+        {"name": "Check library links (chapters linked under a misread number)", "every": "once after an upgrade",
+         "action": "/system/check-links", "next": None},
     ]
     return page(request, "system.html", sources=sources, suwayomi_ok=suwayomi_ok, cfg=_config_view(),
                 uptime=_ago(STARTED), notify_ok=notify.configured(),
@@ -1392,6 +1431,12 @@ def system_logs_page(request: Request, lines: int = 500):
 def system_metadata_refresh():
     runner.submit("metadata", "every series", _job_refresh_metadata, key="metadata")
     return _flash("/activity", "metadata refresh queued")
+
+
+@app.post("/system/check-links")
+def system_check_links():
+    runner.submit("check-links", "check library links", _job_check_links, key="check-links")
+    return _flash("/activity", "library link check queued")
 
 
 @app.post("/system/update-check")
@@ -1843,7 +1888,10 @@ def api_command(body: dict):
                                    key="search-wanted")).as_dict()
     if name == "RefreshMetadata":
         return runner.submit("metadata", "every series", _job_refresh_metadata, key="metadata").as_dict()
-    raise HTTPException(400, f"unknown command {name!r}; known: RefreshAll, SearchWanted, RefreshMetadata")
+    if name == "CheckLibraryLinks":
+        return runner.submit("check-links", "check library links", _job_check_links, key="check-links").as_dict()
+    raise HTTPException(400, f"unknown command {name!r}; known: RefreshAll, SearchWanted, RefreshMetadata, "
+                             "CheckLibraryLinks")
 
 
 def _settings_out(v: dict) -> dict:

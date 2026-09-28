@@ -1,11 +1,11 @@
-"""Command line: search, resolve (dry run), add, refresh, import, adopt, status, show, daemon."""
+"""Command line: search, resolve (dry run), add, refresh, import, adopt, check-links, status, show, daemon."""
 import argparse
 import logging
 import os
 import signal
 import sys
 
-from . import config, core, daemon, db, logsetup, metadata, model
+from . import config, core, daemon, db, logsetup, metadata, model, relink
 from .model import Series
 from .resolver import Plan, primary, ranges, resolve
 from .suwayomi import Client, SuwayomiError
@@ -212,6 +212,20 @@ def cmd_adopt(a):
     return 0
 
 
+def cmd_check_links(a):
+    with db.connect() as con:
+        if a.dry_run:
+            lines, would = relink.preview(con, Client())
+            for line in lines:
+                out(f"  {line}")
+            out(f"{would} misread link(s)" + (" (dry run: nothing changed)" if lines else ""))
+            return 0
+        result = relink.check_links(con, Client())
+        out(result.message)
+        relink.finish(con, result)
+    return 0
+
+
 def cmd_status(a):
     with db.connect() as con:
         rows = db.series_rows(con)
@@ -307,6 +321,10 @@ def main(argv=None):
     s.add_argument("--only", help="folder name fragment")
     s.add_argument("--dry-run", action="store_true")
     s.set_defaults(fn=cmd_adopt)
+
+    s = sub.add_parser("check-links", help="repair chapters linked under a misread number, then import")
+    s.add_argument("--dry-run", action="store_true", help="only list what would be repaired")
+    s.set_defaults(fn=cmd_check_links)
 
     s = sub.add_parser("status", help="tracked series")
     s.set_defaults(fn=cmd_status)
