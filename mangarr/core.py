@@ -730,7 +730,7 @@ def _import_folder(con, client: Client | None, series_id: int, title: str, folde
     chapters were newly linked; what the folder holds goes into `staged`."""
     staged = staged if staged is not None else Staged()
     sf.prune_quarantine()
-    doubled: list[str] = []
+    doubled: list[tuple[str, float, str]] = []           # (file, number, the file that has it)
     found, unparsed = sf.scan(doubled)
     unread = list(unparsed)                 # not even Suwayomi's names match them
     asked = False                           # Suwayomi's names were there to match them
@@ -751,6 +751,9 @@ def _import_folder(con, client: Client | None, series_id: int, title: str, folde
                 if n is not None and n not in found:
                     found[n] = name
                     matched += 1
+                elif n is not None:
+                    doubled.append((name, n, found[n]))
+                    log.debug("%s: file %s matches chapter %g, which %s already is", title, name, n, found[n])
                 else:
                     unread.append(name)
                     log.debug("%s: no chapter matches file %s", title, name)
@@ -887,7 +890,7 @@ class Staged:
     Suwayomi not answering), is `unchecked`: nothing is said about it."""
     numbers: set = field(default_factory=set)
     unread: dict = field(default_factory=dict)          # source name -> [file names]
-    doubled: dict = field(default_factory=dict)         # source name -> [file names]
+    doubled: dict = field(default_factory=dict)         # source name -> [(file name, number, the file that has it)]
     unchecked: set = field(default_factory=set)
 
     def why_missing(self, n: float, source: str | None, alone: bool) -> str:
@@ -909,8 +912,13 @@ class Staged:
             return f"{where}: downloaded, but its file is one of {len(unread)} whose chapter number could not be " \
                    f"read ({few(unread)}); rename it or report the name"
         if doubled:
-            return f"{where}: reported downloaded, but no file reads as chapter {n:g}; {len(doubled)} file(s) read " \
-                   f"as a chapter another file already is ({few(doubled)}): rename it or report the name"
+            f, m, other = doubled[0]
+            said = f"{oneline(f, 70)} read as chapter {m:g}, which {oneline(other, 70)} already is"
+            if len(doubled) == 1:
+                return f"{where}: reported downloaded, but no file reads as chapter {n:g}; {said}: rename it or " \
+                       "report the name"
+            return f"{where}: reported downloaded, but no file reads as chapter {n:g}; {len(doubled)} files read as " \
+                   f"a chapter another file already is ({said}, ...): rename them or report the names"
         return f"{where}: reported downloaded, but no file in its download folder reads as chapter {n:g}; delete " \
                "the download in Suwayomi to fetch it again"
 

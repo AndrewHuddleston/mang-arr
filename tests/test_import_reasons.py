@@ -144,8 +144,8 @@ class MissingFileReasonTest(Tree):
             with self.assertLogs("mangarr.core", "WARNING"):
                 core.import_series(con, sid, FakeSuwayomi({41: []}), downloaded={171.01: MN})
             self.assertEqual(self.reason(con, sid), f"{MN}: reported downloaded, but no file reads as chapter 171.01; "
-                                                    f"1 file(s) read as a chapter another file already is ({NATO}_"
-                                                    "Chapter 1.cbz): rename it or report the name")
+                                                    f"{NATO}_Chapter 1.cbz read as chapter 1, which Other_Chapter 1 - "
+                                                    "Spin-off 1.cbz already is: rename it or report the name")
 
     def test_no_file_at_all_and_a_failed_one_is_wanted_again(self):
         with db.connect() as con:
@@ -180,6 +180,37 @@ class MissingFileReasonTest(Tree):
             self.assertEqual(rows[171.01]["status"], "have")
             self.assertEqual((rows[171.02]["status"], rows[171.02]["reason"]),
                              ("ignored", f"available on {MN}; not downloaded yet - waiting for a download pass"))
+
+    def test_a_file_suwayomi_matched_to_a_number_another_file_has(self):
+        """A season episode Suwayomi numbers 5, next to the file read as 5:
+        it is said to be a duplicate, not unreadable."""
+        wc = "Weeb Central (EN)"
+        with db.connect() as con:
+            sid = self.series(con, "Wind Breaker", 7)
+            self.source(con, sid, wc, "Wind Breaker", 71, ["Official_Chapter 5.cbz", "Official_S1 - Episode 5.cbz"])
+            con.execute("INSERT INTO chapter (series_id, number, status, updated_at) VALUES (?, 7, 'wanted', ?)",
+                        (sid, db.now()))
+            con.commit()
+            fake = FakeSuwayomi({71: [Chapter(1, 5.0, "Chapter 5", "Official", True),
+                                      Chapter(2, 5.0, "S1 - Episode 5", "Official", True),
+                                      Chapter(3, 7.0, "Chapter 7", "Official", True)]})
+            with self.assertLogs("mangarr.core", "WARNING"):
+                core.import_series(con, sid, fake, downloaded={7.0: wc})
+            self.assertEqual(self.reason(con, sid, 7.0), f"{wc}: reported downloaded, but no file reads as chapter 7; "
+                                                         "Official_S1 - Episode 5.cbz read as chapter 5, which "
+                                                         "Official_Chapter 5.cbz already is: rename it or report the "
+                                                         "name")
+
+    def test_several_files_read_as_numbers_other_files_have(self):
+        with db.connect() as con:
+            sid = self.setup_series(con, [f"{NATO}_Chapter 1.cbz", "Other_Chapter 1 - Spin-off 1.cbz",
+                                          f"{NATO}_Chapter 2.cbz", "Other_Chapter 2 - Spin-off 2.cbz"])
+            with self.assertLogs("mangarr.core", "WARNING"):
+                core.import_series(con, sid, FakeSuwayomi({41: []}), downloaded={171.01: MN})
+            self.assertEqual(self.reason(con, sid), f"{MN}: reported downloaded, but no file reads as chapter 171.01; "
+                                                    f"2 files read as a chapter another file already is ({NATO}_"
+                                                    "Chapter 1.cbz read as chapter 1, which Other_Chapter 1 - Spin-off"
+                                                    " 1.cbz already is, ...): rename them or report the names")
 
     def test_a_refresh_says_it(self):
         """Through add_series: the plan's Suwayomi-downloaded chapters reach the import."""

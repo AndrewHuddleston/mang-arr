@@ -157,7 +157,8 @@ def scan_series_dir(path: str, dir_fd: int | None = None,
                     doubled: list[str] | None = None) -> tuple[dict[float, str], list[str]]:
     """{chapter number: file path} for one series folder, plus the files
     whose number could not be read. Duplicate numbers keep the first name
-    (the others go into `doubled`, when given). Symlinks and anything that
+    (the others go into `doubled`, when given, as (name, number, the name
+    that has it)). Symlinks and anything that
     is not a regular file are skipped (logged). With dir_fd (the folder,
     already open) the folder is listed through it and plain file names come
     back; path is then only used in log lines."""
@@ -184,7 +185,7 @@ def scan_series_dir(path: str, dir_fd: int | None = None,
         elif n not in found:
             found[n] = key
         elif doubled is not None:
-            doubled.append(key)
+            doubled.append((key, n, found[n]))
     return found, unparsed
 
 
