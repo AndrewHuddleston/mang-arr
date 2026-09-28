@@ -871,12 +871,15 @@ results.
 Counting a fractional chapter's pages asks its source for the page list,
 so the count is kept and not taken again every pass. A chapter is counted
 again when its source lists it differently (another name, scanlator or
-release date), when the count is 30 days old (90 days for one found to be
-junk), and after a count that failed only once its retry is due: half a
-day later, then a day, three days and a week. Until then the last count
-stands, or, when there is none, the chapter is kept, as it is when a count
-fails. A new *Minimum pages for a fractional chapter* applies to the kept
-counts at once.
+release date) and when the count is 30 days old. A count that makes it
+junk is checked again sooner, since a wrong one costs a chapter (an empty
+answer, an upload still in progress, a placeholder the site fixes later):
+a day later, then a week and a month later while it comes out the same,
+and from then on every 90 days. After a count that failed, the chapter is
+kept, as it always was when a count fails, and is counted again in the
+next pass, then a day, three days and a week later while it keeps failing.
+A new *Minimum pages for a fractional chapter* applies to the kept counts
+at once.
 
 The downloader works one source at a time. It queues a batch of its own
 chapter ids in Suwayomi, watches them, and dequeues them if it gives up;

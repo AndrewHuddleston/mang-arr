@@ -550,7 +550,8 @@ def _prune_junk(client: Client, plan: Plan, progress: Callable[[str], None] | No
     just single-source ones - aggregators (Bato, Manganato) scrape the same
     upstream and list the same junk, so agreement between them proves nothing.
     With `counts`, a count kept from an earlier pass is used while it holds,
-    and only the other chapters are probed."""
+    a chapter whose count failed is kept until its retry is due, and only
+    the other chapters are probed."""
     from . import settings
     min_pages = int(settings.get("min_pages"))
     suspects = sorted(n for n in plan.assignment if n != int(n))
@@ -569,8 +570,10 @@ def _prune_junk(client: Client, plan: Plan, progress: Callable[[str], None] | No
         else:
             todo.append((n, m, ch))
     if todo or pages:
-        log.info("probing %d fractional chapter(s) for junk (< %d pages)%s", len(todo), min_pages,
-                 f"; {len(pages)} more counted in an earlier pass" if pages else "")
+        waiting = sum(1 for v in pages.values() if v is None)    # a failed count, not due again yet
+        log.info("probing %d fractional chapter(s) for junk (< %d pages)%s%s", len(todo), min_pages,
+                 f"; {len(pages) - waiting} more counted in an earlier pass" if len(pages) > waiting else "",
+                 f"; {waiting} kept until a failed count is tried again" if waiting else "")
     for i, (n, m, ch) in enumerate(todo, 1):
         if progress:
             progress(f"counting the pages of fractional chapters ({i} of {len(todo)})")

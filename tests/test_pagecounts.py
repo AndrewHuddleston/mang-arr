@@ -1,7 +1,7 @@
 """Page counts of fractional chapters are kept between passes (pagecounts.py, migration 14). Every refresh used to
 count the pages of every fractional chapter not downloaded yet, junk found long ago included: one fetchChapterPages
-per chapter, per series, per pass. A count is now taken once and again only when the chapter may have changed. No
-network, no real Suwayomi: a fake source site counts what it is asked."""
+per chapter, per series, per pass. A count is now kept, and taken again only when the chapter may have changed (and a
+junk count soon after it is new). No network, no real Suwayomi: a fake source site counts what it is asked."""
 import os
 import sqlite3
 import tempfile
@@ -110,6 +110,13 @@ class Base(unittest.TestCase):
             sets = ", ".join(f"{k}=?" for k in cols)
             con.execute(f"UPDATE page_probe SET {sets} WHERE chapter_id=?", (*cols.values(), chapter_id))
 
+    def age(self, hours: float) -> None:
+        """Let `hours` go by for every kept count and retry."""
+        shift = f"-{int(hours * 3600)} seconds"
+        with db.connect() as con:
+            con.execute("UPDATE page_probe SET counted_at=datetime(counted_at, ?), next_try=datetime(next_try, ?)",
+                        (shift, shift))
+
 
 class KeptCountTest(Base):
     def test_second_pass_counts_nothing_again(self):
@@ -156,12 +163,14 @@ class KeptCountTest(Base):
     def test_old_counts_are_counted_again(self):
         self.refresh()
         extra, notice, old_notice = cid(1, 12.5), cid(1, 5.5), cid(1, 10.5)
+        settled = len(pagecounts.JUNK_RECOUNT_DAYS)                 # junk that came out the same that often ...
         self.set_row(extra, counted_at=ago(pagecounts.RECOUNT_DAYS + 1))
-        self.set_row(notice, counted_at=ago(pagecounts.RECOUNT_DAYS + 1))        # junk is trusted longer ...
-        self.set_row(old_notice, counted_at=ago(pagecounts.JUNK_RECOUNT_DAYS + 1))
+        self.set_row(notice, agreed=settled, counted_at=ago(pagecounts.RECOUNT_DAYS + 1))    # ... is trusted longer
+        self.set_row(old_notice, agreed=settled, counted_at=ago(pagecounts.JUNK_RECOUNT_DAYS[-1] + 1))
         self.assertEqual(sorted(self.refresh()), sorted([extra, old_notice]))
         rows = self.rows()
         self.assertGreater(rows[extra]["counted_at"], ago(1))
+        self.assertEqual(rows[old_notice]["agreed"], settled + 1)
         self.assertLess(rows[notice]["counted_at"], ago(pagecounts.RECOUNT_DAYS))
         self.set_row(extra, counted_at=ago(-30))                    # a clock that went back: not trusted
         self.assertEqual(self.refresh(), [extra])
@@ -173,13 +182,15 @@ class KeptCountTest(Base):
         self.assertEqual(self.statuses()[24.5], "wanted")          # kept, as when a count fails
         row = self.rows()[extra]
         self.assertEqual((row["pages"], row["tries"]), (None, 1))
-        self.assertNotIn(extra, self.refresh())                     # not every pass ...
+        self.assertEqual(self.refresh(), [extra])                   # the next pass tries once more (a hiccup) ...
+        self.assertEqual(self.rows()[extra]["tries"], 2)
+        self.assertNotIn(extra, self.refresh())                     # ... then not every pass ...
         self.assertEqual(self.statuses()[24.5], "wanted")
         self.set_row(extra, next_try=ago(0.01))                     # ... but once its time has come
         self.assertEqual(self.refresh(), [extra])
         row = self.rows()[extra]
-        self.assertEqual(row["tries"], 2)
-        self.assertGreater(row["next_try"], ago(-(pagecounts.RETRY_HOURS[1] - 1) / 24))   # further out each time
+        self.assertEqual(row["tries"], 3)
+        self.assertGreater(row["next_try"], ago(-(pagecounts.RETRY_HOURS[2] - 1) / 24))   # further out each time
         self.set_row(extra, next_try=ago(0.01))
         self.site.pages[extra] = 22
         self.assertEqual(self.refresh(), [extra])
@@ -187,20 +198,74 @@ class KeptCountTest(Base):
         self.assertEqual((row["pages"], row["tries"], row["next_try"]), (22, 0, None))
         self.assertEqual(self.refresh(), [])
 
-    def test_a_failed_recount_keeps_the_last_count_of_the_same_listing(self):
+    def test_a_failed_recount_keeps_the_chapter(self):
         self.refresh()
         notice = cid(1, 15.5)
-        self.set_row(notice, counted_at=ago(pagecounts.JUNK_RECOUNT_DAYS + 1))
+        self.set_row(notice, agreed=4, counted_at=ago(pagecounts.JUNK_RECOUNT_DAYS[-1] + 1))
         self.site.pages[notice] = None                              # the source will not say this time
         self.assertEqual(self.refresh(), [notice])
-        self.assertEqual(self.statuses()[15.5], "junk")            # still two pages as far as anyone knows
-        row = self.rows()[notice]
-        self.assertEqual((row["pages"], row["tries"]), (2, 1))
-        self.assertEqual(self.refresh(), [])                        # and not asked again until the retry is due
+        self.assertEqual(self.statuses()[15.5], "wanted")          # kept, as whenever a count fails: the old
+        row = self.rows()[notice]                                   # count is not judged by ...
+        self.assertEqual((row["pages"], row["agreed"], row["tries"]), (2, 4, 1))
+        self.assertEqual(self.refresh(), [notice])
+        self.assertEqual(self.refresh(), [])                        # ... nor while the retry is not due
+        self.assertEqual(self.statuses()[15.5], "wanted")
+        self.site.pages[notice] = 2
+        self.set_row(notice, next_try=ago(0.01))
+        self.assertEqual(self.refresh(), [notice])
+        self.assertEqual(self.statuses()[15.5], "junk")
+        row = self.rows()[notice]                                   # agrees with the count before the failures
+        self.assertEqual((row["pages"], row["agreed"], row["tries"], row["next_try"]), (2, 5, 0, None))
+        self.set_row(notice, counted_at=ago(pagecounts.JUNK_RECOUNT_DAYS[-1] + 1))
+        self.site.pages[notice] = None
         self.site.names[notice] = "Chapter 15.5 (new)"             # listed differently: that count is void
         self.assertEqual(self.refresh(), [notice])
         self.assertEqual(self.statuses()[15.5], "wanted")
-        self.assertEqual((self.rows()[notice]["pages"], self.rows()[notice]["tries"]), (None, 1))
+        row = self.rows()[notice]
+        self.assertEqual((row["pages"], row["agreed"], row["tries"]), (None, 0, 1))
+
+    def test_a_new_junk_count_is_checked_again_soon(self):
+        side = cid(1, 12.5)
+        self.site.pages[side] = 0                                   # a real side chapter answers empty once
+        self.refresh()
+        self.assertEqual(self.statuses()[12.5], "junk")
+        del self.site.pages[side]
+        self.assertEqual(self.refresh(), [])                        # not the next pass ...
+        self.set_row(side, counted_at=ago(pagecounts.JUNK_RECOUNT_DAYS[0] + 0.01))
+        self.assertEqual(self.refresh(), [side])                    # ... but a day later
+        self.assertEqual(self.statuses()[12.5], "wanted")
+
+    def test_junk_is_trusted_longer_each_time_it_comes_out_the_same(self):
+        self.refresh()
+        notice = cid(1, 5.5)
+        for i, days in enumerate(pagecounts.JUNK_RECOUNT_DAYS, 1):  # a day, a week, a month, then 90 days
+            self.assertEqual(self.rows()[notice]["agreed"], i)
+            self.set_row(notice, counted_at=ago(days - 0.1))
+            self.assertEqual(self.refresh(), [])
+            self.set_row(notice, counted_at=ago(days + 0.1))
+            self.assertEqual(self.refresh(), [notice])
+            self.assertEqual(self.statuses()[5.5], "junk")
+        self.set_row(notice, counted_at=ago(pagecounts.JUNK_RECOUNT_DAYS[-1] - 0.1))
+        self.assertEqual(self.refresh(), [])                        # 90 days from then on
+        self.site.pages[notice] = 3                                 # another count: new again
+        self.set_row(notice, counted_at=ago(pagecounts.JUNK_RECOUNT_DAYS[-1] + 0.1))
+        self.assertEqual(self.refresh(), [notice])
+        self.assertEqual(self.rows()[notice]["agreed"], 1)
+        self.site.pages[notice] = 24                                # a placeholder the site fixed in place
+        self.set_row(notice, counted_at=ago(pagecounts.JUNK_RECOUNT_DAYS[0] + 0.1))
+        self.assertEqual(self.refresh(), [notice])
+        self.assertEqual(self.statuses()[5.5], "wanted")
+
+    def test_ten_days_of_passes(self):
+        """A pass every 6 hours for 10 days: 12 counts in the first pass, none in the second (all 12 saved), then
+        only the 8 junk counts again, a day and a week later. Counting every pass, as before, is 12 a pass."""
+        asked = []
+        for _ in range(4 * 10):
+            asked.append(len(self.refresh()))
+            self.age(6)
+        self.assertEqual(asked[:2], [12, 0])
+        self.assertEqual(sorted(a for a in asked if a), [8, 8, 12])
+        self.assertEqual((sum(asked), 12 * len(asked)), (28, 480))
 
     def test_suwayomi_not_answering_is_not_remembered(self):
         extra = cid(1, 36.5)
@@ -235,7 +300,8 @@ class KeptCountTest(Base):
         self.set_row(b, pages=-3)
         self.set_row(c, counted_at=None)
         self.set_row(d, tries=1, next_try="9999-01-01 00:00:00")   # further out than any retry
-        self.assertEqual(sorted(self.refresh()), sorted([a, b, c, d]))
+        self.set_row(e := cid(1, 20.5), agreed=-1)
+        self.assertEqual(sorted(self.refresh()), sorted([a, b, c, d, e]))
         self.assertEqual(self.refresh(), [])
 
     def test_without_kept_counts_every_chapter_is_counted(self):
@@ -269,6 +335,31 @@ class MigrationTest(Base):
         self.assertEqual(len(self.refresh()), 12)                   # counted once after the upgrade ...
         self.assertEqual(self.refresh(), [])                        # ... and kept from then on
         self.assertEqual({n for n, s in self.statuses().items() if s == "junk"}, set(NOTICES))
+
+    def test_a_schema_14_without_the_table_still_resolves(self):
+        con = sqlite3.connect(self.path)
+        db.migrate(con, target=13)
+        con.execute("CREATE TABLE other_branch (x INTEGER)")       # another branch's migration 14
+        con.execute("PRAGMA user_version = 14")
+        con.commit()
+        con.close()
+        with mock.patch.object(pagecounts, "_warned", False), \
+                self.assertLogs("mangarr.pagecounts", "WARNING") as logs:
+            self.assertEqual(len(self.refresh()), 12)
+            self.assertEqual(len(self.refresh()), 12)               # nothing kept: counted every pass, as before
+        self.assertEqual(len(logs.output), 1, logs.output)          # said once, not per series and pass
+        self.assertIn("page_probe", logs.output[0])
+        self.assertEqual({n for n, s in self.statuses().items() if s == "junk"}, set(NOTICES))
+
+    def test_the_migration_runs_over_a_table_that_is_there(self):
+        con = sqlite3.connect(self.path)
+        db.migrate(con, target=13)
+        con.executescript(db.MIGRATIONS[13])                        # made under another number before a renumber
+        con.close()
+        with db.connect() as con:
+            self.assertEqual(con.execute("PRAGMA user_version").fetchone()[0], 14)
+        self.assertEqual(len(self.refresh()), 12)
+        self.assertEqual(self.refresh(), [])
 
 
 class ClientTest(unittest.TestCase):

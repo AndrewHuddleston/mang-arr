@@ -164,17 +164,20 @@ MIGRATIONS = [
     # 14: the page counts of fractional chapters, so a refresh does not count
     #     them all again every pass (see pagecounts.py). Keyed by Suwayomi's
     #     ids, not by series: save_plan rewrites series_source every resolve.
+    #     IF NOT EXISTS: should a merge renumber this migration, a database
+    #     that already has the table still upgrades.
     """
-    CREATE TABLE page_probe (
+    CREATE TABLE IF NOT EXISTS page_probe (
       manga_id        INTEGER NOT NULL,       -- Suwayomi's id for the source entry
       chapter_id      INTEGER NOT NULL,       -- Suwayomi's id for the chapter
       number          REAL NOT NULL,          -- the chapter as the source listed it when last counted or tried
       name            TEXT,
       scanlator       TEXT,
       uploaded        TEXT,
-      pages           INTEGER,                -- the count for that listing; NULL: none yet (the tries failed)
+      pages           INTEGER,                -- the last count for that listing; NULL: none yet (the tries failed)
       counted_at      TEXT,
-      tries           INTEGER NOT NULL DEFAULT 0,   -- failed counts since the last one that worked
+      agreed          INTEGER NOT NULL DEFAULT 0,   -- counts in a row of that listing that gave these pages
+      tries           INTEGER NOT NULL DEFAULT 0,   -- failed counts since the last one that worked (pages not used)
       next_try        TEXT,                   -- after a failed count: not counted again before this
       PRIMARY KEY (manga_id, chapter_id)
     );
