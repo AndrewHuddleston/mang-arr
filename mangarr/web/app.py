@@ -112,7 +112,8 @@ async def lifespan(app: FastAPI):
 
 def _queue_maintenance() -> None:
     """Queue the one-time tasks an upgrade scheduled (db.maintenance_due):
-    they run before the first refresh pass."""
+    at start they run before the first refresh pass; after each pass, one
+    that could not finish runs again."""
     try:
         with db.connect() as con:
             due = db.maintenance_due(con)
@@ -491,6 +492,13 @@ def _pass_stopped_text(items: list, reached: int, why: str) -> str:
 
 
 def _job_refresh_all(job: jobs.Job):
+    try:
+        return _refresh_all(job)
+    finally:
+        _queue_maintenance()        # a one-time task Suwayomi did not answer (relink.finish) runs again after a pass
+
+
+def _refresh_all(job: jobs.Job):
     with db.connect() as con:
         duplicates.read_links(con)                 # the AniList links of MangaDex series, skipped ones too
         due = db.chapters_due(con, bool(settings.get("download_in_order")))
@@ -540,13 +548,16 @@ def _job_refresh_metadata(job: jobs.Job):
 
 
 def _job_check_links(job: jobs.Job):
-    """Repair links made under a misread chapter number, then import every
-    series (relink.check_links); done, the one-time run is not due again."""
+    """Repair links made under a misread chapter number and set back
+    chapters whose library file is gone, importing every series
+    (relink.check_links); done, the one-time run is not due again, unless
+    Suwayomi did not answer (then it runs again after the next refresh
+    pass: _job_refresh_all)."""
     with db.connect() as con:
-        msg = relink.check_links(con, with_cancel(client, lambda: job.cancel),
-                                 progress=lambda m: setattr(job, "progress", m), should_cancel=lambda: job.cancel)
-        db.maintenance_done(con, relink.TASK)
-    return msg
+        result = relink.check_links(con, with_cancel(client, lambda: job.cancel),
+                                    progress=lambda m: setattr(job, "progress", m), should_cancel=lambda: job.cancel)
+        relink.finish(con, result)
+    return result.message
 
 
 def _job_search_wanted(job: jobs.Job):

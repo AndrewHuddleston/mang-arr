@@ -377,6 +377,13 @@ def maintenance_done(con, name: str) -> None:
                 " ON CONFLICT(name) DO UPDATE SET done_at=excluded.done_at", (name, now(), now()))
 
 
+def maintenance_due_again(con, name: str) -> None:
+    """A task that could not do all of its work (a service it needs did not
+    answer) is due again: the next start or pass runs it (maintenance_due)."""
+    con.execute("INSERT INTO maintenance (name, due_at) VALUES (?,?)"
+                " ON CONFLICT(name) DO UPDATE SET done_at=NULL", (name, now()))
+
+
 def valid_folder(folder) -> bool:
     """Is this a usable series folder name: one plain path component (no
     separator, no NUL, not absolute, not '', '.' or '..')? Folders are joined

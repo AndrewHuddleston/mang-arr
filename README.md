@@ -752,16 +752,30 @@ happen. See the next section.
 Repairs chapters linked into the library under a number their file name
 was misread as (0.3.0 read `Humane Scans_Ch.17 - Maidens 101_ A Success_`
 as chapter 101, and `Losers in eXile_Ch.150 - Hana to Yume March 2020
-Special` as 2020): every chapter whose library file is a hard link of its
-staging file has that file's name read again, and where it reads as
-another number the library link is removed (only a regular file inside the
-series' library folder that is the staging file itself; staging is never
-touched), the chapter goes back to wanted (when a source lists that number)
-or is dropped (when none does), and every series is imported again, so the
-file is linked under its real number and a file the old reading took for a
-chapter already on disk is linked at last. Each repair is logged and shown
-in History. `--dry-run` only lists the links it would remove. It runs once
-by itself on the first start after upgrading from 0.3.0.
+Special` as 2020). A link is only touched when three readings agree that it
+is one of those: 0.3.0's reading of its staging file's name is the number
+it is linked as (so the link came from that reading, not from Suwayomi's
+chapter names), the name reads as another number now, and Suwayomi's own
+chapter list gives the file that new number. When Suwayomi does not answer,
+nothing is changed and the check stays due: it runs again after the next
+refresh pass (the worker: before its next cycle). A link Suwayomi numbers
+otherwise is left as it is and logged. Before the first change the
+database is backed up (*before library link repair*); if that fails,
+nothing is changed. Then the library link is removed (only a regular file
+inside the series' library folder that is the staging file itself;
+staging is never touched), the chapter goes back to wanted (*its file was
+chapter 17 (a misread name); ...*) when a source lists that number or is
+dropped when none does, and every series is imported again, so the file is
+linked under its real number and a file the old reading took for a chapter
+already on disk is linked at last. A chapter marked in the library whose
+library file is gone and that the import cannot link again (a wrong file
+removed by hand, a backup of before the repair restored) goes back to
+wanted (*its library file Chapter 2020.0.cbz was gone; ...*) or is dropped
+the same way, unless the series' whole library folder is missing (a
+library that is not mounted). Each change is logged and shown in History;
+Komga is asked to scan, and once more at the next import or 10 minutes
+later if it did not answer. `--dry-run` only lists what it would do. It
+runs once by itself on the first start after upgrading from 0.3.0.
 
 #### `mangarr status`
 
@@ -861,7 +875,8 @@ copies are untouched.
 Komga's periodic scan picks new chapters up on its own. To get them sooner,
 put Komga's URL and an API key on the Settings page: mang-arr then asks
 Komga to scan (one library, or all) after every import that linked
-something.
+something. When Komga does not answer, the scan is asked for once more, at
+the next import or 10 minutes later.
 
 ## Monitoring
 
@@ -1113,7 +1128,7 @@ mangarr/
   library.py     staging tree parsing, hard-link library, file names
   db.py          SQLite: series, sources, chapters, page counts, events, lists, settings
   core.py        add / refresh / import / adopt / per-chapter download
-  relink.py      one-time repair of links made under a misread chapter number
+  relink.py      one-time repair of links made under a misread chapter number, and of chapters whose library file is gone
   lists.py       import lists: fetchers, params, sync
   jobs.py        job runner + scheduler (web)
   daemon.py      standalone background worker

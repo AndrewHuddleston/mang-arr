@@ -51,7 +51,8 @@ class Tree(unittest.TestCase):
         self.addCleanup(tmp.cleanup)
         self.staging, self.lib = os.path.join(tmp.name, "staging"), os.path.join(tmp.name, "library")
         self.scans = []
-        for p in (mock.patch.object(config, "DB_PATH", os.path.join(tmp.name, "t.db")),
+        for p in (mock.patch.object(config, "DATA_DIR", os.path.join(tmp.name, "data")),     # backups go there
+                  mock.patch.object(config, "DB_PATH", os.path.join(tmp.name, "t.db")),
                   mock.patch.object(config, "STAGING_ROOT", self.staging),
                   mock.patch.object(config, "LIBRARY_ROOT", self.lib),
                   mock.patch.object(komga, "scan", lambda *a: self.scans.append(a) or True)):
@@ -59,6 +60,7 @@ class Tree(unittest.TestCase):
             self.addCleanup(p.stop)
         settings._cache.clear()
         self.addCleanup(settings._cache.clear)
+        self.addCleanup(komga.take_retry)          # no Komga retry left waiting for the next test
         self.ids = {}
 
     def series(self, con, title: str, anilist_id: int) -> int:

@@ -215,14 +215,14 @@ def cmd_adopt(a):
 def cmd_check_links(a):
     with db.connect() as con:
         if a.dry_run:
-            found = relink.find_misreads(relink.links(con))
-            for m in found:
-                out(f"  {m.link.title}: chapter {m.link.number:g} is {m.actual:g}: would remove {m.link.library_path}"
-                    f" (a link of {m.link.staging_path})")
-            out(f"{len(found)} misread link(s)" + (" (dry run: nothing changed)" if found else ""))
+            lines, would = relink.preview(con, Client())
+            for line in lines:
+                out(f"  {line}")
+            out(f"{would} misread link(s)" + (" (dry run: nothing changed)" if lines else ""))
             return 0
-        out(relink.check_links(con, Client()))
-        db.maintenance_done(con, relink.TASK)
+        result = relink.check_links(con, Client())
+        out(result.message)
+        relink.finish(con, result)
     return 0
 
 

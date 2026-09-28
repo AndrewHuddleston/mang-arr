@@ -663,8 +663,7 @@ def series_staging_dirs(con, series_id: int) -> list[tuple[str, str, int | None]
     for s in db.sources(con, series_id):
         if s["note"]:
             continue
-        folder = s["folder"] or os.path.join(root, library.safe_title(s["source_name"]),
-                                             library.safe_title(s["title"]))
+        folder = source_folder(s)
         if not os.path.isdir(folder):
             continue
         if os.path.islink(folder) or not library.is_within(folder, root):
@@ -673,6 +672,14 @@ def series_staging_dirs(con, series_id: int) -> list[tuple[str, str, int | None]
             continue
         out.append((s["source_name"], folder, s["manga_id"]))
     return out
+
+
+def source_folder(s) -> str:
+    """Where Suwayomi writes a source entry's chapters (a series_source row):
+    the folder adopt recorded, else <staging>/<source>/<title> made safe as
+    Suwayomi makes them. Not checked: see series_staging_dirs."""
+    return s["folder"] or os.path.join(library.config.STAGING_ROOT, library.safe_title(s["source_name"]),
+                                       library.safe_title(s["title"]))
 
 
 SETTLE_SECONDS = 120    # a staged file younger than this may still be being written
@@ -719,7 +726,9 @@ def import_series(con, series_id: int, client: Client | None = None, downloaded:
         log.info("%s: imported %d chapter(s) into %s", title, linked, library.library_dir(folder))
     con.commit()
     if linked:
-        komga.scan()
+        komga.scan_retrying()
+    elif komga.take_retry():
+        komga.scan()                    # the one retry of a scan Komga did not answer (scan_retrying)
     return linked
 
 

@@ -12,7 +12,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from test_import_reasons import MN, NATO, FakeSuwayomi, Tree, inode, make_cbz  # noqa: E402
 
-from mangarr import db, jobs, library, relink  # noqa: E402
+from mangarr import backup, core, db, jobs, komga, library, relink  # noqa: E402
 from mangarr.suwayomi import Chapter  # noqa: E402
 
 try:
@@ -121,15 +121,16 @@ class LiveBoxTest(LiveBox):
 
         from mangarr import __main__ as cli
         with db.connect() as con:
-            self.build(con)
+            fake = self.build(con)
         before = self.staging_state()
         library_before = {os.path.join(d, f) for d, _, fs in os.walk(self.lib) for f in fs}
         buf = io.StringIO()
-        with contextlib.redirect_stdout(buf):
+        with contextlib.redirect_stdout(buf), mock.patch.object(cli, "Client", lambda *a, **k: fake):
             self.assertEqual(cli.cmd_check_links(argparse.Namespace(dry_run=True)), 0)
         text = buf.getvalue()
         self.assertIn("Kamisama Kiss: chapter 2020 is 150: would remove ", text)
         self.assertIn("3 misread link(s) (dry run: nothing changed)", text)
+        self.assertFalse(os.listdir(backup.backup_dir()))                  # a dry run writes no backup either
         self.assertEqual(self.staging_state(), before)
         self.assertEqual({os.path.join(d, f) for d, _, fs in os.walk(self.lib) for f in fs}, library_before)
         with db.connect() as con:
@@ -146,7 +147,7 @@ class LiveBoxTest(LiveBox):
                 self.lib_path(con, self.ids["Hana-kun Can’t Live without Me"], "Chapter 001.0.cbz"),
                 *(self.lib_path(con, self.ids["Dreaming Freedom"], f"Chapter {n:05.1f}.cbz") for n in range(1, 14)))}
             with self.assertLogs("mangarr.relink", "WARNING") as cm:
-                msg = relink.check_links(con, fake)
+                msg = relink.check_links(con, fake).message
             self.assertEqual(msg, "3 misread link(s) repaired; 17 chapter(s) imported")
             # the three wrong links are gone, their files linked under their real numbers, the bogus rows deleted
             for title, wrong, right, name in (("Kamisama Kiss", 2020.0, 150.0, LOSERS),
@@ -182,20 +183,56 @@ class LiveBoxTest(LiveBox):
                 "Chapter 2026 was a misread file (it is chapter 185.5); link removed, re-imported as 185.5"])
             self.assertEqual(len([m for m in cm.output if "was a misread file" in m]), 3)
             self.assertTrue(self.scans)                                     # Komga was asked to scan
-            # a second run finds nothing more to do
-            self.assertEqual(relink.check_links(con, fake), "no misread links; 0 chapter(s) imported")
+            # the database was backed up once, before the first change: the backup still has the wrong rows
+            (b,) = backup.listing()
+            with db.connect(backup.path_of(b["name"])) as old:
+                self.assertEqual(old.execute("SELECT status FROM chapter WHERE number=2020").fetchone()[0], "have")
+            # a second run finds nothing more to do, and writes no backup
+            self.assertEqual(relink.check_links(con, fake).message, "no misread links; 0 chapter(s) imported")
+            self.assertEqual(len(backup.listing()), 1)
 
-    def test_without_suwayomi_the_rows_decide(self):
-        """Suwayomi down: the file names alone repair; a row no resolve ever
-        listed (2020: made by the import alone) is deleted."""
+    def test_without_suwayomi_nothing_is_changed_and_it_runs_again(self):
+        """Suwayomi down: no link is removed and no row changed (only the
+        import runs); the check stays due, and the next run, with Suwayomi
+        back, repairs."""
+        with db.connect() as con:
+            fake = self.build(con)
+            con.execute("INSERT INTO maintenance (name, due_at) VALUES (?, ?)", (relink.TASK, db.now()))
+            wrong = self.lib_path(con, self.ids["Kamisama Kiss"], "Chapter 2020.0.cbz")
+        fake.down = True
+        with self.assertLogs("mangarr", "WARNING") as cm:
+            msg = relink.run_if_due(fake)
+        # the import links the three files under their real numbers too; the wrong links stay until confirmed
+        self.assertEqual(msg, "no misread links; 3 left for a later run (Suwayomi did not answer); 17 chapter(s) "
+                              "imported")
+        self.assertIn("nothing changed, the check runs again later", "\n".join(cm.output))
+        self.assertTrue(os.path.exists(wrong))
+        with db.connect() as con:
+            self.assertEqual(self.rows(con, self.ids["Kamisama Kiss"])[2020.0]["status"], "have")
+            self.assertEqual(db.maintenance_due(con), {relink.TASK})
+            self.assertEqual(self.events(con, "relinked"), [])
+        self.assertEqual(backup.listing(), [])                             # nothing changed: no backup
+        fake.down = False
+        with self.assertLogs("mangarr.relink", "WARNING"):
+            self.assertEqual(relink.run_if_due(fake), "3 misread link(s) repaired; 0 chapter(s) imported")
+        self.assertFalse(os.path.exists(wrong))
+        with db.connect() as con:
+            self.assertNotIn(2020.0, self.rows(con, self.ids["Kamisama Kiss"]))
+            self.assertEqual(db.maintenance_due(con), set())
+            self.assertEqual(self.events(con, "relinked")[0], "Chapter 2020 was a misread file (it is chapter 150); "
+                                                              "link removed, re-imported as 150")
+
+    def test_a_manual_run_suwayomi_did_not_answer_is_due_again(self):
+        """The System task or the CLI run while Suwayomi is down: due again,
+        so it runs by itself once Suwayomi answers."""
         with db.connect() as con:
             fake = self.build(con)
             fake.down = True
             with self.assertLogs("mangarr", "WARNING"):
-                msg = relink.check_links(con, fake)
-            self.assertTrue(msg.startswith("3 misread link(s) repaired"), msg)
-            self.assertNotIn(2020.0, self.rows(con, self.ids["Kamisama Kiss"]))
-            self.assertEqual(self.rows(con, self.ids["Kamisama Kiss"])[150.0]["status"], "have")
+                result = relink.check_links(con, fake)
+            relink.finish(con, result)
+            self.assertEqual(result.deferred, 3)
+            self.assertEqual(db.maintenance_due(con), {relink.TASK})
 
     def test_once_after_the_upgrade(self):
         """Migration 17 schedules the check for a database with library links;
@@ -216,15 +253,17 @@ class LiveBoxTest(LiveBox):
 
 
 class RepairRulesTest(Tree):
-    def one(self, con, number=1.0, name=HANA_91, listed=(1.0, 9.0, 9.1)):
-        """Hana-kun with 0.3.0 having linked HANA_91 as `number`."""
+    def one(self, con, number=1.0, name=HANA_91, listed=(1.0,)):
+        """Hana-kun with 0.3.0 having linked HANA_91 as `number`; Suwayomi
+        lists the staged files and chapters `listed` (not downloaded)."""
         sid = self.series(con, "Hana-kun", 5)
         p = self.source(con, sid, MN, "Himokuzu", 51, [name, "Chapter 9.cbz"])
         self.link_as(con, sid, f"{p}/Chapter 9.cbz", 9.0, MN)
         dst = self.link_as(con, sid, f"{p}/{name}", number, MN)
         con.commit()
-        return sid, f"{p}/{name}", dst, FakeSuwayomi({51: [Chapter(51000 + i, n, f"Chapter {n:g}", None, n != 1.0)
-                                                           for i, n in enumerate(listed)]})
+        chapters = listing(51, {name: 9.1, "Chapter 9.cbz": 9.0}) + [Chapter(51900 + i, n, f"Chapter {n:g}", None, False)
+                                                                     for i, n in enumerate(listed)]
+        return sid, f"{p}/{name}", dst, FakeSuwayomi({51: chapters})
 
     def test_a_listed_number_is_wanted_again(self):
         with db.connect() as con:
@@ -240,6 +279,29 @@ class RepairRulesTest(Tree):
             self.assertEqual(self.events(con, "relinked"), [
                 "Chapter 1 was a misread file (it is chapter 9.1); link removed, re-imported as 9.1; chapter 1 is "
                 "wanted again"])
+
+    def test_a_chapter_on_disk_from_another_source_is_linked_from_its_own_file(self):
+        """0.3.0 took the spin-off for chapter 1 while another source has the
+        real chapter 1: the spin-off's link goes, and the import links both
+        files under their own numbers."""
+        with db.connect() as con:
+            sid = self.series(con, "Dreaming Freedom", 4)
+            spin = f"{NATO}_Chapter 171.01_ Spin-off 1.cbz"
+            mn = self.source(con, sid, MN, "Dreaming Freedom", 41, [spin])
+            wc = self.source(con, sid, "Weeb Central (EN)", "Dreaming Freedom", 42, ["Chapter 1.cbz"])
+            dst = self.link_as(con, sid, f"{mn}/{spin}", 1.0, MN)
+            con.commit()
+            fake = FakeSuwayomi({41: listing(41, {spin: 171.01}), 42: listing(42, {"Chapter 1.cbz": 1.0})})
+            with self.assertLogs("mangarr.relink", "WARNING"):
+                self.assertEqual(relink.check_links(con, fake).message, "1 misread link(s) repaired; 2 chapter(s) "
+                                                                        "imported")
+            rows = self.rows(con, sid)
+            self.assertEqual(rows[1.0]["staging_path"], f"{wc}/Chapter 1.cbz")
+            self.assertEqual(inode(dst), inode(f"{wc}/Chapter 1.cbz"))
+            self.assertEqual(rows[171.01]["staging_path"], f"{mn}/{spin}")
+            self.assertEqual(self.events(con, "relinked"), [
+                "Chapter 1 was a misread file (it is chapter 171.01); link removed, re-imported as 171.01; chapter 1 "
+                "is linked from Chapter 1.cbz now"])
 
     def test_only_links_mang_arr_made_are_removed(self):
         """A copy (another inode), a symlink, a file outside the series' library
@@ -294,6 +356,279 @@ class RepairRulesTest(Tree):
             self.assertTrue(os.path.exists(dst))
 
 
+class CrossCheckTest(Tree):
+    """A link is only removed when 0.3.0's reading of its staging name is the
+    number it is linked as, the parser reads another number now, and
+    Suwayomi numbers the file as the parser does."""
+
+    def scanlator(self, con, prefix: str, anilist_id: int, numbers=(1, 2, 3, 4, 5)):
+        """A series whose chapters `prefix`_Chapter N.cbz 0.3.0 linked as N."""
+        sid = self.series(con, f"Series {anilist_id}", anilist_id)
+        names = {f"{prefix}_Chapter {n}.cbz": float(n) for n in numbers}
+        p = self.source(con, sid, MN, f"Series {anilist_id}", anilist_id, list(names))
+        dsts = {n: self.link_as(con, sid, f"{p}/{name}", n, MN) for name, n in names.items()}
+        con.commit()
+        return sid, p, dsts, listing(anilist_id, names)
+
+    def test_a_marker_glued_to_a_digit_in_the_prefix_is_no_misread(self):
+        """0.3.0 read these right, and so does the parser: nothing is
+        touched (the previous parser took the prefix's digit for the chapter
+        and the check unlinked every correct file)."""
+        with db.connect() as con:
+            lists = {}
+            made = {}
+            for i, prefix in enumerate(("Ch4os Scans", "Ep1c TL", "www.chapter1.com", "ep2 fans", "Ch 3 Scans")):
+                sid, _, dsts, chapters = self.scanlator(con, prefix, 100 + i)
+                lists[100 + i], made[sid] = chapters, dsts
+            state = {p: inode(p) for dsts in made.values() for p in dsts.values()}
+            self.assertEqual(relink.find_misreads(relink.links(con)), [])
+            self.assertEqual(relink.check_links(con, FakeSuwayomi(lists)).message,
+                             "no misread links; 0 chapter(s) imported")
+            self.assertEqual({p: inode(p) for p in state}, state)
+            for sid, dsts in made.items():
+                self.assertEqual({n: r["status"] for n, r in self.rows(con, sid).items()},
+                                 dict.fromkeys(dsts, "have"))
+            self.assertEqual(backup.listing(), [])
+
+    def test_a_parser_that_misreads_is_stopped_by_suwayomi(self):
+        """Should the parser read the prefix's digit after all ('Ch4os' as
+        chapter 4), Suwayomi's numbers stop the repair: nothing removed."""
+        with db.connect() as con:
+            sid, _, dsts, chapters = self.scanlator(con, "Ch4os Scans", 100)
+            state = {p: inode(p) for p in dsts.values()}
+            with mock.patch.object(library, "parse_number", lambda name: 4.0):
+                self.assertEqual(sorted(m.link.number for m in relink.find_misreads(relink.links(con))),
+                                 [1.0, 2.0, 3.0, 5.0])
+                with self.assertLogs("mangarr.relink", "WARNING") as cm:
+                    msg = relink.check_links(con, FakeSuwayomi({100: chapters})).message
+            self.assertEqual(msg, "no misread links; 4 left as they are (Suwayomi does not confirm the new number); "
+                                  "0 chapter(s) imported")
+            self.assertIn("reads as chapter 4 now, but Suwayomi numbers it 1; left as it is", "\n".join(cm.output))
+            self.assertEqual({p: inode(p) for p in state}, state)
+            self.assertEqual({n: r["status"] for n, r in self.rows(con, sid).items()}, dict.fromkeys(dsts, "have"))
+            self.assertEqual(backup.listing(), [])
+
+    def test_a_link_suwayomi_matched_is_left_alone(self):
+        """0.3.0 read the name as no number and Suwayomi's names made the
+        link (3.5); the parser's reading (3) says nothing about it."""
+        name = "www.x.com_Chapter 3_ Volume 2 Extra.cbz"
+        self.assertIsNone(relink._parse_030(name))
+        self.assertEqual(library.parse_number(name), 3.0)
+        with db.connect() as con:
+            sid = self.series(con, "Extra", 9)
+            p = self.source(con, sid, MN, "Extra", 91, ["www.x.com_Chapter 3.cbz", name])
+            self.link_as(con, sid, f"{p}/www.x.com_Chapter 3.cbz", 3.0, MN)
+            dst = self.link_as(con, sid, f"{p}/{name}", 3.5, MN)
+            con.commit()
+            fake = FakeSuwayomi({91: listing(91, {"www.x.com_Chapter 3.cbz": 3.0, name: 3.5})})
+            self.assertEqual(relink.check_links(con, fake).message, "no misread links; 0 chapter(s) imported")
+            self.assertTrue(os.path.exists(dst))
+            self.assertEqual(self.rows(con, sid)[3.5]["status"], "have")
+
+    def test_suwayomi_numbering_the_file_otherwise_leaves_it(self):
+        """Suwayomi numbers Losers' file 2020 itself, or does not list it, or
+        no source entry holds its folder: the link stays."""
+        for case in ("numbers it 2020", "does not list it", "no entry"):
+            with self.subTest(case=case), db.connect() as con:
+                sid = self.series(con, f"Kamisama Kiss {case}", 1)
+                p = self.source(con, sid, MD, f"Divine Nanami {case}", 11, [LOSERS])
+                dst = self.link_as(con, sid, f"{p}/{LOSERS}", 2020.0, MD)
+                if case == "no entry":
+                    con.execute("UPDATE series_source SET folder=? WHERE series_id=?", (p + "-elsewhere", sid))
+                con.commit()
+                chapters = listing(11, {LOSERS: 2020.0}) if case == "numbers it 2020" else \
+                    listing(11, {"Losers in eXile_Ch.149.cbz": 149.0})
+                with self.assertLogs("mangarr.relink", "WARNING") as cm:
+                    result = relink.check_links(con, FakeSuwayomi({11: chapters}))
+                self.assertEqual((result.repaired, result.left), ([], 1))
+                self.assertIn("left as it is", "\n".join(cm.output))
+                self.assertTrue(os.path.exists(dst))
+                self.assertEqual(self.rows(con, sid)[2020.0]["status"], "have")
+                con.execute("DELETE FROM series WHERE id=?", (sid,))
+                os.remove(dst)
+                con.commit()
+
+    def test_the_name_suwayomi_writes_matches_despite_its_sanitising(self):
+        """number_in: the exact name Suwayomi writes, else the same letters,
+        digits and dots; a name two chapters share says nothing."""
+        chapters = [Chapter(1, 17.0, "Ch.17 - Maidens 101: A Success!", "Humane Scans", True),
+                    Chapter(2, 5.0, "Oneshot", "Team", True), Chapter(3, 6.0, "Oneshot", "Team", True)]
+        self.assertEqual(relink.number_in(chapters, HUMANE), 17.0)
+        self.assertEqual(relink.number_in(chapters, "Humane Scans_Ch.17 - Maidens 101  A Success.cbz"), 17.0)
+        self.assertIsNone(relink.number_in(chapters, "Team_Oneshot.cbz"))
+        self.assertIsNone(relink.number_in(chapters, "Humane Scans_Ch.18.cbz"))
+
+    def test_the_reference_reading_is_0_3_0s(self):
+        """_parse_030 reads the real names as 0.3.0 did (its misreads too)."""
+        for name, old in ((LOSERS, 2020.0), (HUMANE, 101.0), (ANON, 2026.0), (HANA_91, 1.0),
+                          (f"{NATO}_Chapter 171.1_ Spin-off 10.cbz", 10.0), (f"{NATO}_Chapter 0_ Volume 10.cbz", None),
+                          (f"{NATO}_Chapter 16.1_ (1r0n).cbz", 0.0), ("Ch4os Scans_Chapter 12.cbz", 12.0),
+                          ("Official_S2 - Episode 5.cbz", None), ("Unknown_Vol.15 Ch.88.5.cbz", 88.5)):
+            with self.subTest(name=name):
+                self.assertEqual(relink._parse_030(name), old)
+
+
+class GoneFileTest(LiveBox):
+    """A 'have' chapter whose library file is gone, and that the import
+    cannot link again, goes back to what the plan says."""
+
+    def test_a_wrong_file_removed_by_hand(self):
+        with db.connect() as con:
+            fake = self.build(con)
+            ks = self.ids["Kamisama Kiss"]
+            os.remove(self.lib_path(con, ks, "Chapter 2020.0.cbz"))
+            with self.assertLogs("mangarr.relink", "WARNING"):
+                msg = relink.check_links(con, fake).message
+            self.assertEqual(msg, "2 misread link(s) repaired; 1 chapter(s) whose library file was gone set back; "
+                                  "17 chapter(s) imported")
+            rows = self.rows(con, ks)
+            self.assertNotIn(2020.0, rows)
+            self.assertEqual((rows[150.0]["status"], os.path.basename(rows[150.0]["staging_path"])), ("have", LOSERS))
+            self.assertEqual(self.events(con, "gone"), [
+                "Chapter 2020's library file Chapter 2020.0.cbz is gone and no downloaded file could be linked as "
+                "chapter 2020; removed: no source lists it"])
+            self.assertEqual(len(backup.listing()), 1)
+
+    def test_the_backup_of_before_the_repair_restored(self):
+        """The backup the repair wrote is restored: its rows still say 2020,
+        101 and 2026 (and the check is due again), whose files are gone."""
+        with db.connect() as con:
+            fake = self.build(con)
+            con.execute("INSERT INTO maintenance (name, due_at) VALUES (?, ?)", (relink.TASK, db.now()))
+        with self.assertLogs("mangarr.relink", "WARNING"):
+            relink.run_if_due(fake)
+        (b,) = backup.listing()
+        with self.assertLogs("mangarr.backup", "INFO"):
+            backup.restore(backup.path_of(b["name"]))
+        with db.connect() as con:
+            self.assertEqual(db.maintenance_due(con), {relink.TASK})
+            self.assertEqual(self.rows(con, self.ids["Kamisama Kiss"])[2020.0]["status"], "have")
+        with self.assertLogs("mangarr.relink", "WARNING"):
+            msg = relink.run_if_due(fake)
+        self.assertEqual(msg, "no misread links; 3 chapter(s) whose library file was gone set back; 17 chapter(s) "
+                              "imported")
+        with db.connect() as con:
+            for title, wrong, right in (("Kamisama Kiss", 2020.0, 150.0), ("The Dangers in My Heart", 2026.0, 185.5),
+                                        ("Ohitorisama ni wa Naremashita node.: Kon'yakusha Houchi-chuu!", 101.0,
+                                         17.0)):
+                rows = self.rows(con, self.ids[title])
+                self.assertNotIn(wrong, rows)
+                self.assertEqual(rows[right]["status"], "have")
+                self.assertTrue(os.path.exists(rows[right]["library_path"]))
+            self.assertEqual(len(self.events(con, "gone")), 3)
+            self.assertEqual(db.maintenance_due(con), set())
+
+    def test_a_right_file_removed_is_linked_again(self):
+        with db.connect() as con:
+            fake = self.build(con)
+            ks = self.ids["Kamisama Kiss"]
+            lib149 = self.lib_path(con, ks, "Chapter 149.0.cbz")
+            os.remove(lib149)
+            with self.assertLogs("mangarr.relink", "WARNING"):
+                relink.check_links(con, fake)
+            self.assertEqual(self.rows(con, ks)[149.0]["status"], "have")
+            self.assertTrue(os.path.exists(lib149))
+            self.assertEqual(self.events(con, "gone"), [])
+
+    def test_both_files_gone_is_wanted_again(self):
+        """Its staging file went too: a source lists 149, so it is wanted."""
+        with db.connect() as con:
+            fake = self.build(con)
+            ks = self.ids["Kamisama Kiss"]
+            row = self.rows(con, ks)[149.0]
+            os.remove(row["library_path"])
+            os.remove(row["staging_path"])
+            with self.assertLogs("mangarr.relink", "WARNING"):
+                relink.check_links(con, fake)
+            row = self.rows(con, ks)[149.0]
+            self.assertEqual((row["status"], row["library_path"], row["staging_path"]), ("wanted", None, None))
+            self.assertIn("its library file Chapter 149.0.cbz was gone", row["reason"])
+            self.assertEqual(self.events(con, "gone"), [
+                "Chapter 149's library file Chapter 149.0.cbz is gone and no downloaded file could be linked as "
+                "chapter 149; wanted again"])
+
+    def test_a_library_folder_that_is_not_there_is_left_alone(self):
+        """Not every file of a series gone at once: a library not mounted."""
+        import shutil
+        with db.connect() as con:
+            fake = self.build(con)
+            ks = self.ids["Kamisama Kiss"]
+            shutil.rmtree(os.path.join(self.lib, db.get_series(con, ks)["folder"]))
+            con.execute("DELETE FROM series_source WHERE series_id=?", (ks,))      # nothing to link it again from
+            con.commit()
+            with self.assertLogs("mangarr.relink", "WARNING") as cm:
+                relink.check_links(con, fake)
+            self.assertIn("is the library mounted?", "\n".join(cm.output))
+            self.assertEqual({r["status"] for r in self.rows(con, ks).values()}, {"have"})
+            self.assertEqual(self.events(con, "gone"), [])
+
+
+class BackupAndKomgaTest(LiveBox):
+    def test_no_backup_no_change(self):
+        """The backup before the first change fails: nothing is changed and
+        the check stays due."""
+        with db.connect() as con:
+            fake = self.build(con)
+            con.execute("INSERT INTO maintenance (name, due_at) VALUES (?, ?)", (relink.TASK, db.now()))
+            before = {p: inode(p) for p in self.library_files()}
+            rows = {sid: self.rows(con, sid) for sid in self.ids.values()}
+        with mock.patch.object(backup, "create", side_effect=OSError("No space left on device")), \
+                self.assertRaises(relink.RepairAborted) as cm:
+            relink.run_if_due(fake)
+        self.assertIn("nothing changed", str(cm.exception))
+        self.assertEqual({p: inode(p) for p in self.library_files()}, before)
+        with db.connect() as con:
+            self.assertEqual({sid: self.rows(con, sid) for sid in self.ids.values()}, rows)
+            self.assertEqual(db.maintenance_due(con), {relink.TASK})
+
+    def library_files(self) -> list[str]:
+        return [os.path.join(d, f) for d, _, fs in os.walk(self.lib) for f in fs]
+
+    def test_komga_not_answering_is_asked_once_more(self):
+        """At the next import (nothing linked there) or after a while."""
+        scans = []
+        timers = []
+
+        class Timer:
+            def __init__(self, delay, fn):
+                timers.append(self)
+                self.fn, self.daemon, self.cancelled = fn, False, False
+
+            def start(self):
+                pass
+
+            def cancel(self):
+                self.cancelled = True
+        with db.connect() as con:
+            fake = self.build(con)
+            with mock.patch.object(komga, "scan", lambda *a: scans.append("scan") and False), \
+                    mock.patch.object(komga, "configured", lambda: True), \
+                    mock.patch.object(komga.threading, "Timer", Timer), \
+                    self.assertLogs("mangarr", "WARNING") as cm:
+                relink.check_links(con, fake)
+                asked = len(scans)
+                self.assertEqual(len(timers), 1)                        # one retry waits, however many scans failed
+                self.assertIn("trying once more", "\n".join(cm.output))
+                self.assertEqual(core.import_series(con, self.ids["Kamisama Kiss"], fake), 0)
+                self.assertEqual(len(scans), asked + 1)                 # the retry, at the next import
+                self.assertTrue(timers[0].cancelled)
+                core.import_series(con, self.ids["Kamisama Kiss"], fake)
+                self.assertEqual(len(scans), asked + 1)                 # only once
+                self.assertIsNone(komga.retry_now())
+
+    def test_komga_retry_after_a_while(self):
+        scans = []
+        with mock.patch.object(komga, "configured", lambda: True), \
+                mock.patch.object(komga, "RETRY_SECONDS", 3600):
+            with mock.patch.object(komga, "scan", lambda *a: scans.append(1) and False), \
+                    self.assertLogs("mangarr.komga", "WARNING"):
+                self.assertFalse(komga.scan_retrying())
+            with mock.patch.object(komga, "scan", lambda *a: scans.append(1) or True):
+                self.assertTrue(komga.retry_now())                      # what the timer calls
+                self.assertIsNone(komga.retry_now())
+            self.assertEqual(len(scans), 2)
+
+
 @unittest.skipIf(web is None, "web extras not installed")
 class WebTaskTest(LiveBox):
     """The System task, the API command and the run once after the upgrade:
@@ -329,6 +664,39 @@ class WebTaskTest(LiveBox):
             self.assertEqual(web._job_check_links(job), "3 misread link(s) repaired; 17 chapter(s) imported")
         with db.connect() as con:
             self.assertEqual(db.maintenance_due(con), set())
+
+
+    def test_a_check_suwayomi_did_not_answer_is_queued_again_after_a_pass(self):
+        with db.connect() as con:
+            fake = self.build(con)
+        fake.down = True
+        job = jobs.Job(1, "check-links", "check library links")
+        with mock.patch.object(web, "client", fake), mock.patch.object(web, "with_cancel", lambda c, f: c), \
+                self.assertLogs("mangarr", "WARNING"):
+            self.assertIn("3 left for a later run (Suwayomi did not answer)", web._job_check_links(job))
+        with db.connect() as con:
+            self.assertEqual(db.maintenance_due(con), {relink.TASK})
+        with mock.patch.object(web, "_refresh_all", lambda job: "pass done"):
+            self.assertEqual(web._job_refresh_all(jobs.Job(2, "refresh-all", "all")), "pass done")
+        self.assertEqual(self.queued(), ["check-links"])
+
+
+class WorkerTest(unittest.TestCase):
+    def test_the_worker_runs_a_due_check_before_every_cycle(self):
+        import signal
+
+        from mangarr import daemon
+        calls = []
+        handlers = signal.getsignal(signal.SIGTERM), signal.getsignal(signal.SIGINT)
+        self.addCleanup(signal.signal, signal.SIGINT, handlers[1])
+        self.addCleanup(signal.signal, signal.SIGTERM, handlers[0])
+        with mock.patch.object(daemon, "cycle", lambda c: calls.append("cycle")), \
+                mock.patch.object(relink, "run_if_due", lambda *a, **k: calls.append("check")), \
+                mock.patch.object(daemon.stuck.fetcher, "start", lambda: None), \
+                mock.patch.object(daemon.notify, "flush", lambda: None), \
+                mock.patch.object(daemon.limits, "clamp", lambda k, v: 1.0):
+            daemon.run(once=True)
+        self.assertEqual(calls, ["check", "cycle"])
 
 
 class SchemaTest(unittest.TestCase):
