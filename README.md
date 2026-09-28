@@ -868,6 +868,19 @@ pages become *junk*, chapters no trusted source lists any more become
 the source that lists it. Then it downloads what is wanted and links the
 results.
 
+Counting a fractional chapter's pages asks its source for the page list,
+so the count is kept and not taken again every pass. A chapter is counted
+again when its source lists it differently (another name, scanlator or
+release date) and when the count is 30 days old. A count that makes it
+junk is checked again sooner, since a wrong one costs a chapter (an empty
+answer, an upload still in progress, a placeholder the site fixes later):
+a day later, then a week and a month later while it comes out the same,
+and from then on every 90 days. After a count that failed, the chapter is
+kept, as it always was when a count fails, and is counted again in the
+next pass, then a day, three days and a week later while it keeps failing.
+A new *Minimum pages for a fractional chapter* applies to the kept counts
+at once.
+
 The downloader works one source at a time. It queues a batch of its own
 chapter ids in Suwayomi, watches them, and dequeues them if it gives up;
 it never clears Suwayomi's queue, so your own manual downloads and
@@ -976,11 +989,12 @@ mangarr/
   matching.py    title normalisation + strict match rules
   suwayomi.py    Suwayomi GraphQL client
   resolver.py    search every source, accept matches, build per-chapter plan
+  pagecounts.py  page counts of fractional chapters, kept between passes
   downloader.py  paced per-source download through Suwayomi, with fallback
   lanes.py       download lanes: a refresh pass downloads from several sources at once
   pagewarm.py    fetches a chapter's pages one at a time (sources that refuse bursts)
   library.py     staging tree parsing, hard-link library, file names
-  db.py          SQLite: series, sources, chapters, events, lists, settings
+  db.py          SQLite: series, sources, chapters, page counts, events, lists, settings
   core.py        add / refresh / import / adopt / per-chapter download
   lists.py       import lists: fetchers, params, sync
   jobs.py        job runner + scheduler (web)

@@ -295,11 +295,15 @@ class Client:
 
     def page_count(self, chapter_id: int) -> int | None:
         """How many pages a chapter has (fetches the page list from the
-        source). None when the source will not say."""
+        source). None when the source will not say; SuwayomiUnreachable
+        when Suwayomi itself does not answer, which says nothing about the
+        chapter."""
         try:
             d = self.gq('mutation($id: Int!) { fetchChapterPages(input: {chapterId: $id}) { pages } }',
                         {"id": chapter_id}, timeout=60, retries=1)
             return len(d["fetchChapterPages"]["pages"])
+        except SuwayomiUnreachable:
+            raise
         except SuwayomiError:
             return None
 
