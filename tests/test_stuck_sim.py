@@ -6,7 +6,11 @@ over one series on 2-4 made-up sites. The resolve works from the sites'
 chapter lists with the real ranking (resolver._assign) and the real junk
 check (resolver._prune_junk, with the page-count cache between passes); the
 download is the real downloader.download loop, with a stand-in for what
-Suwayomi does with one run of chapters. Between passes the clock moves on by
+Suwayomi does with one run of chapters (a chapter it downloads is listed as
+downloaded from then on), and the import links what arrived unless the
+library already has another file under its name (until you move it away)
+or checking the file runs out of time (core.not_linked either way).
+Between passes the clock moves on by
 hours to days (now and then several days) and the sites change: they rename
 a fractional chapter (a side story's name, a title of its own, a plain one),
 list or drop chapters (now and then one goes from every site), add new ones,
@@ -38,7 +42,14 @@ a model that keeps what the passes saw:
      short of that and every other one a copy it would not count (a copy
      Suwayomi did not count keeps it), and every site that listed it within
      KEEP_DAYS but did not answer had a copy that was not the chapter when it
-     last listed it. A copy counted short is never tried (I2-short).
+     last listed it. A chapter Suwayomi has downloaded is on disk, linked
+     or not. A copy of a fractional chapter is tried only when the counts
+     the resolve went by say it is the chapter (min_pages or more), or its
+     site would not count it (I2-short): never one counted short, one whose
+     count expired, one never counted (a fallback behind a full best copy)
+     or one Suwayomi did not count this time. (A copy its site changed in
+     place since a count still kept is not seen before that count is due
+     again: the pass goes by the count, as pagecounts.py says.)
   I3 automatic skip: only with strict order and the automatic skip on, a
      chapter that blocked (failed on every site), whose verdict was HIGH in
      two resolves at least a day apart, in the latest of which every site
@@ -52,6 +63,12 @@ a model that keeps what the passes saw:
   I5 decisions: your skip, un-skip, Keep waiting and ignore stay as you
      left them (dropped only once the chapter is on disk, or no site has
      listed it for GRACE_DAYS + GONE_DAYS).
+  I6 no stall: when the first chapter strict order waits for is due and
+     one of its copies may be tried (not one that failed and waits for its
+     retry, nor one no site lists now), the pass tries a chapter, or you
+     took one back during its download; never twice in a row without.
+     Chapters on disk, ignored, junk or unavailable are passed, and so is
+     one Suwayomi has downloaded that the import could not link.
 
 None of them exempts junk: a junk chapter is still listed, keeps its
 evidence and your decisions, and holds strict order unless it is junk as
@@ -96,6 +113,8 @@ PLAIN = ("Chapter {}", None)
 PENDING = ("wanted", "failed", "unavailable")
 # what a page count of a fractional chapter's copy tells the resolve (Model.observe)
 FULL, SHORT, UNKNOWN, UNASKED = "full", "short", "unknown", "unasked"
+NOT_IT = {SHORT: "was counted short", UNASKED: "was not counted: Suwayomi did not answer",
+          None: "was not counted in this resolve, and no kept count of it holds"}
 SHM = "/dev/shm"                        # a memory file system where there is one: no disk syncs
 
 
@@ -124,7 +143,12 @@ class World:
             for f in self.fracs:
                 if rng.random() < 0.6:
                     self.add(s, f)
-        self.delivered: set[float] = set()
+        self.delivered: set[float] = set()                     # in staging: Suwayomi downloaded them
+        self.downloaded: set[tuple[str, float]] = set()         # ... from these sites (listed as downloaded)
+        # the library already has another file under these chapters' names (a restore, a series added again)
+        self.foreign: set[float] = set()
+        if rng.random() < 0.35:
+            self.foreign.add(rng.choice([float(k) for k in range(1, self.top + 1)] + self.fracs))
 
     def name(self, n: float) -> str | None:
         if n == int(n):
@@ -164,7 +188,12 @@ class World:
             mine = sorted(b for b in self.broken if b[0] == s)
             if mine and rng.random() < 0.06:
                 self.broken.discard(rng.choice(mine))
+        for n in sorted(self.foreign):
+            if rng.random() < 0.1:                      # you moved the other file away
+                self.foreign.discard(n)
         listed = sorted({n for s in self.sites for n in self.lists[s]})
+        if listed and rng.random() < 0.04:
+            self.foreign.add(rng.choice(listed))
         if listed and rng.random() < 0.06:              # renumbered, or taken down: gone from every site
             n = rng.choice(listed)
             for s in self.sites:
@@ -299,6 +328,11 @@ class Sim:
         self.judged: dict[tuple[str, float], object] = {}
         self.prng = random.Random()             # what happens inside a pass: apart from how the world goes on
         self.take_back = False
+        self.took_back = False                  # you took a chapter back during this pass's download
+        self.tried = 0                          # chapters tried in this pass
+        self.expect: float | None = None        # I6: the chapter this pass was to try (or one after it)
+        self.idle = 0                           # passes in a row that tried nothing though one was due
+        self.last_judged: dict[tuple[str, float], str] = {}   # (site, n) -> what its last count judged by said
         self.stats: Counter = Counter()
 
     # -- the stand-ins ------------------------------------------------------------------------------
@@ -316,6 +350,8 @@ class Sim:
         """What Suwayomi says a copy's page list has (the resolve counts fractional chapters)."""
         key = self.copy_of(chapter_id)
         self.stats["page counts"] += 1
+        if self.last_judged.get(key) == SHORT:
+            self.stats["short counts counted again before the copy is used"] += 1
         if self.prng.random() < 0.03:
             self.judged[key] = UNASKED
             self.stats["page counts Suwayomi did not answer"] += 1
@@ -337,7 +373,8 @@ class Sim:
             if o == "miss":
                 continue
             answered.append(s)
-            chapters = [Chapter(cid(w.mid[s], n), n, name, None, False) for n, name in sorted(w.lists[s].items())]
+            chapters = [Chapter(cid(w.mid[s], n), n, name, None, (s, n) in w.downloaded)
+                        for n, name in sorted(w.lists[s].items())]
             matches.append(SourceMatch(src, w.mid[s], "Freedom", None, 0, "Freedom", 1, chapters))
         candidates = _assign(matches)
         plan = Plan(series, matches, [], unreachable, {n: c[0] for n, c in candidates.items()}, candidates=candidates)
@@ -352,9 +389,11 @@ class Sim:
                     self.judged[self.copy_of(ch.id)] = got[1]
                 return got
             counts.lookup = kept
-        resolver._prune_junk(client, plan, None, counts)
+        resolver._prune_junk(client, plan, None, counts, kw.get("settled"))
         self.model.observe(self.t, w, answered, self.judged)
+        self.last_judged.update((k, copy_state(v)) for k, v in self.judged.items())
         self.plan = plan
+        self.stats["copies left out as not counted"] += sum(len(v) for v in getattr(plan, "uncounted", {}).values())
         self.stats["junk chapters"] += len(plan.junk)
         self.stats["junk as I2 says"] += sum(1 for n in plan.junk if self.model.junk.get(n))
         self.stats["short copies left out of a chapter"] += sum(
@@ -363,15 +402,52 @@ class Sim:
         return plan
 
     def import_series(self, con, series_id, client=None):
+        """What arrived is linked, unless the library already has another file under its name, or checking the
+        file runs out of time this once (core.not_linked: the next import tries again)."""
         rows = {r["number"]: r for r in db.chapters(con, series_id)}
         linked = 0
         for n in sorted(self.world.delivered):
             r = rows.get(n)
-            if r is None or r["status"] not in ("have", "ignored"):
-                db.set_have(con, series_id, n, None, None)
-                linked += 1
+            if r is not None and r["status"] in ("have", "ignored", "junk"):
+                continue
+            if n in self.world.foreign:
+                core.not_linked(con, series_id, n, f"Site: downloaded, not linked: the library already has another "
+                                f"file at Chapter {n:g}.cbz, which is never overwritten")
+                self.stats["imports that found another file in the library"] += 1
+                continue
+            if self.prng.random() < 0.1:
+                core.not_linked(con, series_id, n, "Site: downloaded, not linked yet: checking it took longer than "
+                                "30s (slow or busy storage); checked again at the next import")
+                self.stats["imports whose check ran out of time"] += 1
+                continue
+            db.set_have(con, series_id, n, None, None)
+            linked += 1
         con.commit()
         return linked
+
+    def due(self, con, series_id, plan):
+        """core._due, and what I6 expects of the download: the first chapter strict order waits for, when it is
+        due and one of its copies may be tried."""
+        wanted = self.real_due(con, series_id, plan)
+        rows = {r["number"]: r for r in db.chapters(con, series_id)}
+        have, now_ = plan.have(), db.now()
+        self.expect = None
+        for k in sorted(rows):
+            r = rows[k]
+            if r["status"] in ("have", "ignored", "junk", "unavailable") or k in have:
+                if k in have and r["status"] in ("wanted", "failed") and any(n > k for n in wanted):
+                    self.stats["downloads due past a chapter downloaded but not linked"] += 1
+                continue
+            if r["status"] == "failed" and r["next_try"] and r["next_try"] > now_:
+                break                                   # waits for its retry
+            if k not in plan.assignment:
+                break                                   # no site lists it now: waited for
+            if k != int(k) and not any(copy_state(self.judged[(s, k)]) in (FULL, UNKNOWN)
+                                       for s in self.world.sites if (s, k) in self.judged):
+                break                                   # no copy known to be it: counted first
+            self.expect = k
+            break
+        return wanted
 
     def download_source(self, client, manga_id, todo, batch, label, source_name, patient, cancel, report, memo,
                         stop_on_fail=False, throttled=False, warm=False, gone=set):
@@ -383,10 +459,11 @@ class Sim:
                 self.take_back_one(c.number)
             if c.number in gone():
                 continue
+            self.tried += 1
             if stop_on_fail:
                 self.check_order(c.number)
-            if (source_name, c.number) in self.model.short:
-                self.fail("I2-short", f"ch {c.number:g} tried on {source_name}, whose copy was counted short")
+            if c.number != int(c.number):
+                self.check_copy(source_name, c.number)
             if self.cut_after is not None and len(self.arrived) >= self.cut_after:
                 raise SuwayomiUnreachable("Suwayomi at http://sim unreachable: connection refused")
             if (source_name, c.number) in self.world.broken:
@@ -398,7 +475,22 @@ class Sim:
                 ok.append(c.number)
                 self.arrived.append(c.number)
                 self.world.delivered.add(c.number)
+                self.world.downloaded.add((source_name, c.number))
         return ok, failed, why
+
+    def check_copy(self, site: str, n: float) -> None:
+        """I2-short, as a copy of fractional chapter n is tried on `site`."""
+        key = (site, n)
+        state = copy_state(self.judged[key]) if key in self.judged else None
+        if state not in (FULL, UNKNOWN):
+            self.fail("I2-short", f"ch {n:g} tried on {site}, whose copy {NOT_IT[state]} (it has "
+                                  f"{self.world.pages.get(key)} pages)")
+            return
+        if self.plan.candidates.get(n) and self.plan.candidates[n][0].source.name != site:
+            self.stats[f"fallback copies tried, counted {state}"] += 1
+        if (self.world.pages.get(key) or MIN_PAGES) < MIN_PAGES:
+            self.stats["short copies tried on a count kept from before the site changed them in place"
+                       if state == FULL else "short copies tried that their site would not count"] += 1
 
     def take_back_one(self, n: float) -> None:
         """You un-skip (or want again) a chapter before n while the download runs."""
@@ -415,6 +507,7 @@ class Sim:
                 stuck.forget(other, self.sid, k)
                 other.commit()
         if done:
+            self.took_back = True
             self.decide(k, "unskip")
             self.stats["chapters taken back while the download ran"] += 1
             self.history.append(f"  (you took {k:g} back while {n:g} was about to download)")
@@ -457,10 +550,11 @@ class Sim:
         settings._cache.clear()
 
     def run(self) -> list[tuple[str, str]]:
-        self.real_judge, self.real_record = stuck.judge, core.record_downloads
+        self.real_judge, self.real_record, self.real_due = stuck.judge, core.record_downloads, core._due
         patches = [mock.patch.object(config, "DB_PATH", self.path),
                    mock.patch.object(core, "resolve", self.resolve),
                    mock.patch.object(core, "import_series", self.import_series),
+                   mock.patch.object(core, "_due", self.due),
                    mock.patch.object(core, "record_downloads", self.record_downloads),
                    mock.patch.object(downloader, "_download_source", self.download_source),
                    mock.patch.object(downloader, "download_lock", lambda *a, **k: contextlib.nullcontext()),
@@ -498,6 +592,7 @@ class Sim:
         self.cut_after = rng.randint(0, 3) if rng.random() < 0.05 else None
         self.race, self.raced, self.resolved = rng.random() < 0.15, False, False
         self.take_back, self.arrived = rng.random() < 0.15, []
+        self.took_back, self.tried, self.expect = False, 0, None
         if rng.random() < 0.05:
             self.auto = not self.auto
             self.set(auto_skip_side_stories=self.auto)
@@ -517,6 +612,9 @@ class Sim:
             self.history.append(f"  counts {sorted((k[0][5], k[1], v) for k, v in self.judged.items())}; "
                                 f"junk {sorted(self.plan.junk)}")
             self.stats["voided junk"] += len(getattr(self.plan, "voided", {}))
+        self.history.append(f"  tried {self.tried}; due first {self.expect}; not linked "
+                            f"{sorted(n for n in w.delivered if n in w.foreign)}")
+        self.check_progress()
         self.check()
         self.act()
         if rng.random() < 0.06:
@@ -604,12 +702,28 @@ class Sim:
                 break
             r = rows.get(k)
             status = r["status"] if r is not None else None
-            if k in self.arrived or status in ("have", "ignored") or m.past_grace(k, self.t) or m.junk.get(k):
+            if k in self.world.delivered or status in ("have", "ignored") or m.past_grace(k, self.t) or \
+                    m.junk.get(k):
                 continue
             self.fail("I2", f"ch {n:g} tried while ch {k:g} is {status} and not past its grace "
                             f"(missed {m.missed.get(k, 0)}, last listed {(self.t - m.last_listed[k]) / 3600:.1f} h ago)"
                             + (" nor junk as I2 says" if status == "junk" else ""))
             return
+
+    def check_progress(self) -> None:
+        """I6, after a pass."""
+        if self.expect is None or self.tried or self.took_back:
+            self.idle = 0
+            return
+        self.idle += 1
+        self.stats["passes that tried nothing though a chapter was due"] += 1
+        if self.idle >= 2:
+            with db.connect() as con:
+                r = db.chapters_by_number(con, self.sid, [self.expect])[self.expect]
+                later = [(x["number"], x["reason"]) for x in db.chapters(con, self.sid)
+                         if x["number"] > self.expect and x["status"] == "wanted"][:1]
+            self.fail("I6", f"{self.idle} passes in a row tried nothing, though ch {self.expect:g} was due "
+                            f"({r['status']}: {r['reason']!r}; after it {later})")
 
     def check(self) -> None:
         m, t = self.model, self.t
@@ -815,11 +929,18 @@ class PassSimulatorTest(unittest.TestCase):
                              for inv, (text, hist) in sorted(first.items()))
         self.assertEqual(dict(counts), {}, f"{SCENARIOS} scenarios, {runs} passes, {took:.1f} s\n{report}")
         # the junk paths are all taken: chapters judged junk by every copy, a short copy left out of a chapter
-        # another site has in full, junk withheld while a site that may have it did not answer, recounts
+        # another site has in full, junk withheld while a site that may have it did not answer, recounts; and so
+        # are the fallback copies (counted before one is tried, a short count counted again once it expired, a copy
+        # not counted this time left out) and the downloads due past a chapter Suwayomi has but the import could
+        # not link (another file in the library, a check out of time)
         for what, least in (("junk chapters", 100), ("junk as I2 says", 100), ("short copies left out of a chapter", 50),
                             ("voided junk", 5), ("junk rows with evidence or a decision", 20),
                             ("page counts Suwayomi did not answer", 10), ("chapters taken back while the download ran", 10),
-                            ("automatic skips", 10), ("restores", 10)):
+                            ("automatic skips", 10), ("restores", 10), ("fallback copies tried, counted full", 20),
+                            ("short counts counted again before the copy is used", 50),
+                            ("copies left out as not counted", 20), ("imports that found another file in the library", 100),
+                            ("imports whose check ran out of time", 50),
+                            ("downloads due past a chapter downloaded but not linked", 20)):
             self.assertGreaterEqual(stats[what], least, f"{what}: {dict(stats)}")
         if self.shm:                            # on a disk, the syncs alone can take longer (about 50 s without it)
             self.assertLess(took, 60)
