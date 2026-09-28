@@ -11,6 +11,7 @@
     {{ m.toolbar_button('History', 'history', href='#history') }}
     {{ m.toolbar_button('Sources', 'network', href='#sources') }}
     {{ m.toolbar_separator() }}
+    {{ m.toolbar_button('Preview Rename', 'folder', attrs={'id': 'rename-open', 'data-rename-preview': '/api/v1/rename?seriesId=' ~ s.id}, title='What the naming formats would rename in this series; nothing is renamed until you say so') }}
     {{ m.toolbar_button('Edit', 'edit', attrs={'data-open-modal': 'edit-modal'}) }}
     {{ m.toolbar_button('Delete', 'delete', attrs={'data-open-modal': 'delete-modal'}, disabled=busy, title=('a job for this series is running' if busy else none)) }}
   </div>
@@ -232,6 +233,28 @@
     </tbody></table></div>
   </details>
 </div>
+
+{# -- Preview Rename modal (Sonarr OrganizePreviewModal), filled by JS from /api/v1/rename -- #}
+{% call m.modal('rename-modal', 'large') %}
+<form method="post" action="/series/{{ s.id }}/rename" id="rename-form" class="form">
+  <div class="modal-header" id="rename-modal-title">Rename - {{ s.title }}</div>
+  <div class="modal-body">
+    <div class="help-text">Nothing is renamed until you press Rename. A database backup is made first and the rename can be undone for 7 days (Activity, History). Suwayomi's downloads (staging) are not touched.</div>
+    <input type="hidden" name="latest_titles" value="0">
+    <label class="inline-check">{{ m.check('latest_titles', false, '1', 'rename-latest', 'primary') }} Use the latest chapter titles from sources</label>
+    <span class="help-text inline">Off: every file keeps the title its name has now.</span>
+    <input type="hidden" name="only" value="" id="rename-only">
+    <input type="hidden" name="rename_folder" value="1" id="rename-folder-field">
+    <div id="rename-body" class="rename-body"><div class="loading">Loading the preview…</div></div>
+    <div id="rename-komga" class="alert info small" hidden></div>
+    <label class="inline-check text-warning" id="rename-confirm" hidden>{{ m.check('confirmed', false, '1', 'rename-confirmed', 'warning') }} I understand: {{ progress_lost }}</label>
+  </div>
+  <div class="modal-footer">
+    <button type="button" class="button" data-close-modal>Cancel</button>
+    <button type="submit" class="button primary" id="rename-submit" disabled>Rename</button>
+  </div>
+</form>
+{% endcall %}
 
 {# -- Edit Series modal --------------------------------------------------- #}
 {% call m.modal('edit-modal', 'medium') %}

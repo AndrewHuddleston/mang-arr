@@ -39,7 +39,7 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
 
-from . import config, core, db, downloader, limits, metrics, settings, stuck
+from . import config, core, db, downloader, limits, metrics, serieslock, settings, stuck
 from .resolver import Plan
 from .suwayomi import BREAKER_SECS, SuwayomiUnreachable, with_cancel
 
@@ -582,11 +582,13 @@ class LanePool:
             t0 = self.clock()
             try:
                 downloader.clear_leftovers(self.client, self.cancelled)
-                ok, failed, why = downloader._download_source(
-                    self.client, run.match.manga_id, run.todo, run.batch, task.title, src.name, run.patient,
-                    self.cancelled, self._reporter(task, lane), memo, stop_on_fail=run.in_order,
-                    throttled=src.throttled, warm=src.page_warm, gone=gone)
-            except downloader.Cancelled:
+                # the series' files are not renamed while it downloads (let go before the import)
+                with serieslock.hold(task.series_id, shared=True, should_cancel=self.cancelled):
+                    ok, failed, why = downloader._download_source(
+                        self.client, run.match.manga_id, run.todo, run.batch, task.title, src.name, run.patient,
+                        self.cancelled, self._reporter(task, lane), memo, stop_on_fail=run.in_order,
+                        throttled=src.throttled, warm=src.page_warm, gone=gone)
+            except (downloader.Cancelled, serieslock.Cancelled):
                 task.cut = True
                 return True, 0.0
             except SuwayomiUnreachable as e:

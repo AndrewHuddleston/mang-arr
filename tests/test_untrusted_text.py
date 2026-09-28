@@ -5,7 +5,7 @@ import time
 import unittest
 from unittest import mock
 
-from mangarr import anilist, library, mangadex, matching, metadata
+from mangarr import anilist, library, mangadex, matching, metadata, naming
 from mangarr.matching import disambiguator, match_level, oneline, strip_disambiguator
 from mangarr.web import views
 
@@ -47,6 +47,15 @@ class LinearTimeTest(unittest.TestCase):
         self.assertFast(library.safe_title)
         self.assertFast(lambda s: library.chapter_label(1.0, s))
         self.assertFast(lambda s: library.chapter_filename(1.0, s))
+
+    def test_naming(self):
+        drop = naming.Options(drop_number_only_titles=True, colon_replacement="smart")
+        self.assertFast(lambda s: naming.chapter_title(1.0, s, drop))
+        self.assertFast(naming.number_only)
+        self.assertFast(lambda s: naming.clean(s, drop))
+        self.assertFast(lambda s: naming.validate(s, "chapter"))
+        self.assertFast(lambda s: naming.validate("{" + s + "}", "folder"))
+        self.assertFast(lambda s: naming.title_from_name(f"Chapter 001.0 - {s}.cbz", None, 1.0))
 
     def test_plain_description(self):
         self.assertFast(views.plain_description)

@@ -2152,7 +2152,7 @@ class PagesTest(WebBase, _Offline):
         self.assertIn(f'<tr data-id="{self.sid}" data-failed="1" data-stuck="1" >', html)
 
     def test_settings_download_order(self):
-        html = self.page("/settings")
+        html = self.page("/settings/downloading")
         self.assertIn(">Download Order</label>", html)
         self.assertNotIn(">Download In Order</label>", html)
         self.assertIn('id="download_in_order" checked data-hides="order-warning" data-enables="auto-skip-option"',
@@ -2168,14 +2168,14 @@ class PagesTest(WebBase, _Offline):
         self.client.post("/settings", data={"download_in_order": ["0", "1"], "auto_skip_side_stories": ["0", "1"]})
         settings._cache.clear()
         self.assertTrue(settings.get("auto_skip_side_stories"))
-        html = self.page("/settings")
+        html = self.page("/settings/downloading")
         self.assertIn('id="auto_skip_side_stories" checked data-shows="auto-skip-warning">', html)
         self.assertIn('id="auto-skip-warning" >', html)
         # strict order off: the option is greyed out and not sent, so it keeps its value
         self.client.post("/settings", data={"download_in_order": "0"})
         settings._cache.clear()
         self.assertEqual((settings.get("download_in_order"), settings.get("auto_skip_side_stories")), (False, True))
-        html = self.page("/settings")
+        html = self.page("/settings/downloading")
         self.assertIn('<div class="order-option off" id="auto-skip-option"><input type="hidden" '
                       'name="auto_skip_side_stories" value="0" disabled>', html)
         self.assertRegex(html, r'id="auto_skip_side_stories"\s+checked data-shows="auto-skip-warning" '

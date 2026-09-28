@@ -51,7 +51,7 @@ import stat
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 
-from . import backup, config, core, db, komga, library, limits
+from . import backup, config, core, db, komga, library, limits, serieslock
 from .matching import oneline
 from .suwayomi import Client, SuwayomiError
 
@@ -327,33 +327,47 @@ def check_links(con, client: Client | None = None, progress: Callable[[str], Non
     for i, r in enumerate(rows, 1):
         if should_cancel and should_cancel():
             raise limits.Cancelled()
-        sid, title = r["id"], r["title"]
+        sid = r["id"]
         lists, confirmed, listed = asked.get(sid) or (Lists(con, client, sid), [], None)
-        done = []
-        if confirmed:
-            say(f"repairing {oneline(title, 80)}")
-            for m in confirmed:
-                guard.before_change()
-                if _unlink(m):
-                    done.append((m, _reset(con, sid, m, listed)))
+        if con.in_transaction:
             con.commit()
-        say(f"importing series {i} of {len(rows)}: {oneline(title, 80)}")
-        result.imported += core.import_series(con, sid, client)
-        for m, wanted in done:
-            result.repaired.append(_record(con, sid, m, wanted))
-        con.commit()
-        gone = _gone(con, sid, title, r["folder"])
-        if gone:
-            if listed is None:
-                listed = _listed_numbers(lists, title)
-            for row in gone:
-                guard.before_change()
-                result.healed.append(_heal(con, sid, title, row, listed))
-            con.commit()
+        with serieslock.hold(sid, should_cancel=should_cancel):     # its files are not renamed meanwhile
+            _check_series(con, client, r, i, len(rows), lists, confirmed, listed, guard, result, say)
     if (result.repaired or result.healed) and not result.imported:
         komga.scan_retrying()           # a link went and none came: import_series did not ask
     log.info("check library links: %s", result.message)
     return result
+
+
+def _check_series(con, client, r, i: int, of: int, lists: "Lists", confirmed: list, listed: set | None,
+                  guard: "_BackupFirst", result: "Result", say: Callable[[str], None]) -> None:
+    """check_links for one series, its lock held."""
+    sid, title = r["id"], r["title"]
+    row = db.get_series(con, sid)
+    if row is None:
+        return                          # deleted meanwhile
+    folder = row["folder"]              # as it is now: a rename may have ended just before the lock was free
+    done = []
+    if confirmed:
+        say(f"repairing {oneline(title, 80)}")
+        for m in confirmed:
+            guard.before_change()
+            if _unlink(m):
+                done.append((m, _reset(con, sid, m, listed)))
+        con.commit()
+    say(f"importing series {i} of {of}: {oneline(title, 80)}")
+    result.imported += core.import_series(con, sid, client)
+    for m, wanted in done:
+        result.repaired.append(_record(con, sid, m, wanted))
+    con.commit()
+    gone = _gone(con, sid, title, folder)
+    if gone:
+        if listed is None:
+            listed = _listed_numbers(lists, title)
+        for row in gone:
+            guard.before_change()
+            result.healed.append(_heal(con, sid, title, row, listed))
+        con.commit()
 
 
 class _BackupFirst:
@@ -411,9 +425,9 @@ def _set_back(con, series_id: int, number: float, listed: set | None, reason: st
     if row is None or row["status"] != "have":
         return False
     if _listed(row, listed):
-        con.execute("UPDATE chapter SET status='wanted', reason=?, staging_path=NULL, library_path=NULL, pages=NULL,"
-                    " tries=0, next_try=NULL, failed_since=NULL, updated_at=? WHERE series_id=? AND number=?"
-                    " AND status='have'", (reason, db.now(), series_id, number))
+        con.execute("UPDATE chapter SET status='wanted', reason=?, staging_path=NULL, library_path=NULL,"
+                    " file_title=NULL, pages=NULL, tries=0, next_try=NULL, failed_since=NULL, updated_at=?"
+                    " WHERE series_id=? AND number=? AND status='have'", (reason, db.now(), series_id, number))
         return True
     con.execute("DELETE FROM chapter WHERE series_id=? AND number=? AND status='have'", (series_id, number))
     return False

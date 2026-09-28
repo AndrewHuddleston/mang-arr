@@ -4,7 +4,7 @@ import logging
 import signal
 import time
 
-from . import config, core, db, downloader, limits, notify, relink, stuck
+from . import config, core, db, downloader, limits, notify, relink, renamer, stuck
 from .suwayomi import BREAKER_SECS, Client, SuwayomiError, SuwayomiUnreachable
 
 log = logging.getLogger(__name__)
@@ -77,6 +77,7 @@ def run(interval_hours: float = config.REFRESH_HOURS, once: bool = False) -> Non
     stuck.fetcher.start()               # MangaDex lookups for the chapters series are stuck behind
     interval_hours = limits.clamp("refresh_hours", interval_hours)
     log.info("worker started: refresh every %.1fh, suwayomi at %s", interval_hours, config.SUWAYOMI_URL)
+    renamer.repair()                    # a rename a kill interrupted is settled before anything is imported
     while not _stop:
         started = time.monotonic()
         try:

@@ -16,7 +16,20 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass, field, replace
 
-from . import db, downloader, duplicates, komga, library, limits, metadata, metrics, settings, stuck
+from . import (
+    db,
+    downloader,
+    duplicates,
+    komga,
+    library,
+    limits,
+    metadata,
+    metrics,
+    naming,
+    serieslock,
+    settings,
+    stuck,
+)
 from .matching import oneline
 from .model import Series
 from .pagecounts import PageCounts
@@ -433,10 +446,12 @@ def download_wanted(con, client: Client, series_id: int, plan: Plan,
     reasons: dict = {}
     seen_throttle: set = set()
     attempts: list = []
-    results = downloader.download(client, plan, only=wanted_set, should_cancel=should_cancel, reasons=reasons,
-                                  progress=progress, throttled=seen_throttle,
-                                  dropped=lambda: dropped_chapters(con, series_id, wanted_set), attempts=attempts,
-                                  taken_back=lambda: taken_back(con, series_id, wanted_set, before))
+    with serieslock.hold(series_id, shared=True, should_cancel=should_cancel):    # let go before the import
+        results = downloader.download(client, plan, only=wanted_set, should_cancel=should_cancel, reasons=reasons,
+                                      progress=progress, throttled=seen_throttle,
+                                      dropped=lambda: dropped_chapters(con, series_id, wanted_set),
+                                      attempts=attempts,
+                                      taken_back=lambda: taken_back(con, series_id, wanted_set, before))
     record_downloads(con, series_id, plan, wanted, results, reasons, seen_throttle, attempts)
     return results
 
@@ -492,8 +507,9 @@ def download_chapter(con, client: Client, series_id: int, number: float, manga_i
             continue
         if s["note"] and manga_id is None:
             continue
-        ok, failed, why = downloader.download_one(client, s["manga_id"], ch, title, s["source_name"],
-                                                  should_cancel=cancel, progress=progress)
+        with serieslock.hold(series_id, shared=True, should_cancel=cancel):       # let go before the import
+            ok, failed, why = downloader.download_one(client, s["manga_id"], ch, title, s["source_name"],
+                                                      should_cancel=cancel, progress=progress)
         metrics.record_download(s["source_name"], "ok" if ok else "failed")
         db.record_source_result(con, s["source_name"], "ok" if ok else "failed")
         con.commit()                                # before the next source's network calls
@@ -551,6 +567,9 @@ def _source_tier(con) -> Callable[[str], int]:
     return tier
 
 
+DELETE_WAIT_SECS = 15       # a delete is a web request: it waits this long for a rename or import of the series
+
+
 def delete_series(con, client: Client, series_id: int, delete_library: bool = False) -> None:
     """Stop tracking. Optionally remove the library folder (only the links
     this series recorded; Suwayomi's staging files are never touched). The
@@ -559,7 +578,9 @@ def delete_series(con, client: Client, series_id: int, delete_library: bool = Fa
     tracked twice is cleaned up); a Suwayomi outage does not block the delete.
     Komga is asked to scan once library files are gone, so the series leaves
     it now rather than at its next scheduled scan; the scan request runs on a
-    thread of its own, so the delete does not wait for Komga's answer."""
+    thread of its own, so the delete does not wait for Komga's answer.
+    serieslock.Busy when the series' files are being renamed or imported
+    and that does not end in DELETE_WAIT_SECS: nothing is deleted then."""
     row = db.get_series(con, series_id)
     title, folder = row["title"], row["folder"]
     for s in db.sources(con, series_id):
@@ -572,11 +593,17 @@ def delete_series(con, client: Client, series_id: int, delete_library: bool = Fa
         except SuwayomiError as e:
             log.warning("%s: could not unset library flag on %s entry: %s", title, s["source_name"], e)
     removed = False
-    if delete_library and folder:
-        removed = _delete_library_files(con, series_id, title, folder)
-    db.delete_series(con, series_id)
-    db.event(con, "deleted", f"{title} removed" + (" with library files" if delete_library else ""))
-    con.commit()
+    if con.in_transaction:
+        con.commit()                    # never hold a write while waiting for the lock
+    with serieslock.hold(series_id, wait_secs=DELETE_WAIT_SECS):   # not while its files are renamed or linked
+        row = db.get_series(con, series_id)
+        if row is not None:
+            folder = row["folder"]      # a rename may have given it another one meanwhile
+        if delete_library and folder:
+            removed = _delete_library_files(con, series_id, title, folder)
+        db.delete_series(con, series_id)
+        db.event(con, "deleted", f"{title} removed" + (" with library files" if delete_library else ""))
+        con.commit()
     log.info("%s: no longer tracked", title)
     if removed and komga.configured():
         # a delete is a web request: it does not wait for Komga's answer (up to 20 s)
@@ -704,7 +731,16 @@ def import_series(con, series_id: int, client: Client | None = None, downloaded:
     other files. Every write is committed at once, so no database write is
     held across a Suwayomi call or an archive check. A cancel during the
     chapter-list lookup (a cancellable client) only leaves the unnumbered
-    files for the next import; the rest is linked as usual."""
+    files for the next import; the rest is linked as usual. The series'
+    lock is held meanwhile (serieslock: its files are not renamed while
+    they are linked); serieslock.Busy when it is not free in time."""
+    if con.in_transaction:
+        con.commit()                    # never hold a write while waiting for the lock
+    with serieslock.hold(series_id):
+        return _import_series(con, series_id, client, downloaded)
+
+
+def _import_series(con, series_id: int, client: Client | None, downloaded: dict | None) -> int:
     row = db.get_series(con, series_id)
     title, folder = row["title"], row["folder"]
     known = {r["number"]: dict(r) for r in db.chapters(con, series_id)}
@@ -835,10 +871,14 @@ def _import_file(con, series_id: int, title: str, folder: str, n: float, prev, f
         log.warning("%s: ch %g from %s is unusable (%s); quarantined %s", title, n, source_name, detail, moved)
         return None
     label = prev["name"] if prev and "name" in prev.keys() else None
-    expected = os.path.join(library.library_dir(folder), library.chapter_filename(n, label))
+    chapter = naming.ChapterInfo(n, label)
+    names = naming.SeriesNames.from_row(db.get_series(con, series_id) or {"title": title})
+    options = settings.naming_options(con)
+    name = naming.render(names, chapter, options)       # per the naming settings (Settings -> Media Management)
+    expected = os.path.join(library.library_dir(folder), name)
     ours = bool(prev and prev["library_path"] == expected)
     try:
-        dst = library.link_into_library(f, folder, n, replace=ours, label=label)
+        dst = library.link_into_library(f, folder, n, replace=ours, name=name)
     except FileNotFoundError:
         raise
     except OSError as e:
@@ -849,7 +889,8 @@ def _import_file(con, series_id: int, title: str, folder: str, n: float, prev, f
                    f"file at {expected}, which is never overwritten; move it away and the next import links this one")
         return None
     pages = _PAGES.fullmatch(detail)        # kept for the stuck-behind verdict (verdict.py compares lengths)
-    db.set_have(con, series_id, n, f.path, dst, source_name, pages=int(pages.group(1)) if pages else None)
+    db.set_have(con, series_id, n, f.path, dst, source_name, pages=int(pages.group(1)) if pages else None,
+                file_title=naming.stored_title(chapter, options))
     con.commit()                            # never hold a write across the next file check
     log.debug("%s: linked ch %g <- %s", title, n, f.path)
     return dst

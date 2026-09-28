@@ -356,8 +356,16 @@ class PagesTest(unittest.TestCase):
                  'id="queue-filter"', "Suwayomi", 'class="progress-bar purple"')
         html = self._ok("/activity/history", "added by test", "boom", 'id="history-filter"', 'data-kind="failed"')
         self.assertIn('class="col-icon event-icon danger"', html)                   # event type icon per row
-        self._ok("/settings", 'id="sources"', 'id="scheduling"', 'id="komga"', 'id="notifications"', 'id="security"',
-                 "Weeb Central", 'name="refresh_hours"', 'id="api_key"', 'value="test-komga"')
+        # Settings: Sonarr-style sub-pages; /settings opens Media Management
+        html = self._ok("/settings", 'id="naming"', 'name="chapter_file_format"', 'id="advanced-toggle"',
+                        'id="existing-files"', 'href="/rename"', 'id="folders"')
+        self.assertNotIn('name="refresh_hours"', html)
+        self._ok("/settings/sources", 'id="sources"', "Weeb Central", 'name="page" value="sources"')
+        self._ok("/settings/downloading", 'id="scheduling"', 'name="refresh_hours"', 'name="download_in_order"')
+        self._ok("/settings/komga", 'id="komga"', 'value="test-komga"')
+        self._ok("/settings/notifications", 'id="notifications"', 'value="test-notify"')
+        self._ok("/settings/general", 'id="security"', 'id="api_key"')
+        self.assertEqual(self.client.get("/settings/nope").status_code, 404)
         html = self._ok("/system", 'id="tasks"', 'id="backups"', "Suwayomi", "/system/logs",
                         'action="/system/backups/create"', 'id="health-table"', 'class="description-list"',
                         'action="/system/check-links"', "Check library links")
@@ -367,21 +375,24 @@ class PagesTest(unittest.TestCase):
         self._ok("/login?next=/")                              # no login configured: redirects home (followed)
 
     def test_settings_download_lanes_and_page_by_page(self):
-        html = self._ok("/settings", "Download Lanes", 'name="download_lanes" value="3"',
-                        "Suwayomi currently allows 1 source in parallel.", "<th>Pages</th>", "one by one",
-                        "Page Delay", 'name="page_delay_seconds" value="2.5"', "fetched page by page")
+        self._ok("/settings/sources", '<th class="advanced">Pages</th>', "one by one", "fetched page by page")
+        html = self._ok("/settings/downloading", "Download Lanes", 'name="download_lanes" value="3"',
+                        "Suwayomi currently allows 1 source in parallel.", 'id="suwayomi-fewer"',
+                        "Page Delay", 'name="page_delay_seconds" value="2.5"')
         self.assertRegex(html, r'<button class="button small" name="action" value="suwayomi-parallel" '
                                r'type="submit">Save and let Suwayomi use 3</button>')
-        self.assertRegex(html, r'<input type="checkbox" name="warm_sources" value="weeb central"\s+'
-                               r'aria-label="Fetch Weeb Central page by page">')          # not ticked
+        self.assertRegex(self.client.get("/settings/sources").text,
+                         r'<input type="checkbox" name="warm_sources" value="weeb central"\s+'
+                         r'aria-label="Fetch Weeb Central page by page">')                 # not ticked
         with mock.patch("mangarr.web.app.client.gq",
                         lambda q, **kw: {"settings": {"maxSourcesInParallel": 3}} if "maxSources" in q
                         else _fake_gq(q, **kw)):
-            html = self._ok("/settings", "Suwayomi currently allows 3 sources in parallel.")
+            html = self._ok("/settings/downloading", "Suwayomi currently allows 3 sources in parallel.")
         self.assertNotIn('value="suwayomi-parallel"', html)                   # enough: no button
         with mock.patch("mangarr.web.app.client.sources", side_effect=SuwayomiError("down")):
-            html = self._ok("/settings", "Suwayomi currently allows - sources in parallel (it did not answer).",
-                            'colspan="6"')
+            self._ok("/settings/sources", 'colspan="6"')
+            html = self._ok("/settings/downloading",
+                            "Suwayomi currently allows - sources in parallel (it did not answer).")
         self.assertNotIn('value="suwayomi-parallel"', html)
 
     def test_one_by_one_ticks_round_trip(self):
@@ -394,7 +405,7 @@ class PagesTest(unittest.TestCase):
         self.assertEqual((r.status_code, _flash(r)), (303, "saved"))
         # ticks only count for the sources on the page; sources not installed now keep their entry
         self.assertEqual(settings.all_values()["page_warm_sources"], sorted({*default, "weeb central"}))
-        self.assertRegex(self.client.get("/settings").text,
+        self.assertRegex(self.client.get("/settings/sources").text,
                          r'name="warm_sources" value="weeb central"\s+checked')
         r = self.client.post("/settings", data={**form, "warm_sources": []}, follow_redirects=False)
         self.assertEqual(settings.all_values()["page_warm_sources"], sorted(default))
@@ -478,7 +489,7 @@ class PagesTest(unittest.TestCase):
 
     def test_shell(self):
         html = self._ok("/wanted", 'id="health"', 'id="status"', 'id="sidebar"', "/static/app.js",
-                        'href="/activity/history"', 'href="/settings#komga"', 'href="/system/logs"',
+                        'href="/activity/history"', 'href="/settings/komga"', 'href="/system/logs"',
                         'class="page-header"', 'id="navtoggle"', 'id="series-search"')
         self.assertIn('class="navsec open current" data-section="wanted"', html)
         self.assertIn('href="/wanted" class="on"', html)
@@ -508,7 +519,7 @@ class PagesTest(unittest.TestCase):
         for tag in re.findall(r'<a[^>]*href="https://anilist.co/manga/2"[^>]*>', html):
             self.assertIn('target="_blank"', tag)
         # every absolute off-site link in every page carries the attributes
-        for path in ("/", f"/series/{self.sid}", "/system", "/settings"):
+        for path in ("/", f"/series/{self.sid}", "/system", "/settings", "/settings/komga", "/rename"):
             for tag in re.findall(r'<a[^>]*href="https?://[^"]*"[^>]*>', self.client.get(path).text):
                 self.assertIn('target="_blank"', tag, tag)
 

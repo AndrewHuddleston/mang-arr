@@ -15,7 +15,7 @@ import threading
 import time
 from contextlib import contextmanager
 
-from . import config, library
+from . import config, library, naming, settings
 from .matching import oneline
 from .model import Series
 
@@ -245,6 +245,53 @@ MIGRATIONS = [
     INSERT OR IGNORE INTO maintenance (name, due_at) SELECT 'check-library-links', datetime('now', 'localtime')
       WHERE EXISTS (SELECT 1 FROM chapter WHERE status = 'have' AND library_path IS NOT NULL);
     """,
+    # 18: naming formats and renaming library files (naming.py, renamer.py).
+    #     chapter.file_title: the title the chapter's library file name
+    #     carries ('' when it has none; NULL: not known), so a rename keeps
+    #     it whatever the source calls the chapter by now; filled in from
+    #     the file names (_backfill_file_titles). rename_run: one row per
+    #     rename (or undo of one); rename_log: its journal, every step written
+    #     before it is done, so an interrupted rename can be repaired at the
+    #     next start and a finished one undone. No file is renamed by this
+    #     migration. (The column is added by _backfill_file_titles, unless it
+    #     is there: like the IF NOT EXISTS below, for a database that is
+    #     migrated to here a second time.)
+    """
+    CREATE TABLE IF NOT EXISTS rename_run (
+      id              INTEGER PRIMARY KEY AUTOINCREMENT,
+      started_at      TEXT NOT NULL,
+      finished_at     TEXT,
+      state           TEXT NOT NULL,          -- running | done | failed | cancelled | interrupted (repaired at a start)
+      undo_of         INTEGER,                -- the run this one reverses (an undo), else NULL
+      undone_by       INTEGER,                -- the run that reversed this one
+      options         TEXT NOT NULL DEFAULT '{}',   -- JSON: the naming settings and choices it was made with
+      backup          TEXT,                   -- the database backup written before it
+      komga           TEXT,                   -- JSON {series id: what Komga had of it before: folder, book ids}
+      renamed         INTEGER NOT NULL DEFAULT 0,   -- files and folders renamed
+      skipped         INTEGER NOT NULL DEFAULT 0,   -- steps left undone, each with its reason in rename_log
+      message         TEXT
+    );
+    CREATE TABLE IF NOT EXISTS rename_log (
+      id              INTEGER PRIMARY KEY AUTOINCREMENT,
+      run_id          INTEGER NOT NULL,
+      series_id       INTEGER NOT NULL,       -- no foreign key: the journal outlives a deleted series
+      number          REAL,                   -- the chapter; NULL for the series folder
+      kind            TEXT NOT NULL,          -- file | folder | converted (a converted copy: 0.5.0)
+      old_path        TEXT NOT NULL,
+      new_path        TEXT NOT NULL,
+      old_title       TEXT,                   -- chapter.file_title before and after
+      new_title       TEXT,
+      size            INTEGER,                -- of the file when the step was planned, with its modification
+      mtime_ns        INTEGER,                --   time and inode: how a repair knows it is the same file
+      ino             INTEGER,
+      state           TEXT NOT NULL,          -- planned | done | skipped | failed
+      detail          TEXT,                   -- why it was skipped or failed
+      at              TEXT NOT NULL,
+      done_at         TEXT
+    );
+    CREATE INDEX IF NOT EXISTS rename_log_run ON rename_log(run_id, id);
+    CREATE INDEX IF NOT EXISTS rename_log_state ON rename_log(state);
+    """,
 ]
 
 
@@ -302,6 +349,8 @@ def migrate(con: sqlite3.Connection, target: int | None = None) -> None:
                     _backfill_failed_since(con)
                 if i == 16:
                     _backfill_listing(con)
+                if i == 18:
+                    _backfill_file_titles(con)
                 con.execute(f"PRAGMA user_version = {i}")
                 con.commit()
             except BaseException as e:
@@ -363,6 +412,36 @@ def _backfill_listing(con) -> None:
         missed = (1 if when >= cutoff else LISTING_GRACE_RESOLVES) if gone else 0
         con.execute("UPDATE chapter SET listed=?, listed_at=?, unlisted=?, missed=? WHERE series_id=? AND number=?",
                     (listed, when, int(gone), missed, sid, n))
+
+
+def _backfill_file_titles(con) -> None:
+    """Migration 18: the column chapter.file_title, and its value for the
+    files the library has, read from their names: every name so far was made by the default format, so the title
+    is what follows "Chapter 012.0 - ". When the source's name for the
+    chapter still gives that very title, its own spelling is stored (see
+    naming.title_to_store). A name the default format did not make (a file
+    put there by hand) stays NULL: not known."""
+    if "file_title" not in {r[1] for r in con.execute("PRAGMA table_info(chapter)")}:
+        con.execute("ALTER TABLE chapter ADD COLUMN file_title TEXT")
+    known = unknown = 0
+    rows = con.execute("SELECT series_id, number, name, library_path FROM chapter WHERE status='have'"
+                       " AND library_path IS NOT NULL AND file_title IS NULL").fetchall()
+    for sid, number, name, path in rows:
+        try:
+            title = naming.read_title(os.path.basename(path), None, number)
+            if title is not None:
+                title = naming.title_to_store(number, name, title)
+        except Exception as e:          # a row no name can be made of (a number that is not one): not known
+            log.debug("file title of series #%s ch %r not read: %s: %s", sid, number, type(e).__name__, e)
+            title = None
+        if title is None:
+            unknown += 1
+            continue
+        known += 1
+        con.execute("UPDATE chapter SET file_title=? WHERE series_id=? AND number=?", (title, sid, number))
+    if rows:
+        log.info("chapter titles read from %d library file name(s)%s", known,
+                 f"; {unknown} name(s) mang-arr did not make are left as they are" if unknown else "")
 
 
 def maintenance_due(con) -> set[str]:
@@ -508,16 +587,23 @@ def upsert_series(con, s: Series) -> int:
         con.execute(f"UPDATE series SET {sets} WHERE id=?", (*fields.values(), row["id"]))
         if not row["folder"]:
             taken = {r["folder"] for r in con.execute("SELECT folder FROM series WHERE folder IS NOT NULL")}
-            con.execute("UPDATE series SET folder=? WHERE id=?",
-                        (library.unique_folder(s.title, taken, s.ref), row["id"]))
+            con.execute("UPDATE series SET folder=? WHERE id=?", (new_folder(con, s, taken), row["id"]))
         return row["id"]
     taken = {r["folder"] for r in con.execute("SELECT folder FROM series WHERE folder IS NOT NULL")}
-    fields["folder"] = library.unique_folder(s.title, taken, s.ref)
+    fields["folder"] = new_folder(con, s, taken)
     cols = ", ".join(["ref", *fields, "added_at"])
     marks = ", ".join("?" for _ in range(len(fields) + 2))
     cur = con.execute(f"INSERT INTO series ({cols}) VALUES ({marks})",
                       (s.ref, *fields.values(), now()))
     return cur.lastrowid
+
+
+def new_folder(con, s: Series, taken) -> str:
+    """The library folder of a series that has none yet: what the series
+    folder format (Settings -> Media Management) gives it, made unique among
+    `taken` (library.unique_folder with the default format)."""
+    names = naming.SeriesNames(s.title, s.romaji, s.english, s.native, s.year)
+    return naming.render(names, None, settings.naming_options(con), taken=taken, suffix=s.ref)
 
 
 def series_to_model(row) -> Series:
@@ -901,17 +987,23 @@ def _save_listing(con, series_id: int, plan) -> None:
 
 
 def set_have(con, series_id: int, number: float, staging_path: str | None,
-             library_path: str | None, source_name: str | None = None, pages: int | None = None) -> None:
-    """The chapter is on disk (pages: its page count, when it was counted)."""
+             library_path: str | None, source_name: str | None = None, pages: int | None = None,
+             file_title: str | None = None) -> None:
+    """The chapter is on disk (pages: its page count, when it was counted).
+    file_title: the title its library file name carries ('' for none); it
+    belongs to library_path and is stored with it (without a library_path
+    the one on record stays)."""
     con.execute(
-        "INSERT INTO chapter (series_id, number, status, source_name, staging_path, library_path, pages, updated_at)"
-        " VALUES (?,?,'have',?,?,?,?,?)"
+        "INSERT INTO chapter (series_id, number, status, source_name, staging_path, library_path, pages, file_title,"
+        " updated_at) VALUES (?,?,'have',?,?,?,?,?,?)"
         " ON CONFLICT(series_id, number) DO UPDATE SET status='have', reason=NULL, failed_since=NULL,"
         " staging_path=COALESCE(excluded.staging_path, chapter.staging_path),"
+        " file_title=CASE WHEN excluded.library_path IS NULL THEN chapter.file_title ELSE excluded.file_title END,"
         " library_path=COALESCE(excluded.library_path, chapter.library_path),"
         " source_name=COALESCE(excluded.source_name, chapter.source_name),"
         " pages=COALESCE(excluded.pages, chapter.pages), updated_at=excluded.updated_at",
-        (series_id, number, source_name, staging_path, library_path, pages, now()))
+        (series_id, number, source_name, staging_path, library_path, pages,
+         file_title if library_path is not None else None, now()))
 
 
 def set_reason(con, series_id: int, number: float, reason: str) -> bool:

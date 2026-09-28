@@ -42,8 +42,11 @@ from .. import (
     metadata,
     metrics,
     model,
+    naming,
     notify,
     relink,
+    renamer,
+    serieslock,
     settings,
     stuck,
     updates,
@@ -99,6 +102,7 @@ async def lifespan(app: FastAPI):
         _startup_security()
     except Exception as e:
         log.error("could not open the database at %s: %s", config.DB_PATH, e)
+    renamer.repair()                         # a rename a kill interrupted is settled before any job runs
     _queue_maintenance()
     updates.start_background()
     backup.start_background()
@@ -790,7 +794,7 @@ def api_key_regenerate(request: Request):
     except settings.NotAllowed:
         return _sign_in_lost(request)
     log.info("API key regenerated; every session signed out")
-    resp = _flash("/settings", "new API key generated: update every script that used the old one")
+    resp = _flash("/settings/general", "new API key generated: update every script that used the old one")
     _reissue_session(request, resp)
     return resp
 
@@ -919,7 +923,8 @@ def series_page(request: Request, series_id: int, page_no: int = Query(1, alias=
                 size_human=views.human_size(size_bytes), ref_url=views.ref_url(r), stuck=blocked,
                 stuck_at={st.number: st for st in blocked}, skipped={k["number"]: k for k in skips},
                 skip_notes=skips,
-                auto_skip=bool(settings.get("auto_skip_side_stories") and settings.get("download_in_order")))
+                auto_skip=bool(settings.get("auto_skip_side_stories") and settings.get("download_in_order")),
+                progress_lost=renamer.PROGRESS_LOST)
 
 
 @app.post("/series/{series_id}/refresh")
@@ -1168,7 +1173,11 @@ def series_delete(series_id: int, files: str = Form("0"), exclude: str = Form("0
         if exclude == "1":
             lists_routes.exclude_deleted(con, r)
             con.commit()                   # never hold a write across delete_series' Suwayomi calls
-        core.delete_series(con, client, series_id, delete_library=(files == "1"))
+        try:
+            core.delete_series(con, client, series_id, delete_library=(files == "1"))
+        except serieslock.Busy:
+            return _flash(f"/series/{series_id}", "cannot delete while files of this series are being renamed or "
+                                                  "imported; try again in a moment")
     return _flash("/", f"deleted {r['title']}")
 
 
@@ -1376,7 +1385,9 @@ def activity_page(request: Request):
 def history_page(request: Request):
     with db.connect() as con:
         events = db.events(con, 200)
-    return page(request, "history.html", events=events)
+        renames = renamer.runs(con, 20)
+    return page(request, "history.html", events=events, renames=renames,
+                confirm_undo=request.query_params.get("confirm", ""), progress_lost=renamer.PROGRESS_LOST)
 
 
 @app.post("/activity/refresh-all")
@@ -1647,22 +1658,364 @@ def system_notify_test():
     return _flash("/system", "; ".join(parts))
 
 
-@app.get("/settings")
-def settings_page(request: Request):
+# -- renaming existing files (renamer.py): preview, rename, undo ------------------------------------
+
+RENAME_MAX_SERIES = 2000            # series in one rename or preview request
+
+
+def _flag(value) -> bool:
+    return str(value).strip().lower() in ("1", "true", "on", "yes")
+
+
+def _numbers(value) -> list[float] | None:
+    """Chapter numbers from a form field ('12,12.5') or a JSON list; None
+    for no choice (all chapters). ValueError for anything else."""
+    if value is None or value == "":
+        return None
+    items = value if isinstance(value, (list, tuple)) else str(value).split(",")
+    out = []
+    for x in items:
+        n = float(x)
+        if not math.isfinite(n):
+            raise ValueError("not a chapter number")
+        out.append(n)
+    return out
+
+
+def _rename_plan(con, series_id: int, latest: bool, only=None, folder: bool = True, check_komga: bool = True) -> dict:
+    """renamer.plan with the naming settings as stored (refused, with the
+    reason, when they cannot be used)."""
+    options, errors = settings.checked_naming_options(con)
+    if errors:
+        raise naming.FormatError(errors)
+    return renamer.plan(con, series_id, options, use_latest_titles=latest, only=only, rename_folder=folder,
+                        check_komga=check_komga)
+
+
+def _plan_out(p: dict) -> dict:
+    """A preview for the browser: only what changes or is left out for a reason."""
+    shown = [c for c in p["chapters"] if c["changed"] or c["skip"]]
+    return {"seriesId": p["series_id"], "title": p["title"], "folder": p["folder"], "renames": p["renames"],
+            "files": len(p["chapters"]), "collisions": p["collisions"], "warnings": p["warnings"],
+            "komga": p["komga"], "useLatestTitles": p["use_latest_titles"],
+            "chapters": [{"number": c["number"], "oldName": c["old_name"], "newName": c["new_name"],
+                          "changed": c["changed"], "skip": c["skip"]} for c in shown]}
+
+
+def _queue_rename(plans: list[dict], confirmed: bool) -> tuple[bool, str]:
+    """Queue the rename of these previews: (queued, what to tell the user)."""
+    plans = [p for p in plans if p["renames"] or (p["folder"] and p["folder"]["changed"]
+                                                  and not p["folder"]["blocked"])]
+    if not plans:
+        return False, "nothing to rename: every file already has the name the formats give"
     try:
-        sources = ui_client.sources()
-    except SuwayomiError as e:
-        sources = []
-        log.error("settings page: suwayomi unreachable: %s", e)
-    # Suwayomi's 'max sources in parallel', next to Download Lanes; not asked when it just failed to answer
-    cap = ui_client.max_sources_in_parallel() if sources else None
+        job = renamer.submit(runner, plans, confirmed)
+    except renamer.NeedsConfirmation as e:
+        return False, (f"not renamed: {renamer.PROGRESS_LOST} "
+                       f"({', '.join(str(x['title']) for x in e.series[:5])}{' ...' if len(e.series) > 5 else ''}). "
+                       "Tick the confirmation in the preview to rename anyway.")
+    n = sum(p["renames"] for p in plans)
+    return True, f"rename queued (job #{job.id}): {n} file(s) in {len(plans)} series; a backup is made first"
+
+
+@app.get("/api/v1/rename")
+def api_rename_preview(seriesId: int, latestTitles: bool = False, renameFolder: bool = True):  # noqa: N803
+    """The rename preview of one series (renamer.plan): what would be
+    renamed to what, what is left as it is and why, and whether Komga keeps
+    reading progress. Renames nothing."""
     with db.connect() as con:
-        stats = db.source_stats(con)
-    komga_ok, _, komga_test = (views.flash_from(request.query_params, "komga_test") or "").partition(":")
+        try:
+            return _plan_out(_rename_plan(con, seriesId, latestTitles, folder=renameFolder))
+        except LookupError:
+            raise HTTPException(404, "no such series") from None
+        except naming.FormatError as e:
+            raise HTTPException(409, f"the naming settings cannot be used: {e}") from e
+
+
+@app.post("/series/{series_id}/rename")
+async def series_rename(request: Request, series_id: int):
+    form = await request.form()
+    return await run_in_threadpool(_series_rename, series_id, form)
+
+
+def _series_rename(series_id: int, form) -> Response:
+    back = f"/series/{series_id}"
+    try:
+        only = _numbers(form.get("only"))
+    except (TypeError, ValueError):
+        return _flash(back, "not renamed: the chapter choice could not be read")
+    with db.connect() as con:
+        try:
+            p = _rename_plan(con, series_id, _flag(form.get("latest_titles", "0")), only,
+                             _flag(form.get("rename_folder", "1")))
+        except LookupError:
+            raise HTTPException(404, "no such series") from None
+        except naming.FormatError as e:
+            return _flash(back, f"not renamed: the naming settings cannot be used: {e}")
+    return _flash(back, _queue_rename([p], _flag(form.get("confirmed", "0")))[1])
+
+
+@app.post("/api/v1/series/{series_id}/rename")
+def api_series_rename(series_id: int, body: dict | None = None):
+    """Rename one series' files to the naming formats: {"useLatestTitles",
+    "only": [numbers], "renameFolder", "confirmed"} (all optional).
+    confirmed: true is needed when Komga would not keep reading progress
+    (409 otherwise, with the series and why)."""
+    body = body or {}
+    try:
+        only = _numbers(body.get("only"))
+    except (TypeError, ValueError):
+        raise HTTPException(400, "only: a list of chapter numbers") from None
+    with db.connect() as con:
+        try:
+            p = _rename_plan(con, series_id, bool(body.get("useLatestTitles")), only,
+                             bool(body.get("renameFolder", True)))
+        except LookupError:
+            raise HTTPException(404, "no such series") from None
+        except naming.FormatError as e:
+            raise HTTPException(409, f"the naming settings cannot be used: {e}") from e
+    if not p["renames"] and not (p["folder"]["changed"] and not p["folder"]["blocked"]):
+        return {"queued": False, "message": "nothing to rename"}
+    try:
+        job = renamer.submit(runner, [p], bool(body.get("confirmed")))
+    except renamer.NeedsConfirmation as e:
+        return JSONResponse({"error": str(e), "needsConfirmation": e.series}, status_code=409)
+    return {"queued": True, "jobId": job.id, "renames": p["renames"]}
+
+
+@app.get("/rename")
+def rename_page(request: Request, latest: str = "0"):
+    """Rename Files for several series: every series with the number of
+    files the naming formats would rename. Komga is asked only when a rename
+    is started (one question per series)."""
+    rows, error = [], None
+    use_latest = _flag(latest)
+    with db.connect() as con:
+        try:
+            for r in con.execute("SELECT id FROM series ORDER BY title COLLATE NOCASE LIMIT ?", (RENAME_MAX_SERIES,)):
+                p = _rename_plan(con, r["id"], use_latest, check_komga=False)
+                moves = bool(p["folder"] and p["folder"]["changed"] and not p["folder"]["blocked"])
+                rows.append({"id": r["id"], "title": p["title"], "files": len(p["chapters"]), "renames": p["renames"],
+                             "folder": p["folder"], "moves": moves,
+                             "skipped": sum(1 for c in p["chapters"] if c["skip"]),
+                             "collisions": len(p["collisions"]),
+                             "sample": next(((c["old_name"], c["new_name"]) for c in p["chapters"]
+                                             if c["changed"] and not c["skip"]), None)})
+        except naming.FormatError as e:
+            error = f"The naming settings cannot be used: {e}"
+        history = renamer.runs(con, 20)
+    todo = [r for r in rows if r["renames"] or r["moves"]]
+    return page(request, "rename.html", rows=todo, total=len(rows), files=sum(r["files"] for r in rows),
+                renames=sum(r["renames"] for r in todo), error=error, latest=use_latest,
+                komga_on=komga.configured(), history=history,
+                confirm_undo=request.query_params.get("confirm", ""), progress_lost=renamer.PROGRESS_LOST)
+
+
+@app.post("/rename")
+async def rename_many(request: Request):
+    form = await request.form()
+    return await run_in_threadpool(_rename_many, form)
+
+
+def _rename_many(form) -> Response:
+    latest = _flag(form.get("latest_titles", "0"))
+    back = "/rename" + ("?latest=1" if latest else "")
+    try:
+        ids = sorted({int(x) for x in form.getlist("series")})[:RENAME_MAX_SERIES]
+    except (TypeError, ValueError):
+        return _flash(back, "not renamed: the series choice could not be read")
+    if not ids:
+        return _flash(back, "nothing selected")
+    plans = []
+    with db.connect() as con:
+        try:
+            for sid in ids:
+                try:
+                    p = _rename_plan(con, sid, latest, check_komga=False)
+                except LookupError:
+                    continue
+                if p["renames"] or (p["folder"] and p["folder"]["changed"] and not p["folder"]["blocked"]):
+                    plans.append(_rename_plan(con, sid, latest))        # with Komga's answer
+        except naming.FormatError as e:
+            return _flash(back, f"not renamed: the naming settings cannot be used: {e}")
+    queued, msg = _queue_rename(plans, _flag(form.get("confirmed", "0")))
+    return _flash("/activity" if queued else back, msg)
+
+
+@app.post("/api/v1/rename")
+def api_rename_many(body: dict):
+    """Rename the files of several series as one job: {"seriesIds": [...],
+    "useLatestTitles", "confirmed"}."""
+    try:
+        ids = sorted({int(x) for x in body.get("seriesIds") or []})[:RENAME_MAX_SERIES]
+    except (TypeError, ValueError):
+        raise HTTPException(400, "seriesIds: a list of series ids") from None
+    plans = []
+    with db.connect() as con:
+        try:
+            for sid in ids:
+                try:
+                    plans.append(_rename_plan(con, sid, bool(body.get("useLatestTitles"))))
+                except LookupError:
+                    continue
+        except naming.FormatError as e:
+            raise HTTPException(409, f"the naming settings cannot be used: {e}") from e
+    plans = [p for p in plans if p["renames"] or (p["folder"]["changed"] and not p["folder"]["blocked"])]
+    if not plans:
+        return {"queued": False, "message": "nothing to rename"}
+    try:
+        job = renamer.submit(runner, plans, bool(body.get("confirmed")))
+    except renamer.NeedsConfirmation as e:
+        return JSONResponse({"error": str(e), "needsConfirmation": e.series}, status_code=409)
+    return {"queued": True, "jobId": job.id, "renames": sum(p["renames"] for p in plans), "series": len(plans)}
+
+
+@app.get("/api/v1/rename/history")
+def api_rename_history(seriesId: int | None = None):  # noqa: N803
+    """The renames (and undos) so far, newest first, each with canUndo."""
+    with db.connect() as con:
+        return renamer.runs(con, 50, seriesId)
+
+
+def _undo_needs_confirmation(con, run_id: int) -> list[str]:
+    """The series of a rename whose undo Komga would not keep reading
+    progress through (their titles): it must be confirmed first."""
+    out = []
+    for r in con.execute("SELECT DISTINCT series_id FROM rename_log WHERE run_id=? AND state='done'", (run_id,)):
+        row = db.get_series(con, r["series_id"])
+        if row is None or not db.valid_folder(row["folder"]):
+            continue
+        moved = con.execute("SELECT 1 FROM rename_log WHERE run_id=? AND series_id=? AND kind='folder' AND"
+                            " state='done'", (run_id, r["series_id"])).fetchone() is not None
+        if renamer.komga_check(row["folder"], folder_renamed=moved)["needs_confirmation"]:
+            out.append(row["title"])
+    return out
+
+
+def _queue_undo(run_id: int, confirmed: bool) -> tuple[int, str, list[str]]:
+    """(HTTP status, message, the series to confirm for) for an undo request."""
+    with db.connect() as con:
+        run = con.execute("SELECT * FROM rename_run WHERE id=?", (run_id,)).fetchone()
+        ok, why = renamer.can_undo(run)
+        if not ok:
+            return (404 if run is None else 409), f"not undone: {why}", []
+        ask = [] if confirmed else _undo_needs_confirmation(con, run_id)
+    if ask:
+        return 409, (f"not undone: {renamer.PROGRESS_LOST} ({', '.join(ask[:5])}{' ...' if len(ask) > 5 else ''}). "
+                     "Tick the confirmation next to Undo to go on."), ask
+    job = runner.submit("rename", f"undo rename #{run_id}", renamer.undo_job(run_id, confirmed), key="rename")
+    return 200, f"undo of rename #{run_id} queued (job #{job.id}); a backup is made first", []
+
+
+@app.post("/rename/{run_id}/undo")
+def rename_undo(run_id: int, confirmed: str = Form("0"), back: str = Form("/rename")):
+    back = back if back in ("/rename", "/activity/history") else "/rename"
+    status, msg, ask = _queue_undo(run_id, _flag(confirmed))
+    return _flash(f"{back}?confirm={run_id}" if ask else back, msg)
+
+
+@app.post("/api/v1/rename/{run_id}/undo")
+def api_rename_undo(run_id: int, body: dict | None = None):
+    """Undo a finished rename (for 7 days, once): {"confirmed": true} when
+    Komga would not keep reading progress."""
+    status, msg, ask = _queue_undo(run_id, bool((body or {}).get("confirmed")))
+    if status != 200:
+        return JSONResponse({"error": msg, "needsConfirmation": ask}, status_code=status)
+    return {"queued": True, "message": msg}
+
+
+SETTINGS_PAGES = dict(views.SETTINGS_PAGES)
+# the settings shown only with Show Advanced on, by page (media-management proposal, section 1)
+ADVANCED_SETTINGS = {
+    "media-management": ("replace_illegal_characters", "chapter_title_max_chars", "drop_number_only_titles"),
+    "sources": ("page_warm_sources",),
+    "downloading": ("throttled_delay_seconds", "download_lanes", "search_parallel", "page_delay_seconds",
+                    "recheck_finished_days", "min_pages"),
+    "general": ("allowed_hosts",),
+}
+
+
+def _settings_url(slug: str | None) -> str:
+    return f"/settings/{slug if slug in SETTINGS_PAGES else 'media-management'}"
+
+
+@app.get("/settings")
+def settings_home(request: Request):
+    """Settings opens on Media Management, as in Sonarr; a flash or test
+    result given to /settings goes along."""
+    query = request.url.query
+    return RedirectResponse(_settings_url(None) + (f"?{query}" if query else ""), 303)
+
+
+def _naming_examples(params) -> dict:
+    """naming.examples for the naming settings as stored, with those in
+    `params` (a form or a query) in their place: real chapters of the
+    library's largest series when it has one, built-in samples otherwise.
+    A value that is not even of its type is an error like any other."""
+    values = {k: settings.get(k) for k in settings.NAMING_KEYS}
+    try:
+        for k in settings.NAMING_KEYS:
+            if k in params:
+                values[k] = settings._naming_value(k, str(params[k])[:1000])
+    except ValueError as e:
+        return {"folder": None, "chapters": [], "errors": [str(e).partition(": ")[2] or str(e)], "warnings": []}
+    series, chapters, highest = None, None, None
+    with db.connect() as con:
+        top = con.execute("SELECT series_id, COUNT(*) AS n, MAX(number) AS highest FROM chapter WHERE status='have'"
+                          " GROUP BY series_id ORDER BY n DESC, series_id LIMIT 1").fetchone()
+        row = db.get_series(con, top["series_id"]) if top else None
+        if row is not None:
+            series, highest = naming.SeriesNames.from_row(row), top["highest"]
+            chapters = [(r["number"], r["name"]) for r in con.execute(
+                "SELECT number, name FROM chapter WHERE series_id=? AND status='have' ORDER BY number LIMIT 2000",
+                (top["series_id"],))]
+    return naming.examples(naming.as_options(values), series, chapters, highest)
+
+
+@app.get("/settings/naming/examples")
+@app.get("/api/v1/config/naming/examples")
+def naming_examples(request: Request):
+    """The live preview under the naming fields: {"folder", "chapters",
+    "errors", "warnings"} for the formats in the query (the stored ones for
+    what it leaves out), made by the code that names the files."""
+    return _naming_examples(request.query_params)
+
+
+@app.get("/settings/{slug}")
+def settings_page(request: Request, slug: str):
+    if slug not in SETTINGS_PAGES:
+        raise HTTPException(404)
     values = settings.all_values()
-    return page(request, "settings.html", v=settings.masked(values), bad_urls=settings.invalid_urls(values),
-                sources=sources, komga_test=komga_test, komga_ok=(komga_ok == "1"), stats=stats,
-                auto_days=db.AUTO_THROTTLE_DAYS, suwayomi_cap=cap, lanes=int(limits.setting("download_lanes")))
+    ctx: dict = {"sp": slug, "sp_name": SETTINGS_PAGES[slug], "v": settings.masked(values),
+                 "bad_urls": settings.invalid_urls(values)}
+    if slug in ("sources", "downloading"):
+        try:
+            sources = ui_client.sources()
+        except SuwayomiError as e:
+            sources = []
+            log.error("settings page: suwayomi unreachable: %s", e)
+        # Suwayomi's 'max sources in parallel', next to Download Lanes; not asked when it just failed to answer
+        cap = ui_client.max_sources_in_parallel() if sources else None
+        with db.connect() as con:
+            stats = db.source_stats(con)
+        ctx.update(sources=sources, stats=stats, auto_days=db.AUTO_THROTTLE_DAYS, suwayomi_cap=cap,
+                   lanes=int(limits.setting("download_lanes")))
+    if slug == "komga":
+        komga_ok, _, komga_test = (views.flash_from(request.query_params, "komga_test") or "").partition(":")
+        ctx.update(komga_test=komga_test, komga_ok=(komga_ok == "1"))
+    if slug == "media-management":
+        with db.connect() as con:
+            n = con.execute("SELECT COUNT(*) AS files, COUNT(DISTINCT series_id) AS series FROM chapter"
+                            " WHERE status='have' AND library_path IS NOT NULL").fetchone()
+        ctx.update(examples=_naming_examples({}), library={"files": n["files"], "series": n["series"]},
+                   komga_on=komga.configured(),
+                   folders={"library": config.LIBRARY_ROOT, "staging": config.STAGING_ROOT,
+                            "copied": library.COPIED})
+    advanced = ADVANCED_SETTINGS.get(slug, ())
+    focus = request.query_params.get("focus", "")
+    ctx.update(changed_advanced=sum(1 for k in advanced if values.get(k) != settings.DEFAULTS.get(k)),
+               focus=focus if focus in settings.DEFAULTS else "", show_advanced=focus in advanced)
+    return page(request, "settings.html", **ctx)
 
 
 @app.post("/settings")
@@ -1672,6 +2025,7 @@ async def settings_save(request: Request):
 
 
 def _settings_save(request: Request, form) -> Response:
+    back = _settings_url(str(form.get("page", "")))
     values = {}
     for key in settings.DEFAULTS:
         if key in ("unusable_sources", "throttled_sources", "page_warm_sources", "api_key") \
@@ -1690,7 +2044,8 @@ def _settings_save(request: Request, form) -> Response:
         warm = {str(x).lower().strip() for x in form.getlist("warm_sources")}
         stored = set(settings.all_values()["page_warm_sources"])
         values["page_warm_sources"] = sorted((stored - listed) | (warm & listed))
-    epoch = settings.all_values()["session_epoch"]
+    before = settings.all_values()
+    epoch = before["session_epoch"]
     try:
         with db.connect() as con:
             notices = settings.set_many(con, values, still_allowed=_still(request))
@@ -1698,30 +2053,37 @@ def _settings_save(request: Request, form) -> Response:
         return _sign_in_lost(request)
     except (ValueError, KeyError) as e:
         log.warning("settings not saved: %s", e)
-        return _flash("/settings", f"invalid value, nothing saved: {e}")
+        # the page comes back on the field at fault (with the advanced settings shown when it is one of them)
+        key = str(e.args[0] if isinstance(e, KeyError) and e.args else e).partition(":")[0].strip()
+        focus = f"?focus={key}" if key in settings.DEFAULTS and key not in settings.SECRET_KEYS else ""
+        return _flash(back + focus, f"invalid value, nothing saved: {e}")
     except sqlite3.OperationalError as e:
         log.error("settings not saved: %s", e)
-        return _flash("/settings", f"could not save (database busy?): {e}")
+        return _flash(back, f"could not save (database busy?): {e}")
     action = str(form.get("action", ""))
-    resp = _settings_action(action, "; ".join(notices))
+    after = settings.all_values()
+    if any(after[k] != before[k] for k in settings.NAMING_KEYS):
+        notices = [*notices, "new files and folders use the new naming; the files already in the library keep "
+                             "their names until you rename them (Existing Files, Preview Rename)"]
+    resp = _settings_action(action, "; ".join(notices), back)
     if settings.all_values()["session_epoch"] != epoch:
         _reissue_session(request, resp)                # changed the password: keep this browser signed in
     return resp
 
 
-def _settings_action(action: str, notice: str) -> Response:
+def _settings_action(action: str, notice: str, back: str = "/settings") -> Response:
     extra = f" ({notice})" if notice else ""
     if action == "test-komga":
         ok, msg = komga.test()
-        return RedirectResponse(f"/settings?{views.flash_query(f'{int(ok)}:{msg}{extra}', 'komga_test')}", 303)
+        return RedirectResponse(f"/settings/komga?{views.flash_query(f'{int(ok)}:{msg}{extra}', 'komga_test')}", 303)
     if action == "test-notify" or action.startswith("test-notify-"):
         only = action[len("test-notify-"):] if action.startswith("test-notify-") else None
         res = notify.send_detailed("mang-arr test", "If you can read this, notifications work.", "test", only=only,
                                    force=True)
         if not res:
-            return _flash("/settings", "nothing to test: fill in that channel first" + extra)
+            return _flash(back, "nothing to test: fill in that channel first" + extra)
         parts = [f"{notify.CHANNELS[k][0]}: {'sent' if r is True else r}" for k, r in res.items()]
-        return _flash("/settings", "; ".join(parts) + extra)
+        return _flash(back, "; ".join(parts) + extra)
     if action == "suwayomi-parallel":
         # the one place mang-arr changes Suwayomi's own 'max sources in parallel': a button the user presses
         n = int(limits.setting("download_lanes"))
@@ -1730,10 +2092,10 @@ def _settings_action(action: str, notice: str) -> Response:
         except (SuwayomiError, KeyError, TypeError, ValueError) as e:
             why = str(e) if isinstance(e, SuwayomiError) else f"unexpected answer ({type(e).__name__})"
             log.warning("could not set Suwayomi's max sources in parallel to %d: %s", n, why)
-            return _flash("/settings", f"could not change Suwayomi's setting: {why}{extra}")
+            return _flash(back, f"could not change Suwayomi's setting: {why}{extra}")
         log.info("Suwayomi's max sources in parallel set to %d from the Settings page", m)
-        return _flash("/settings", f"Suwayomi now downloads from up to {m} sources at once{extra}")
-    return _flash("/settings", "saved" + extra)
+        return _flash(back, f"Suwayomi now downloads from up to {m} sources at once{extra}")
+    return _flash(back, "saved" + extra)
 
 
 @app.get("/metrics")
@@ -1845,7 +2207,11 @@ def api_series_delete(series_id: int, files: bool = False):
             raise HTTPException(404)
         if runner.pending_for(series_id):
             raise HTTPException(409, "a job for this series is running")
-        core.delete_series(con, client, series_id, delete_library=files)
+        try:
+            core.delete_series(con, client, series_id, delete_library=files)
+        except serieslock.Busy as e:
+            raise HTTPException(409, "files of this series are being renamed or imported; try again in a "
+                                     "moment") from e
     return {"ok": True}
 
 
