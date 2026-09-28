@@ -161,7 +161,28 @@ MIGRATIONS = [
     """
     ALTER TABLE series ADD COLUMN anilist_link INTEGER;
     """,
-    # 14: chapters a series is stuck behind (stuck.py): when a chapter's
+    # 14: the page counts of fractional chapters, so a refresh does not count
+    #     them all again every pass (see pagecounts.py). Keyed by Suwayomi's
+    #     ids, not by series: save_plan rewrites series_source every resolve.
+    #     IF NOT EXISTS: should a merge renumber this migration, a database
+    #     that already has the table still upgrades.
+    """
+    CREATE TABLE IF NOT EXISTS page_probe (
+      manga_id        INTEGER NOT NULL,       -- Suwayomi's id for the source entry
+      chapter_id      INTEGER NOT NULL,       -- Suwayomi's id for the chapter
+      number          REAL NOT NULL,          -- the chapter as the source listed it when last counted or tried
+      name            TEXT,
+      scanlator       TEXT,
+      uploaded        TEXT,
+      pages           INTEGER,                -- the last count for that listing; NULL: none yet (the tries failed)
+      counted_at      TEXT,
+      agreed          INTEGER NOT NULL DEFAULT 0,   -- counts in a row of that listing that gave these pages
+      tries           INTEGER NOT NULL DEFAULT 0,   -- failed counts since the last one that worked (pages not used)
+      next_try        TEXT,                   -- after a failed count: not counted again before this
+      PRIMARY KEY (manga_id, chapter_id)
+    );
+    """,
+    # 15: chapters a series is stuck behind (stuck.py): when a chapter's
     #     failures began, and per blocker what the sites listing it call it,
     #     where it is on them, which of them it failed on, and what was done
     #     about it
@@ -231,7 +252,7 @@ def migrate(con: sqlite3.Connection, target: int | None = None) -> None:
                     con.execute(stmt)
                 if i == 3:
                     _backfill_folders(con)
-                if i == 14:
+                if i == 15:
                     _backfill_failed_since(con)
                 con.execute(f"PRAGMA user_version = {i}")
                 con.commit()
@@ -252,7 +273,7 @@ def _backfill_folders(con) -> None:
 
 
 def _backfill_failed_since(con) -> None:
-    """failed_since of the chapters that failed before migration 14: the
+    """failed_since of the chapters that failed before migration 15: the
     first event naming the chapter among a download's failures ("ch 7.2:
     ...") or as a failed chapter search ("chapter 7.2: ..."), and at the
     latest its last update. Events are pruned after a while, so for an old

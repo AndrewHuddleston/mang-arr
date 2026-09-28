@@ -190,12 +190,14 @@ class FailedSinceTest(StuckBase):
             self.assertIsNone(row()["failed_since"])
         self.assertEqual(first, "2026-09-23 12:00:00")
 
-    def test_migration_14_takes_it_from_the_first_failure_in_the_history(self):
+    def test_migration_15_takes_it_from_the_first_failure_in_the_history(self):
         path = os.path.join(self.tmp, "old.db")
         con = sqlite3.connect(path)
         self.addCleanup(con.close)
         con.row_factory = sqlite3.Row
-        db.migrate(con, 13)
+        db.migrate(con, 14)                                                # page_probe, before the stuck table
+        self.assertEqual(con.execute("PRAGMA user_version").fetchone()[0], 14)
+        self.assertFalse(con.execute("SELECT 1 FROM sqlite_master WHERE name='stuck'").fetchone())
         con.execute("INSERT INTO series (id, ref, title, added_at) VALUES (1, 'anilist:1', 'S', '2026-01-01')")
         for n, updated in ((7.2, "2026-09-27 08:00:00"), (8.0, "2026-09-27 09:00:00"), (9.0, "2026-09-27 10:00:00")):
             con.execute("INSERT INTO chapter (series_id, number, status, updated_at) VALUES (1, ?, 'failed', ?)",
