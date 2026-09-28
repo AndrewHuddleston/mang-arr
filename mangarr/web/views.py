@@ -30,17 +30,18 @@ COUNTED = ("have", "wanted", "failed", "unavailable")   # what "listed" means on
 
 # sidebar: (section, icon, [(label, href)]); a section whose first link is
 # its own page (Settings, System) has anchors as sub-links
+# Settings sub-pages, as in Sonarr: slug -> name, in sidebar order
+SETTINGS_PAGES = (("media-management", "Media Management"), ("sources", "Sources"), ("downloading", "Downloading"),
+                  ("komga", "Komga"), ("notifications", "Notifications"), ("general", "General"))
 NAV = [
     ("Series", "series", [("Add New", "/add"), ("Library Import", "/import"), ("Lists", "/lists")]),
     ("Activity", "activity", [("Queue", "/activity"), ("History", "/activity/history")]),
     ("Wanted", "wanted", [("Missing", "/wanted")]),
-    ("Settings", "settings", [("Sources", "/settings#sources"), ("Scheduling", "/settings#scheduling"),
-                              ("Komga", "/settings#komga"), ("Notifications", "/settings#notifications"),
-                              ("Security", "/settings#security")]),
+    ("Settings", "settings", [(label, f"/settings/{slug}") for slug, label in SETTINGS_PAGES]),
     ("System", "system", [("Status", "/system"), ("Tasks", "/system#tasks"), ("Backups", "/system#backups"),
                           ("Logs", "/system/logs")]),
 ]
-SECTION_HOME = {"Series": "/", "Settings": "/settings", "System": "/system"}
+SECTION_HOME = {"Series": "/", "Settings": "/settings/media-management", "System": "/system"}
 
 
 def status_label(status: str | None) -> str:
@@ -67,7 +68,7 @@ def nav_section(path: str) -> str:
 
 def nav_current(path: str) -> str:
     """The sidebar link that is 'on' for a request path."""
-    if path.startswith("/series/"):
+    if path.startswith("/series/") or path.startswith("/rename"):
         return "/"
     if path.startswith("/activity/history"):
         return "/activity/history"
@@ -398,6 +399,7 @@ EVENT_ICONS = {
     "unignore": ("bookmark", "default", "Chapter wanted again"),
     "skip": ("ignore", "default", "Chapter skipped or un-skipped"),
     "list": ("list", "default", "Import list"),
+    "renamed": ("edit", "default", "Files renamed"),
 }
 
 

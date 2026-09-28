@@ -680,6 +680,140 @@
     } catch (err) { toast('could not read the API key: ' + (err.message || err), 'danger'); }
   });
 
+  /* -- Settings: Show Advanced (Sonarr's toolbar toggle), remembered per browser.
+        Hidden fields stay in the form, so hiding never resets a value. -------- */
+  const advToggle = $('#advanced-toggle');
+  function setAdvanced(on, remember) {
+    if (on) document.documentElement.setAttribute('data-advanced', ''); else document.documentElement.removeAttribute('data-advanced');
+    if (advToggle) {
+      advToggle.setAttribute('aria-pressed', String(on));
+      $('.toolbar-label', advToggle).textContent = on ? 'Hide Advanced' : 'Show Advanced';
+    }
+    $$('.advanced-hint').forEach((el) => { el.hidden = on; });
+    if (remember) store.set('show-advanced', on ? '1' : '0');
+  }
+  if (advToggle) {
+    // a save that failed on an advanced field comes back with them shown (not remembered)
+    setAdvanced(store.get('show-advanced') === '1' || body.dataset.forceAdvanced === '1', false);
+    advToggle.addEventListener('click', () => setAdvanced(!document.documentElement.hasAttribute('data-advanced'), true));
+    $$('[data-show-advanced]').forEach((b) => b.addEventListener('click', () => setAdvanced(true, true)));
+    const focus = body.dataset.focus ? document.getElementById(body.dataset.focus) : null;
+    if (focus && focus.focus) { focus.focus(); focus.classList.add('input-error'); }
+  }
+
+  /* -- Settings -> Media Management: the live naming preview, rendered by the server
+        with the code that names the files ----------------------------------- */
+  const namingBox = $('[data-naming-examples]');
+  if (namingBox) {
+    const fields = $$('[data-naming]', namingBox);
+    const folderOut = $('#folder-preview'), chapterOut = $('#chapter-preview'), messages = $('#naming-messages');
+    const lines = (list, cls) => list.map((t) => `<div class="${cls}">${esc(t)}</div>`).join('');
+    let timer = null, seq = 0;
+    async function preview() {
+      const q = new URLSearchParams();
+      fields.forEach((f) => { q.set(f.name, f.type === 'checkbox' ? (f.checked ? '1' : '0') : f.value); });
+      const mine = ++seq;
+      try {
+        const r = await fetch(namingBox.dataset.namingExamples + '?' + q.toString(), { headers: { Accept: 'application/json' } });
+        if (!r.ok || mine !== seq) return;
+        const d = await r.json();
+        folderOut.innerHTML = d.folder ? lines([d.folder], 'example') : '';
+        chapterOut.innerHTML = lines(d.chapters || [], 'example');
+        messages.innerHTML = lines(d.errors || [], 'help-text text-danger') + lines(d.warnings || [], 'help-text text-warning');
+      } catch (e) { /* keep the last preview */ }
+    }
+    const soon = () => { clearTimeout(timer); timer = setTimeout(preview, 250); };
+    fields.forEach((f) => { f.addEventListener('input', soon); f.addEventListener('change', soon); });
+    $$('[data-insert-token]', namingBox).forEach((b) => b.addEventListener('click', () => {
+      const input = document.getElementById(b.dataset.target);
+      if (!input) return;
+      const at = input.selectionStart == null ? input.value.length : input.selectionStart;
+      input.value = input.value.slice(0, at) + b.dataset.insertToken + input.value.slice(input.selectionEnd == null ? at : input.selectionEnd);
+      const pop = b.closest('details'); if (pop) pop.open = false;
+      input.focus();
+      input.setSelectionRange(at + b.dataset.insertToken.length, at + b.dataset.insertToken.length);
+      soon();
+    }));
+  }
+
+  /* -- Rename Files: select all, and options that preview again -------------- */
+  $$('input[data-check-all]').forEach((all) => {
+    const boxes = () => $$(`input[type=checkbox][name="${all.dataset.checkAll}"]`, all.closest('form') || document);
+    all.addEventListener('change', () => boxes().forEach((b) => { b.checked = all.checked; }));
+    boxes().forEach((b) => b.addEventListener('change', () => { all.checked = boxes().every((x) => x.checked); }));
+  });
+  $$('input[data-submit-on-change]').forEach((cb) => cb.addEventListener('change', () => cb.form && cb.form.submit()));
+
+  /* -- series page: Preview Rename (Sonarr's Organize preview) --------------- */
+  const renameOpen = $('#rename-open'), renameModal = $('#rename-modal');
+  if (renameOpen && renameModal) {
+    const bodyEl = $('#rename-body'), komgaEl = $('#rename-komga'), confirmRow = $('#rename-confirm');
+    const confirmBox = $('#rename-confirmed'), submit = $('#rename-submit'), latest = $('#rename-latest');
+    const onlyField = $('#rename-only'), folderField = $('#rename-folder-field');
+    let plan = null;
+    const num = (n) => String(Number(n));
+    function sync() {
+      const picked = $$('input[data-rename-chapter]', bodyEl).filter((b) => b.checked);
+      const all = $$('input[data-rename-chapter]', bodyEl);
+      const folderBox = $('input[data-rename-folder]', bodyEl);
+      const folder = !!(folderBox && folderBox.checked);
+      folderField.value = folder ? '1' : '0';
+      // no list = every chapter: what is ticked is sent only when something was unticked
+      onlyField.value = picked.length === all.length ? '' : picked.map((b) => b.dataset.renameChapter).join(',');
+      const something = picked.length > 0 || folder;
+      const needs = !!(plan && plan.komga && plan.komga.needs_confirmation);
+      confirmRow.hidden = !needs || !something;
+      // with nothing ticked an empty list would mean "all": Rename stays off instead
+      submit.disabled = !something || (all.length > 0 && picked.length === 0 && !folder) || (needs && !confirmBox.checked);
+      if (all.length > 0 && picked.length === 0 && folder) onlyField.value = '-1';     // the folder only: no chapter has this number
+      submit.textContent = something ? `Rename (${picked.length} file${picked.length === 1 ? '' : 's'}${folder ? ' and the folder' : ''})` : 'Rename';
+    }
+    function render(d) {
+      plan = d;
+      const out = [];
+      const f = d.folder || {};
+      if (f.changed && !f.blocked) out.push(`<div class="rename-item"><label class="inline-check"><label class="check-input primary"><input type="checkbox" data-rename-folder checked><span class="check-box">${ICON('check', 'sm')}</span></label> Folder</label><div class="rename-names"><code>${esc(f.old)}</code><span class="arrow">&rarr;</span><code>${esc(f.new)}</code></div></div>`);
+      else if (f.blocked) out.push(`<div class="alert warning small">The folder keeps its name: ${esc(f.blocked)}.</div>`);
+      (d.collisions || []).forEach((c) => out.push(`<div class="alert warning small">${esc(c.message)}</div>`));
+      (d.warnings || []).forEach((w) => out.push(`<div class="alert warning small">${esc(w.message)}</div>`));
+      const change = (d.chapters || []).filter((c) => c.changed && !c.skip);
+      const left = (d.chapters || []).filter((c) => c.skip);
+      if (!change.length && !(f.changed && !f.blocked)) out.push(`<div class="alert success">All ${d.files} files of this series have the names the naming formats give. Nothing to rename.</div>`);
+      change.forEach((c) => out.push(`<div class="rename-item"><label class="check-input primary"><input type="checkbox" data-rename-chapter="${esc(num(c.number))}" checked aria-label="Rename chapter ${esc(num(c.number))}"><span class="check-box">${ICON('check', 'sm')}</span></label><div class="rename-names"><code>${esc(c.oldName)}</code><span class="arrow">&rarr;</span><code>${esc(c.newName)}</code></div></div>`));
+      if (left.length) {
+        out.push(`<details class="rename-left"><summary>${left.length} file${left.length === 1 ? ' is' : 's are'} left as ${left.length === 1 ? 'it is' : 'they are'}</summary>` +
+          left.map((c) => `<div class="rename-item skipped"><div class="rename-names"><code>${esc(c.oldName)}</code><div class="note">${esc(c.skip)}</div></div></div>`).join('') + '</details>');
+      }
+      bodyEl.innerHTML = out.join('');
+      komgaEl.hidden = !d.komga;
+      if (d.komga) {
+        komgaEl.className = 'alert small ' + (d.komga.needs_confirmation ? 'warning' : 'info');
+        komgaEl.textContent = 'Komga: ' + d.komga.message;
+      }
+      confirmBox.checked = false;
+      $$('input[type=checkbox]', bodyEl).forEach((b) => b.addEventListener('change', sync));
+      sync();
+    }
+    async function load() {
+      plan = null;
+      submit.disabled = true;
+      komgaEl.hidden = true; confirmRow.hidden = true;
+      bodyEl.innerHTML = '<div class="loading">Loading the preview…</div>';
+      try {
+        const r = await fetch(renameOpen.dataset.renamePreview + '&latestTitles=' + (latest.checked ? 'true' : 'false'), { headers: { Accept: 'application/json' } });
+        const d = await r.json();
+        if (!r.ok) throw new Error(d.detail || d.error || `HTTP ${r.status}`);
+        render(d);
+      } catch (e) {
+        bodyEl.innerHTML = `<div class="alert danger">Could not make the preview: ${esc(e.message || e)}</div>`;
+      }
+    }
+    renameOpen.addEventListener('click', () => { latest.checked = false; openModal(renameModal); load(); });
+    latest.addEventListener('change', load);
+    confirmBox.addEventListener('change', sync);
+    if (location.hash === '#rename') { openModal(renameModal); load(); }
+  }
+
   /* -- pages that reload themselves while something runs ------------------ */
   const main = $('main[data-reload]');
   if (main) {

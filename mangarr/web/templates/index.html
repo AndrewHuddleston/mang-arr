@@ -10,6 +10,8 @@
     {{ m.toolbar_separator() }}
     {{ m.toolbar_button('Add New', 'plus', href='/add') }}
     {{ m.toolbar_button('Library Import', 'import', href='/import') }}
+    {{ m.toolbar_separator() }}
+    {{ m.toolbar_button('Rename Files', 'edit', href='/rename', disabled=(not rows), title='Preview renaming the files of several series to the naming formats') }}
   </div>
   <div class="toolbar-section right">
     <span class="toolbar-count" id="series-count" data-total="{{ rows|length }}">{{ rows|length }} series</span>

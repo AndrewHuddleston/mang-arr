@@ -238,8 +238,11 @@ Source names are Suwayomi's display names as shown on the System page, e.g.
 `Weeb Central (EN)`.
 
 **Runtime settings** live in the database and are edited on the Settings
-page (`/settings`; the sidebar's Settings entries are anchors into it:
-Sources, Scheduling, Komga, Notifications, Security). The environment
+pages (`/settings`; one page per sidebar entry, as in Sonarr: Media
+Management, Sources, Downloading, Komga, Notifications, General). Settings
+that are rarely changed are hidden until you press *Show Advanced* in the
+toolbar (remembered per browser); hiding them never changes their values,
+and a page says when a hidden one differs from its default. The environment
 variables above are only their initial values; a saved setting wins and
 applies to the next job.
 
@@ -288,8 +291,8 @@ run: 300 s, or 60 s when another source can supply the same chapters).
 
 The layout follows Sonarr: a sidebar on the left with the sections
 **Series** (Series, Add New, Library Import, Lists), **Activity** (Queue,
-History), **Wanted** (Missing), **Settings** (anchors into the one settings
-page) and **System** (Status, Tasks, Backups, Logs). The top bar shows the
+History), **Wanted** (Missing), **Settings** (Media Management, Sources,
+Downloading, Komga, Notifications, General) and **System** (Status, Tasks, Backups, Logs). The top bar shows the
 running job and the health summary (*healthy*, *N warnings* or *N
 problems*, linking to System → Status), and updates every five seconds.
 An update banner appears at the top of every page when a newer release is
@@ -307,7 +310,8 @@ published.
 | **Queue** (`/activity`) | mang-arr's jobs with progress, results and cancel, and Suwayomi's own download queue. |
 | **History** (`/activity/history`) | The last 200 events: adds, resolves, downloads, imports, failures, monitor and ignore changes. |
 | **Missing** (`/wanted`) | Every series with wanted or failed chapters, which numbers, and the last failure reason. |
-| **Settings** (`/settings`) | Runtime settings: sources, scheduling, Komga, notifications, security. |
+| **Settings** (`/settings`) | Runtime settings, one page each: Media Management (file and folder naming), Sources, Downloading, Komga, Notifications, General (security). |
+| **Rename Files** (`/rename`) | What the naming formats would rename, per series; renames the selected series and lists the renames so far with their Undo. See [Media Management](#media-management). |
 | **Status** (`/system`) | Version, uptime, health checks, scheduled tasks, backups, sources, effective configuration. |
 | **Logs** (`/system/logs`) | The log file, filtered by level, auto-refreshing. |
 | **Sign in** (`/login`) | The login form, when the login method is *login page*. |
@@ -582,6 +586,69 @@ instead of linked, if any. Then:
 **Logs** (`/system/logs`) shows the last 500 lines of the log file (up to
 5000 with `?lines=`) with a minimum-level filter, auto-refresh every five
 seconds and follow.
+
+### Media Management
+
+**Settings → Media Management** sets how library folders and chapter files
+are named. The defaults give the names mang-arr has always made, so an
+upgrade changes nothing.
+
+| Setting | Default | Notes |
+|---|---|---|
+| Series Folder Format | `{Series Title}` | Must contain a series title token. A name that is taken gets ` (anilist:123)` added, as before. |
+| Chapter File Format | `Chapter {Chapter:000.0}{ - Chapter Title}` | Must contain `{Chapter}`. |
+| Colon Replacement | Underscore | What a `:` becomes: underscore (like Suwayomi), delete, dash, space dash, or smart (` - ` before a space, `-` between letters). |
+| Replace Illegal Characters (advanced) | on | `? * " < > \|` become `_`; off removes them. |
+| Chapter Title Length (advanced) | 80 | A title in a file name is cut to this many characters. |
+| Number-only Titles (advanced) | off | On leaves out titles that are only numbers ("Vol.3 chapter 13"). |
+
+Tokens: `{Series Title}` (English, else romaji, else native), `{Series
+Romaji}`, `{Series English}`, `{Series Native}`, `{Year}`, `{Chapter}` and
+`{Chapter Title}`. Text inside the braces around a name is kept only when
+the token has a value: `{ - Chapter Title}` adds " - Title" only when there
+is a title, `{ (Year)}` only when the year is known. `{Chapter:000.0}` sets
+the digits before and after the point: `012.0`, `012.5`; `{Chapter:000}`
+gives `012`, `012.5`; `{Chapter}` gives `12`, `12.5`.
+
+Examples from your own library appear under the fields as you type, made by
+the code that names the files, with a warning when the names would sort out
+of order by plain file name (`Chapter 012.5` before `Chapter 012`). A format
+that cannot be used (an unknown token, a `/`, no `{Chapter}`) is refused
+with the reason and nothing is saved.
+
+**Existing files are never renamed on their own**: not by an upgrade, not by
+changing a format, not when a source edits a chapter title. A new format
+applies to files linked from then on. To rename what is already in the
+library:
+
+- **Series page → Preview Rename** lists old → new for every file of the
+  series, and the folder. Untick what should keep its name, then *Rename*.
+- **Series → Rename Files** (`/rename`) does the same for several series as
+  one job.
+
+By default a file keeps the title its name has now; tick *Use the latest
+chapter titles from sources* to take the sources' current titles instead.
+
+What a rename does, in this order:
+
+1. It asks Komga whether reading progress is kept. Komga pairs a renamed
+   file with its book by file hash, so its library needs *Compute hash for
+   files* on (Komga: Libraries → Edit → Options) and the books hashed. Then
+   nothing more is asked. Without Komga, with hashing off or books not
+   hashed yet, or when the series folder is renamed, the rename needs your
+   tick on "reading progress in your reader app may be lost".
+2. It writes a database backup ("before rename").
+3. Series by series, under a lock that keeps imports, downloads and deletes
+   of that series out, every step is written to a journal before it is done.
+4. Each file is renamed inside its folder with one rename, never over
+   another file. A hard link stays the same file under another name, so no
+   disk space is used and Suwayomi's downloads (staging) are not touched.
+5. It checks that every chapter's file is where the database says, and asks
+   Komga for one scan.
+
+A rename that is interrupted (a kill, a power cut) is settled from the
+journal at the next start. A finished rename can be undone for 7 days from
+Activity → History or the Rename Files page.
 
 ### Backups
 
@@ -1220,6 +1287,12 @@ curl -H "X-Api-Key: $KEY" http://localhost:6789/api/v1/wanted
 | `GET /api/v1/wanted` | series with missing chapters |
 | `GET /api/v1/queue` | mang-arr's jobs and Suwayomi's download queue |
 | `POST /api/v1/command` | `{"name": "RefreshAll"}` (refresh every monitored series; returns the existing job if one is already queued), `{"name": "SearchWanted"}` (download-only pass over series with wanted chapters), `{"name": "RefreshMetadata"}` (metadata only, every series) or `{"name": "CheckLibraryLinks"}` (see `mangarr check-links`). 400 for any other name. |
+| `GET /api/v1/config/naming/examples?chapter_file_format=...` | the names the naming settings give for a few chapters of the library: `{"folder", "chapters", "errors", "warnings"}`; settings left out of the query are the stored ones. Saves nothing. |
+| `GET /api/v1/rename?seriesId=1&latestTitles=false&renameFolder=true` | the rename preview of a series: `{"folder", "renames", "files", "chapters": [{"number", "oldName", "newName", "changed", "skip"}], "collisions", "warnings", "komga": {"state", "message", "needs_confirmation"}}`. Renames nothing. |
+| `POST /api/v1/series/{id}/rename` | rename a series' files to the stored naming formats. Body (all optional): `{"useLatestTitles": false, "only": [12, 12.5], "renameFolder": true, "confirmed": false}`. 409 with `needsConfirmation` when Komga would not keep reading progress and `confirmed` is not true. Form route: `POST /series/{id}/rename` |
+| `POST /api/v1/rename` | the same for several series as one job: `{"seriesIds": [1, 2], "useLatestTitles": false, "confirmed": false}` |
+| `GET /api/v1/rename/history?seriesId=` | the renames and undos so far, newest first, each with `can_undo` |
+| `POST /api/v1/rename/{run}/undo` | undo a finished rename (7 days, once): `{"confirmed": true}` when Komga would not keep reading progress; 409 when it cannot be undone, 404 for an unknown one |
 | `GET /api/v1/log?lines=200` | tail of the log file (`lines` capped at 5000) |
 | `GET /metrics` | Prometheus exposition; see Monitoring |
 | `GET /system/backup` | take a backup now and download it (`mangarr-<date>-<time>.db`) |

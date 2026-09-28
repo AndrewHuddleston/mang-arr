@@ -530,3 +530,23 @@ body.login{display:flex;align-items:center;justify-content:center;min-height:100
 .stuck-skipped form{display:inline}
 .verdict-label{margin-left:4px}
 .stuck-cell{white-space:nowrap}
+
+/* -- Settings: Show Advanced; naming preview; rename preview ------------------------------------- */
+html:not([data-advanced]) .advanced{display:none !important}
+.advanced > .form-label,th.advanced{color:var(--warning-label)}
+.default-note{color:var(--help);white-space:nowrap}
+.advanced-hint{margin:0 0 15px}
+#advanced-toggle[aria-pressed="true"]{color:var(--warning-label)}
+.input.input-error{border-color:var(--danger)}
+.format-row{display:flex;gap:8px;align-items:flex-start}.format-row .input{flex:1;font-family:ui-monospace,Menlo,Consolas,monospace;font-size:13px}
+.token-help{position:relative}.token-list{list-style:none;margin:0 0 8px;padding:0}.token-list li{margin:2px 0}
+.naming-preview{margin-top:6px}.naming-preview .example{color:var(--help);font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12px;line-height:18px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.rename-options{margin:0 0 15px}
+.rename-body{margin-top:12px;max-height:50vh;overflow:auto}
+.rename-item{display:flex;gap:10px;align-items:flex-start;padding:6px 0;border-bottom:1px solid #3a3a3a}
+.rename-item.skipped{opacity:.8}
+.rename-names{min-width:0;font-size:12px;line-height:18px}.rename-names code{display:block;overflow-wrap:anywhere}.rename-names .arrow{display:none}
+.rename-names code + .arrow + code{color:var(--success)}
+.rename-left{margin-top:10px}.rename-left > summary{cursor:pointer;color:var(--help)}
+#rename-komga{margin-top:12px}
+.rename-runs .note{color:var(--help);font-size:12px}

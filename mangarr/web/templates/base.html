@@ -11,7 +11,7 @@
 {% set path = request.url.path %}
 {% set section = nav_section(path) %}
 {% set cur = nav_current(path) %}
-<body data-page="{{ section|lower }}">
+<body data-page="{{ section|lower }}"{% block body_attrs %}{% endblock %}>
 <a class="skip" href="#main">Skip to content</a>
 {% include "icons.html" %}
 

@@ -9,12 +9,18 @@
   </div>
   <div class="toolbar-section right">
     <span class="toolbar-count" id="history-count" data-total="{{ events|length }}">{{ events|length }} events</span>
-    {{ m.toolbar_menu('Filter', 'filter', 'history-filter', [('all', 'All'), ('downloaded', 'Downloaded'), ('imported', 'Imported'), ('failed', 'Failed'), ('added', 'Added'), ('resolved', 'Resolved'), ('deleted', 'Deleted'), ('review', 'Needs review'), ('monitor', 'Monitoring')], 'all') }}
+    {{ m.toolbar_menu('Filter', 'filter', 'history-filter', [('all', 'All'), ('downloaded', 'Downloaded'), ('imported', 'Imported'), ('failed', 'Failed'), ('added', 'Added'), ('resolved', 'Resolved'), ('deleted', 'Deleted'), ('review', 'Needs review'), ('monitor', 'Monitoring'), ('renamed', 'Renamed')], 'all') }}
   </div>
 </div>
 {% endblock %}
 
 {% block body %}
+{% if renames %}
+<details class="fieldset" id="renames" {% if confirm_undo %}open{% endif %}>
+  <summary class="legend">Renames <span class="legend-note">a finished rename can be undone for 7 days</span></summary>
+  {{ m.rename_runs(renames, '/activity/history', confirm_undo, progress_lost) }}
+</details>
+{% endif %}
 {% if not events %}
 <div class="alert info">No history found.</div>
 {% else %}

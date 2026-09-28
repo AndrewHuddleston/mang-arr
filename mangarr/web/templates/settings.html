@@ -1,45 +1,94 @@
 {% extends "base.html" %}
 {% import "macros.html" as m %}
-{% block title %}Settings - mang-arr{% endblock %}
+{% block title %}{{ sp_name }} - Settings - mang-arr{% endblock %}
+{% block body_attrs %}{% if show_advanced %} data-force-advanced="1"{% endif %}{% if focus %} data-focus="{{ focus }}"{% endif %}{% endblock %}
 
 {% block toolbar %}
 <div class="page-toolbar">
   <div class="toolbar-section left">
     <button class="toolbar-button" form="settings-form" title="Save changes">{{ m.icon('save') }}<span class="toolbar-label">Save Changes</span></button>
     {{ m.toolbar_separator() }}
-    <button class="toolbar-button" form="settings-form" name="action" value="test-komga">{{ m.icon('check-circle') }}<span class="toolbar-label">Test Komga</span></button>
-    <button class="toolbar-button" form="settings-form" name="action" value="test-notify">{{ m.icon('rss') }}<span class="toolbar-label">Test Notify</span></button>
-  </div>
-  <div class="toolbar-section right">
-    <nav class="settings-nav" aria-label="Settings sections"><a href="#sources">Sources</a><a href="#scheduling">Scheduling</a><a href="#komga">Komga</a><a href="#notifications">Notifications</a><a href="#security">Security</a></nav>
+    <button type="button" class="toolbar-button" id="advanced-toggle" aria-pressed="false" title="Show or hide the settings that are rarely changed">{{ m.icon('settings') }}<span class="toolbar-label">Show Advanced</span></button>
+    {% if sp == 'komga' %}{{ m.toolbar_separator() }}<button class="toolbar-button" form="settings-form" name="action" value="test-komga">{{ m.icon('check-circle') }}<span class="toolbar-label">Test Komga</span></button>{% endif %}
+    {% if sp == 'notifications' %}{{ m.toolbar_separator() }}<button class="toolbar-button" form="settings-form" name="action" value="test-notify">{{ m.icon('rss') }}<span class="toolbar-label">Test Notify</span></button>{% endif %}
   </div>
 </div>
 {% endblock %}
 
 {% block body %}
 <div class="help-text">Stored in the database; environment variables are the defaults. Changes apply to the next job.</div>
+{% if changed_advanced %}<div class="help-text advanced-hint">{{ changed_advanced }} advanced setting{{ 's are' if changed_advanced != 1 else ' is' }} changed from {{ 'their defaults' if changed_advanced != 1 else 'its default' }}. <button type="button" class="linkbtn" data-show-advanced>Show Advanced</button></div>{% endif %}
 <form method="post" action="/settings" class="settings-form form" id="settings-form">
+<input type="hidden" name="page" value="{{ sp }}">
 
+{% if sp == 'media-management' %}
+<fieldset class="fieldset" id="naming" data-naming-examples="/settings/naming/examples">
+  <legend class="legend">Chapter Naming</legend>
+  <div class="help-text">How new series folders and chapter files are named. Files already in the library keep their names until you rename them (Existing Files below).</div>
+  {% macro tokens(target, names) %}
+  <details class="popover token-help"><summary class="button small" title="The tokens this format can use">?</summary>
+    <div class="popover-body"><div class="popover-title">Tokens (click to insert)</div>
+      <ul class="token-list">{% for t, what in names %}<li><button type="button" class="linkbtn" data-insert-token="{{ t }}" data-target="{{ target }}"><code>{{ t }}</code></button> <span class="muted">{{ what }}</span></li>{% endfor %}</ul>
+      <div class="popover-text muted small">Text inside the braces around a name, like the " - " in <code>{ - Chapter Title}</code>, is added only when the token has a value.</div></div></details>
+  {% endmacro %}
+  {% set series_tokens = [('{Series Title}', 'English, else romaji, else native'), ('{Series Romaji}', 'romaji title'), ('{Series English}', 'English title'), ('{Series Native}', 'title in its own script'), ('{ (Year)}', 'start year, when known')] %}
+  {% call m.form_group('Series Folder Format', none, 'series_folder_format') %}
+    <div class="format-row"><input class="input" id="series_folder_format" name="series_folder_format" value="{{ v.series_folder_format }}" maxlength="200" autocomplete="off" spellcheck="false" data-naming>{{ tokens('series_folder_format', series_tokens) }}</div>
+    <div class="naming-preview" id="folder-preview">{% if examples.folder %}<div class="example">{{ examples.folder }}</div>{% endif %}</div>
+  {% endcall %}
+  {% call m.form_group('Chapter File Format', none, 'chapter_file_format') %}
+    <div class="format-row"><input class="input" id="chapter_file_format" name="chapter_file_format" value="{{ v.chapter_file_format }}" maxlength="200" autocomplete="off" spellcheck="false" data-naming>{{ tokens('chapter_file_format', [('{Chapter:000.0}', 'number: 012.0, 012.5'), ('{Chapter:000}', '012, 012.5'), ('{Chapter}', '12, 12.5'), ('{ - Chapter Title}', 'the title, when it says more than the number')] + series_tokens) }}</div>
+    <div class="naming-preview" id="chapter-preview">{% for name in examples.chapters %}<div class="example">{{ name }}</div>{% endfor %}</div>
+    <div class="naming-messages" id="naming-messages">{% for e in examples.errors %}<div class="help-text text-danger">{{ e }}</div>{% endfor %}{% for w in examples.warnings %}<div class="help-text text-warning">{{ w }}</div>{% endfor %}</div>
+  {% endcall %}
+  {% call m.form_group('Colon Replacement', 'What a ":" in a title becomes in a name', 'colon_replacement') %}
+    <select class="input select" id="colon_replacement" name="colon_replacement" data-naming>{% for o, text in [('underscore', 'Underscore (like Suwayomi)'), ('delete', 'Delete'), ('dash', 'Dash'), ('space_dash', 'Space Dash'), ('smart', 'Smart (" - " before a space, "-" between letters)')] %}<option value="{{ o }}" {% if v.colon_replacement == o %}selected{% endif %}>{{ text }}</option>{% endfor %}</select>
+  {% endcall %}
+  {% call m.form_group('Replace Illegal Characters', none, 'replace_illegal_characters', advanced=true, default='on') %}
+    <input type="hidden" name="replace_illegal_characters" value="0"><label class="inline-check">{{ m.check('replace_illegal_characters', v.replace_illegal_characters, '1', 'replace_illegal_characters', 'primary', {'data-naming': ''}) }} ? * " &lt; &gt; | become _ (off: they are removed)</label>
+  {% endcall %}
+  {% call m.form_group('Chapter Title Length', 'A chapter title in a file name is cut to this many characters (1-255)', 'chapter_title_max_chars', advanced=true, default='80') %}<input class="input" id="chapter_title_max_chars" name="chapter_title_max_chars" value="{{ v.chapter_title_max_chars }}" data-naming><span class="input-unit">characters</span>{% endcall %}
+  {% call m.form_group('Number-only Titles', none, 'drop_number_only_titles', advanced=true, default='off') %}
+    <input type="hidden" name="drop_number_only_titles" value="0"><label class="inline-check">{{ m.check('drop_number_only_titles', v.drop_number_only_titles, '1', 'drop_number_only_titles', 'primary', {'data-naming': ''}) }} Leave out titles that are only numbers, like "Vol.3 chapter 13"</label>
+  {% endcall %}
+</fieldset>
+
+<fieldset class="fieldset" id="existing-files">
+  <legend class="legend">Existing Files</legend>
+  <div class="help-text">{{ '{:,}'.format(library.files) }} chapter file{{ 's' if library.files != 1 }} in {{ library.series }} series. Nothing is renamed on its own: not by an upgrade, not by changing a format. To rename files to the naming above, preview the rename first.</div>
+  <p><a class="button" href="/rename">Preview Rename...</a></p>
+  <div class="help-text">{% if komga_on %}Komga keeps reading progress through a rename when its library has "Compute hash for files" on; the preview checks that for each series.{% else %}No Komga is set up: a rename asks you to confirm that reading progress in your reader app may be lost.{% endif %} Suwayomi's downloads (staging) are never renamed.</div>
+</fieldset>
+
+<fieldset class="fieldset" id="folders">
+  <legend class="legend">Folders</legend>
+  {% call m.form_group('Library Folder', 'Komga reads this (MANGARR_LIBRARY)') %}<input class="input read-only" readonly value="{{ folders.library }}" aria-label="Library folder">{% endcall %}
+  {% call m.form_group('Staging Folder', "Suwayomi's downloads; never renamed (MANGARR_STAGING)") %}<input class="input read-only" readonly value="{{ folders.staging }}" aria-label="Staging folder">{% endcall %}
+  {% call m.form_group('Hard Links', 'A library file is a second name for the downloaded file, so it takes no extra space. When staging and library are on different filesystems or mounts a link is impossible and the file is copied.', advanced=true) %}<span class="{{ 'text-warning' if folders.copied else '' }}">{% if folders.copied %}copying: {{ folders.copied }} chapter{{ 's' if folders.copied != 1 }} copied since start{% else %}working (0 copies since start){% endif %}</span>{% endcall %}
+</fieldset>
+{% elif sp == 'sources' %}
 <fieldset class="fieldset" id="sources">
   <legend class="legend">Sources</legend>
-  <div class="help-text">The sources installed in Suwayomi. Untick one to stop using it: it is neither searched nor downloaded from. Rate limiting is detected automatically: a source that starts refusing requests is paced (one chapter at a time, a pause between chapters) and loses close calls to other sources for {{ auto_days }} days. A source whose image server refuses bursts (Comick) can be fetched page by page ("one by one"): each page is requested through Suwayomi a few seconds apart, then Suwayomi builds the chapter from its cache. That is slow (2-4 min a chapter), so such a source is used only for chapters no other source lists.</div>
+  <div class="help-text">The sources installed in Suwayomi. Untick one to stop using it: it is neither searched nor downloaded from. Rate limiting is detected automatically: a source that starts refusing requests is paced (one chapter at a time, a pause between chapters) and loses close calls to other sources for {{ auto_days }} days.</div>
+  <div class="help-text advanced">A source whose image server refuses bursts (Comick) can be fetched page by page ("one by one"): each page is requested through Suwayomi a few seconds apart, then Suwayomi builds the chapter from its cache. That is slow (2-4 min a chapter), so such a source is used only for chapters no other source lists.</div>
   <input type="hidden" name="sources_listed" value="{{ '1' if sources else '0' }}">
   <div class="table-container"><table class="table">
-  <thead><tr><th class="col-check">Enabled</th><th>Source</th><th>Language</th><th>Reliability</th><th>Rate limiting</th><th>Pages</th></tr></thead>
+  <thead><tr><th class="col-check">Enabled</th><th>Source</th><th>Language</th><th>Reliability</th><th>Rate limiting</th><th class="advanced">Pages</th></tr></thead>
   <tbody>
   {% for s in sources %}
   <tr><td class="col-check"><input type="hidden" name="listed_sources" value="{{ s.name|lower }}">{{ m.check('enabled_sources', (s.name|lower not in v.unusable_sources), s.name|lower, none, 'primary', {'aria-label': 'Enable ' ~ s.name}) }}</td>
   <td>{{ s.name }}</td><td class="muted">{{ s.lang }}</td>
   {% set st = stats.get(s.name) %}<td class="muted small">{% if st %}{% set tot = st.ok + st.failed + st.corrupt %}{{ ((st.ok / tot) * 100)|round|int if tot else 0 }}% of {{ tot }} chapter{{ 's' if tot != 1 }}{% if st.corrupt %} ({{ st.corrupt }} corrupt){% endif %}{% else %}no downloads yet{% endif %}</td>
   <td class="small">{% if s.throttled %}<span class="text-warning">paced</span>{% if st and st.last_throttled %} <span class="muted">- limited us {{ st.throttled }}x, last {{ st.last_throttled|ago }}</span>{% endif %}{% else %}<span class="muted">none seen</span>{% endif %}</td>
-  <td class="small"><label class="inline-check">{{ m.check('warm_sources', (s.name|lower in v.page_warm_sources), s.name|lower, none, 'primary', {'aria-label': 'Fetch ' ~ s.name ~ ' page by page'}) }} one by one</label></td></tr>
+  <td class="small advanced"><label class="inline-check">{{ m.check('warm_sources', (s.name|lower in v.page_warm_sources), s.name|lower, none, 'primary', {'aria-label': 'Fetch ' ~ s.name ~ ' page by page'}) }} one by one</label></td></tr>
   {% endfor %}
   {% if not sources %}<tr><td colspan="6" class="text-danger">Suwayomi unreachable - source list unavailable</td></tr>{% endif %}
   </tbody></table></div>
 </fieldset>
 
+{% elif sp == 'downloading' %}
 <fieldset class="fieldset" id="scheduling">
-  <legend class="legend">Scheduling &amp; Matching</legend>
+  <legend class="legend">Downloading</legend>
   {% call m.form_group('Download Order', none, 'download_in_order') %}
     <div class="order-option"><input type="hidden" name="download_in_order" value="0"><label class="inline-check">{{ m.check('download_in_order', v.download_in_order, '1', 'download_in_order', 'primary', {'data-hides': 'order-warning', 'data-enables': 'auto-skip-option'}) }} Strict download in order</label>
       <div class="help-text">Each series is downloaded in chapter order. If a chapter cannot be downloaded from any source, that series waits at it (and it is retried on schedule) while the other series carry on; its page says what the chapter probably is and lets you skip it.</div>
@@ -51,15 +100,17 @@
       <div class="alert warning small" id="auto-skip-warning" {% if off or not v.auto_skip_side_stories %}hidden{% endif %}>Chapters judged to be side stories or already-covered pieces are skipped automatically when they block a series. The judgement is a best guess from chapter titles and other sites' chapter lists; you might miss parts of the story.</div></div>
   {% endcall %}
   {% call m.form_group('Refresh Interval', 'Hours between automatic refreshes of every monitored series', 'refresh_hours') %}<input class="input" id="refresh_hours" name="refresh_hours" value="{{ v.refresh_hours }}"><span class="input-unit">hours</span>{% endcall %}
-  {% call m.form_group('Throttled Delay', 'Seconds between chapters on rate-limited sources; a steady pause stays under the site\'s limit, bursts get HTTP 429 and long backoffs', 'throttled_delay_seconds') %}<input class="input" id="throttled_delay_seconds" name="throttled_delay_seconds" value="{{ v.throttled_delay_seconds }}"><span class="input-unit">seconds</span>{% endcall %}
-  {% call m.form_group('Download Lanes', 'How many sources download at the same time during a refresh pass or Search Wanted (1-8). A source still serves one series at a time and keeps its pacing, so a slow or rate-limited source no longer holds up the others. Suwayomi must allow at least as many (\'max sources in parallel\'); the lower number wins.', 'download_lanes') %}<input class="input" id="download_lanes" name="download_lanes" value="{{ v.download_lanes }}"><span class="input-unit">sources</span>
+  {% if suwayomi_cap is not none and suwayomi_cap < lanes %}<div class="alert warning small" id="suwayomi-fewer">Suwayomi allows {{ suwayomi_cap }} source{{ 's' if suwayomi_cap != 1 }} in parallel, fewer than the {{ lanes }} download lanes set here, so downloads from different sources take turns. <button class="button small" name="action" value="suwayomi-parallel" type="submit">Save and let Suwayomi use {{ lanes }}</button></div>{% endif %}
+  {% call m.form_group('Throttled Delay', 'Seconds between chapters on rate-limited sources; a steady pause stays under the site\'s limit, bursts get HTTP 429 and long backoffs', 'throttled_delay_seconds', advanced=true, default='8') %}<input class="input" id="throttled_delay_seconds" name="throttled_delay_seconds" value="{{ v.throttled_delay_seconds }}"><span class="input-unit">seconds</span>{% endcall %}
+  {% call m.form_group('Download Lanes', 'How many sources download at the same time during a refresh pass or Search Wanted (1-8). A source still serves one series at a time and keeps its pacing, so a slow or rate-limited source no longer holds up the others. Suwayomi must allow at least as many (\'max sources in parallel\'); the lower number wins.', 'download_lanes', advanced=true, default='3') %}<input class="input" id="download_lanes" name="download_lanes" value="{{ v.download_lanes }}"><span class="input-unit">sources</span>
     <div class="help-text" id="suwayomi-parallel">Suwayomi currently allows {{ suwayomi_cap if suwayomi_cap is not none else '-' }} source{{ 's' if suwayomi_cap != 1 }} in parallel{% if suwayomi_cap is none %} (it did not answer){% endif %}.{% if suwayomi_cap is not none and suwayomi_cap < lanes %} Downloads from different sources take turns until it allows {{ lanes }}. <button class="button small" name="action" value="suwayomi-parallel" type="submit">Save and let Suwayomi use {{ lanes }}</button>{% endif %}</div>{% endcall %}
-  {% call m.form_group('Parallel Searches', 'How many sites are searched at the same time while a series is resolved (1-8). A site still gets one search at a time, spaced as before, so this only makes a pass get to its downloads sooner.', 'search_parallel') %}<input class="input" id="search_parallel" name="search_parallel" value="{{ v.search_parallel }}"><span class="input-unit">sites</span>{% endcall %}
-  {% call m.form_group('Page Delay', 'Seconds between page requests on sources fetched page by page (Sources: one by one). This is the starting and minimum spacing; it grows by itself when the image server answers busy and eases back slowly.', 'page_delay_seconds') %}<input class="input" id="page_delay_seconds" name="page_delay_seconds" value="{{ v.page_delay_seconds }}"><span class="input-unit">seconds</span>{% endcall %}
-  {% call m.form_group('Re-check Finished Series', 'Days between checks of a complete finished or cancelled series (chapters on disk, nothing missing or failed). Every pass still asks AniList or MangaDex whether it goes on after all; 0 = check it every pass', 'recheck_finished_days') %}<input class="input" id="recheck_finished_days" name="recheck_finished_days" value="{{ v.recheck_finished_days }}"><span class="input-unit">days</span>{% endcall %}
-  {% call m.form_group('Minimum Pages', 'Below this a "Chapter 12.5" is treated as a notice image and skipped', 'min_pages') %}<input class="input" id="min_pages" name="min_pages" value="{{ v.min_pages }}"><span class="input-unit">pages</span>{% endcall %}
+  {% call m.form_group('Parallel Searches', 'How many sites are searched at the same time while a series is resolved (1-8). A site still gets one search at a time, spaced as before, so this only makes a pass get to its downloads sooner.', 'search_parallel', advanced=true, default='5') %}<input class="input" id="search_parallel" name="search_parallel" value="{{ v.search_parallel }}"><span class="input-unit">sites</span>{% endcall %}
+  {% call m.form_group('Page Delay', 'Seconds between page requests on sources fetched page by page (Sources: one by one). This is the starting and minimum spacing; it grows by itself when the image server answers busy and eases back slowly.', 'page_delay_seconds', advanced=true, default='2.5') %}<input class="input" id="page_delay_seconds" name="page_delay_seconds" value="{{ v.page_delay_seconds }}"><span class="input-unit">seconds</span>{% endcall %}
+  {% call m.form_group('Re-check Finished Series', 'Days between checks of a complete finished or cancelled series (chapters on disk, nothing missing or failed). Every pass still asks AniList or MangaDex whether it goes on after all; 0 = check it every pass', 'recheck_finished_days', advanced=true, default='7') %}<input class="input" id="recheck_finished_days" name="recheck_finished_days" value="{{ v.recheck_finished_days }}"><span class="input-unit">days</span>{% endcall %}
+  {% call m.form_group('Minimum Pages', 'Below this a "Chapter 12.5" is treated as a notice image and skipped', 'min_pages', advanced=true, default='8') %}<input class="input" id="min_pages" name="min_pages" value="{{ v.min_pages }}"><span class="input-unit">pages</span>{% endcall %}
 </fieldset>
 
+{% elif sp == 'komga' %}
 <fieldset class="fieldset" id="komga">
   <legend class="legend">Komga</legend>
   {% call m.form_group('URL', none, 'komga_url') %}<input class="input" id="komga_url" name="komga_url" value="{{ v.komga_url }}" placeholder="http://komga:25600">{{ m.url_warning('komga_url', bad_urls) }}{% endcall %}
@@ -68,6 +119,7 @@
   {% if komga_test %}<div class="alert {{ 'success' if komga_ok else 'danger' }}">Komga: {{ komga_test }}</div>{% endif %}
 </fieldset>
 
+{% elif sp == 'notifications' %}
 <fieldset class="fieldset" id="notifications">
   <legend class="legend">Notifications</legend>
   <div class="help-text">Fill in any of the services below; every configured one gets each message. "Test" saves the form and sends a test to that service only.</div>
@@ -110,6 +162,7 @@
   {% call m.form_group('Webhook URL', 'POSTs {title, message, kind} as JSON', 'webhook_url') %}<input class="input" id="webhook_url" name="webhook_url" type="password" value="{{ v.webhook_url }}" autocomplete="off" placeholder=""> <button class="button small" name="action" value="test-notify-webhook" type="submit">Test</button>{{ m.url_warning('webhook_url', bad_urls) }}{% endcall %}
 </fieldset>
 
+{% elif sp == 'general' %}
 <fieldset class="fieldset" id="security">
   <legend class="legend">Security</legend>
   {% call m.form_group('Authentication') %}
@@ -118,16 +171,20 @@
   {% call m.form_group('Username', 'Empty = no login (clear it to turn the login off)', 'auth_user') %}<input class="input" id="auth_user" name="auth_user" value="{{ v.auth_user }}" autocomplete="username">{% endcall %}
   {% call m.form_group('Password', 'Required while a username is set. Stored as a salted hash and shown as ********: leave that as it is to keep the password. Changing it signs every browser out.', 'auth_password') %}<input class="input" id="auth_password" name="auth_password" type="password" value="{{ v.auth_password }}" autocomplete="new-password">{% endcall %}
   {% call m.form_group('API Key', 'Send it as the X-Api-Key header to use the JSON API when a login is set (?apikey= is accepted only on GET requests under /api/). Regenerating it breaks every script that uses the old key and signs every browser out.', 'api_key') %}<input class="input" id="api_key" type="password" value="{{ v.api_key }}" readonly autocomplete="off" aria-label="API key"> <button class="button small" type="button" data-reveal-api-key="api_key">Show</button> <button class="button small" type="submit" form="regenerate-api-key">Regenerate</button>{% endcall %}
-  {% call m.form_group('Sessions', 'Sign every browser out, including this one (e.g. after using a shared computer)') %}<button class="button small" type="submit" form="logout-all">Sign out everywhere</button>{% endcall %}
-  {% call m.form_group('Allowed Host Names', 'The web UI answers only to IP addresses, localhost, single-label names (mangarr) and .local / .lan / .home.arpa / .internal / .localdomain names, which blocks DNS rebinding. Add any other name you open it by, e.g. manga.example.com behind a reverse proxy: the name alone, a port is ignored (comma-separated; also MANGARR_ALLOWED_HOSTS).', 'allowed_hosts') %}<input class="input" id="allowed_hosts" name="allowed_hosts" value="{{ v.allowed_hosts|join(', ') }}" placeholder="manga.example.com">{% endcall %}
+  {% call m.form_group('Sessions', 'Sign every browser out, including this one (e.g. after using a shared computer)', advanced=true) %}<button class="button small" type="submit" form="logout-all">Sign out everywhere</button>{% endcall %}
+  {% call m.form_group('Allowed Host Names', 'The web UI answers only to IP addresses, localhost, single-label names (mangarr) and .local / .lan / .home.arpa / .internal / .localdomain names, which blocks DNS rebinding. Add any other name you open it by, e.g. manga.example.com behind a reverse proxy: the name alone, a port is ignored (comma-separated; also MANGARR_ALLOWED_HOSTS).', 'allowed_hosts', advanced=true, default='none') %}<input class="input" id="allowed_hosts" name="allowed_hosts" value="{{ v.allowed_hosts|join(', ') }}" placeholder="manga.example.com">{% endcall %}
 </fieldset>
+
+{% endif %}
 
 <div class="form-actions">
   <button class="button primary">Save Changes</button>
-  <button name="action" value="test-komga" class="button">Save &amp; test Komga</button>
-  <button name="action" value="test-notify" class="button">Save &amp; send test notification</button>
+  {% if sp == 'komga' %}<button name="action" value="test-komga" class="button">Save &amp; test Komga</button>{% endif %}
+  {% if sp == 'notifications' %}<button name="action" value="test-notify" class="button">Save &amp; send test notification</button>{% endif %}
 </div>
 </form>
+{% if sp == 'general' %}
 <form method="post" action="/settings/api-key/regenerate" id="regenerate-api-key" data-confirm="Regenerate the API key? Scripts using the old key stop working and every browser is signed out."></form>
 <form method="post" action="/settings/logout-all" id="logout-all" data-confirm="Sign every browser out, including this one?"></form>
+{% endif %}
 {% endblock %}

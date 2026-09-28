@@ -68,11 +68,13 @@
 </div>
 {%- endmacro %}
 
-{# Sonarr FormGroup: label left (150px, bold, right-aligned on wide screens), input + help right #}
-{% macro form_group(label_text, help=none, for_id=none) -%}
-<div class="form-group">
+{# Sonarr FormGroup: label left (150px, bold, right-aligned on wide screens), input + help right.
+   advanced: shown only with Show Advanced on (the fields stay in the form, so hiding never resets them);
+   default: what the setting is out of the box, said after the help so it can be put back. #}
+{% macro form_group(label_text, help=none, for_id=none, advanced=false, default=none) -%}
+<div class="form-group{% if advanced %} advanced{% endif %}">
   <label class="form-label" {% if for_id %}for="{{ for_id }}"{% endif %}>{{ label_text }}</label>
-  <div class="form-input">{{ caller() }}{% if help %}<div class="help-text">{{ help }}</div>{% endif %}</div>
+  <div class="form-input">{{ caller() }}{% if help or default is not none %}<div class="help-text">{{ help or '' }}{% if default is not none %} <span class="default-note">Default: {{ default }}</span>{% endif %}</div>{% endif %}</div>
 </div>
 {%- endmacro %}
 
@@ -94,3 +96,19 @@
 {% macro poster_img(src, alt='', cls='poster-image') -%}
 {% if src %}<img class="{{ cls }}" src="{{ src }}" alt="{{ alt }}" loading="lazy">{% else %}<div class="{{ cls }} poster-none">{{ icon('image') }}<span>no cover</span></div>{% endif %}
 {%- endmacro %}
+
+{# A finished rename's Undo (for 7 days, once); the confirmation shows after an undo was refused for it #}
+{% macro rename_runs(runs, back, confirm_undo, progress_lost) %}
+<div class="table-container"><table class="table rename-runs">
+<thead><tr><th>#</th><th>Started</th><th>What</th><th class="num">Renamed</th><th class="num">Left</th><th>Result</th><th class="col-actions"></th></tr></thead>
+<tbody>
+{% for r in runs %}
+<tr><td>{{ r.id }}</td><td class="nowrap">{{ r.started_at }}</td>
+  <td>{{ ('Undo of #' ~ r.undo_of) if r.undo_of else 'Rename' }}</td>
+  <td class="num">{{ r.renamed }}</td><td class="num">{{ r.skipped }}</td>
+  <td>{{ r.state }}{% if r.message %}<div class="note">{{ r.message }}</div>{% endif %}{% if r.undone_by %}<div class="note">undone by #{{ r.undone_by }}</div>{% endif %}</td>
+  <td class="col-actions nowrap">{% if r.can_undo %}<form method="post" action="/rename/{{ r.id }}/undo" class="inline" data-confirm="Give the files of rename #{{ r.id }} their old names back?"><input type="hidden" name="back" value="{{ back }}">
+    {% if confirm_undo == r.id|string %}<label class="inline-check text-warning">{{ check('confirmed', false, '1', none, 'warning') }} I understand: {{ progress_lost }}</label> {% endif %}<button class="button small">Undo</button></form>{% elif r.undo_reason and not r.undo_of and not r.undone_by %}<span class="muted small" title="{{ r.undo_reason }}">cannot be undone</span>{% endif %}</td></tr>
+{% endfor %}
+</tbody></table></div>
+{% endmacro %}

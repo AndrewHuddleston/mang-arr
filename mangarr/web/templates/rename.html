@@ -1,0 +1,61 @@
+{% extends "base.html" %}
+{% import "macros.html" as m %}
+{% block title %}Rename Files - mang-arr{% endblock %}
+
+{% block toolbar %}
+<div class="page-toolbar">
+  <div class="toolbar-section left">
+    {{ m.toolbar_button('Series', 'series', href='/') }}
+    {{ m.toolbar_button('Naming', 'settings', href='/settings/media-management', title='The naming formats (Settings, Media Management)') }}
+    {{ m.toolbar_separator() }}
+    <button class="toolbar-button" form="rename-form" {% if not rows %}disabled{% endif %} title="Rename the files of the selected series">{{ m.icon('edit') }}<span class="toolbar-label">Rename</span></button>
+  </div>
+  <div class="toolbar-section right">
+    <span class="toolbar-count">{{ '{:,}'.format(renames) }} of {{ '{:,}'.format(files) }} files would be renamed</span>
+  </div>
+</div>
+{% endblock %}
+
+{% block body %}
+<div class="help-text">This is a preview: what the naming formats (Settings, Media Management) would rename. Nothing is renamed until you press Rename. A database backup is made first, every step is written down before it is done, and a finished rename can be undone for 7 days. Suwayomi's downloads (staging) are never touched; a file is never renamed over another file.</div>
+{% if error %}<div class="alert danger">{{ error }} <a href="/settings/media-management">Correct them in Settings.</a></div>{% endif %}
+
+<form method="get" action="/rename" class="rename-options">
+  <input type="hidden" name="latest" value="0">
+  <label class="inline-check">{{ m.check('latest', latest, '1', 'rename-latest', 'primary', {'data-submit-on-change': ''}) }} Use the latest chapter titles from sources</label>
+  <span class="help-text inline">Off: every file keeps the title its name has now.</span>
+  <noscript><button class="button small">Preview again</button></noscript>
+</form>
+
+{% if rows %}
+<form method="post" action="/rename" id="rename-form" class="form">
+<input type="hidden" name="latest_titles" value="{{ '1' if latest else '0' }}">
+<div class="table-container"><table class="table" id="rename-table">
+<thead><tr><th class="col-check">{{ m.check(none, true, '1', 'rename-all', 'primary', {'aria-label': 'Select every series', 'data-check-all': 'series'}) }}</th><th>Series</th><th class="num">Files</th><th class="num">To rename</th><th>Folder</th><th>Example</th><th>Left as they are</th></tr></thead>
+<tbody>
+{% for r in rows %}
+<tr><td class="col-check">{{ m.check('series', true, r.id, none, 'primary', {'aria-label': 'Rename ' ~ r.title}) }}</td>
+  <td><a href="/series/{{ r.id }}">{{ r.title }}</a></td>
+  <td class="num">{{ r.files }}</td><td class="num">{{ r.renames }}</td>
+  <td class="small">{% if r.moves %}<code>{{ r.folder.old }}</code> &rarr; <code>{{ r.folder.new }}</code>{% elif r.folder and r.folder.blocked %}<span class="text-warning">{{ r.folder.blocked }}</span>{% else %}<span class="muted">unchanged</span>{% endif %}</td>
+  <td class="small">{% if r.sample %}<code>{{ r.sample[0] }}</code> &rarr; <code>{{ r.sample[1] }}</code>{% endif %}</td>
+  <td class="small">{% if r.skipped or r.collisions %}<span class="text-warning">{{ r.skipped }} file{{ 's' if r.skipped != 1 }}{% if r.collisions %}, {{ r.collisions }} name{{ 's' if r.collisions != 1 }} taken{% endif %}</span> <a href="/series/{{ r.id }}#rename">why</a>{% else %}<span class="muted">none</span>{% endif %}</td></tr>
+{% endfor %}
+</tbody></table></div>
+<div class="alert {{ 'info' if komga_on else 'warning' }} small">{% if komga_on %}Komga is asked about each selected series when you press Rename. Where it keeps reading progress (file hashing on, every book hashed) nothing more is needed. Where it would not, the rename is refused unless you tick the box below.{% else %}No Komga is set up, so mang-arr cannot check what happens to reading progress.{% endif %}</div>
+<div class="form-actions">
+  <label class="inline-check text-warning">{{ m.check('confirmed', false, '1', 'rename-confirmed', 'warning') }} Rename even where it cannot be checked: I understand that {{ progress_lost }}</label>
+</div>
+<div class="form-actions"><button class="button primary">Rename</button></div>
+</form>
+{% elif not error %}
+<div class="alert success">All {{ '{:,}'.format(files) }} chapter files in {{ total }} series have the names the naming formats give. Nothing to rename.</div>
+{% endif %}
+
+{% if history %}
+<fieldset class="fieldset" id="renames">
+  <legend class="legend">Renames so far</legend>
+  {{ m.rename_runs(history, '/rename', confirm_undo, progress_lost) }}
+</fieldset>
+{% endif %}
+{% endblock %}

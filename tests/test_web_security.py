@@ -147,9 +147,10 @@ class EscapingTest(WebBase):
 
     def test_source_name_in_settings_checkbox_is_escaped(self):
         with mock.patch.object(self.web.client, "sources", lambda *a, **k: [_FakeSource(XSS_TITLE)]):
-            html = self.client.get("/settings").text
+            html = self.client.get("/settings/sources").text
         self.assertNotIn('autofocus onfocus="alert', html)
         self.assertIn('aria-label="Enable X&#34; autofocus', html)
+        html = self.client.get("/settings/downloading").text
         self.assertNotIn("onchange=", html)                  # inline handlers moved to app.js (CSP)
         self.assertIn('data-hides="order-warning"', html)
 
@@ -863,7 +864,7 @@ class ApiKeyTest(WebBase):
     def test_api_key_masked_and_not_logged(self):
         self.assertEqual(self.settings.masked(self.settings.all_values())["api_key"], self.settings.MASK)
         self.signin()
-        html = self.client.get("/settings").text
+        html = self.client.get("/settings/general").text
         self.assertNotIn(self.key, html)
         self.assertNotIn('name="api_key"', html)                 # not settable from the general form
         self.assertEqual(self.client.get("/api/v1/settings").json()["api_key"], self.key)   # authed caller
@@ -1212,9 +1213,11 @@ class LegacyUrlSettingTest(WebBase):
                         " ('gotify_url', '\"gotify.lan\"')")
             con.commit()
             self.settings.refresh(con)
-        html = self.client.get("/settings").text
+        html = self.client.get("/settings/komga").text
         self.assertIn('value="192.168.1.213:25600"', html)                  # still shown as stored ...
-        self.assertEqual(html.count("The stored value is not a valid URL"), 2)   # ... with a hint (and gotify's)
+        self.assertEqual(html.count("The stored value is not a valid URL"), 1)   # ... with a hint
+        self.assertEqual(self.client.get("/settings/notifications").text.count(
+            "The stored value is not a valid URL"), 1)                       # and gotify's
         parser = _FormFields("settings-form")
         parser.feed(html)
         form = dict(parser.fields, refresh_hours=["12"])
@@ -1242,7 +1245,7 @@ class LegacyUrlSettingTest(WebBase):
             con.commit()
             self.settings.refresh(con)
         self.assertIn('<div class="help-text text-warning">The stored value is not a valid URL',
-                      self.client.get("/settings").text)
+                      self.client.get("/settings/komga").text)
         css = self.client.get("/static/style.css").text
         rules = {sel.strip(): body for sel, body in re.findall(r"([^{}]+)\{([^{}]*)\}", css)}
         self.assertIn("color:var(--warning-label)", rules.get(".help-text.text-warning", ""))
