@@ -513,7 +513,7 @@ class CoreTest(TmpData):
         with db.connect() as con, mock.patch.object(core, "resolve", lambda *a_, **k: _plan([a], s)), \
              mock.patch.object(core, "_set_library_entries", lambda *a_: None), \
              mock.patch.object(core, "download_wanted", delete_meanwhile), \
-             mock.patch.object(core, "import_series", lambda con, sid_, c=None: imported.append(sid_) or 0):
+             mock.patch.object(core, "import_series", lambda con, sid_, c=None, **k: imported.append(sid_) or 0):
             with self.assertRaises(core.Gone):
                 core.add_series(con, FakeClient(), s, series_id=sid)
         self.assertEqual(imported, [sid])                    # only the import before the download ran
@@ -696,7 +696,7 @@ class CoreSplitTest(TmpData):
     def test_finish_download(self):
         sid = self.seed({1: "wanted"})
         plan = _plan([_match("A", 1, [1])])
-        with db.connect() as con, mock.patch.object(core, "import_series", lambda con, sid, client=None: 2):
+        with db.connect() as con, mock.patch.object(core, "import_series", lambda con, sid, client=None, **k: 2):
             out = core.finish_download(con, FakeClient(), core.Outcome(sid, plan, imported=1))
             self.assertEqual(out.imported, 3)
             db.delete_series(con, sid)
@@ -813,8 +813,8 @@ class ImportWriteLockTest(TmpData):                    # findings 21, 33
         self.stage("B", "Official_Special.cbz")                     # no number: Suwayomi is asked
         real_scan = core.library.StagingFolder.scan
 
-        def scan_then_vanish(sf):
-            found = real_scan(sf)
+        def scan_then_vanish(sf, *a):
+            found = real_scan(sf, *a)
             if os.path.exists(gone):
                 os.remove(gone)
             return found

@@ -154,7 +154,7 @@ class ChapterMarkerTest(unittest.TestCase):
             Chapter(2, 171.1, "Chapter 171.1: Spin-off 10", "www.natomanga.com", True),
             Chapter(3, 150.0, "Ch.150 - Hana to Yume March 2020 Special", "Losers in eXile", True),
             Chapter(4, 17.0, "Ch.17 - Maidens 101: A Success!", "Humane Scans", True),
-            Chapter(5, 185.5, "Ch.185.5 - Twitter Extra - Valentine's Day 2026", "/a/nonymous/", True),
+            Chapter(5, 185.5, "Ch.185.5 - Twitter Extra - Valentine's Day 2026", "/a/nonymous", True),
             Chapter(6, 9.1, "Chapter 9.1: Hana-kun\u2019s Obsession is a Powerful Poison - Part 1", "www.natomanga.com",
                     True),
             Chapter(7, 0.0, "Chapter 0: Volume 10", "www.natomanga.com", True),

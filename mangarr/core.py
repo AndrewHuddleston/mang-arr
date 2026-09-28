@@ -93,7 +93,7 @@ def add_series(con, client: Client, series: Series, download: bool = True, do_im
         _set_library_entries(lookups, plan, p.manga_id, stale)
         stuck.update(con, lookups, series_id, series, plan, blocked)    # may skip one: before the chapters due
     if do_import:
-        out.imported += import_series(con, series_id, lookups)
+        out.imported += import_series(con, series_id, lookups, downloaded=suwayomi_downloaded(plan))
     if download and p:
         out.results = download_wanted(con, client, series_id, plan, should_cancel, progress)
         if do_import:
@@ -412,7 +412,8 @@ def finish_download(con, client: Client, out: Outcome) -> Outcome:
     series was deleted while it downloaded (nothing is linked then)."""
     if not db.get_series(con, out.series_id):
         raise Gone(f"{out.plan.series.title} was deleted during the download")
-    out.imported += import_series(con, out.series_id, client)
+    downloaded = {**{n: None for n, r in out.results.items() if r == "ok"}, **suwayomi_downloaded(out.plan)}
+    out.imported += import_series(con, out.series_id, client, downloaded=downloaded)
     return out
 
 
@@ -659,10 +660,14 @@ SETTLE_SECONDS = 120    # a staged file younger than this may still be being wri
 _PAGES = re.compile(r"(\d+) pages")      # library.verify_archive's detail for a good archive
 
 
-def import_series(con, series_id: int, client: Client | None = None) -> int:
+def import_series(con, series_id: int, client: Client | None = None, downloaded: dict | None = None) -> int:
     """Link every staged chapter into <library>/<folder>/. Returns how many
     chapters were newly linked. Files whose name carries no global chapter
     number (season episodes) are matched through Suwayomi's chapter list.
+    With `downloaded` ({number: source name} of the chapters Suwayomi
+    reports downloaded, suwayomi_downloaded), a chapter among them that no
+    staged file was read as says why it is not in the library
+    (_explain_missing) instead of waiting for a download that never comes.
     One bad file never stops the others: a failure is recorded on that
     chapter and the import goes on. A file that fails verification while it
     is still fresh (Suwayomi may be writing it) is left for the next import
@@ -678,14 +683,18 @@ def import_series(con, series_id: int, client: Client | None = None) -> int:
     title, folder = row["title"], row["folder"]
     known = {r["number"]: dict(r) for r in db.chapters(con, series_id)}
     linked = 0
+    staged = Staged()
     for source_name, staging, manga_id in series_staging_dirs(con, series_id):
         try:
             sf = library.StagingFolder(staging)
         except OSError as e:            # swapped for a symlink or removed since it was listed
             log.warning("%s: skipping staging folder %s: %s", title, oneline(staging, 300), e)
+            staged.unchecked.add(source_name)
             continue
         with sf:
-            linked += _import_folder(con, client, series_id, title, folder, known, sf, source_name, manga_id)
+            linked += _import_folder(con, client, series_id, title, folder, known, sf, source_name, manga_id, staged)
+    if downloaded:
+        _explain_missing(con, series_id, title, downloaded, staged)
     if linked:
         db.event(con, "imported", f"{linked} chapter(s) linked into the library", series_id)
         log.info("%s: imported %d chapter(s) into %s", title, linked, library.library_dir(folder))
@@ -696,11 +705,16 @@ def import_series(con, series_id: int, client: Client | None = None) -> int:
 
 
 def _import_folder(con, client: Client | None, series_id: int, title: str, folder: str, known: dict,
-                   sf: library.StagingFolder, source_name: str, manga_id: int | None) -> int:
+                   sf: library.StagingFolder, source_name: str, manga_id: int | None,
+                   staged: "Staged | None" = None) -> int:
     """import_series for one opened staging folder. Returns how many
-    chapters were newly linked."""
+    chapters were newly linked; what the folder holds goes into `staged`."""
+    staged = staged if staged is not None else Staged()
     sf.prune_quarantine()
-    found, unparsed = sf.scan()
+    doubled: list[str] = []
+    found, unparsed = sf.scan(doubled)
+    unread = list(unparsed)                 # not even Suwayomi's names match them
+    asked = False                           # Suwayomi's names were there to match them
     if unparsed and client is not None and manga_id is not None:
         names: dict | None = None
         try:
@@ -709,22 +723,30 @@ def _import_folder(con, client: Client | None, series_id: int, title: str, folde
             log.info("%s: cancelled before %d unnumbered file(s) in %s were matched; the next import does it",
                      title, len(unparsed), sf.path)
         except SuwayomiError as e:
-            names = {}
             log.warning("%s: cannot list chapters of %s entry to match %d unnamed file(s): %s",
                         title, source_name, len(unparsed), e)
         if names is not None:
-            matched = 0
+            matched, unread, asked = 0, [], True
             for name in unparsed:
                 n = library.match_unparsed(name, names)
                 if n is not None and n not in found:
                     found[n] = name
                     matched += 1
                 else:
+                    unread.append(name)
                     log.debug("%s: no chapter matches file %s", title, name)
             log.info("%s: %d of %d unnumbered file(s) in %s matched through Suwayomi's chapter list",
                      title, matched, len(unparsed), sf.path)
+        else:
+            staged.unchecked.add(source_name)       # matched at the next import
     elif unparsed:
         log.debug("%s: %d file(s) in %s without a chapter number", title, len(unparsed), sf.path)
+    if unread and asked:
+        log.info("%s: %d file(s) in %s whose chapter number cannot be read, not imported: %s", title, len(unread),
+                 sf.path, ", ".join(oneline(u, 120) for u in unread[:5]) + (" ..." if len(unread) > 5 else ""))
+    staged.numbers.update(found)
+    staged.unread.setdefault(source_name, []).extend(unread)
+    staged.doubled.setdefault(source_name, []).extend(doubled)
     linked = 0
     for n, name in found.items():
         prev = known.get(n)
@@ -833,6 +855,81 @@ def _still_being_written(f: library.StagedFile, title: str, n: float, source_nam
     log.info("%s: ch %g from %s is not readable yet (%s) and was written %.0fs ago; "
              "probably still being written, trying again at the next import", title, n, source_name, detail, age)
     return True
+
+
+@dataclass
+class Staged:
+    """What an import found in a series' staging folders: every chapter
+    number a file was read as (or matched to through Suwayomi's names), and
+    per source the files that are no chapter it could tell: whose number
+    could not be read (`unread`), or read as a number another file of the
+    folder already has (`doubled`). A source whose folder could not be
+    opened, or whose unnumbered files were not matched this time (cancelled,
+    Suwayomi not answering), is `unchecked`: nothing is said about it."""
+    numbers: set = field(default_factory=set)
+    unread: dict = field(default_factory=dict)          # source name -> [file names]
+    doubled: dict = field(default_factory=dict)         # source name -> [file names]
+    unchecked: set = field(default_factory=set)
+
+    def why_missing(self, n: float, source: str | None, alone: bool) -> str:
+        """The reason of chapter n, which Suwayomi reports downloaded on
+        `source` (None: some source) but no staged file was read as. `alone`:
+        it is the only such chapter of that source, so a single unreadable
+        file there is its file."""
+        def files(d: dict) -> list[str]:
+            return list(d.get(source, ())) if source is not None else [f for fs in d.values() for f in fs]
+
+        def few(names: list[str]) -> str:
+            return ", ".join(oneline(f, 70) for f in names[:2]) + (" ..." if len(names) > 2 else "")
+        where = oneline(source, 60) if source else "Suwayomi"
+        unread, doubled = files(self.unread), files(self.doubled)
+        if len(unread) == 1 and alone:
+            return f"{where}: downloaded as {oneline(unread[0], 150)} but its chapter number could not be read; " \
+                   "rename it or report the name"
+        if unread:
+            return f"{where}: downloaded, but its file is one of {len(unread)} whose chapter number could not be " \
+                   f"read ({few(unread)}); rename it or report the name"
+        if doubled:
+            return f"{where}: reported downloaded, but no file reads as chapter {n:g}; {len(doubled)} file(s) read " \
+                   f"as a chapter another file already is ({few(doubled)}): rename it or report the name"
+        return f"{where}: reported downloaded, but no file in its download folder reads as chapter {n:g}; delete " \
+               "the download in Suwayomi to fetch it again"
+
+
+def suwayomi_downloaded(plan: Plan) -> dict[float, str]:
+    """{chapter number: source name} of the chapters Suwayomi reports
+    downloaded on a trusted source of the plan (Plan.have)."""
+    out: dict[float, str] = {}
+    for m in plan.usable:
+        for c in m.chapters:
+            if c.downloaded:
+                out.setdefault(c.number, m.source.name)
+    return out
+
+
+def _explain_missing(con, series_id: int, title: str, downloaded: dict, staged: Staged) -> None:
+    """A chapter Suwayomi reports downloaded is never downloaded again, so
+    one that no staged file was read as would wait for a download pass
+    that never comes, every pass saying "nothing to download" (0.3.0's
+    misread names, e.g. Dreaming Freedom 171.01-171.13). Its reason says
+    what is wrong instead (Staged.why_missing); a failed one is wanted
+    again (not_linked). Logged when the reason is new. Committed."""
+    rows = db.chapters_by_number(con, series_id, [n for n in downloaded if n not in staged.numbers])
+    missing = sorted(n for n, r in rows.items() if r["status"] in ("wanted", "failed")
+                     and (downloaded[n] not in staged.unchecked if downloaded[n] is not None else not staged.unchecked))
+    per_source: dict = {}
+    for n in missing:
+        per_source[downloaded[n]] = per_source.get(downloaded[n], 0) + 1
+    fresh = []
+    for n in missing:
+        why = staged.why_missing(n, downloaded[n], per_source[downloaded[n]] == 1)
+        if db.with_listing_note(rows[n], why) != rows[n]["reason"]:
+            fresh.append(n)
+        not_linked(con, series_id, n, why)
+    if fresh:
+        log.warning("%s: Suwayomi reports %d chapter(s) downloaded that no file in its download folder reads as, "
+                    "so they are not in the library: %s (the chapter's reason says more)", title, len(fresh),
+                    ", ".join(f"{n:g}" for n in fresh[:20]) + (" ..." if len(fresh) > 20 else ""))
 
 
 def _import_failed(con, series_id: int, title: str, n: float, what: str, e: OSError) -> None:

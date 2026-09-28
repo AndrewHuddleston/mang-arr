@@ -109,12 +109,14 @@ def _real_dir(entry: os.DirEntry) -> bool:
         return False
 
 
-def scan_series_dir(path: str, dir_fd: int | None = None) -> tuple[dict[float, str], list[str]]:
+def scan_series_dir(path: str, dir_fd: int | None = None,
+                    doubled: list[str] | None = None) -> tuple[dict[float, str], list[str]]:
     """{chapter number: file path} for one series folder, plus the files
-    whose number could not be read. Duplicate numbers keep the first name.
-    Symlinks and anything that is not a regular file are skipped (logged).
-    With dir_fd (the folder, already open) the folder is listed through it
-    and plain file names come back; path is then only used in log lines."""
+    whose number could not be read. Duplicate numbers keep the first name
+    (the others go into `doubled`, when given). Symlinks and anything that
+    is not a regular file are skipped (logged). With dir_fd (the folder,
+    already open) the folder is listed through it and plain file names come
+    back; path is then only used in log lines."""
     found: dict[float, str] = {}
     unparsed: list[str] = []
     try:
@@ -137,6 +139,8 @@ def scan_series_dir(path: str, dir_fd: int | None = None) -> tuple[dict[float, s
             unparsed.append(key)
         elif n not in found:
             found[n] = key
+        elif doubled is not None:
+            doubled.append(key)
     return found, unparsed
 
 
@@ -374,9 +378,9 @@ class StagingFolder:
             os.close(self.fd)
             self.fd = -1
 
-    def scan(self) -> tuple[dict[float, str], list[str]]:
+    def scan(self, doubled: list[str] | None = None) -> tuple[dict[float, str], list[str]]:
         """scan_series_dir, with file names as values."""
-        return scan_series_dir(self.path, dir_fd=self.fd)
+        return scan_series_dir(self.path, dir_fd=self.fd, doubled=doubled)
 
     def prune_quarantine(self) -> int:
         return prune_quarantine(self.path, QUARANTINE_DAYS, dir_fd=self.fd)

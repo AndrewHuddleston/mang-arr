@@ -949,8 +949,8 @@ class StagingSwapTest(ImportBase):
         age(make_cbz(os.path.join(self.folder, "Chapter 2.cbz")), 3600)
         real_scan = library.StagingFolder.scan
 
-        def scan_then_swap(sf):
-            found = real_scan(sf)
+        def scan_then_swap(sf, *a):
+            found = real_scan(sf, *a)
             os.remove(os.path.join(self.folder, "Chapter 1.cbz"))
             os.symlink(os.path.join(self.victim, "Chapter 001.0.cbz"), os.path.join(self.folder, "Chapter 1.cbz"))
             return found
