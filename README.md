@@ -1003,7 +1003,7 @@ mangarr/
   health.py      health checks (System page, top bar, /api/v1/health)
   backup.py      scheduled and on-demand database backups, restore
   updates.py     GitHub release check
-  komga.py       Komga scan trigger and connection test
+  komga.py       Komga scan trigger, connection test, file hashing and books (rename checks)
   notify.py      Discord, Telegram, ntfy, Gotify, Pushover, Slack, Notifiarr, email, Apprise, webhook
   metrics.py     Prometheus metrics
   logsetup.py    logging (text or JSON lines)
