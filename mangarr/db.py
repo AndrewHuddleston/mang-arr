@@ -161,6 +161,24 @@ MIGRATIONS = [
     """
     ALTER TABLE series ADD COLUMN anilist_link INTEGER;
     """,
+    # 14: chapters a series is stuck behind (stuck.py): when a chapter's
+    #     failures began, and per blocker what the sites listing it call it,
+    #     where it is on them, and what was done about it
+    """
+    ALTER TABLE chapter ADD COLUMN failed_since TEXT;
+    CREATE TABLE stuck (
+      series_id       INTEGER NOT NULL REFERENCES series(id) ON DELETE CASCADE,
+      number          REAL NOT NULL,
+      names           TEXT NOT NULL DEFAULT '{}',   -- JSON {source name: its title for the chapter there, or null}
+      urls            TEXT NOT NULL DEFAULT '{}',   -- JSON {source name: the chapter's page on that site ('': none)}
+      dismissed       TEXT,                   -- "Keep waiting": the chapter's state then (JSON, stuck.state_of)
+      skipped         TEXT,                   -- 'manual' | 'auto' once skipped from here
+      skipped_state   TEXT,                   -- the chapter's state when it was skipped
+      verdict         TEXT,                   -- the verdict's headline then
+      updated_at      TEXT NOT NULL,
+      PRIMARY KEY (series_id, number)
+    );
+    """,
 ]
 
 
@@ -209,6 +227,8 @@ def migrate(con: sqlite3.Connection, target: int | None = None) -> None:
                     con.execute(stmt)
                 if i == 3:
                     _backfill_folders(con)
+                if i == 14:
+                    _backfill_failed_since(con)
                 con.execute(f"PRAGMA user_version = {i}")
                 con.commit()
             except BaseException as e:
@@ -225,6 +245,21 @@ def _backfill_folders(con) -> None:
         folder = library.unique_folder(r[2], taken, r[1])
         taken.add(folder)
         con.execute("UPDATE series SET folder=? WHERE id=?", (folder, r[0]))
+
+
+def _backfill_failed_since(con) -> None:
+    """failed_since of the chapters that failed before migration 14: the
+    first event naming the chapter among a download's failures ("ch 7.2:
+    ...") or as a failed chapter search ("chapter 7.2: ..."), and at the
+    latest its last update. Events are pruned after a while, so for an old
+    failure this is the oldest one still recorded."""
+    for r in con.execute("SELECT series_id, number, updated_at FROM chapter WHERE status='failed'").fetchall():
+        n = f"{r[1]:g}"
+        first = con.execute("SELECT MIN(at) FROM event WHERE series_id=? AND kind IN ('downloaded','failed') AND"
+                            " (message LIKE ? OR message LIKE ? OR message LIKE ?)",
+                            (r[0], f"%: ch {n}: %", f"%; ch {n}: %", f"chapter {n}: %")).fetchone()[0]
+        con.execute("UPDATE chapter SET failed_since=? WHERE series_id=? AND number=?",
+                    (min((x for x in (first, r[2]) if x), default=None), r[0], r[1]))
 
 
 def valid_folder(folder) -> bool:
@@ -552,15 +587,17 @@ def save_plan(con, series_id: int, plan, primary_manga_id: int | None) -> list[s
 
 
 def set_have(con, series_id: int, number: float, staging_path: str | None,
-             library_path: str | None, source_name: str | None = None) -> None:
+             library_path: str | None, source_name: str | None = None, pages: int | None = None) -> None:
+    """The chapter is on disk (pages: its page count, when it was counted)."""
     con.execute(
-        "INSERT INTO chapter (series_id, number, status, source_name, staging_path, library_path, updated_at)"
-        " VALUES (?,?,'have',?,?,?,?)"
-        " ON CONFLICT(series_id, number) DO UPDATE SET status='have', reason=NULL,"
+        "INSERT INTO chapter (series_id, number, status, source_name, staging_path, library_path, pages, updated_at)"
+        " VALUES (?,?,'have',?,?,?,?,?)"
+        " ON CONFLICT(series_id, number) DO UPDATE SET status='have', reason=NULL, failed_since=NULL,"
         " staging_path=COALESCE(excluded.staging_path, chapter.staging_path),"
         " library_path=COALESCE(excluded.library_path, chapter.library_path),"
-        " source_name=COALESCE(excluded.source_name, chapter.source_name), updated_at=excluded.updated_at",
-        (series_id, number, source_name, staging_path, library_path, now()))
+        " source_name=COALESCE(excluded.source_name, chapter.source_name),"
+        " pages=COALESCE(excluded.pages, chapter.pages), updated_at=excluded.updated_at",
+        (series_id, number, source_name, staging_path, library_path, pages, now()))
 
 
 def set_reason(con, series_id: int, number: float, reason: str) -> bool:
@@ -578,8 +615,9 @@ RETRY_HOURS = (0, 24, 72, 168)      # after the 1st failure: next pass; then 1 d
 def set_status(con, series_id: int, number: float, status: str, reason: str | None = None,
                only_from: tuple[str, ...] | None = None) -> bool:
     """Change a chapter's status with a reason (cleared for have). A failure
-    bumps the try count and schedules the next attempt further out each time;
-    success or a fresh 'wanted' resets the schedule. With only_from, the row
+    bumps the try count and schedules the next attempt further out each time
+    (failed_since keeps when the first of these failures was); success or a
+    fresh 'wanted' resets the schedule. With only_from, the row
     changes only if its current status is one of those (so a background job
     never overwrites what the user set meanwhile, e.g. 'ignored'). Returns
     whether a row changed."""
@@ -596,12 +634,14 @@ def set_status(con, series_id: int, number: float, status: str, reason: str | No
         next_try = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(time.time() + hours * 3600))
         if hours:
             reason = f"{reason or 'download failed'} (failed {tries}x; next attempt after {next_try[:16]})"
-        cur = con.execute("UPDATE chapter SET status='failed', reason=?, tries=?, next_try=?, updated_at=?"
+        stamp = now()
+        cur = con.execute("UPDATE chapter SET status='failed', reason=?, tries=?, next_try=?, updated_at=?,"
+                          " failed_since=CASE WHEN ? = 1 OR failed_since IS NULL THEN ? ELSE failed_since END"
                           " WHERE series_id=? AND number=?" + guard,
-                          ((reason or None) and reason[:300], tries, next_try if hours else None, now(), series_id,
-                           number, *gargs))
+                          ((reason or None) and reason[:300], tries, next_try if hours else None, stamp, tries, stamp,
+                           series_id, number, *gargs))
         return cur.rowcount > 0
-    reset = ", tries=0, next_try=NULL" if status in ("have", "wanted") else ""
+    reset = ", tries=0, next_try=NULL, failed_since=NULL" if status in ("have", "wanted") else ""
     cur = con.execute(f"UPDATE chapter SET status=?, reason=?, updated_at=?{reset} WHERE series_id=? AND number=?"
                       + guard, (status, (reason or None) and reason[:300], now(), series_id, number, *gargs))
     return cur.rowcount > 0

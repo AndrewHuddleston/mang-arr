@@ -288,6 +288,15 @@ class Client:
                     timeout=60, retries=2)
         return dedupe(d["manga"]["chapters"]["nodes"])
 
+    def chapter_url(self, chapter_id: int) -> str | None:
+        """The chapter's page on its source's site (Suwayomi's realUrl, from
+        the extension; checked by the caller before it is shown), or None
+        when Suwayomi has none. Raises SuwayomiError, also when this
+        Suwayomi does not know the field."""
+        d = self.gq("query($id: Int!) { chapter(id: $id) { realUrl } }", {"id": chapter_id}, timeout=30, retries=1)
+        url = (d.get("chapter") or {}).get("realUrl") if isinstance(d, dict) else None
+        return url if isinstance(url, str) and url else None
+
     def downloaded_ids(self, manga_id: int) -> set[int]:
         d = self.gq('query($id: Int!) { manga(id: $id) { chapters { nodes { id isDownloaded } } } }',
                     {"id": manga_id}, timeout=60, retries=2)

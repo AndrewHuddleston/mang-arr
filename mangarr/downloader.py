@@ -262,6 +262,25 @@ class RunMemo:
             self.shared.note_unstarted(name, now)
 
 
+# The reason of a chapter that waits, in order, for an earlier one that
+# failed on every source. stuck.py finds the series stuck behind a chapter
+# from it, in the rows any pass left, so the start stays as it is.
+WAITING_START = "waiting for chapter {}: chapters download in order"
+_WAITING_RE = re.compile(r"waiting for chapter (\S{1,30}): chapters download in order")
+
+
+def waiting_reason(n: float) -> str:
+    return (WAITING_START.format(f"{n:g}") + f" and {n:g} failed on every source (it is retried on schedule; skip it "
+            "on the series page, or turn off strict download in order, to go on without it)")
+
+
+def waiting_for(reason: str | None) -> str | None:
+    """The chapter (as waiting_reason wrote its number) a chapter with this
+    reason waits for, or None."""
+    m = _WAITING_RE.match(reason or "")
+    return m.group(1) if m else None
+
+
 def busy_reason(name: str) -> str:
     """The reason of a chapter left for the next pass without being queued:
     Suwayomi did not start chapters of source `name` a short while ago, and
@@ -431,9 +450,7 @@ class SeriesSteps:
                 (" (no other source has this chapter)" if only_one else "")
             waiting = [x for x in order[self.idx + 1:] if results.get(x) != "ok" and x not in skip]
             for x in waiting:
-                self.reasons[x] = (f"waiting for chapter {n:g}: chapters download in order and {n:g} failed on "
-                                   "every source (it is retried on schedule; turn off 'download in order' to skip "
-                                   "ahead)")
+                self.reasons[x] = waiting_reason(n)
             log.warning("%s: ch %g failed on every source; stopping here, %d later chapter(s) wait for it",
                         self.label, n, len(waiting))
             self.finished = True

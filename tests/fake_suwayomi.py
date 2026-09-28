@@ -149,6 +149,11 @@ class FakeSuwayomi:
             return [Chapter(chapter_id(manga_id, n), n, f"Chapter {n:g}", None, chapter_id(manga_id, n) in self.have)
                     for n in self.listing.get(manga_id, [])]
 
+    def chapter_url(self, cid: int) -> str | None:
+        """The chapter's page on its (made-up) site, as Suwayomi's realUrl."""
+        self._check()
+        return f"https://site{cid // 1000}.example/chapter/{cid}" if cid // 1000 in self.sources else None
+
     def set_in_library(self, manga_id: int, in_library: bool, retries: int = 3, timeout: int = 60) -> None:
         self._check()
         self.in_library[manga_id] = in_library

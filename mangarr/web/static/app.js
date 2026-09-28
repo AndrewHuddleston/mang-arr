@@ -524,7 +524,8 @@
     if (wf) wf.addEventListener('menuselect', (e) => {
       $$('tbody tr', missingTable).forEach((tr) => {
         const failed = Number(tr.dataset.failed) > 0;
-        tr.hidden = e.detail.value === 'failed' ? !failed : e.detail.value === 'clean' ? failed : false;
+        const v = e.detail.value;
+        tr.hidden = v === 'failed' ? !failed : v === 'clean' ? failed : v === 'stuck' ? tr.dataset.stuck !== '1' : false;
       });
       syncToolbar();
     });
@@ -634,6 +635,23 @@
   // a checkbox that hides an element while ticked: <input type=checkbox data-hides="element-id">
   $$('input[data-hides]').forEach((cb) => {
     const sync = () => { const el = document.getElementById(cb.dataset.hides); if (el) el.hidden = cb.checked; };
+    cb.addEventListener('change', sync);
+  });
+  // ... and one that shows it while ticked: data-shows="element-id"
+  $$('input[data-shows]').forEach((cb) => {
+    const sync = () => { const el = document.getElementById(cb.dataset.shows); if (el) el.hidden = !cb.checked; };
+    cb.addEventListener('change', sync);
+  });
+  // a checkbox the fields of another element depend on: data-enables="element-id". While it is not ticked
+  // they are disabled (not sent, so what they hold is kept) and greyed out, and its [data-when-off] hint shows.
+  $$('input[data-enables]').forEach((cb) => {
+    const sync = () => {
+      const g = document.getElementById(cb.dataset.enables);
+      if (!g) return;
+      $$('input', g).forEach((i) => { i.disabled = !cb.checked; });
+      g.classList.toggle('off', !cb.checked);
+      $$('[data-when-off]', g).forEach((el) => { el.hidden = cb.checked; });
+    };
     cb.addEventListener('change', sync);
   });
   // Lists: show only the fields of the chosen list kind

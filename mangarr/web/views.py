@@ -393,6 +393,7 @@ EVENT_ICONS = {
     "monitor": ("bookmark", "default", "Monitoring changed"),
     "ignore": ("ignore", "default", "Chapter ignored"),
     "unignore": ("bookmark", "default", "Chapter wanted again"),
+    "skip": ("ignore", "default", "Chapter skipped or un-skipped"),
     "list": ("list", "default", "Import list"),
 }
 
@@ -400,6 +401,69 @@ EVENT_ICONS = {
 def event_icon(kind: str | None) -> dict:
     icon, ikind, tip = EVENT_ICONS.get(kind or "", ("unknown", "default", kind or "event"))
     return {"icon": icon, "kind": ikind, "tip": tip}
+
+
+# -- stuck behind a chapter (stuck.py) -------------------------------------------
+
+SKIP_DISCLAIMER = ("Skipping means this chapter is not downloaded and the chapters after it continue. If it turns out "
+                   "to be part of the story you will have a gap. You can undo this: the chapter stays listed as "
+                   "skipped and can be un-skipped.")
+IMAGES_GONE = ("no working pages", "failed instantly")      # failure reasons that mean its images are gone
+
+
+def _and(items: list[str]) -> str:
+    return items[0] if len(items) == 1 else f"{', '.join(items[:-1])} and {items[-1]}"
+
+
+def _num(n) -> str:
+    return f"{n:g}"
+
+
+def stuck_note(st) -> dict:
+    """The texts of the note on a series stuck behind a chapter (a
+    stuck.Stuck): {head: 'Stuck behind chapter 7.2 - 372 chapters waiting.',
+    body: 'Only Manganato lists it and its images are gone (failed on every
+    try since 2026-09-26).'}."""
+    n = _num(st.number)
+    head = f"Stuck behind chapter {n} - {st.waiting} chapter{'s' if st.waiting != 1 else ''} waiting."
+    gone = any(k in (st.reason or "") for k in IMAGES_GONE)
+    what = "its images are gone" if gone else "it could not be downloaded"
+    day = (st.failed_since or "")[:10]
+    when = (f"failed on every try since {day}" if st.tries > 1 else f"failed on {day}") if day else \
+        "failed on every try"
+    sites = [k for k in st.names][:4]
+    if sites:
+        more = len(st.names) - len(sites)
+        who = _and(sites + ([f"{more} more"] if more > 0 else []))
+        body = f"Only {who} list{'s' if len(st.names) == 1 else ''} it and {what} ({when})."
+    else:
+        body = f"It failed on every source that lists it ({when})."
+    return {"head": head, "body": body}
+
+
+def verdict_label(v, number) -> dict:
+    """A verdict (verdict.Verdict) as a small label for the chapter's row:
+    {text, kind, tip}."""
+    whole = _num(int(number)) if isinstance(number, (int, float)) and number >= 0 else "?"
+    text = {"side_story": "Side story?", "covered": f"Covered by {whole}?",
+            "rest_of_chapter": f"Rest of {whole}?"}.get(v.kind, "Unknown")
+    kind = ("info" if v.confidence == "high" else "default") if v.skippable else \
+        "warning" if v.kind == "rest_of_chapter" else "default"
+    tip = "\n".join([f"{v.headline} ({v.confidence} confidence)", *v.evidence])
+    return {"text": text, "kind": kind, "tip": tip}
+
+
+def skip_note(k: dict) -> str:
+    """The line on a series page for a chapter skipped from a stuck note
+    (stuck.skipped): automatically, or changed since it was skipped."""
+    n = _num(k["number"])
+    if k["changed"]:
+        names = "; ".join(f'{src}: "{name}"' for src, name in list(k["names"].items())[:3] if name)
+        who = "was skipped automatically" if k["how"] == "auto" else "you skipped"
+        return (f"Chapter {n}, which {who}, is listed differently now" + (f" ({names})" if names else "") +
+                ": it may be a chapter of the story after all.")
+    what = k["verdict"] or "judged skippable"
+    return f"Chapter {n} skipped automatically: {what[:1].lower() + what[1:]}"
 
 
 def provider(row_or_series) -> str:
@@ -496,7 +560,8 @@ def install(env) -> None:
                        status_label=status_label, status_class=status_class, progress=progress,
                        progress_kind=progress_kind, chapter_status=chapter_status, event_icon=event_icon,
                        provider=provider, network_line=network_line, index_stats=index_stats, human_size=human_size,
-                       row_kind=row_kind, row_language=row_language)
+                       row_kind=row_kind, row_language=row_language, stuck_note=stuck_note,
+                       verdict_label=verdict_label, skip_note=skip_note, SKIP_DISCLAIMER=SKIP_DISCLAIMER)
     env.filters["ranges"] = short_ranges
     env.filters["status_label"] = status_label
     env.filters["status_class"] = status_class

@@ -373,6 +373,16 @@ def _chapters_near(s: Series, number: float) -> ChapterList:
                        min((n for n in agg if n >= whole + 1), default=None), max(agg, default=None))
 
 
+def looked_up(s: Series, number: float) -> bool:
+    """Whether english_chapters(s, number, fetch=False) answers from a lookup
+    already made (one that failed too, until FAILED_TTL), or needs none: a
+    manual series, a number that is not one. False means that a background
+    lookup would change the answer."""
+    if not math.isfinite(number) or s.manual:
+        return True
+    return _cache.get(("near", s.ref, math.floor(number)))[0]
+
+
 def english_chapters(s: Series, number: float, fetch: bool = True) -> ChapterList | None:
     """MangaDex's English chapters of this series numbered from the whole
     chapter under `number` up to the next one (for 7.2: 7, 7.5 ...) and the

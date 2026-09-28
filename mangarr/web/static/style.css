@@ -511,3 +511,20 @@ body.login{display:flex;align-items:center;justify-content:center;min-height:100
 
 .subhead{margin:18px 0 6px;font-size:14px;font-weight:600;color:#e1e2e3;border-bottom:1px solid #3a3a3a;padding-bottom:4px}
 .inline-check{display:inline-flex;align-items:center;gap:6px;margin-right:16px}
+
+/* Settings -> Download Order: an option that depends on another one */
+.order-option + .order-option{margin-top:14px}
+.order-option.off > .inline-check,.order-option.off > .help-text:not([data-when-off]){opacity:.5}
+
+/* series page: stuck behind a chapter (stuck.py) */
+.stuck-note .stuck-head{line-height:1.5}
+.stuck-note .stuck-verdict{margin-top:8px}
+.stuck-note .stuck-evidence{margin:6px 0 0;padding-left:22px;color:var(--help)}
+.stuck-note .stuck-checking,.stuck-note .stuck-reason{margin-top:6px}
+.stuck-note .stuck-actions{display:flex;flex-wrap:wrap;align-items:center;gap:8px;margin-top:10px}
+.stuck-note .stuck-actions form{display:inline}
+.stuck-info{align-self:center}.stuck-info > summary{color:var(--text)}
+.stuck-info .popover-body{top:28px;padding:10px 15px}
+.stuck-skipped form{display:inline}
+.verdict-label{margin-left:4px}
+.stuck-cell{white-space:nowrap}

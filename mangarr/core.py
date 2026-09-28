@@ -10,12 +10,13 @@ import hashlib
 import logging
 import math
 import os
+import re
 import threading
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field, replace
 
-from . import db, downloader, duplicates, komga, library, limits, metadata, metrics
+from . import db, downloader, duplicates, komga, library, limits, metadata, metrics, stuck
 from .matching import oneline
 from .model import Series
 from .resolver import Plan, primary, resolve
@@ -64,6 +65,7 @@ def add_series(con, client: Client, series: Series, download: bool = True, do_im
         raise Gone(f"{series.title} was deleted during the refresh")
     series_id = db.upsert_series(con, series)
     p = primary(plan)
+    blocked = stuck.blockers(con, series_id)        # as the last pass left it: save_plan makes these wanted again
     expired = db.save_plan(con, series_id, plan, p.manga_id if p else None)
     if expired:
         log.warning("%s: %s could not be searched for over %d days; its entry is dropped and the chapters "
@@ -80,12 +82,15 @@ def add_series(con, client: Client, series: Series, download: bool = True, do_im
     out = Outcome(series_id, plan)
     if p:
         _set_library_entries(lookups, plan, p.manga_id, stale)
+        stuck.update(con, lookups, series_id, series, plan, blocked)    # may skip one: before the chapters due
     if do_import:
         out.imported += import_series(con, series_id, lookups)
     if download and p:
         out.results = download_wanted(con, client, series_id, plan, should_cancel, progress)
         if do_import:
             finish_download(con, lookups, out)          # deleted while it downloaded: links nothing, raises Gone
+        if out.results:
+            stuck.update(con, lookups, series_id, series, plan)     # the chapter this download stopped at, if any
     return out
 
 
@@ -553,6 +558,7 @@ def series_staging_dirs(con, series_id: int) -> list[tuple[str, str, int | None]
 
 
 SETTLE_SECONDS = 120    # a staged file younger than this may still be being written
+_PAGES = re.compile(r"(\d+) pages")      # library.verify_archive's detail for a good archive
 
 
 def import_series(con, series_id: int, client: Client | None = None) -> int:
@@ -688,7 +694,8 @@ def _import_file(con, series_id: int, title: str, folder: str, n: float, prev, f
         return None
     if dst is None:
         return None
-    db.set_have(con, series_id, n, f.path, dst, source_name)
+    pages = _PAGES.fullmatch(detail)        # kept for the stuck-behind verdict (verdict.py compares lengths)
+    db.set_have(con, series_id, n, f.path, dst, source_name, pages=int(pages.group(1)) if pages else None)
     con.commit()                            # never hold a write across the next file check
     log.debug("%s: linked ch %g <- %s", title, n, f.path)
     return dst

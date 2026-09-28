@@ -39,7 +39,7 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
 
-from . import config, core, db, downloader, limits, metrics, settings
+from . import config, core, db, downloader, limits, metrics, settings, stuck
 from .resolver import Plan
 from .suwayomi import BREAKER_SECS, SuwayomiUnreachable, with_cancel
 
@@ -634,6 +634,8 @@ class LanePool:
             except core.Gone:
                 item["state"], item["result"] = "cancelled", "series was deleted"
                 return
+            # the chapter the series stopped at, if any (after the import: what arrived counts as on disk)
+            stuck.update(con, with_cancel(self.client, self.cancelled), sid, task.plan.series, task.plan)
             if task.error is not None:
                 e = task.error
                 item["state"], item["result"] = "error", f"{type(e).__name__}: {e}"[:300]
