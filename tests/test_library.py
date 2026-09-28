@@ -77,6 +77,96 @@ class ParseTest(unittest.TestCase):
         self.assertIsNone(parse_number("Official_Prologue.cbz"))
 
 
+class ChapterMarkerTest(unittest.TestCase):
+    """A chapter marker after a scanlator or site prefix decides the number:
+    never a number from the prefix or from the title after the marker. The
+    first 17 names are real files 0.3.0 read wrong (2026-09-28): three were
+    linked into the library as chapters 2020, 101 and 2026, the others were
+    taken for chapters already on disk and never imported."""
+    real = {
+        "Losers in eXile_Ch.150 - Hana to Yume March 2020 Special.cbz": 150.0,
+        "Humane Scans_Ch.17 - Maidens 101_ A Success_.cbz": 17.0,
+        "_a_nonymous_Ch.185.5 - Twitter Extra - Valentine's Day 2026.cbz": 185.5,
+        "www.natomanga.com_Chapter 9.1_ Hana-kun\u2019s Obsession is a Powerful Poison - Part 1.cbz": 9.1,
+        **{f"www.natomanga.com_Chapter 171.{i:02d}_ Spin-off {i}.cbz": float(f"171.{i:02d}")
+           for i in (1, 2, 3, 4, 5, 6, 7, 8, 9, 11, 12, 13)},
+        "www.natomanga.com_Chapter 171.1_ Spin-off 10.cbz": 171.1,
+    }
+    variants = {
+        # the marker in any case, with or without a dot or a space
+        "Humane Scans_ch 17 - Maidens 101.cbz": 17.0,
+        "Humane Scans_CH.17 - Maidens 101.cbz": 17.0,
+        "Humane Scans_Ch17 Maidens 101.cbz": 17.0,
+        "Scans_CHAPTER 12_ Room 404.cbz": 12.0,
+        "Scans_chapter12.cbz": 12.0,
+        "Scans_Chap. 8 - 2020 Special.cbz": 8.0,
+        "Team_Episode 3 - Day 2020.cbz": 3.0,
+        "Team_Ep. 4 - Part 9.cbz": 4.0,
+        "Team_EP 4_ Stage 7.cbz": 4.0,
+        # after a volume, after a prefix with digits of its own, after a prefix full of "_"
+        "www.natomanga.com_Vol.3 Chapter 21_ 1000 Cranes.cbz": 21.0,
+        "Humane Scans_Vol.2 Ch.11 - Winter 2020.cbz": 11.0,
+        "Uploaded by Phuocphuc46_Vol.25 Ch.149.6.cbz": 149.6,
+        "Scans 2020_Ch.5 - Five.cbz": 5.0,
+        "Group 101_Chapter 7.cbz": 7.0,
+        "_a_nonymous_Vol.1 Ch.3.5 - Day 14 Extra.cbz": 3.5,
+        "__Chapter 2_ Part 3.cbz": 2.0,
+        # a chapter marker before another keyword: the marker wins
+        "Scans_Day 5 - Chapter 12.cbz": 12.0,
+        # the marker's number even when it is 0 and a volume follows
+        "www.natomanga.com_Chapter 0_ Volume 10.cbz": 0.0,
+        # a word that only contains a marker is not one
+        "Rich 2_Chapter 3.cbz": 3.0,
+        "Deep Epilogue 2.cbz": 2.0,
+        "Scans_Chapters 1-3 Recap 4.cbz": 4.0,
+        # other keywords after a prefix count like before, and the last number without any
+        "Unknown_Day 4 - 2020.cbz": 4.0,
+        "Unknown_#3 - Room 101.cbz": 3.0,
+        "Oneshot 2020.cbz": 2020.0,
+    }
+
+    def test_real_names(self):
+        for name, want in self.real.items():
+            with self.subTest(name=name):
+                self.assertEqual(parse_number(name), want)
+        self.assertEqual(len(self.real), 17)
+
+    def test_variants(self):
+        for name, want in self.variants.items():
+            with self.subTest(name=name):
+                self.assertEqual(parse_number(name), want)
+
+    def test_season_episodes_after_a_prefix_stay_unnumbered(self):
+        for name in ("www.natomanga.com_S2 - Episode 5_ Part 1.cbz", "Humane Scans_S2 - Ch.5 - 2020.cbz",
+                     "_a_nonymous_S2 - Ep. 5.cbz"):
+            with self.subTest(name=name):
+                self.assertIsNone(parse_number(name))
+                self.assertEqual(parse_season(name), (2, 5.0))
+        self.assertEqual(parse_number("Team_Part 1 - S2 - Episode 5.cbz"), 1.0)     # a keyword before the season
+
+    def test_suwayomi_file_names_read_as_suwayomi_numbers(self):
+        """The file Suwayomi writes for a chapter ('<scanlator>_<name>', made
+        safe) reads as the number Suwayomi gives the chapter, so import and
+        the name map (match_unparsed) agree on every one of these."""
+        from mangarr.suwayomi import Chapter
+        chapters = [
+            Chapter(1, 171.01, "Chapter 171.01: Spin-off 1", "www.natomanga.com", True),
+            Chapter(2, 171.1, "Chapter 171.1: Spin-off 10", "www.natomanga.com", True),
+            Chapter(3, 150.0, "Ch.150 - Hana to Yume March 2020 Special", "Losers in eXile", True),
+            Chapter(4, 17.0, "Ch.17 - Maidens 101: A Success!", "Humane Scans", True),
+            Chapter(5, 185.5, "Ch.185.5 - Twitter Extra - Valentine's Day 2026", "/a/nonymous/", True),
+            Chapter(6, 9.1, "Chapter 9.1: Hana-kun\u2019s Obsession is a Powerful Poison - Part 1", "www.natomanga.com",
+                    True),
+            Chapter(7, 0.0, "Chapter 0: Volume 10", "www.natomanga.com", True),
+        ]
+        names = suwayomi_name_map(chapters)
+        for c in chapters:
+            path = "/staging/Src/Series/" + safe_title(f"{c.scanlator}_{c.name}") + ".cbz"
+            with self.subTest(name=path):
+                self.assertEqual(parse_number(path), c.number)
+                self.assertEqual(match_unparsed(path, names), c.number)
+
+
 class NamesTest(unittest.TestCase):
     def test_filename_sorts(self):
         names = [chapter_filename(n) for n in (12.0, 12.5, 100.0, 1.0, 16.0, 16.5)]

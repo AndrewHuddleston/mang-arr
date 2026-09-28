@@ -37,14 +37,25 @@ log = logging.getLogger(__name__)
 
 _EXT = (".cbz", ".cbr", ".zip")
 
-# Chapter number from a Suwayomi file name. The scanlator prefix (up to the
-# first "_") is ignored by matching the chapter keyword anywhere. Keywords
-# come from real names on disk: Chapter, Ch., Episode, #, Page, Day, Mission,
-# Room, Act, Step, bullet ...
+# Chapter number from a Suwayomi file name, which is "<scanlator>_<chapter
+# name>" ("Humane Scans_Ch.17 - Maidens 101_ A Success_", "www.natomanga.com_
+# Chapter 171.01_ Spin-off 1"). A chapter marker (Chapter, Chap, Ch, Episode,
+# Ep; a dot after it optional; after "Vol.N " too) decides: the number right
+# after the first one is the chapter, never a number from the prefix before it
+# or from the title after it ("... March 2020 Special", "Valentine's Day 2026",
+# "Part 1"). A marker is a word of its own, and "_" separates words here: it is
+# what Suwayomi puts between the scanlator (which may itself contain "_", e.g.
+# "_a_nonymous_") and the name, and what it makes of a ':'. Without a marker,
+# the other keywords from real names on disk count the same way (#, Page, Day,
+# Mission, Room, Act, Step, bullet ...), then the last number in the name.
+_WORD_START = r"(?<![^\W_])"         # not right after a letter or digit ("_" is a separator)
+_MARKER = r"(?:chapter|chap|ch|episode|ep)(?![^\W\d_])\.?"     # "Ch.17", "Ch 17", "Ch17"; not "Chapters"
+_NUMBER = r"\s*(\d+(?:\.\d+)?)"
 _SEASON = re.compile(r"(?<![A-Za-z])S(\d+)\s*[-–]\s*(?:Episode|Ep\.?|Chapter|Ch\.?)\s*(\d+(?:\.\d+)?)", re.I)
+_CHAPTER = re.compile(_WORD_START + _MARKER + _NUMBER, re.I)
 _KEYWORD = re.compile(
-    r"(?:\b(?:chapter|chap|ch|episode|ep|page|day|mission|room|act|step|bullet|part|lesson|round|file|case|"
-    r"night|stage)\b\.?|#)\s*(\d+(?:\.\d+)?)", re.I)
+    r"(?:" + _WORD_START + r"(?:page|day|mission|room|act|step|bullet|part|lesson|round|file|case|night|stage)\b\.?"
+    r"|#)" + _NUMBER, re.I)
 _VOLUME_ONLY = re.compile(r"(?<![A-Za-z])vol(?:ume)?\.?\s*\d+", re.I)
 # the last number in the name. Anchored at the start of a digit run and
 # followed only by non-digits: linear, where "(?!.*\d)" rescans the rest of
@@ -57,17 +68,16 @@ def parse_number(filename: str) -> float | None:
     """Chapter number in a file name, or None when there is none (volume-only
     files are not chapters; season-numbered files such as 'S2 - Episode 5'
     carry no global number - import resolves those through Suwayomi's own
-    chapter listing, see suwayomi_name_map)."""
+    chapter listing, see suwayomi_name_map). A chapter marker wins over
+    every other number in the name (see _CHAPTER)."""
     stem = os.path.splitext(os.path.basename(filename))[0][:MAX_PARSE]
-    m = _KEYWORD.search(stem)
-    if m and not (_SEASON.search(stem) and _SEASON.search(stem).start() <= m.start()):
-        return float(m.group(1))
-    if _SEASON.search(stem):
+    season = _SEASON.search(stem)
+    for pattern in (_CHAPTER, _KEYWORD):
+        m = pattern.search(stem)
+        if m and not (season and season.start() <= m.start()):
+            return float(m.group(1))
+    if season:
         return None
-    if m:
-        return float(m.group(1))
-    if m:
-        return float(m.group(1))
     if _VOLUME_ONLY.search(stem):
         return None
     m = _LASTNUM.search(stem)
