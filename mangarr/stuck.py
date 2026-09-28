@@ -10,20 +10,22 @@ passes left in the database, earlier ones too. For each blocker this module
 keeps what the verdict (verdict.py) needs, and does what the user or the
 automatic skip decides:
 
-  * evidence: what every source listing the chapter calls it, which of
-    its whole chapters it names with a side-story or extra word (so a word
-    it gives every chapter is the series', not this one's) and where it is
-    on their sites (the stuck table, from each resolve's plan and from the
-    chapter's listing that db.save_plan keeps every resolve, from before it
-    blocked too: update(); a site missing from a resolve, which may just
-    not have answered, keeps its name for KEEP_DAYS), the sites a download
-    run failed it on (note_failures), and the page counts of the chapters
-    it is compared with (fill_pages). Kept until the chapter is on disk or
-    no site has listed it for its whole grace (db.past_grace), never
-    dropped for one resolve that missed it.
+  * evidence: what every source listing the chapter calls it (every one
+    that lists it in a resolve, whatever its copy is: one too short to be
+    the chapter, or the chapter junk this time), which of its whole
+    chapters it names with a side-story or extra word (so a word it gives
+    every chapter is the series', not this one's) and where it is on their
+    sites (the stuck table, from each resolve's plan and from the chapter's
+    listing that db.save_plan keeps every resolve, from before it blocked
+    too: update(); a site missing from a resolve, which may just not have
+    answered, keeps its name for KEEP_DAYS), the sites a download run
+    failed it on (note_failures), and the page counts of the chapters it is
+    compared with (fill_pages). Kept until the chapter is on disk or no
+    site has listed it for its whole grace (db.past_grace), never dropped
+    for one resolve that missed it, nor while it is junk.
   * decisions, kept apart from the evidence (the stuck_choice table): kept
     until the chapter is on disk, or GONE_DAYS after its grace is over
-    (it is gone for good).
+    (it is gone for good); a junk chapter is still listed, so they stay.
   * skip(): the chapter becomes 'ignored', so the later chapters go on at
     the next pass; unskip() makes it wanted again. A skip keeps the
     chapter's state (state_of: its name on each site), and one whose state
@@ -37,7 +39,8 @@ automatic skip decides:
     is a HIGH-confidence side_story or covered (Verdict.auto_skip) in the
     passes of at least HIGH_DAYS (never the first resolve that says so),
     that failed on every site listing it (a site that has just started
-    listing it is tried first), in a pass in which every site that listed
+    listing it is tried first; one whose copy is too short to be the
+    chapter is never tried), in a pass in which every site that listed
     it within KEEP_DAYS answered and matched the series, and only with
     MangaDex's chapter list in the verdict (or none to be had: a manual
     series); never one you skipped, declined or keep waiting for
@@ -95,6 +98,7 @@ class Stuck:
     urls: dict = field(default_factory=dict)    # {source: its page on that site, '' when there is none}
     failed_on: list = field(default_factory=list)   # the sites a download run failed it on
     wholes: dict = field(default_factory=dict)  # {source: {number: name}}: its whole chapters with a side-story word
+    short: list = field(default_factory=list)   # the sites listing it whose copy is too short to be it: never tried
     high_since: str | None = None       # since when every pass has judged it one the automatic skip may act on
     keep_waiting: bool = False          # you chose "Keep waiting": never skipped automatically
     dismissed: bool = False             # ... and its state has not changed since: the note is folded
@@ -109,8 +113,10 @@ class Stuck:
     @property
     def untried(self) -> list[str]:
         """The sites listing it that no download run has failed it on yet
-        (one that has just started to list it): the next pass tries them."""
-        return [k for k in self.names if k not in self.failed_on]
+        (one that has just started to list it): the next pass tries them.
+        Not one whose copy is too short to be the chapter: no pass tries
+        that one."""
+        return [k for k in self.names if k not in self.failed_on and k not in self.short]
 
     def as_dict(self) -> dict:
         """For the API."""
@@ -118,7 +124,8 @@ class Stuck:
         return {"number": self.number, "waiting": self.waiting, "status": self.status, "name": self.name,
                 "reason": self.reason, "tries": self.tries, "failedSince": self.failed_since,
                 "sources": dict(self.names), "urls": {k: u for k, u in self.urls.items() if u},
-                "failedOn": list(self.failed_on), "dismissed": self.dismissed, "keepWaiting": self.keep_waiting,
+                "failedOn": list(self.failed_on), "shortOn": list(self.short), "dismissed": self.dismissed,
+                "keepWaiting": self.keep_waiting,
                 "declined": self.declined, "checkingMangaDex": self.checking, "mangaDexWait": self.md_wait,
                 "highSince": self.high_since,
                 "verdict": None if v is None else {"kind": v.kind, "headline": v.headline, "confidence": v.confidence,
@@ -221,10 +228,16 @@ def blockers(con, series_id: int | None = None) -> list[Stuck]:
             row = failed.get(token) if s2 == sid else None
             if row is not None:
                 st = Stuck(row["series_id"], row["number"], waiting, row["status"], row["name"], row["source_name"],
-                           row["reason"], row["tries"] or 0, row["failed_since"])
+                           row["reason"], row["tries"] or 0, row["failed_since"], short=_short(row))
                 _stored(st, stored.get(row["number"]), choices.get(row["number"]))
                 out.append(st)
     return sorted(out, key=lambda st: (st.series_id, st.number))
+
+
+def _short(row) -> list[str]:
+    """The sites whose copy of the chapter (its row) was too short to be it
+    when they last listed it (db.short_copy)."""
+    return [k for k, v in db.listed_by(row).items() if db.short_copy(v)]
 
 
 def _stored(st: Stuck, stored, choice) -> None:
@@ -560,8 +573,44 @@ def _answered(plan) -> set[str]:
 def _gone(c) -> bool:
     """Whether the chapter (its row) is on disk, deleted, or not listed by
     any site for long enough to be gone (db.past_grace): its evidence is no
-    longer needed. One resolve that missed it never is."""
+    longer needed. One resolve that missed it never is, and neither is a
+    junk chapter: sites still list it."""
     return c is None or c["status"] == "have" or db.past_grace(c)
+
+
+def _listing(plan) -> dict:
+    """Every site that lists each chapter in the resolve, best first, whatever
+    its copy is (resolver.Plan.listing); the candidates of a plan without it."""
+    whole = getattr(plan, "listing", None)
+    return whole() if callable(whole) else getattr(plan, "candidates", None) or {}
+
+
+class _Sites:
+    """What one update reads from each site's chapter list, worked out once
+    per site however many chapters it keeps evidence on: the chapter of
+    each number there (the first listed), and its whole chapters named with
+    a side-story or extra word (verdict.site_marks)."""
+
+    def __init__(self, series: Series):
+        self.series = series
+        self._chapters: dict[int, dict] = {}
+        self._marks: dict[int, list] = {}
+
+    def chapter(self, m, number: float):
+        got = self._chapters.get(id(m))
+        if got is None:
+            got = self._chapters[id(m)] = {}
+            for c in getattr(m, "chapters", None) or ():
+                got.setdefault(getattr(c, "number", None), c)
+        return got.get(number)
+
+    def marks(self, m) -> list:
+        got = self._marks.get(id(m))
+        if got is None:
+            listed = [(getattr(c, "number", None), getattr(c, "name", None))
+                      for c in getattr(m, "chapters", None) or ()]
+            got = self._marks[id(m)] = verdict.site_marks(listed, self.series)
+        return got
 
 
 def _update(con, client, series_id: int, series: Series, plan, found: list[Stuck]) -> None:
@@ -570,22 +619,23 @@ def _update(con, client, series_id: int, series: Series, plan, found: list[Stuck
     if not found and not stored and not choices:
         return                              # the common case: nothing to keep, nothing to judge
     rows = db.chapters_by_number(con, series_id, list({*stored, *choices, *(st.number for st in found)}))
-    candidates = getattr(plan, "candidates", None) or {}
+    listed = _listing(plan)
+    sites = _Sites(series)
     now = db.now()
     evidence: dict[float, tuple[dict, dict, dict, dict]] = {}      # number -> (names, seen, wholes, chapter ids)
     # every blocker, skipped chapter and chapter with evidence, until it is on disk or gone for good
     for n in {st.number for st in found} | {n for n, r in choices.items() if r["skipped"]} | set(stored):
         if _gone(rows.get(n)):
             continue
-        listing = candidates.get(n) or []
-        fresh, ids = _names(listing, n)
+        listing = listed.get(n) or []
+        fresh, ids = _names(listing, n, sites)
         r = stored.get(n)
         names, seen = _merge(rows.get(n), r, fresh, now)
         if not names and r is None:
             continue                        # no site seen listing it yet: nothing to keep
         kept = _loads(r["wholes"], {}) if r is not None else {}
         wholes = {**{k: w for k, w in kept.items() if k in names and k not in fresh},
-                  **_wholes(listing, fresh, n, series)}
+                  **_wholes(listing, fresh, n, sites)}
         evidence[n] = (names, seen, wholes, ids)
     if con.in_transaction:
         con.commit()                        # no write is held across the lookups on Suwayomi
@@ -603,7 +653,8 @@ def _update(con, client, series_id: int, series: Series, plan, found: list[Stuck
                     " VALUES (?,?,?,?,?,?,?) ON CONFLICT(series_id, number) DO UPDATE SET names=excluded.names,"
                     " seen=excluded.seen, wholes=excluded.wholes, urls=excluded.urls, updated_at=excluded.updated_at",
                     (series_id, n, json.dumps(names), json.dumps(seen), json.dumps(wholes), json.dumps(urls[n]), now))
-    # the evidence goes once the chapter is on disk or gone for good; a decision after GONE_DAYS more
+    # the evidence goes once the chapter is on disk or gone for good; a decision after GONE_DAYS more (a junk
+    # chapter is still listed: it is not gone)
     for n in stored:
         if _gone(rows.get(n)):
             con.execute("DELETE FROM stuck WHERE series_id=? AND number=?", (series_id, n))
@@ -612,7 +663,7 @@ def _update(con, client, series_id: int, series: Series, plan, found: list[Stuck
         c = rows.get(n)
         if c is not None and c["status"] == "have":
             con.execute("DELETE FROM stuck_choice WHERE series_id=? AND number=?", (series_id, n))
-        elif c is None or c["status"] == "junk" or (c["status"] == "unavailable" and db.past_grace(c)):
+        elif c is None or (c["status"] in ("unavailable", "junk") and db.past_grace(c)):
             if not r["gone_since"]:         # not listed for its whole grace (db.past_grace), or not a chapter
                 con.execute("UPDATE stuck_choice SET gone_since=? WHERE series_id=? AND number=?", (now, series_id, n))
             elif r["gone_since"] < cutoff:
@@ -647,6 +698,8 @@ def _update(con, client, series_id: int, series: Series, plan, found: list[Stuck
         c = current.get(st.number)
         if c is not None:
             st.status, st.name = c.status, c.name
+        if (row := now_rows.get(st.number)) is not None:
+            st.short = _short(row)
         _stored(st, now_stored.get(st.number), now_choices.get(st.number))
         md = _mangadex(series, st)
         if st.md_wait == "pending":
@@ -684,16 +737,16 @@ def _note_verdict(con, series_id: int, st: Stuck, v: Verdict, now: str) -> None:
     st.high_since = since
 
 
-def _names(candidates, number: float) -> tuple[dict, dict]:
+def _names(listing, number: float, sites: _Sites) -> tuple[dict, dict]:
     """({source: its name for the chapter}, {source: its chapter id there})
-    from the plan's candidates for it, best first."""
+    from the sites that list it in the plan, best first."""
     names: dict[str, str | None] = {}
     ids: dict[str, int | None] = {}
-    for m in candidates:
+    for m in listing:
         src = getattr(getattr(m, "source", None), "name", None)
         if not isinstance(src, str) or not src or len(src) > MAX_SOURCE or src in names:
             continue
-        ch = next((c for c in getattr(m, "chapters", None) or () if c.number == number), None)
+        ch = sites.chapter(m, number)
         names[src] = oneline(ch.name, MAX_NAME) if ch is not None and isinstance(ch.name, str) and ch.name else None
         ids[src] = ch.id if ch is not None and isinstance(ch.id, int) else None
         if len(names) >= MAX_SOURCES:
@@ -701,18 +754,17 @@ def _names(candidates, number: float) -> tuple[dict, dict]:
     return names, ids
 
 
-def _wholes(candidates, names: dict, number: float, series: Series) -> dict:
+def _wholes(listing, names: dict, number: float, sites: _Sites) -> dict:
     """{source: {number (as text): name}} for the sources in names (this
     resolve's): their whole chapters named with a side-story or extra word
     (verdict.site_words), so the verdict tells a word such a site gives
     every chapter from this chapter's own."""
     out: dict[str, dict] = {}
-    for m in candidates:
+    for m in listing:
         src = getattr(getattr(m, "source", None), "name", None)
         if src not in names or src in out:
             continue
-        listed = [(getattr(c, "number", None), getattr(c, "name", None)) for c in getattr(m, "chapters", None) or ()]
-        out[src] = {f"{k:g}": oneline(v, MAX_NAME) for k, v in verdict.site_words(listed, series, number).items()}
+        out[src] = {f"{k:g}": oneline(v, MAX_NAME) for k, v in verdict.words_near(sites.marks(m), number).items()}
     return out
 
 

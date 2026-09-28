@@ -245,6 +245,9 @@ def _set_library_entries(client: Client, plan: Plan, primary_manga_id: int, stal
 # statuses a background job may overwrite; anything else ('ignored', 'have')
 # was set by the user or an import meanwhile and is left alone
 _JOB_OWNED = ("wanted", "failed", "unavailable")
+# statuses an import may turn 'failed' when the file it finds is bad: not
+# 'ignored' (you skipped it: that stays as you left it) nor 'junk'
+_IMPORT_OWNED = (*_JOB_OWNED, "have")
 
 
 def hold_in_order(con, series_id: int, plan: Plan, rows: dict | None = None) -> float | None:
@@ -322,6 +325,23 @@ def dropped_chapters(con, series_id: int, wanted: set) -> set:
         if r["number"] in wanted}
 
 
+def taken_back(con, series_id: int, wanted) -> float | None:
+    """The first chapter below the last one of `wanted` (a download's
+    chapters, due when it began) that is wanted or failed now without being
+    one of them: you un-skipped it or wanted it again while the download
+    ran. With strict download in order the chapters of the download after
+    it wait for it (downloader.SeriesSteps.wait_for). None when there is
+    none. Asked before each chunk, like dropped_chapters."""
+    if not wanted:
+        return None
+    wanted = set(wanted)
+    for r in con.execute("SELECT number FROM chapter WHERE series_id=? AND number<? AND status IN ('wanted','failed')"
+                         " ORDER BY number", (series_id, max(wanted))):
+        if r["number"] not in wanted:
+            return r["number"]
+    return None
+
+
 def record_downloads(con, series_id: int, plan: Plan, wanted: list[float], results: dict, reasons: dict,
                      throttled: set, attempts: list | None = None) -> None:
     """Write what a download run did: sources that rate-limited us, source
@@ -389,7 +409,8 @@ def download_wanted(con, client: Client, series_id: int, plan: Plan,
     attempts: list = []
     results = downloader.download(client, plan, only=wanted_set, should_cancel=should_cancel, reasons=reasons,
                                   progress=progress, throttled=seen_throttle,
-                                  dropped=lambda: dropped_chapters(con, series_id, wanted_set), attempts=attempts)
+                                  dropped=lambda: dropped_chapters(con, series_id, wanted_set), attempts=attempts,
+                                  taken_back=lambda: taken_back(con, series_id, wanted_set))
     record_downloads(con, series_id, plan, wanted, results, reasons, seen_throttle, attempts)
     return results
 
@@ -728,8 +749,10 @@ def _import_file(con, series_id: int, title: str, folder: str, n: float, prev, f
         except OSError as e:
             _import_failed(con, series_id, title, n, f"{source_name}: bad file {f.name} not set aside", e)
             return None
-        db.set_status(con, series_id, n, "failed", f"{source_name}: bad file ({detail}); set aside as "
-                      f"{os.path.basename(moved)}, will be fetched again")
+        if not db.set_status(con, series_id, n, "failed", f"{source_name}: bad file ({detail}); set aside as "
+                             f"{os.path.basename(moved)}, will be fetched again", only_from=_IMPORT_OWNED):
+            log.info("%s: ch %g is %s: it stays so, although its file from %s was bad", title, n,
+                     prev["status"] if prev else "not a chapter of the plan", source_name)
         db.record_source_result(con, source_name, "corrupt")
         con.commit()                        # never hold a write across the next file check
         log.warning("%s: ch %g from %s is unusable (%s); quarantined %s", title, n, source_name, detail, moved)
@@ -774,7 +797,7 @@ def _import_failed(con, series_id: int, title: str, n: float, what: str, e: OSEr
     not held across the checks and Suwayomi calls still to come."""
     why = f"{what}: {type(e).__name__}: {e}"
     log.error("%s: ch %g: %s", title, n, why)
-    db.set_status(con, series_id, n, "failed", why[:500])
+    db.set_status(con, series_id, n, "failed", why[:500], only_from=_IMPORT_OWNED)   # never over your skip
     con.commit()
 
 

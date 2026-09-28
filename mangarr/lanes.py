@@ -539,8 +539,14 @@ class LanePool:
             self._render()
 
     def _gone(self, con, task: SeriesTask) -> Callable[[], set]:
-        return downloader._dropper(lambda: core.dropped_chapters(con, task.series_id, set(task.wanted)),
-                                   task.title, told=task.told)
+        """What the series leaves out now, read again before each step and
+        chunk: its chapters ignored (or linked) meanwhile, and in order the
+        ones after a chapter you took back meanwhile (downloader.waiting)."""
+        wanted = set(task.wanted)
+        dropped = downloader._dropper(lambda: core.dropped_chapters(con, task.series_id, wanted), task.title,
+                                      told=task.told)
+        return downloader.waiting(task.steps, dropped, lambda: core.taken_back(con, task.series_id, wanted),
+                                  task.title)
 
     def _step(self, task: SeriesTask, key: str, lane: int) -> tuple[bool, float]:
         """One run of `task` on site `key` (on the lane's thread). Queue

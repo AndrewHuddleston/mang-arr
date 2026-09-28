@@ -275,7 +275,7 @@ class Sim:
         return linked
 
     def download(self, client, plan, only=None, should_cancel=None, reasons=None, progress=None, throttled=None,
-                 in_order=None, dropped=None, attempts=None):
+                 in_order=None, dropped=None, attempts=None, taken_back=None):
         reasons = reasons if reasons is not None else {}
         wanted = set(plan.wanted()) if only is None else set(only)
         in_order = bool(settings.get("download_in_order")) if in_order is None else in_order

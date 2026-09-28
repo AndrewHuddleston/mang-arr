@@ -281,6 +281,14 @@ def waiting_unlisted_reason(n: float, note: str) -> str:
     return WAITING_START.format(f"{n:g}") + f" and {n:g} is {note}"
 
 
+def taken_back_reason(n: float) -> str:
+    """The reason of a chapter a download left for the next pass because
+    chapter n before it was wanted again while it ran (un-skipped, or its
+    Want button), with strict download in order."""
+    return WAITING_START.format(f"{n:g}") + f" and {n:g} was wanted again while this download ran: the next pass " \
+        "downloads it first"
+
+
 def waiting_for(reason: str | None) -> str | None:
     """The chapter (as waiting_reason wrote its number) a chapter with this
     reason waits for, or None."""
@@ -359,6 +367,7 @@ class SeriesSteps:
         self.dead: set[int] = set()                        # manga ids that delivered nothing: asked last
         self.attempts: list[tuple[str, float, str]] = []   # (source name, chapter, 'ok' | 'failed') per try
         self.held: dict[float, str] = {}                   # its last source did not start it -> reason if none left
+        self.back: float | None = None                     # in order: a chapter before these wanted again meanwhile
         self.finished = False
         pending = {n for n in wanted if plan.candidates.get(n)}
         for n in wanted - pending:
@@ -643,6 +652,28 @@ class SeriesSteps:
         else:
             self.pending.update(nums)
 
+    def wait_for(self, k: float | None) -> set[float]:
+        """In order: chapter k, before some of these chapters but not one of
+        them, is wanted again (you un-skipped it, or wanted it, while they
+        downloaded): the ones after it that have not arrived wait for it, as
+        they would in the next pass (taken_back_reason), and this download
+        ends before them. Returns them, for the chapters to leave out
+        (they stay so, whatever k does later in this download); set() when
+        there are none, or out of order (gaps are allowed then)."""
+        if not self.in_order:
+            return set()
+        if k is not None and (self.back is None or k < self.back):
+            self.back = k
+        if self.back is None:
+            return set()
+        out = {n for n in self.order if n > self.back and n not in self.results}
+        for n in out:
+            if self.reasons.get(n) != taken_back_reason(self.back):
+                self.reasons[n] = taken_back_reason(self.back)
+                log.info("%s: ch %g waits for ch %g, which was wanted again while this download ran", self.label, n,
+                         self.back)
+        return out
+
     def stop(self, reason: str) -> None:
         """Nothing more for this series: every wanted chapter not tried to the
         end gets `reason`."""
@@ -657,7 +688,7 @@ def download(client: Client, plan: Plan, only: set[float] | None = None,
              should_cancel: Callable[[], bool] | None = None, reasons: dict | None = None,
              progress: Callable[[str], None] | None = None, throttled: set | None = None,
              in_order: bool | None = None, dropped: Callable[[], set] | None = None,
-             attempts: list | None = None) -> dict:
+             attempts: list | None = None, taken_back: Callable[[], float | None] | None = None) -> dict:
     """Returns {chapter_number: 'ok' | 'failed'} for every chapter attempted.
     Chapters not reached before a cancel are simply absent. When `reasons`
     is given it is filled with a human-readable reason per failed chapter,
@@ -665,18 +696,20 @@ def download(client: Client, plan: Plan, only: set[float] | None = None,
     chapter a source delivered or failed (SeriesSteps.attempts).
     `dropped()`, when given, is asked before every chunk for chapters that are
     no longer wanted (ignored by the user meanwhile); those are skipped and
-    left out of the result."""
+    left out of the result. `taken_back()` likewise, in order: an earlier
+    chapter wanted again meanwhile (core.taken_back), which the chapters
+    after it then wait for (SeriesSteps.wait_for): left out too."""
     reasons = reasons if reasons is not None else {}
     wanted = set(plan.wanted()) if only is None else set(only)
     label = plan.series.title
     cancel = should_cancel or (lambda: False)
     report = progress or (lambda m: None)
-    gone = _dropper(dropped, label)
     from . import settings
     if in_order is None:
         in_order = bool(settings.get("download_in_order"))
     memo = RunMemo(throttle=throttled if throttled is not None else set())
     steps = SeriesSteps(plan, wanted, in_order, label, reasons)
+    gone = waiting(steps, _dropper(dropped, label), taken_back, label)
     try:
         with download_lock(should_cancel=cancel, progress=report):
             clear_leftovers(client, cancel)
@@ -706,6 +739,25 @@ def download(client: Client, plan: Plan, only: set[float] | None = None,
     if attempts is not None:
         attempts.extend(steps.attempts)
     return steps.results
+
+
+def waiting(steps: SeriesSteps, gone: Callable[[], set], taken_back: Callable[[], float | None] | None,
+            label: str) -> Callable[[], set]:
+    """gone() and, in order, the chapters that wait for one taken back
+    meanwhile (taken_back(): core.taken_back; SeriesSteps.wait_for): what a
+    download leaves out, asked before each chunk. A failing check never
+    stops a download."""
+    if taken_back is None or not steps.in_order:
+        return gone
+
+    def left_out() -> set:
+        try:
+            k = taken_back()
+        except Exception as e:
+            log.debug("%s: could not re-check the chapters before these: %s", label, e)
+            k = None
+        return gone() | steps.wait_for(k)
+    return left_out
 
 
 def _dropper(dropped: Callable[[], set] | None, label: str, told: set | None = None) -> Callable[[], set]:

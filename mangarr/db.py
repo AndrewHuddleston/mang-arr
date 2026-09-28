@@ -621,6 +621,12 @@ UNREACHABLE_KEEP_DAYS = 7       # how long a source that cannot be searched keep
 # and LISTING_GRACE_DAYS; a resolve in which a source that listed it in the
 # last LISTING_KEEP_DAYS did not answer, or did not match the series, does
 # not count (past_grace). Only then is it 'unavailable'.
+#
+# A fractional chapter whose copy on every site is too short to be the
+# chapter (resolver._prune_junk) is junk; but not while a site that listed it
+# in the last LISTING_KEEP_DAYS, with a copy not known to be short, did not
+# answer: that site may still have it at full length (void_junk). It is
+# waited for then like a chapter no site listed.
 LISTING_GRACE_RESOLVES = 3
 LISTING_GRACE_DAYS = 2
 LISTING_KEEP_DAYS = UNREACHABLE_KEEP_DAYS
@@ -639,8 +645,9 @@ def past_grace(row) -> bool:
 def listed_by(row, days: float = LISTING_KEEP_DAYS) -> dict:
     """{source name: [when it last listed the chapter, its name there]} of
     the sources that listed it within `days`, from its row; most recent
-    first. A row no resolve has written this for (one made another way)
-    has its own source, as of its last update."""
+    first. An entry has a third item, True, when that source's copy was not
+    the chapter then (short_copy). A row no resolve has written this for
+    (one made another way) has its own source, as of its last update."""
     keys = row.keys()
     if row["listed"] is None:
         source = row["source_name"] if "source_name" in keys else None
@@ -654,15 +661,27 @@ def listed_by(row, days: float = LISTING_KEEP_DAYS) -> dict:
         if not isinstance(got, dict):
             return {}
     cutoff = ago(days)
-    out = {k: v for k, v in got.items() if isinstance(k, str) and isinstance(v, list) and len(v) == 2
-           and isinstance(v[0], str) and v[0] >= cutoff and (v[1] is None or isinstance(v[1], str))}
+    out = {k: v for k, v in got.items() if isinstance(k, str) and isinstance(v, list) and len(v) in (2, 3)
+           and isinstance(v[0], str) and v[0] >= cutoff and (v[1] is None or isinstance(v[1], str))
+           and (len(v) == 2 or v[2] is True)}
     return dict(sorted(out.items(), key=lambda kv: kv[1][0], reverse=True))
 
 
+def short_copy(entry) -> bool:
+    """Whether a listed_by entry says that source's copy was not the chapter
+    when it last listed it: counted shorter than min_pages, or not countable
+    in a chapter every other copy of which was short (plan.short)."""
+    return len(entry) == 3 and entry[2] is True
+
+
 def unlisted_note(row) -> str:
-    """The reason of a chapter no source listed in the last resolve that is
-    still waited for (UNLISTED_NOTE), naming the sources that listed it."""
-    sites = list(listed_by(row))[:3] or ([row["source_name"]] if row["source_name"] else ["any source"])
+    """The reason of a chapter no source listed in the last resolve (or only
+    as a copy too short to be it) that is still waited for (UNLISTED_NOTE),
+    naming the sources that listed it, those with a copy that may be the
+    chapter first."""
+    got = listed_by(row)
+    sites = ([k for k, v in got.items() if not short_copy(v)] or list(got))[:3] or \
+        ([row["source_name"]] if row["source_name"] else ["any source"])
     return UNLISTED_NOTE.format(" or ".join(oneline(k, 60) for k in sites))
 
 
@@ -701,6 +720,7 @@ def save_plan(con, series_id: int, plan, primary_manga_id: int | None) -> list[s
             " VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
             (series_id, m.manga_id, m.source.name, m.title, m.author, m.match, m.author_ok,
              len(m.chapters), m.max, m.note or None, int(m.manga_id == primary_manga_id), now()))
+    void_junk(con, series_id, plan)
     rows = {r["number"]: r for r in con.execute(
         "SELECT number, status, library_path, next_try, source_name FROM chapter WHERE series_id=?", (series_id,))}
     keep = {"have", "ignored"}
@@ -723,7 +743,9 @@ def save_plan(con, series_id: int, plan, primary_manga_id: int | None) -> list[s
             " manga_id=excluded.manga_id, source_name=excluded.source_name, updated_at=excluded.updated_at",
             (series_id, n, "wanted", m.manga_id, m.source.name, reason, now()))
     for n, (m, pages) in plan.junk.items():
-        reason = f"{pages} page(s) on {m.source.name}: a notice image, not a chapter"
+        others = [k for k in (getattr(plan, "short", None) or {}).get(n, {}) if k != m.source.name]
+        reason = f"{pages} page(s) on {m.source.name}" + (f" (no full copy on {', '.join(others[:3])} either)" if
+                                                          others else "") + ": a notice image, not a chapter"
         con.execute(
             "INSERT INTO chapter (series_id, number, status, manga_id, source_name, pages, reason, updated_at)"
             " VALUES (?,?,?,?,?,?,?,?)"
@@ -749,41 +771,78 @@ def save_plan(con, series_id: int, plan, primary_manga_id: int | None) -> list[s
     return expired
 
 
+def void_junk(con, series_id: int, plan) -> None:
+    """The chapters the resolve found junk (no copy it saw is the chapter)
+    that a site listed in the last LISTING_KEEP_DAYS with a copy not known
+    to be short, which did not answer this time or whose search missed the
+    series: it may still have the chapter at full length. Such a chapter is
+    not junk this time: it is taken out of plan.junk (plan.voided names the
+    sites) and waited for like a chapter no site listed (_save_listing,
+    core.hold_in_order), until that site answers or its listing is too old
+    to count."""
+    junk = getattr(plan, "junk", None)
+    if not junk:
+        return
+    answered = {m.source.name for m in plan.matches if m.usable}
+    rows = chapters_by_number(con, series_id, list(junk))
+    for n in list(junk):
+        r = rows.get(n)
+        if r is None or r["status"] in ("have", "ignored"):
+            continue
+        silent = [k for k, v in listed_by(r).items() if k not in answered and not short_copy(v)]
+        if silent:
+            del junk[n]
+            plan.voided[n] = silent
+            log.info("ch %g: every copy listed now is short, but %s may still have it; waiting for %s",
+                     n, " or ".join(silent[:3]), "it" if len(silent) == 1 else "them")
+
+
 def _save_listing(con, series_id: int, plan) -> None:
-    """Which sources list each chapter that is not on disk, and since when
-    none does (see past_grace). A chapter no source lists now is still
-    wanted (a failed one stays failed), its reason says so, until its grace
-    is over; then it is unavailable. It comes back when a source lists it
-    again."""
+    """Which sources list each chapter that is not on disk (every one that
+    answered and lists it, whatever its copy is: a short one is kept with
+    its mark, short_copy), and since when none does (see past_grace). A
+    chapter no source lists now, or only with copies too short to be it
+    while another may still have it (plan.voided), is still wanted (a
+    failed one stays failed), its reason says so, until its grace is over;
+    then it is unavailable. It comes back when a source lists it again."""
     stamp = now()
     answered = {m.source.name for m in plan.matches if m.usable}
-    listing: dict[float, dict[str, str | None]] = {}
+    short = getattr(plan, "short", None) or {}
+    voided = getattr(plan, "voided", None) or {}
+    listing: dict[float, dict[str, list]] = {}
     index: dict[int, dict] = {}
-    pairs = [(n, m) for n, ms in plan.candidates.items() for m in ms] + [(n, m) for n, (m, _) in plan.junk.items()]
-    for n, m in pairs:
-        chapters = index.get(id(m))
-        if chapters is None:
-            chapters = index[id(m)] = {}
-            for c in m.chapters:
-                chapters.setdefault(c.number, c)
-        c = chapters.get(n)
-        name = oneline(c.name, MAX_LISTED_NAME) if c is not None and isinstance(c.name, str) and c.name else None
-        listing.setdefault(n, {}).setdefault(m.source.name, name)
+    whole = plan.listing() if callable(getattr(plan, "listing", None)) else \
+        {**{n: list(ms) for n, ms in plan.candidates.items()}, **{n: [m] for n, (m, _) in plan.junk.items()}}
+    for n, ms in whole.items():
+        for m in ms:
+            chapters = index.get(id(m))
+            if chapters is None:
+                chapters = index[id(m)] = {}
+                for c in m.chapters:
+                    chapters.setdefault(c.number, c)
+            c = chapters.get(n)
+            name = oneline(c.name, MAX_LISTED_NAME) if c is not None and isinstance(c.name, str) and c.name else None
+            listing.setdefault(n, {}).setdefault(m.source.name, [stamp, name] + ([True] if m.source.name in
+                                                                                  short.get(n, ()) else []))
     writes = []
     for r in con.execute("SELECT * FROM chapter WHERE series_id=? AND status != 'have'", (series_id,)).fetchall():
         n, status, reason = r["number"], r["status"], r["reason"]
         kept = listed_by(r)
         now_listing = listing.get(n)
-        if now_listing:
-            sites = {k: [stamp, v] for k, v in now_listing.items()}
-            sites.update((k, v) for k, v in kept.items() if k not in sites)
+        sites = dict(now_listing or {})
+        sites.update((k, v) for k, v in kept.items() if k not in sites)
+        held = n in voided
+        if now_listing and not held:
             listed_at, unlisted, missed = stamp, 0, 0
+        elif held:                          # listed, if only as a copy too short to be it: its grace starts again,
+            listed_at, unlisted, missed = stamp, (r["unlisted"] or 0) + 1, 0    # but it is not listed in full
         else:
-            sites, listed_at, unlisted = kept, r["listed_at"], (r["unlisted"] or 0) + 1
+            listed_at, unlisted = r["listed_at"], (r["unlisted"] or 0) + 1
             # counts toward its grace only when every source that listed it answered, and did not list it
             missed = (r["missed"] or 0) + (not any(k not in answered for k in kept))
         sites = dict(list(sites.items())[:MAX_LISTED])
-        if not now_listing and status in ("wanted", "failed", "unavailable"):
+        if (not now_listing or held) and (status in ("wanted", "failed", "unavailable") or
+                                          (held and status == "junk")):
             row = {**dict(r), "listed": json.dumps(sites), "listed_at": listed_at, "missed": missed}
             if past_grace(row):
                 status, reason = "unavailable", "no trusted source lists this chapter any more"

@@ -1,11 +1,12 @@
 """The page counts of fractional chapters, kept between passes.
 
-A resolve counts the pages of every fractional chapter that is not
-downloaded yet, to drop the notices and ads among them
-(resolver._prune_junk). Each count asks the source for the chapter's page
-list, so the counts are kept (the page_probe table), per source entry and
-chapter as Suwayomi numbers them, and a chapter is counted again only when
-it may have changed:
+A resolve counts the pages of the best-ranked copy of every fractional
+chapter that is not downloaded yet, and of the other sites' copies when
+that one is short, to tell the notices, ads and placeholders among them
+from the chapters (resolver._prune_junk). Each count asks the source for
+the chapter's page list, so the counts are kept (the page_probe table), per
+source entry and chapter as Suwayomi numbers them, and a copy is counted
+again only when it may have changed:
 
 - its source lists it differently: another number, name, scanlator or
   upload date;

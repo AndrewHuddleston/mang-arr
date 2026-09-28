@@ -31,7 +31,7 @@ from test_verdict import (  # noqa: E402
     WRONG,
 )
 
-from mangarr import core, db, downloader, jobs, library, mangadex, settings, stuck  # noqa: E402
+from mangarr import config, core, db, downloader, jobs, library, mangadex, resolver, settings, stuck  # noqa: E402
 from mangarr.mangadex import ChapterList  # noqa: E402
 from mangarr.model import Series  # noqa: E402
 from mangarr.verdict import HIGH  # noqa: E402
@@ -532,7 +532,15 @@ class EvidenceTest(StuckBase):
             resolve("unavailable", gone=True)
             since = con.execute("SELECT gone_since FROM stuck_choice").fetchone()[0]
             self.assertIsNotNone(since)
+            # Review: a resolve in which it was junk counted as gone too, although the sites still list it: a
+            # decision was dropped a week later. Listed as junk it is not gone; a junk chapter past its grace is
             resolve("junk")
+            self.assertIsNone(con.execute("SELECT gone_since FROM stuck_choice").fetchone()[0])
+            self.assertEqual((count("stuck"), count("stuck_choice")), (0, 1))
+            resolve("junk", gone=True)
+            since = con.execute("SELECT gone_since FROM stuck_choice").fetchone()[0]
+            self.assertIsNotNone(since)
+            resolve("unavailable", gone=True)
             self.assertEqual(con.execute("SELECT gone_since FROM stuck_choice").fetchone()[0], since)
             old = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(time.time() - (stuck.GONE_DAYS + 1) * 86400))
             con.execute("UPDATE stuck_choice SET gone_since=?", (old,))
@@ -602,6 +610,30 @@ class EvidenceTest(StuckBase):
             db.set_have(con, sid, 7.2, None, None)
             stuck.update(con, None, sid, DANGERS, None, found=[])
             self.assertEqual(con.execute("SELECT COUNT(*) FROM stuck").fetchone()[0], 0)
+
+    def test_each_site_s_list_is_read_once_per_update(self):
+        # Review: the side-story words of every site's whole chapters were worked out again for every chapter with
+        # evidence (rows x sites x chapters, twice a pass): 3.6 s for 2000 chapters and 100 rows
+        with db.connect() as con:
+            sid = seed_dangers(con)
+            fractions = [n + 0.5 for n in range(100, 140)]
+            sites = [_Match(f"Site {k}", [_Chapter(k * 10000 + n, n, f"Chapter {n} Extra" if n % 50 == 0 else
+                                                   f"Chapter {n}") for n in [*range(1, 400), *fractions]])
+                     for k in range(3)]
+            for n in fractions:                                         # skipped ones keep their evidence
+                add(con, sid, n, "ignored", "Side Story", "Site 0")
+                names_of(con, sid, n, {"Site 0": "Side Story"})
+            con.commit()
+            plan = _Plan({n: sites for n in [7.2, *fractions]})
+            real = stuck.verdict.site_marks
+            calls = []
+            with mock.patch.object(stuck.verdict, "site_marks", lambda *a: calls.append(1) or real(*a)):
+                stuck.update(con, None, sid, DANGERS, plan)
+            self.assertEqual(len(calls), 3)                             # once per site, not per chapter
+            wholes = json.loads(con.execute("SELECT wholes FROM stuck WHERE number=120.5").fetchone()[0])
+        alone = stuck.verdict.site_words([(c.number, c.name) for c in sites[1].chapters], DANGERS, 120.5)
+        self.assertEqual(wholes["Site 1"], {f"{k:g}": v for k, v in alone.items()})     # as worked out on its own
+        self.assertIn("100", wholes["Site 1"])
 
     def test_it_never_raises(self):
         with db.connect() as con:
@@ -1220,15 +1252,23 @@ class PassTest(PassBase, _Offline):
         fake.broken = {chapter_id(1, 3.5)}
         return fake, {"Freedom": [m]}, row
 
-    def run_pass(self, fake, plans, row, down=()):
-        """One pass; `down`: the entries of sites that do not answer in it (plan.unreachable)."""
+    def run_pass(self, fake, plans, row, down=(), pages=None):
+        """One pass; `down`: the entries of sites that do not answer in it (plan.unreachable). With `pages`
+        ({chapter id: its page count; 20 for any other}) the resolve judges the copies of fractional chapters by
+        their pages, as a real one does (resolver._prune_junk, with the page counts kept between passes)."""
         job = jobs.Job(1, "refresh-all", "all")
         settings._cache.clear()
         plain = resolver_for(fake, plans)
 
+        class Counter:
+            def page_count(self, cid):
+                return pages.get(cid, 20)
+
         def resolve(client, series, **kw):
             plan = plain(client, series, **kw)
             plan.unreachable = [(m.source, "timed out") for m in down]
+            if pages is not None:
+                resolver._prune_junk(Counter(), plan, None, kw.get("counts"))
             return plan
         with mock.patch.object(web, "client", fake), mock.patch.object(core, "resolve", resolve):
             web._run_pass(job, [row], "test")
@@ -1551,6 +1591,196 @@ class PassTest(PassBase, _Offline):
         self.run_pass(fake, {"Freedom": [entry(fake, X, 1, "Freedom", [1, 2, 3]), y]}, row)
         st = self.status(row["id"])
         self.assertEqual([st[n][0] for n in (3.5, 4, 5, 6, 7)], ["unavailable", "have", "have", "have", "have"])
+
+
+    # -- junk is a property of a site's copy (resolver._prune_junk), and a junk chapter is still listed --
+
+    def site(self, fake, name, mid, numbers, title=None, broken=True):
+        """Another site listing 3.5 under `title` (with `numbers`), its copy broken unless said otherwise."""
+        m = entry(fake, name, mid, "Freedom", numbers)
+        for c in m.chapters:
+            if c.number == 3.5:
+                c.name = title
+                if broken:
+                    fake.broken.add(chapter_id(mid, 3.5))
+        return m
+
+    @staticmethod
+    def new_copy(*entries, when="2026-09-20"):
+        """The sites put up a new copy of 3.5 (another upload date): its pages are counted again."""
+        for m in entries:
+            next(ch for ch in m.chapters if ch.number == 3.5).uploaded = when
+
+    def listed(self, sid, n):
+        with db.connect() as con:
+            return db.listed_by(db.chapters_by_number(con, sid, [n])[n])
+
+    def test_a_junk_resolve_keeps_every_site_that_lists_the_chapter(self):
+        # Review: a resolve that dropped 3.5 as junk (its best copy had 4 pages) recorded only that site, not Site D,
+        # which had just started to list it under a title of its own; the next pass, which D's search missed,
+        # skipped 3.5 automatically as a side story from the other sites' "Side Story 1"
+        fake, plans, row = self.scenario(auto_skip_side_stories=True)
+        x, d = plans["Freedom"][0], entry(fake, "Site D (EN)", 3, "Freedom", [1, 2, 3, 4, 5])
+        c = self.site(fake, "Site C (EN)", 2, [1, 2, 3, 3.5, 4, 5], "Side Story 1")
+        self.run_pass(fake, {"Freedom": [x, c, d]}, row, pages={})         # 3.5 fails on X and C
+        self.assertEqual(self.status(row["id"])[3.5][0], "failed")
+        self.later(0.6)
+        d = self.site(fake, "Site D (EN)", 3, [1, 2, 3, 3.5, 4, 5], "Chapter 3.5: The Duel")
+        self.new_copy(x, c)                                                # X and C put up short ones
+        short = {chapter_id(1, 3.5): 4, chapter_id(2, 3.5): 3, chapter_id(3, 3.5): 2}
+        self.run_pass(fake, {"Freedom": [x, c, d]}, row, pages=short)      # every copy short: junk this time
+        self.assertEqual(self.status(row["id"])[3.5][0], "junk")
+        self.assertEqual(set(self.listed(row["id"], 3.5)), {X, "Site C (EN)", "Site D (EN)"})
+        with db.connect() as con:
+            names = json.loads(con.execute("SELECT names FROM stuck WHERE number=3.5").fetchone()[0])
+        self.assertEqual(names["Site D (EN)"], "Chapter 3.5: The Duel")
+        self.later(0.6)
+        c = self.site(fake, "Site C (EN)", 2, [1, 2, 3, 3.5, 4, 5, 6], "Side Story 1")     # ranked first now
+        self.new_copy(c, when="2026-09-21")                                                # at full length
+        self.run_pass(fake, {"Freedom": [x, c]}, row, pages={chapter_id(1, 3.5): 4})    # D's search missed it
+        st = self.status(row["id"])
+        self.assertEqual((st[3.5][0], st[4.0][0], st[6.0][0]), ("failed", "have", "wanted"))   # (4, 5: past junk)
+        self.assertEqual(self.skip_events(row["id"]), [])
+        with db.connect() as con:
+            b = stuck.details(con, db.get_series(con, row["id"]))[0]
+        self.assertEqual(b.names["Site D (EN)"], "Chapter 3.5: The Duel")
+        self.assertFalse(b.verdict.auto_skip)
+        self.assertEqual(set(b.short), {X, "Site D (EN)"})                 # never tried: not waited for
+        self.assertEqual(b.untried, [])
+
+    def test_what_you_decided_outlasts_a_week_as_junk(self):
+        # Review: after a week as junk (its copies short while both sites still listed it) your un-skip was
+        # dropped, and once a copy was long enough again the automatic skip took the chapter over it
+        fake, plans, row = self.scenario(auto_skip_side_stories=True)
+        x = plans["Freedom"][0]
+        c = self.site(fake, "Site C (EN)", 2, [1, 2, 3, 3.5, 4, 5], "Side Story 1")
+        both = {"Freedom": [x, c]}
+        self.run_pass(fake, both, row, pages={})
+        self.later(1.1)
+        self.run_pass(fake, both, row, pages={})
+        self.assertEqual(self.status(row["id"])[3.5][0], "ignored")        # skipped automatically
+        with db.connect() as con:
+            self.assertTrue(stuck.unskip(con, row["id"], 3.5))
+        self.later(0.2)
+        self.run_pass(fake, both, row, pages={})
+        self.assertEqual(self.status(row["id"])[3.5][0], "failed")
+        short = {chapter_id(1, 3.5): 4, chapter_id(2, 3.5): 3}
+        for i, days in enumerate((0.5, 4, 4, 4)):                          # junk for 12 days, still listed
+            self.later(days)
+            self.new_copy(x, c, when=f"2026-10-0{i + 1}")                  # a new copy each time: counted again
+            self.run_pass(fake, both, row, pages=short)
+            self.assertEqual(self.status(row["id"])[3.5][0], "junk", i)
+            with db.connect() as con:
+                k = con.execute("SELECT * FROM stuck_choice WHERE number=3.5").fetchone()
+                evidence = con.execute("SELECT names FROM stuck WHERE number=3.5").fetchone()
+            self.assertTrue(k["declined"], i)
+            self.assertIsNone(k["gone_since"], i)
+            self.assertEqual(set(json.loads(evidence[0])), {X, "Site C (EN)"}, i)
+        self.later(0.5)
+        self.new_copy(c, when="2026-10-20")                                # C's copy is whole again
+        self.run_pass(fake, both, row, pages={chapter_id(1, 3.5): 4})
+        self.assertEqual(self.status(row["id"])[3.5][0], "failed")          # tried on C, never skipped again
+        self.assertEqual(self.skip_events(row["id"]), [
+            "chapter 3.5 skipped automatically: probably a side story (high confidence); it held back 2 chapters",
+            "chapter 3.5 un-skipped: wanted again"])
+
+    def test_a_short_best_copy_does_not_let_the_series_past_the_chapter(self):
+        # Review: with its best-ranked copy a 4-page placeholder, 3.5 was junk though Site C had it at full length,
+        # and strict order downloaded 4 and 5 past it; it could not be downloaded at all
+        fake, plans, row = self.scenario("Chapter 3.5: The Duel")
+        x = plans["Freedom"][0]
+        c = self.site(fake, "Site C (EN)", 2, [3.5], "Chapter 3.5: The Duel")
+        pages = {chapter_id(1, 3.5): 4}
+        for _ in range(2):
+            self.run_pass(fake, {"Freedom": [x, c]}, row, pages=pages)
+            st = self.status(row["id"])
+            self.assertEqual((st[3.5][0], st[4.0][0], st[5.0][0]), ("failed", "wanted", "wanted"))
+            self.later(1.1)
+        self.assertNotIn(4.0, self.enqueued(fake))
+        self.assertNotIn(chapter_id(1, 3.5), [e[4] for e in fake.kinds("enqueue")])   # the placeholder: never
+        fake.broken.discard(chapter_id(2, 3.5))                                       # C's copy works again
+        self.run_pass(fake, {"Freedom": [x, c]}, row, pages=pages)
+        self.assertEqual({n: s for n, (s, _) in self.status(row["id"]).items()},
+                         {1.0: "have", 2.0: "have", 3.0: "have", 3.5: "have", 4.0: "have", 5.0: "have"})
+        self.assertEqual(self.enqueued(fake)[-3:], [3.5, 4.0, 5.0])
+
+    def test_not_junk_while_the_site_that_has_it_does_not_answer(self):
+        fake, plans, row = self.scenario("Chapter 3.5: The Duel")
+        x = plans["Freedom"][0]
+        c = self.site(fake, "Site C (EN)", 2, [1, 2, 3, 3.5, 4, 5], "Chapter 3.5: The Duel")
+        pages = {chapter_id(1, 3.5): 4}
+        self.run_pass(fake, {"Freedom": [x, c]}, row, pages=pages)         # C has it in full; it fails there
+        self.later(1.1)
+        self.run_pass(fake, {"Freedom": [x]}, row, down=[c], pages=pages)  # only X's placeholder this time
+        st = self.status(row["id"])
+        self.assertEqual((st[3.5][0], st[4.0][0], st[5.0][0]), ("failed", "wanted", "wanted"))
+        self.assertTrue(st[3.5][1].endswith("; not listed by Site C (EN) in the last check; still waiting for it"),
+                        st[3.5][1])
+        self.assertNotIn(4.0, self.enqueued(fake))
+        for _ in range(3):                                                 # C stays away for more than a week:
+            self.later(3)                                                  # its listing no longer counts, and
+            self.run_pass(fake, {"Freedom": [x]}, row, down=[c], pages=pages)     # 3.5 is junk
+        st = self.status(row["id"])
+        self.assertEqual((st[3.5][0], st[4.0][0], st[5.0][0]), ("junk", "have", "have"))
+
+    def test_a_bad_file_for_a_skipped_chapter_leaves_it_skipped(self):
+        # Review: an import that found a corrupt file of a chapter you skipped made it 'failed', and strict order
+        # held the series behind it again
+        fake, plans, row = self.scenario()
+        self.run_pass(fake, plans, row)
+        with db.connect() as con:
+            self.assertTrue(stuck.skip(con, row["id"], 3.5, "manual"))
+        self.run_pass(fake, plans, row)
+        path = os.path.join(config.STAGING_ROOT, library.safe_title(X), "Freedom", "Chapter 3.5.cbz")
+        with open(path, "wb") as f:
+            f.write(b"PK\x03\x04" + bytes(3000))
+        os.utime(path, (time.time() - 3600, time.time() - 3600))
+        self.run_pass(fake, plans, row)
+        self.assertEqual(self.status(row["id"])[3.5][0], "ignored")
+        self.assertTrue(os.path.exists(path + ".corrupt") or not os.path.exists(path))   # still set aside
+        with db.connect() as con:
+            self.assertEqual(con.execute("SELECT skipped FROM stuck_choice WHERE number=3.5").fetchone()[0], "manual")
+
+    def take_back_at(self, fake, sid, n, at):
+        """You un-skip chapter n when the pass queues chapter `at` (Site X's)."""
+        queue = fake.enqueue
+
+        def enqueue(ids):
+            if chapter_id(1, at) in ids:
+                with db.connect() as con:
+                    self.assertTrue(stuck.unskip(con, sid, n))
+            queue(ids)
+        fake.enqueue = enqueue
+
+    def test_a_chapter_taken_back_during_the_download_holds_the_ones_after_it(self):
+        # Review: an un-skip of 3.5 while the lanes downloaded 4-7 did not stop them: a gap once 3.5 then failed
+        fake, plans, row = self.scenario()
+        m = entry(fake, X, 1, "Freedom", [1, 2, 3, 3.5, 4, 5, 6, 7])
+        plans = {"Freedom": [m]}
+        self.run_pass(fake, plans, row)
+        with db.connect() as con:
+            self.assertTrue(stuck.skip(con, row["id"], 3.5, "manual"))
+        self.take_back_at(fake, row["id"], 3.5, 4)
+        self.run_pass(fake, plans, row)
+        st = self.status(row["id"])
+        self.assertEqual([st[n][0] for n in (3.5, 4, 5, 6, 7)], ["wanted", "have", "wanted", "wanted", "wanted"])
+        self.assertEqual(st[5.0][1], downloader.taken_back_reason(3.5))
+        self.assertEqual(self.enqueued(fake)[-1], 4.0)
+        fake.broken.clear()
+        self.run_pass(fake, plans, row)                                    # the next pass: 3.5 first
+        self.assertEqual(self.enqueued(fake)[-4:], [3.5, 5.0, 6.0, 7.0])
+
+    def test_a_chapter_taken_back_during_a_refresh_s_download_holds_the_ones_after_it(self):
+        fake, plans, row = self.scenario()
+        plans = {"Freedom": [entry(fake, X, 1, "Freedom", [1, 2, 3, 3.5, 4, 5, 6, 7])]}
+        with mock.patch.object(core, "resolve", resolver_for(fake, plans)), db.connect() as con:
+            core.refresh_series(con, fake, row["id"], download=True)
+            self.assertTrue(stuck.skip(con, row["id"], 3.5, "manual"))
+            self.take_back_at(fake, row["id"], 3.5, 4)
+            core.refresh_series(con, fake, row["id"], download=True)
+        st = self.status(row["id"])
+        self.assertEqual([st[n][0] for n in (3.5, 4, 5, 6, 7)], ["wanted", "have", "wanted", "wanted", "wanted"])
+        self.assertEqual(st[7.0][1], downloader.taken_back_reason(3.5))
 
 
 # -- the pages and the API --------------------------------------------------------------------

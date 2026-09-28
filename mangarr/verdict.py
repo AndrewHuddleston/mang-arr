@@ -308,9 +308,13 @@ def site_words(chapters, series: Series, b: float) -> dict[float, str]:
     your own chapters' names, to tell a word the site gives every chapter
     (a spin-off's "... Gaiden Chapter 12") from this chapter's own word
     (Blocker.wholes). Every name is capped first (matching.MAX_TITLE)."""
-    b = _num(b)
-    if b is None:
-        return {}
+    return words_near(site_marks(chapters, series), b)
+
+
+def site_marks(chapters, series: Series) -> list[tuple[float, str, frozenset]]:
+    """The part of site_words that does not depend on the blocker, worked out
+    once per site for all of them: its whole chapters named with a
+    side-story or extra word, as (number, name, words)."""
     marked = []
     for n, name in chapters:
         n = _num(n)
@@ -318,10 +322,18 @@ def site_words(chapters, series: Series, b: float) -> dict[float, str]:
             continue
         name = oneline(name, MAX_TITLE)
         if _MARKLESS.search(name.lower()) and (marks := _marks(_clean(name, series))):
-            marked.append((abs(n - b), n, name, marks))
+            marked.append((n, name, frozenset(marks)))
+    return marked
+
+
+def words_near(marked: list[tuple[float, str, frozenset]], b: float) -> dict[float, str]:
+    """site_words from a site's site_marks, for the blocker b."""
+    b = _num(b)
+    if b is None:
+        return {}
     out: dict[float, str] = {}
     kept: dict[str, int] = {}
-    for _, n, name, marks in sorted(marked, key=lambda x: x[:2]):
+    for _, n, name, marks in sorted(((abs(n - b), n, name, marks) for n, name, marks in marked), key=lambda x: x[:2]):
         if n not in out and any(kept.get(m, 0) < SITE_WORDS for m in marks):
             out[n] = name
             for m in marks:
