@@ -175,6 +175,78 @@ class ChapterMarkerTest(unittest.TestCase):
                 self.assertEqual(match_unparsed(path, names), c.number)
 
 
+class MarkerAsWordTest(unittest.TestCase):
+    """A chapter marker counts only as a word of its own, with its number a
+    word too: a scanlator or site name such as 'Ch4os Scans', 'Ep1c TL' or
+    'www.chapter1.com' holds none (0.3.0 read those names right, the first
+    marker-first parser took the prefix's digit). Of several markers, the
+    one that starts the chapter name (after the scanlator's "_") wins."""
+    GLUED = ["Ch4os Scans_", "Ep1c TL_", "www.chapter1.com_", "Chap7er Team_", "ep2 fans_", "EP9x_", "The Ch3f_",
+             "www.ep1sode.net_", "ch1.org_", "The ep2 fans_", "EP9 Group_", "Ch17 Scans_"]
+    SPACED = ["Ch 3 Scans_", "Episode 5 TL_", "Chapter 1 Group_", "Ep. 9 Fansub_", "Ch.2 Team_"]
+    PLAIN = ["", "Humane Scans_", "_a_nonymous_", "www.natomanga.com_", "Scans 2020_", "Rich 2_"]
+    VOLUMES = ["", "Vol.3 ", "Volume 2 ", "Vol.2 - ", "Vol.TBD "]
+    MARKERS = ["Chapter {}", "Ch.{}", "Ch. {}", "ch{}", "CHAPTER {}", "Chap. {}", "Episode {}", "Ep.{}", "EP {}"]
+    NUMBERS = ["0", "9", "17", "185.5", "171.01", "171.10", "14.005", "2020"]
+    TITLES = ["", " - March 2020 Special", "_ Maidens 101_ A Success_", "_ Part 1", " - Day 14 Extra", "_ #3",
+              " - S2 - Episode 5 recap", "_ Volume 10", " (ch. 11)", " (1r0n)", "_ Ch 3 recap", " [Ch4os Scans]"]
+
+    def test_examples(self):
+        for name, want in {"Ch4os Scans_Chapter 12.cbz": 12.0, "Ep1c TL_Ch.5 - x.cbz": 5.0,
+                           "www.chapter1.com_Chapter 7.cbz": 7.0, "Ch 3 Scans_Chapter 12.cbz": 12.0,
+                           "Episode 5 TL_Ch.5 - Episode 2 of the arc.cbz": 5.0, "Scans_Chapter 12 (ch. 11).cbz": 12.0,
+                           "Chapter 12_ Ch 3 recap.cbz": 12.0, "Ch 3 Scans_Vol.3 Ch.5.cbz": 5.0,
+                           "ep2 fans_Day 3.cbz": 3.0, "EP9 Group_#4 - Room 101.cbz": 4.0, "Scans_Ch17.cbz": 17.0,
+                           "Ch17.cbz": 17.0, "Ch17_ The Start.cbz": 17.0, "Scans_Chapter 3a.cbz": 3.0}.items():
+            with self.subTest(name=name):
+                self.assertEqual(parse_number(name), want)
+        for name in ("Ep 5 TL_S2 - Episode 7.cbz", "Ch4os Scans_S2 - Ep. 7.cbz", "Day 3 TL_S1 - Chapter 2.cbz"):
+            with self.subTest(name=name):
+                self.assertIsNone(parse_number(name))           # a season episode, matched through Suwayomi's names
+
+    def test_fuzz_prefixes_with_a_marker_in_them(self):
+        """Every prefix class x volume x marker form x number x title reads
+        as the chapter's number."""
+        import itertools
+        wrong = []
+        for p, v, m, n, t in itertools.product(self.GLUED + self.SPACED + self.PLAIN, self.VOLUMES, self.MARKERS,
+                                               self.NUMBERS, self.TITLES):
+            name = f"{p}{v}{m.format(n)}{t}.cbz"
+            if parse_number(name) != float(n):
+                wrong.append((name, parse_number(name)))
+        self.assertEqual(wrong[:10], [])
+
+    def test_fuzz_prefixes_before_a_chapter_name_without_a_marker(self):
+        """A marker glued to a digit in the prefix is no marker for a name
+        with only a keyword (#, Day, Part ...) either, as in 0.3.0."""
+        import itertools
+        wrong = []
+        for p, v, k, n, t in itertools.product(self.GLUED + self.PLAIN, ["", "Vol.3 "],
+                                               ["#{}", "Day {}", "Part {}", "Room {}", "Mission {}"], self.NUMBERS,
+                                               ["", " - The End", " (1r0n)", "_ Room 404"]):
+            name = f"{p}{v}{k.format(n)}{t}.cbz"
+            if parse_number(name) != float(n):
+                wrong.append((name, parse_number(name)))
+        self.assertEqual(wrong[:10], [])
+
+    def test_fuzz_season_episodes_after_a_prefix(self):
+        import itertools
+        for p, s, n, t in itertools.product(self.GLUED + self.SPACED + self.PLAIN,
+                                            ["S2 - Episode {}", "S1 - Ch.{}", "S3 - Ep. {}"], self.NUMBERS,
+                                            ["", "_ Part 1", " - 2020 Special"]):
+            name = f"{p}{s.format(n)}{t}.cbz"
+            with self.subTest(name=name):
+                self.assertIsNone(parse_number(name))
+
+    def test_long_names_stay_fast(self):
+        """Many markers in one name: every one is looked at once."""
+        import time
+        for name in ("Ch1 " * 400, "_Ch.1" * 300, "Vol.1 " * 300 + "Ch.2", "ch1_" * 400):
+            t = time.monotonic()
+            parse_number(name + ".cbz")
+            self.assertLess(time.monotonic() - t, 0.5, name[:20])
+
+
 class NamesTest(unittest.TestCase):
     def test_filename_sorts(self):
         names = [chapter_filename(n) for n in (12.0, 12.5, 100.0, 1.0, 16.0, 16.5)]

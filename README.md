@@ -820,8 +820,11 @@ series. Chapter numbers are parsed from the file names (`Chapter 12`,
 `Ch.12.5`, `Episode 12`, `#12`, and a dozen other shapes seen in the wild);
 a chapter marker (`Chapter`, `Ch.`, `Episode`, `Ep.`) decides, after
 Suwayomi's `<scanlator>_` prefix too, so `Humane Scans_Ch.17 - Maidens 101`
-is chapter 17. Files without a readable number are reported and, unless
-Suwayomi's chapter list can place them (next section), skipped.
+is chapter 17. A marker counts only as a word of its own with its number
+(`Ch4os Scans_Chapter 12` is 12, `www.chapter1.com_Chapter 7` is 7), and of
+several the one that starts the chapter name after the prefix wins (`Ch 3
+Scans_Chapter 12` is 12). Files without a readable number are reported and,
+unless Suwayomi's chapter list can place them (next section), skipped.
 
 Note that a refresh keeps only one Suwayomi entry per series (the primary
 source) in Suwayomi's own library, so Suwayomi's update checks one entry
