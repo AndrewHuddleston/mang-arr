@@ -386,18 +386,34 @@ class StopTest(PipelineBase):
         self.assertTrue(self.lock_free())
 
     def test_one_blip_seen_by_all_lanes_counts_once(self):
+        """Suwayomi stops answering while the lanes download, once the resolve step is done: a resolve in the
+        blip would fail too (a 4th error), and its wait for the hold (limits.pause) takes 2 ms here (time.sleep
+        is patched), so the next resolve would count as a second outage. It answers again when the pass has
+        waited out its hold, not after a set time: a 0.15 s Timer was seen firing up to 90 ms late."""
         fake = self.fake(secs=0.05)
         plans = self.many(fake, 6, chapters=3)
         rows = self.seed(*plans)
-        seen = []
+        seen, resolved, blip = [], threading.Event(), threading.Event()
+        close = lanes.LanePool.close
+
+        def closed(pool):                               # the resolve step has handed every series over
+            close(pool)
+            resolved.set()
+
+        class Blip(lanes.Outages):
+            def served(self):
+                if self.pending:                        # the hold is over: the blip is too
+                    fake.down = False
+                super().served()
 
         def on_finish(f, cid):
             seen.append(cid)
-            if len(seen) == 2:
+            if len(seen) >= 2 and resolved.is_set() and not blip.is_set():
+                blip.set()
                 f.down = True
-                threading.Timer(0.15, setattr, (f, "down", False)).start()
         fake.on_finish = on_finish
-        with self.assertLogs("mangarr.lanes", "WARNING"):
+        with mock.patch.object(lanes.LanePool, "close", closed), mock.patch.object(lanes, "Outages", Blip), \
+                self.assertLogs("mangarr.lanes", "WARNING"):
             job, out = self.run_pass(fake, plans, rows)
         done, downloaded, imported, errors = out            # no PassStopped: one outage, held once
         self.assertGreaterEqual(errors, 1)
