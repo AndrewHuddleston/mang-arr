@@ -39,7 +39,7 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
 
-from . import config, core, db, downloader, limits, metrics, serieslock, settings, stuck
+from . import config, core, db, downloader, inflight, limits, metrics, serieslock, settings, stuck
 from .resolver import Plan
 from .suwayomi import BREAKER_SECS, SuwayomiUnreachable, with_cancel
 
@@ -265,6 +265,7 @@ class LanePool:
             with self._cv:
                 self._render()
             return
+        inflight.queue(series_id, title, wanted, None, "waiting for a download lane")
         with self._cv:
             item["state"], item["result"] = "waiting", f"resolved: {len(wanted)} chapter(s) due; waiting for a " \
                                                        "download lane"
@@ -351,6 +352,8 @@ class LanePool:
                 except OSError as e:
                     log.warning("%s: could not release the download lock: %s", self.label, e)
                 self._fd = None
+            for it in list(getattr(self.job, "items", None) or []):     # nothing of the pass is in flight any more
+                inflight.clear(it.get("series_id"))
             with self._cv:
                 self._lane_state.clear()
                 self._ending = ""
@@ -583,7 +586,8 @@ class LanePool:
             try:
                 downloader.clear_leftovers(self.client, self.cancelled)
                 # the series' files are not renamed while it downloads (let go before the import)
-                with serieslock.hold(task.series_id, shared=True, should_cancel=self.cancelled):
+                with serieslock.hold(task.series_id, shared=True, should_cancel=self.cancelled), \
+                        inflight.tracking(task.series_id, task.title):
                     ok, failed, why = downloader._download_source(
                         self.client, run.match.manga_id, run.todo, run.batch, task.title, src.name, run.patient,
                         self.cancelled, self._reporter(task, lane), memo, stop_on_fail=run.in_order,
@@ -628,6 +632,12 @@ class LanePool:
         (outside _cv, with its own connection); set its item and add it to
         the counts. A series the pass stopped before any step of it ran is
         only marked."""
+        try:
+            self._write(task)
+        finally:
+            inflight.clear(task.series_id)          # its chapters are no longer in flight, whatever came of them
+
+    def _write(self, task: SeriesTask) -> None:
         item, sid = task.item, task.series_id
         if task.deleted:
             item["state"], item["result"] = "cancelled", "series was deleted"

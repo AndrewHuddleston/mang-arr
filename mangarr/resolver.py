@@ -191,7 +191,7 @@ class Plan:
 def resolve(client: Client, series: Series, sources: list[Source] | None = None,
             reliability: dict[str, float] | None = None, should_cancel: Callable[[], bool] | None = None,
             progress: Callable[[str], None] | None = None, counts: PageCounts | None = None,
-            settled: set[float] | None = None) -> Plan:
+            settled: set[float] | None = None, known: dict[str, dict] | None = None) -> Plan:
     """The plan for a series. Several sites are searched at once
     (search_parallel; _search_parallel), and the plan is the same whatever
     order they answer in. A cancel (should_cancel) is noticed between
@@ -200,7 +200,16 @@ def resolve(client: Client, series: Series, sources: list[Source] | None = None,
     `counts`, fractional chapters counted in an earlier pass are not
     counted again while their count holds (see pagecounts.py). `settled`:
     the chapters on disk or ignored, which no pass downloads, so only the
-    best copy of each is counted (_prune_junk)."""
+    best copy of each is counted (_prune_junk).
+
+    `known` makes it a quick check: {source name: the entry stored for the
+    series there (manga_id, title, match_level)}, as the last full search
+    left them. No site is searched by title then: each known entry's chapter
+    list is read again, and the sources that had no entry are left out. An
+    entry that cannot be read counts as a source that could not be searched,
+    so what is stored for it is kept. Without it (None) every source is
+    searched by title, which also finds the series on a source that has
+    added it since."""
     cancel = should_cancel or (lambda: False)
     report = progress or (lambda m: None)
     raw = client
@@ -208,8 +217,13 @@ def resolve(client: Client, series: Series, sources: list[Source] | None = None,
     sources = sources if sources is not None else client.sources()
     reliability = reliability or {}
     titles = capped_search_titles(series)
-    log.info("resolving %s [%s] across %d sources, titles: %s", oneline(series.title), series.ref[:80],
-             len(sources), oneline(" | ".join(titles[:5]), 400))
+    if known is not None:
+        sources = [x for x in sources if x.name in known]
+        log.info("checking %s [%s]: the chapter lists of its %d known source entries (no title search)",
+                 oneline(series.title), series.ref[:80], len(sources))
+    else:
+        log.info("resolving %s [%s] across %d sources, titles: %s", oneline(series.title), series.ref[:80],
+                 len(sources), oneline(" | ".join(titles[:5]), 400))
     matches: list[SourceMatch] = []
     rejected: list[Rejected] = []
     unreachable: list[tuple[Source, str]] = []
@@ -220,14 +234,14 @@ def resolve(client: Client, series: Series, sources: list[Source] | None = None,
     searched = [s for s in sources if not s.unusable]   # disabled in Settings: not searched, not downloaded from
     width = min(int(limits.setting("search_parallel")), len({site_key(s.name) for s in searched}))
     if width > 1:
-        results = _search_parallel(raw, series, searched, titles, width, cancel, report)
+        results = _search_parallel(raw, series, searched, titles, width, cancel, report, known)
     else:
         results = []
         for i, src in enumerate(searched, 1):
             if cancel():
                 raise Cancelled()
-            report(f"searching {src.name} ({i} of {len(searched)} sources)")
-            results.append(_search_one(client, src, series, titles, cancel))
+            report(f"{'reading' if known is not None else 'searching'} {src.name} ({i} of {len(searched)} sources)")
+            results.append(_search_one(client, src, series, titles, cancel, (known or {}).get(src.name)))
     # in the order of the sources, whatever order the searches finished in
     for src, (found, hits) in zip(searched, results, strict=True):
         rejected.extend(hits)
@@ -284,7 +298,7 @@ def gentle_titles(series: Series, titles: list[str]) -> list[str]:
 
 
 def _search_one(client, src: Source, series: Series, titles: list[str],
-                should_cancel: Callable[[], bool]) -> tuple[object, list[Rejected]]:
+                should_cancel: Callable[[], bool], known: dict | None = None) -> tuple[object, list[Rejected]]:
     """(what _search_source returned, the hits it rejected) for one source.
     An unexpected error in one source's search (an odd answer it could not
     read) costs only that source this time: it counts as not searched, so
@@ -292,8 +306,11 @@ def _search_one(client, src: Source, series: Series, titles: list[str],
     still count. Cancelled and SuwayomiUnreachable are raised."""
     rejected: list[Rejected] = []
     try:
-        found = _search_source(client, src, series, gentle_titles(series, titles) if src.page_warm else titles,
-                               rejected, should_cancel)
+        if known is not None:
+            found = _known_entry(client, src, series, known, should_cancel)
+        else:
+            found = _search_source(client, src, series, gentle_titles(series, titles) if src.page_warm else titles,
+                                   rejected, should_cancel)
     except (Cancelled, SuwayomiUnreachable):
         raise
     except Exception as e:
@@ -303,7 +320,8 @@ def _search_one(client, src: Source, series: Series, titles: list[str],
 
 
 def _search_parallel(client, series: Series, sources: list[Source], titles: list[str], width: int,
-                     cancel: Callable[[], bool], report: Callable[[str], None]) -> list:
+                     cancel: Callable[[], bool], report: Callable[[str], None],
+                     known: dict[str, dict] | None = None) -> list:
     """_search_one for every source, up to `width` sites at once, each site
     on one of `width` threads (the sources of a site, its EN and ALL
     variants, one after the other: never two searches on one site at once,
@@ -321,6 +339,8 @@ def _search_parallel(client, series: Series, sources: list[Source], titles: list
         sites.setdefault(site_key(src.name), []).append(i)
 
     def cost(group: list[int]) -> float:              # the most seconds of spacing a site's searches can take
+        if known is not None:                           # one call per entry
+            return sum(GENTLE_SEARCH_GAP_SECS if sources[i].page_warm else SEARCH_GAP_SECS for i in group)
         return sum((GENTLE_SEARCH_GAP_SECS * min(len(titles), GENTLE_SEARCH_TITLES)) if sources[i].page_warm
                    else SEARCH_GAP_SECS * len(titles) for i in group)
     todo = sorted(sites.values(), key=lambda g: (-cost(g), g[0]))
@@ -336,7 +356,8 @@ def _search_parallel(client, series: Series, sources: list[Source], titles: list
 
     def say() -> None:
         with say_lock:                                  # one after the other: the count never goes back
-            report(f"searching {len(sources)} sources, {width} at a time ({done[0]} done)")
+            report(f"{'reading the chapter lists of' if known is not None else 'searching'} {len(sources)} sources, "
+                   f"{width} at a time ({done[0]} done)")
 
     def work() -> None:
         while not halted():
@@ -348,7 +369,7 @@ def _search_parallel(client, series: Series, sources: list[Source], titles: list
                 if halted():
                     return
                 try:
-                    res = _search_one(ops, sources[i], series, titles, halted)
+                    res = _search_one(ops, sources[i], series, titles, halted, (known or {}).get(sources[i].name))
                 except BaseException as e:              # Cancelled, SuwayomiUnreachable, or worse: ends them all
                     with lock:
                         fatal[i] = e
@@ -456,35 +477,60 @@ def _search_source(client, src, series, titles, rejected, should_cancel: Callabl
             continue
         scored.sort(key=lambda x: x[0])
         lvl, hit, matched = scored[0]
-        try:
-            manga, chapters = client.manga(hit["id"])
-        except SuwayomiUnreachable:
-            raise
-        except SuwayomiError as e:
-            if "no chapters" in str(e).lower():       # matched, but the entry is empty
-                manga, chapters = hit, []
-            else:
-                return str(e)[:60]
-        author = manga.get("author") or manga.get("artist") or hit.get("author")
-        author = author[:MAX_TITLE] if isinstance(author, str) else author
-        a_lvl = author_level(author, series.authors)
-        listed = len(chapters)
-        chapters = plausible_chapters(src.name, chapters)
-        m = SourceMatch(src, hit["id"], manga.get("title") or hit["title"], author,
-                        lvl, matched, a_lvl, chapters, query=q)
-        if a_lvl == AUTHOR_DIFFER:
-            m.note = f"author differs ({oneline(author, 80)!r} vs {series.authors[:2]})"
-        elif src.unusable:
-            m.note = "source cannot deliver images from here"
-        elif not chapters:
-            m.note = "lists no chapters" if not listed else "lists no plausible chapter numbers"
-        elif len(chapters) > MAX_CHAPTERS_PER_SOURCE:
-            m.note = f"lists {len(chapters)} chapters, more than any real series ({MAX_CHAPTERS_PER_SOURCE})"
-            log.warning("%s: %s - not trusted", src.name, m.note)
-        log.info("%-26s %-34s %4d ch, max %-6g id=%-6d %s", src.name, oneline(m.title, 34), len(chapters),
-                 m.max, hit["id"], f"[{m.note}]" if m.note else "")
-        return m
+        return _entry(client, src, series, hit["id"], hit, lvl, matched, q)
     return None
+
+
+def _known_entry(client, src, series, known: dict, should_cancel: Callable[[], bool] | None = None):
+    """The quick check of one source: the chapter list of the entry stored
+    for the series there, read again. Returns what _search_source does
+    (never None: the entry was matched by the search that found it). One
+    call to the site, spaced like a search."""
+    import time
+    gone = _unreachable.get(src.id)
+    if gone and time.monotonic() - gone[0] < UNREACHABLE_TTL:
+        return gone[1] + " (skipped: unreachable earlier)"
+    if SEARCHES.wait(site_key(src.name), GENTLE_SEARCH_GAP_SECS if src.page_warm else SEARCH_GAP_SECS,
+                     should_cancel):
+        raise Cancelled()
+    hit = {"id": int(known["manga_id"]), "title": known.get("title") or "", "author": known.get("author")}
+    found = _entry(client, src, series, hit["id"], hit, known.get("match_level", 0), None, "")
+    if isinstance(found, str) and _is_connectivity(found):
+        _unreachable[src.id] = (time.monotonic(), "DNS/network: " + found[:80])
+    return found
+
+
+def _entry(client, src, series, manga_id: int, hit: dict, lvl: int, matched, q: str):
+    """The SourceMatch of one source entry, with its chapter list read from
+    the site; or str when it cannot be read this time."""
+    try:
+        manga, chapters = client.manga(manga_id)
+    except SuwayomiUnreachable:
+        raise
+    except SuwayomiError as e:
+        if "no chapters" in str(e).lower():       # matched, but the entry is empty
+            manga, chapters = hit, []
+        else:
+            return str(e)[:60]
+    author = manga.get("author") or manga.get("artist") or hit.get("author")
+    author = author[:MAX_TITLE] if isinstance(author, str) else author
+    a_lvl = author_level(author, series.authors)
+    listed = len(chapters)
+    chapters = plausible_chapters(src.name, chapters)
+    m = SourceMatch(src, manga_id, manga.get("title") or hit["title"], author,
+                    lvl, matched, a_lvl, chapters, query=q)
+    if a_lvl == AUTHOR_DIFFER:
+        m.note = f"author differs ({oneline(author, 80)!r} vs {series.authors[:2]})"
+    elif src.unusable:
+        m.note = "source cannot deliver images from here"
+    elif not chapters:
+        m.note = "lists no chapters" if not listed else "lists no plausible chapter numbers"
+    elif len(chapters) > MAX_CHAPTERS_PER_SOURCE:
+        m.note = f"lists {len(chapters)} chapters, more than any real series ({MAX_CHAPTERS_PER_SOURCE})"
+        log.warning("%s: %s - not trusted", src.name, m.note)
+    log.info("%-26s %-34s %4d ch, max %-6g id=%-6d %s", src.name, oneline(m.title, 34), len(chapters),
+             m.max, manga_id, f"[{m.note}]" if m.note else "")
+    return m
 
 
 def plausible_chapters(source_name: str, chapters: list[Chapter]) -> list[Chapter]:

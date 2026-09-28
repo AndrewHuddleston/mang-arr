@@ -10,6 +10,7 @@ through get(), so a change on the Settings page applies to the next job.
     page_warm_sources    list   PAGE_WARM_SOURCES  fetched page by page (image server refuses bursts)
     download_lanes       int    3      sources downloading at once in a pass (1-8; Suwayomi's cap wins)
     search_parallel      int    5      sites searched at once while a series is resolved (1-8)
+    full_search_days     float  7      days between searches of every source for a series (0 = every pass)
     page_delay_seconds   float  2.5    starting and minimum gap between page requests (page by page)
     download_in_order    bool   True   strict download in order, per series
     auto_skip_side_stories bool False  skip a blocking chapter judged a side story or covered (stuck.py)
@@ -65,6 +66,9 @@ DEFAULTS: dict[str, object] = {
     "download_in_order": True,       # per series, strictly in chapter order; a stuck chapter holds only its series
     "auto_skip_side_stories": False,  # skip a stuck chapter judged a side story or covered, high confidence only
     "recheck_finished_days": 7.0,   # a finished series with nothing missing is re-checked this often
+    # every source is searched by title for a series this often; passes in between read the chapter
+    # lists of the entries they know (0 = search every source every pass)
+    "full_search_days": 7.0,
     "min_pages": config.MIN_PAGES,
     "throttled_delay_seconds": 8.0,  # pause between chapters on a rate-limited source (avoids 429 -> long backoff)
     "download_lanes": 3,             # sources downloading at once in a pass, one series each (see limits.RANGES)

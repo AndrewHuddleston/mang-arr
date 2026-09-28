@@ -22,6 +22,7 @@ RANGES: dict[str, tuple[float, float]] = {
     "refresh_hours": (0.25, 168.0),             # every 15 min .. once a week
     "throttled_delay_seconds": (0.0, 600.0),    # pause between chapters on a rate-limited source
     "recheck_finished_days": (0.0, 365.0),      # 0 = always re-check finished series
+    "full_search_days": (0.0, 90.0),            # 0 = search every source for every series every pass
     "download_lanes": (1.0, 8.0),               # sources downloading at once in a pass
     "search_parallel": (1.0, 8.0),              # sites searched at once while a series is resolved
     "page_delay_seconds": (0.5, 60.0),          # gap between page requests on a page-by-page source

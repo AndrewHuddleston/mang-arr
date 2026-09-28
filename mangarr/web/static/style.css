@@ -550,3 +550,7 @@ html:not([data-advanced]) .advanced{display:none !important}
 .rename-left{margin-top:10px}.rename-left > summary{cursor:pointer;color:var(--help)}
 #rename-komga{margin-top:12px}
 .rename-runs .note{color:var(--help);font-size:12px}
+
+/* -- chapters in flight ----------------------------------------------------------------------- */
+.episode-row.in-flight{background:rgba(122,67,182,.08)}
+.label.inflight-label{cursor:default}

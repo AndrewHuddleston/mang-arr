@@ -814,6 +814,47 @@
     if (location.hash === '#rename') { openModal(renameModal); load(); }
   }
 
+  /* -- series page: chapters being downloaded, live (Sonarr's queue status on a row) -- */
+  const seriesId = body.dataset.seriesId;
+  if (seriesId && $('.episode-row')) {
+    const rowOf = (n) => $(`.episode-row[data-number="${String(Number(n))}"]`);
+    let seen = new Set($$('.episode-row[data-inflight]').map((r) => r.dataset.number));
+    async function flight() {
+      let list;
+      try {
+        const r = await fetch('/api/v1/queue/chapters?seriesId=' + encodeURIComponent(seriesId), { headers: { Accept: 'application/json' } });
+        if (!r.ok) return;
+        list = await r.json();
+      } catch (e) { return; }
+      const now = new Set();
+      list.forEach((c) => {
+        const tr = rowOf(c.number);
+        now.add(String(Number(c.number)));
+        if (!tr || tr.dataset.status === 'have') return;
+        const busy = c.state === 'downloading';
+        tr.dataset.inflight = c.state;
+        tr.classList.add('in-flight');
+        const cell = $('.col-status', tr);
+        let label = $('.inflight-label', cell);
+        if (!label) {
+          const old = $('.label', cell);
+          label = document.createElement('span');
+          if (old) old.replaceWith(label); else cell.prepend(label);
+        }
+        label.className = `label ${busy ? 'purple' : 'info'} medium inflight-label`;
+        label.textContent = busy ? 'Downloading' : 'Queued';
+        label.title = c.text || '';
+        const why = $('.col-reason', tr);
+        if (why) { why.classList.remove('text-danger'); why.textContent = c.text || (c.source ? 'from ' + c.source : ''); }
+      });
+      // one that was in flight and is not any more arrived or failed: the page has its outcome
+      const over = Array.from(seen).some((n) => !now.has(n));
+      seen = now;
+      if (over && !openModalEl && !menus.some((m) => m.open)) location.reload();
+    }
+    setInterval(flight, 5000);
+  }
+
   /* -- pages that reload themselves while something runs ------------------ */
   const main = $('main[data-reload]');
   if (main) {

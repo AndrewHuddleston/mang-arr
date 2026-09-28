@@ -34,6 +34,7 @@ from .. import (
     downloader,
     duplicates,
     health,
+    inflight,
     jobs,
     komga,
     lanes,
@@ -374,7 +375,7 @@ def _run_pass(job: jobs.Job, rows, label: str, skippable=()) -> tuple[int, int, 
             try:
                 with db.connect() as con:
                     o = core.refresh_series(con, client, r["id"], download=False, should_cancel=cancel,
-                                            progress=prog)
+                                            progress=prog, quick=True)
                     downloaded += o.downloaded
                     imported += o.imported
                     due = core.downloads_due(con, o)
@@ -924,7 +925,7 @@ def series_page(request: Request, series_id: int, page_no: int = Query(1, alias=
                 stuck_at={st.number: st for st in blocked}, skipped={k["number"]: k for k in skips},
                 skip_notes=skips,
                 auto_skip=bool(settings.get("auto_skip_side_stories") and settings.get("download_in_order")),
-                progress_lost=renamer.PROGRESS_LOST)
+                progress_lost=renamer.PROGRESS_LOST, inflight=inflight.by_number(series_id))
 
 
 @app.post("/series/{series_id}/refresh")
@@ -1378,7 +1379,7 @@ def activity_page(request: Request):
     passes = [j for j in jobs_ if j.items]
     current = next((j for j in passes if j.status == "running"), passes[0] if passes else None)
     return page(request, "activity.html", jobs=jobs_, squeue=squeue, queue=views.queue_rows(jobs_, squeue),
-                pass_job=current)
+                pass_job=current, chapters=inflight.rows())
 
 
 @app.get("/activity/history")
@@ -1930,7 +1931,7 @@ ADVANCED_SETTINGS = {
     "media-management": ("replace_illegal_characters", "chapter_title_max_chars", "drop_number_only_titles"),
     "sources": ("page_warm_sources",),
     "downloading": ("throttled_delay_seconds", "download_lanes", "search_parallel", "page_delay_seconds",
-                    "recheck_finished_days", "min_pages"),
+                    "recheck_finished_days", "full_search_days", "min_pages"),
     "general": ("allowed_hosts",),
 }
 
@@ -2234,6 +2235,20 @@ def api_lookup(request: Request, term: str):
 def api_wanted():
     with db.connect() as con:
         return [dict(r) for r in db.wanted_all(con)]
+
+
+def _inflight_out(rows: list[dict]) -> list[dict]:
+    return [{"seriesId": r["series_id"], "title": r["title"], "number": r["number"], "source": r["source"],
+             "state": r["state"], "text": r["text"], "since": r["since"]} for r in rows]
+
+
+@app.get("/api/v1/queue/chapters")
+def api_queue_chapters(seriesId: int | None = None):  # noqa: N803
+    """The chapters being downloaded or waiting their turn right now, of
+    every series or of one: [{"seriesId", "title", "number", "source",
+    "state": "downloading" | "queued", "text", "since"}], what is
+    downloading first. What came of a chapter is in its series."""
+    return _inflight_out(inflight.rows(seriesId))
 
 
 @app.get("/api/v1/queue")

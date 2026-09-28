@@ -20,6 +20,7 @@ from . import (
     db,
     downloader,
     duplicates,
+    inflight,
     komga,
     library,
     limits,
@@ -64,21 +65,29 @@ class Outcome:
 
 def add_series(con, client: Client, series: Series, download: bool = True, do_import: bool = True,
                series_id: int | None = None, should_cancel: Callable[[], bool] | None = None,
-               progress: Callable[[str], None] | None = None) -> Outcome:
+               progress: Callable[[str], None] | None = None, quick: bool = False) -> Outcome:
     """Track a series: resolve it, remember the plan, fetch what is missing,
     link the results into the library. With series_id (a refresh) the row
     must still exist afterwards, or the work is abandoned. A cancel cuts the
     Suwayomi call in flight short: while sources are searched it raises
     limits.Cancelled with nothing saved, afterwards what was saved stays (a
     download returns what arrived). A new series tracked already under its
-    other reference raises duplicates.AlreadyTracked before any search."""
+    other reference raises duplicates.AlreadyTracked before any search.
+
+    quick (a refresh pass): when every source was searched for the series
+    less than full_search_days ago, only the chapter lists of the entries
+    stored for it are read again (known_entries), which finds new chapters
+    without a title search on every site. A search of every source still
+    happens when that is due, when an entry could not be read, and whenever
+    quick is off (adding a series, Refresh on its page)."""
     if series_id is None:
         duplicates.check_new(con, series)
     counts = PageCounts(con)             # fractional chapters counted in an earlier pass
     settled = set() if series_id is None else {r[0] for r in con.execute(
         "SELECT number FROM chapter WHERE series_id=? AND status IN ('have','ignored')", (series_id,))}
+    known = known_entries(con, series_id) if quick and series_id is not None else None
     plan = resolve(client, series, reliability=db.reliability(con), should_cancel=should_cancel, progress=progress,
-                   counts=counts, settled=settled)
+                   counts=counts, settled=settled, known=known)
     lookups = with_cancel(client, should_cancel)
     if series_id is not None and not db.get_series(con, series_id):
         raise Gone(f"{series.title} was deleted during the refresh")
@@ -87,6 +96,10 @@ def add_series(con, client: Client, series: Series, download: bool = True, do_im
     blocked = stuck.blockers(con, series_id)        # as the last pass left it: save_plan makes these wanted again
     expired = db.save_plan(con, series_id, plan, p.manga_id if p else None)
     counts.save(con, plan)
+    if known is None:
+        con.execute("UPDATE series SET last_searched=? WHERE id=?", (db.now(), series_id))
+    elif plan.unreachable or not p:                 # an entry could not be read, or none is usable: search again
+        con.execute("UPDATE series SET last_searched=NULL WHERE id=?", (series_id,))
     hold_in_order(con, series_id, plan)             # save_plan's reasons for the chapters that still wait
     if expired:
         log.warning("%s: %s could not be searched for over %d days; its entry is dropped and the chapters only it "
@@ -116,9 +129,22 @@ def add_series(con, client: Client, series: Series, download: bool = True, do_im
     return out
 
 
+def known_entries(con, series_id: int) -> dict[str, dict] | None:
+    """The source entries stored for a series, by source name, when a quick
+    check of them is enough: every source was searched for it less than
+    full_search_days ago and it has entries. None when the search of every
+    source is due (never done, too long ago, the setting is 0)."""
+    days = limits.setting("full_search_days")
+    row = con.execute("SELECT last_searched FROM series WHERE id=?", (series_id,)).fetchone()
+    if not days or row is None or not row["last_searched"] or row["last_searched"] < db.ago(days):
+        return None
+    rows = db.sources(con, series_id)
+    return {r["source_name"]: dict(r) for r in rows} or None
+
+
 def refresh_series(con, client: Client, series_id: int, download: bool = True,
                    should_cancel: Callable[[], bool] | None = None,
-                   progress: Callable[[str], None] | None = None) -> Outcome:
+                   progress: Callable[[str], None] | None = None, quick: bool = False) -> Outcome:
     """Re-check a tracked series. Metadata is refreshed first (status,
     chapter count, new synonyms) and falls back to the stored row when the
     provider is unavailable. A cancel cuts a slow provider lookup short."""
@@ -135,7 +161,7 @@ def refresh_series(con, client: Client, series_id: int, download: bool = True,
         except (metadata.LookupError_, ValueError) as e:
             log.warning("%s: metadata refresh failed, using stored record: %s", row["title"], e)
     return add_series(con, client, series, download=download, series_id=series_id, should_cancel=should_cancel,
-                      progress=progress)
+                      progress=progress, quick=quick)
 
 
 def refresh_metadata(con, series_id: int) -> str:
@@ -446,12 +472,18 @@ def download_wanted(con, client: Client, series_id: int, plan: Plan,
     reasons: dict = {}
     seen_throttle: set = set()
     attempts: list = []
-    with serieslock.hold(series_id, shared=True, should_cancel=should_cancel):    # let go before the import
-        results = downloader.download(client, plan, only=wanted_set, should_cancel=should_cancel, reasons=reasons,
-                                      progress=progress, throttled=seen_throttle,
-                                      dropped=lambda: dropped_chapters(con, series_id, wanted_set),
-                                      attempts=attempts,
-                                      taken_back=lambda: taken_back(con, series_id, wanted_set, before))
+    title = plan.series.title
+    inflight.queue(series_id, title, wanted, None, "waiting for the download to start")
+    try:
+        with serieslock.hold(series_id, shared=True, should_cancel=should_cancel), \
+                inflight.tracking(series_id, title):                                # let go before the import
+            results = downloader.download(client, plan, only=wanted_set, should_cancel=should_cancel,
+                                          reasons=reasons, progress=progress, throttled=seen_throttle,
+                                          dropped=lambda: dropped_chapters(con, series_id, wanted_set),
+                                          attempts=attempts,
+                                          taken_back=lambda: taken_back(con, series_id, wanted_set, before))
+    finally:
+        inflight.clear(series_id)
     record_downloads(con, series_id, plan, wanted, results, reasons, seen_throttle, attempts)
     return results
 
@@ -507,9 +539,14 @@ def download_chapter(con, client: Client, series_id: int, number: float, manga_i
             continue
         if s["note"] and manga_id is None:
             continue
-        with serieslock.hold(series_id, shared=True, should_cancel=cancel):       # let go before the import
-            ok, failed, why = downloader.download_one(client, s["manga_id"], ch, title, s["source_name"],
-                                                      should_cancel=cancel, progress=progress)
+        inflight.queue(series_id, title, [number], s["source_name"], "waiting for the download to start")
+        try:
+            with serieslock.hold(series_id, shared=True, should_cancel=cancel), \
+                    inflight.tracking(series_id, title):                            # let go before the import
+                ok, failed, why = downloader.download_one(client, s["manga_id"], ch, title, s["source_name"],
+                                                          should_cancel=cancel, progress=progress)
+        finally:
+            inflight.finish(series_id, [number])
         metrics.record_download(s["source_name"], "ok" if ok else "failed")
         db.record_source_result(con, s["source_name"], "ok" if ok else "failed")
         con.commit()                                # before the next source's network calls
