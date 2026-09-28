@@ -2,17 +2,26 @@
 
 A seeded simulator runs core.refresh_series (resolve, save_plan, the
 stuck-behind update, import, download, the update after it) pass after pass
-over one series on 2-4 made-up sites. Between passes the clock moves on by
-hours to days and the sites change: they rename a fractional chapter (a
-side story's name, a title of its own, a plain one), list or drop chapters
-(now and then one goes from every site), add new ones, fix a broken copy. In each pass every site answers, does not
-answer (plan.unreachable) or its search misses the series (absent from the
-plan); now and then Suwayomi itself does not answer (no resolve), stops in
-the middle of a download, or the database is restored from an earlier
-backup. Between passes the user skips, un-skips, keeps waiting, ignores or
-wants a chapter again, and sometimes presses Keep waiting while the pass is
-judging that very chapter. After every pass, and at every download, the
-invariants are checked against a model that keeps what the passes saw:
+over one series on 2-4 made-up sites. The resolve works from the sites'
+chapter lists with the real ranking (resolver._assign) and the real junk
+check (resolver._prune_junk, with the page-count cache between passes); the
+download is the real downloader.download loop, with a stand-in for what
+Suwayomi does with one run of chapters. Between passes the clock moves on by
+hours to days (now and then several days) and the sites change: they rename
+a fractional chapter (a side story's name, a title of its own, a plain one),
+list or drop chapters (now and then one goes from every site), add new ones,
+fix a broken copy, and change what their copy of a fractional chapter is: the
+chapter at full length, a short placeholder or notice (fixed later, or put up
+where the chapter was), or one whose pages the site will not list. In each
+pass every site answers, does not answer (plan.unreachable) or its search
+misses the series (absent from the plan); now and then Suwayomi itself does
+not answer (no resolve, or no page count), stops in the middle of a
+download, or the database is restored from an earlier backup. Between
+passes the user skips, un-skips, keeps waiting, ignores or wants a chapter
+again; sometimes presses Keep waiting while the pass is judging that very
+chapter, or un-skips (or wants) an earlier chapter while the download runs.
+After every pass, and at every download, the invariants are checked against
+a model that keeps what the passes saw:
 
   I1 listing grace: a chapter some site listed stays listed (not
      'unavailable'; its reason says it is still waited for) until no site
@@ -21,8 +30,15 @@ invariants are checked against a model that keeps what the passes saw:
      not answer or missed the series does not count. After that it is
      'unavailable'.
   I2 strict order: no chapter is downloaded (or even tried) while an
-     earlier one that is not on disk, not ignored or skipped and not past
-     its grace exists.
+     earlier one that is not on disk, not ignored or skipped, not past its
+     grace and not junk exists; also not while you take an earlier one back
+     during the download. Junk is a property of a site's copy, judged by the
+     page counts the resolve went by: a chapter is junk only when no site
+     that lists it has it at full length (min_pages or more), one has a copy
+     short of that and every other one a copy it would not count (a copy
+     Suwayomi did not count keeps it), and every site that listed it within
+     KEEP_DAYS but did not answer had a copy that was not the chapter when it
+     last listed it. A copy counted short is never tried (I2-short).
   I3 automatic skip: only with strict order and the automatic skip on, a
      chapter that blocked (failed on every site), whose verdict was HIGH in
      two resolves at least a day apart, in the latest of which every site
@@ -37,8 +53,11 @@ invariants are checked against a model that keeps what the passes saw:
      left them (dropped only once the chapter is on disk, or no site has
      listed it for GRACE_DAYS + GONE_DAYS).
 
-Nothing here reaches the network, Suwayomi (a stand-in answers the few
-calls a pass makes), MangaDex (manual series) or a notifier."""
+None of them exempts junk: a junk chapter is still listed, keeps its
+evidence and your decisions, and holds strict order unless it is junk as
+I2 says. Nothing here reaches the network, Suwayomi (a stand-in answers the
+few calls a pass makes), MangaDex (manual series) or a notifier."""
+import contextlib
 import copy
 import json
 import logging
@@ -55,7 +74,7 @@ from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from mangarr import config, core, db, downloader, mangadex, settings, stuck, verdict  # noqa: E402
+from mangarr import config, core, db, downloader, mangadex, resolver, settings, stuck, verdict  # noqa: E402
 from mangarr.model import Series  # noqa: E402
 from mangarr.resolver import Plan, SourceMatch, _assign  # noqa: E402
 from mangarr.suwayomi import Chapter, Source, SuwayomiUnreachable  # noqa: E402
@@ -66,6 +85,7 @@ GRACE_RESOLVES, GRACE_DAYS = db.LISTING_GRACE_RESOLVES, db.LISTING_GRACE_DAYS   
 KEEP_DAYS = db.LISTING_KEEP_DAYS        # a site's listing counts this long after it was last seen
 GONE_DAYS = stuck.GONE_DAYS             # a decision on a chapter past its grace is dropped this long after
 HIGH_DAYS = 1                           # I3: HIGH in two resolves at least this far apart
+MIN_PAGES = config.MIN_PAGES            # a copy of a fractional chapter with fewer pages is not the chapter
 DAY = 86400
 T0 = 1_790_000_000                      # 2026-09-21, whole seconds
 ODD = 1033                              # every step is whole hours plus this: no two passes are exactly N hours apart
@@ -74,6 +94,9 @@ SIDE = ("Side Story 1", "Side Story: Picnic", "Omake", "Afterword")
 TITLED = ("Chapter {}: The Duel", "The Reunion", "Chapter {}: Night Market")
 PLAIN = ("Chapter {}", None)
 PENDING = ("wanted", "failed", "unavailable")
+# what a page count of a fractional chapter's copy tells the resolve (Model.observe)
+FULL, SHORT, UNKNOWN, UNASKED = "full", "short", "unknown", "unasked"
+SHM = "/dev/shm"                        # a memory file system where there is one: no disk syncs
 
 
 def cid(mid: int, n: float) -> int:
@@ -82,7 +105,8 @@ def cid(mid: int, n: float) -> int:
 
 class World:
     """What the sites list (and under what name), which copies are broken,
-    and what Suwayomi has downloaded."""
+    how many pages each copy of a fractional chapter has, and what Suwayomi
+    has downloaded."""
 
     def __init__(self, rng: random.Random):
         self.rng = rng
@@ -92,6 +116,7 @@ class World:
         self.fracs = sorted(rng.sample([k + 0.5 for k in range(1, self.top)], rng.randint(1, 2)))
         self.lists: dict[str, dict[float, str | None]] = {s: {} for s in self.sites}
         self.broken: set[tuple[str, float]] = set()
+        self.pages: dict[tuple[str, float], int | None] = {}   # a fractional copy's pages; None: not listed
         for s in self.sites:
             for k in range(1, self.top + 1):
                 if rng.random() < 0.85:
@@ -107,8 +132,15 @@ class World:
         name = self.rng.choice(self.rng.choice((SIDE, SIDE, TITLED, PLAIN)))
         return name.format(f"{n:g}") if name else None
 
+    def copy_pages(self) -> int | None:
+        """A copy of a fractional chapter: the chapter, a placeholder or notice, or pages the site will not list."""
+        rng = self.rng
+        return rng.choices((rng.randint(MIN_PAGES + 2, 30), rng.randint(1, MIN_PAGES - 2), None), (0.5, 0.35, 0.15))[0]
+
     def add(self, s: str, n: float) -> None:
         self.lists[s][n] = self.name(n)
+        if n != int(n):
+            self.pages[(s, n)] = self.copy_pages()
         if self.rng.random() < (0.6 if n != int(n) else 0.08):
             self.broken.add((s, n))
 
@@ -123,6 +155,8 @@ class World:
                         self.lists[s][f] = self.name(f)
                     else:
                         self.add(s, f)
+                if f in self.lists[s] and rng.random() < 0.1:   # a placeholder fixed, or put up, in place
+                    self.pages[(s, f)] = self.copy_pages()
             if rng.random() < 0.03:
                 wholes = [n for n in self.lists[s] if n == int(n)]
                 if wholes:
@@ -142,6 +176,15 @@ class World:
                     self.add(s, float(self.top))
 
 
+def copy_state(pages) -> str:
+    """What a page count the resolve went by says of a copy (UNASKED: Suwayomi did not answer)."""
+    if pages == UNASKED:
+        return UNASKED
+    if pages is None:
+        return UNKNOWN
+    return FULL if pages >= MIN_PAGES else SHORT
+
+
 class Model:
     """What the passes saw, as the invariants need it."""
 
@@ -153,28 +196,46 @@ class Model:
         self.complete: dict[float, bool] = {}
         self.full: dict[str, dict[float, str | None]] = {}                  # site -> its last listing seen
         self.high: dict[float, list[int]] = {}                             # n -> resolves with an auto_skip verdict
-        self.decisions: dict[float, set[str]] = {}                          # n -> skip | declined | wait | ignore
+        # n -> {skip | declined | wait | ignore: the last event before it}: an automatic skip after it is over it
+        self.decisions: dict[float, dict[str, int]] = {}
         self.failed: set[float] = set()
         self.had_row: set[float] = set()
         self.failed_on: dict[float, set[str]] = {}
         self.wholes: dict[float, set[str]] = {}
+        self.not_it: dict[tuple[str, float], bool] = {}                     # (site, n): its copy was not the chapter
+        self.junk: dict[float, bool] = {}                                   # n: junk as I2 says, when last listed
+        self.short: set[tuple[str, float]] = set()                          # copies counted short in this resolve
 
-    def observe(self, t: int, world: World, answered: list[str]) -> None:
+    def observe(self, t: int, world: World, answered: list[str], judged: dict) -> None:
+        """A resolve: what the sites that answered list, and the page counts it went by (judged: (site, n) ->
+        pages, None when the count failed, UNASKED when Suwayomi did not answer; not there: not counted)."""
         listing: dict[float, dict[str, str | None]] = {}
         for s in answered:
             self.full[s] = dict(world.lists[s])
             for n, name in world.lists[s].items():
                 listing.setdefault(n, {})[s] = name
         self.listed_now = set(listing)
+        self.short = {k for k, v in judged.items() if copy_state(v) == SHORT}
         for n in set(self.memory) | set(listing):
             mem = {s: v for s, v in self.memory.get(n, {}).items() if t - v[0] <= KEEP_DAYS * DAY}
             if n in listing:
+                self.judge_junk(n, listing[n], [s for s in mem if s not in answered], judged)
                 mem.update({s: (t, name) for s, name in listing[n].items()})
                 self.missed[n], self.last_listed[n] = 0, t
             elif all(s in answered for s in mem):
                 self.missed[n] = self.missed.get(n, 0) + 1
             self.memory[n] = mem
             self.complete[n] = all(s in answered for s in mem)
+
+    def judge_junk(self, n: float, sites: dict, silent: list[str], judged: dict) -> None:
+        if n == int(n):
+            self.junk[n] = False
+            return
+        states = {s: copy_state(judged[(s, n)]) if (s, n) in judged else None for s in sites}
+        every = all(v in (SHORT, UNKNOWN) for v in states.values()) and SHORT in states.values()
+        for s, v in states.items():
+            self.not_it[(s, n)] = v == SHORT or (v == UNKNOWN and every)
+        self.junk[n] = every and all(self.not_it.get((s, n), False) for s in silent)
 
     def past_grace(self, n: float, t: int) -> bool:
         return n not in self.listed_now and self.missed.get(n, 0) >= GRACE_RESOLVES and \
@@ -192,16 +253,16 @@ class Model:
         min_pages = int(settings.get("min_pages") or config.MIN_PAGES)
         return verdict.classify(series, verdict.Blocker(n, names, None, wholes), rows, None, min_pages).auto_skip
 
-    def decide(self, n: float, what: str) -> None:
-        d = self.decisions.setdefault(n, set())
+    def decide(self, n: float, what: str, mark: int) -> None:
+        """You decided `what` about chapter n after event `mark`."""
+        d = self.decisions.setdefault(n, {})
         if what == "skip":
-            d.discard("wait")
-            d.add("skip")
+            d.pop("wait", None)
         elif what == "unskip":
-            d -= {"skip", "wait", "ignore"}
-            d.add("declined")
-        else:
-            d.add(what)
+            for k in ("skip", "wait", "ignore"):
+                d.pop(k, None)
+            what = "declined"
+        d.setdefault(what, mark)
 
 
 class Violations(AssertionError):
@@ -227,6 +288,7 @@ class Sim:
         self.race = False
         self.raced = False
         self.cut_after: int | None = None
+        self.arrived: list[float] = []
         self.outcome: dict[str, str] = {}
         self.outage = False
         self.resolved = False
@@ -234,6 +296,10 @@ class Sim:
         self.last_event = 0
         self.errors: list[str] = []
         self.history: list[str] = []
+        self.judged: dict[tuple[str, float], object] = {}
+        self.prng = random.Random()             # what happens inside a pass: apart from how the world goes on
+        self.take_back = False
+        self.stats: Counter = Counter()
 
     # -- the stand-ins ------------------------------------------------------------------------------
 
@@ -242,6 +308,21 @@ class Sim:
 
     def chapter_url(self, chapter_id):
         return f"https://site{chapter_id // 10000}.example/chapter/{chapter_id}"
+
+    def copy_of(self, chapter_id: int) -> tuple[str, float]:
+        return self.world.sites[chapter_id // 10000 - 1], (chapter_id % 10000) / 10
+
+    def page_count(self, chapter_id):
+        """What Suwayomi says a copy's page list has (the resolve counts fractional chapters)."""
+        key = self.copy_of(chapter_id)
+        self.stats["page counts"] += 1
+        if self.prng.random() < 0.03:
+            self.judged[key] = UNASKED
+            self.stats["page counts Suwayomi did not answer"] += 1
+            raise SuwayomiUnreachable("Suwayomi at http://sim unreachable: connection refused")
+        pages = self.world.pages.get(key)
+        self.judged[key] = pages
+        return pages
 
     def resolve(self, client, series, **kw):
         if self.outage:
@@ -258,10 +339,28 @@ class Sim:
             answered.append(s)
             chapters = [Chapter(cid(w.mid[s], n), n, name, None, False) for n, name in sorted(w.lists[s].items())]
             matches.append(SourceMatch(src, w.mid[s], "Freedom", None, 0, "Freedom", 1, chapters))
-        self.model.observe(self.t, w, answered)
         candidates = _assign(matches)
-        return Plan(series, matches, [], unreachable, {n: c[0] for n, c in candidates.items()},
-                    candidates=candidates)
+        plan = Plan(series, matches, [], unreachable, {n: c[0] for n, c in candidates.items()}, candidates=candidates)
+        self.judged = {}
+        counts = kw.get("counts")
+        if counts is not None:                  # the counts the resolve goes by without asking Suwayomi
+            lookup = counts.lookup
+
+            def kept(manga_id, ch, min_pages):
+                got = lookup(manga_id, ch, min_pages)
+                if got[0]:
+                    self.judged[self.copy_of(ch.id)] = got[1]
+                return got
+            counts.lookup = kept
+        resolver._prune_junk(client, plan, None, counts)
+        self.model.observe(self.t, w, answered, self.judged)
+        self.plan = plan
+        self.stats["junk chapters"] += len(plan.junk)
+        self.stats["junk as I2 says"] += sum(1 for n in plan.junk if self.model.junk.get(n))
+        self.stats["short copies left out of a chapter"] += sum(
+            len(v) for n, v in getattr(plan, "short", {}).items() if n not in plan.junk)
+        self.stats["fractional chapters with a short copy"] += len({n for _, n in self.model.short})
+        return plan
 
     def import_series(self, con, series_id, client=None):
         rows = {r["number"]: r for r in db.chapters(con, series_id)}
@@ -274,47 +373,55 @@ class Sim:
         con.commit()
         return linked
 
-    def download(self, client, plan, only=None, should_cancel=None, reasons=None, progress=None, throttled=None,
-                 in_order=None, dropped=None, attempts=None, taken_back=None):
-        reasons = reasons if reasons is not None else {}
-        wanted = set(plan.wanted()) if only is None else set(only)
-        in_order = bool(settings.get("download_in_order")) if in_order is None else in_order
-        steps = downloader.SeriesSteps(plan, wanted, in_order, plan.series.title, reasons)
-        with db.connect() as con:
-            rows = {r["number"]: r for r in db.chapters(con, self.sid)}
-        arrived: list[float] = []
-        try:
-            while True:
-                skip = dropped() if dropped else set()
-                keys = steps.wants(skip)
-                if not keys:
+    def download_source(self, client, manga_id, todo, batch, label, source_name, patient, cancel, report, memo,
+                        stop_on_fail=False, throttled=False, warm=False, gone=set):
+        """One run of chapters from one source entry, as Suwayomi would do it: each chapter arrives unless its
+        copy there is broken. In order, you may take an earlier chapter back first (un-skip or want it)."""
+        ok, failed, why = [], [], {}
+        for c in todo:
+            if stop_on_fail and self.take_back:
+                self.take_back_one(c.number)
+            if c.number in gone():
+                continue
+            if stop_on_fail:
+                self.check_order(c.number)
+            if (source_name, c.number) in self.model.short:
+                self.fail("I2-short", f"ch {c.number:g} tried on {source_name}, whose copy was counted short")
+            if self.cut_after is not None and len(self.arrived) >= self.cut_after:
+                raise SuwayomiUnreachable("Suwayomi at http://sim unreachable: connection refused")
+            if (source_name, c.number) in self.world.broken:
+                failed.append(c.number)
+                why[c.number] = "the source has no working pages for this chapter"
+                if stop_on_fail:
                     break
-                run = steps.take(keys[0], skip)
-                if run is None:
-                    continue
-                ok, failed, why = [], [], {}
-                for c in run.todo:
-                    if c.number in skip:
-                        continue
-                    if in_order:
-                        self.check_order(c.number, rows, arrived)
-                    if self.cut_after is not None and len(arrived) >= self.cut_after:
-                        raise SuwayomiUnreachable("Suwayomi at http://sim unreachable: connection refused")
-                    if (run.match.source.name, c.number) in self.world.broken:
-                        failed.append(c.number)
-                        why[c.number] = "the source has no working pages for this chapter"
-                        if run.in_order:
-                            break
-                    else:
-                        ok.append(c.number)
-                        arrived.append(c.number)
-                        self.world.delivered.add(c.number)
-                steps.record(run, ok, failed, why)
-        finally:
-            if attempts is not None:
-                attempts.extend(steps.attempts)
-        self.model.failed.update(n for n, r in steps.results.items() if r == "failed")
-        return steps.results
+            else:
+                ok.append(c.number)
+                self.arrived.append(c.number)
+                self.world.delivered.add(c.number)
+        return ok, failed, why
+
+    def take_back_one(self, n: float) -> None:
+        """You un-skip (or want again) a chapter before n while the download runs."""
+        with db.connect() as other:
+            ignored = [r["number"] for r in db.chapters(other, self.sid) if r["status"] == "ignored" and r["number"] < n]
+            if not ignored:
+                return                          # perhaps before a later one
+            self.take_back = False
+            k = self.prng.choice(ignored)
+            if k in {s["number"] for s in stuck.skipped(other, self.sid)}:
+                done = stuck.unskip(other, self.sid, k)
+            else:
+                done = db.want_again(other, self.sid, k)
+                stuck.forget(other, self.sid, k)
+                other.commit()
+        if done:
+            self.decide(k, "unskip")
+            self.stats["chapters taken back while the download ran"] += 1
+            self.history.append(f"  (you took {k:g} back while {n:g} was about to download)")
+
+    def record_downloads(self, con, series_id, plan, wanted, results, *a, **k):
+        self.model.failed.update(n for n, r in results.items() if r == "failed")
+        return self.real_record(con, series_id, plan, wanted, results, *a, **k)
 
     def judge(self, series, st, chapters, *a, **k):
         if self.in_pass:
@@ -325,7 +432,7 @@ class Sim:
                 self.raced = True
                 with db.connect() as other:
                     if stuck.dismiss(other, self.sid, st.number):
-                        self.model.decide(st.number, "wait")
+                        self.decide(st.number, "wait")
                         self.history.append(f"  (Keep waiting on {st.number:g} while the pass judged it)")
         return self.real_judge(series, st, chapters, *a, **k)
 
@@ -336,6 +443,11 @@ class Sim:
 
     # -- the scenario ---------------------------------------------------------------------------------
 
+    def decide(self, n: float, what: str) -> None:
+        with db.connect() as con:
+            mark = con.execute("SELECT COALESCE(MAX(id), 0) FROM event").fetchone()[0]
+        self.model.decide(n, what, mark)
+
     def fail(self, inv: str, text: str) -> None:
         self.found.append((inv, f"seed {self.seed} pass {self.pass_no}: {text}"))
 
@@ -345,11 +457,14 @@ class Sim:
         settings._cache.clear()
 
     def run(self) -> list[tuple[str, str]]:
-        self.real_judge = stuck.judge
+        self.real_judge, self.real_record = stuck.judge, core.record_downloads
         patches = [mock.patch.object(config, "DB_PATH", self.path),
                    mock.patch.object(core, "resolve", self.resolve),
                    mock.patch.object(core, "import_series", self.import_series),
-                   mock.patch.object(downloader, "download", self.download),
+                   mock.patch.object(core, "record_downloads", self.record_downloads),
+                   mock.patch.object(downloader, "_download_source", self.download_source),
+                   mock.patch.object(downloader, "download_lock", lambda *a, **k: contextlib.nullcontext()),
+                   mock.patch.object(downloader, "clear_leftovers", lambda *a, **k: True),
                    mock.patch.object(stuck, "judge", self.judge),
                    mock.patch.object(time, "time", lambda: float(self.t)),
                    mock.patch.object(db, "now", lambda: time.strftime("%Y-%m-%d %H:%M:%S",
@@ -375,12 +490,14 @@ class Sim:
     def one_pass(self) -> None:
         rng, w = self.rng, self.world
         self.pass_no += 1
-        self.t += rng.randint(1, 40) * 3600 + ODD
+        self.prng.seed(self.seed * 1000 + self.pass_no)
+        self.t += (rng.randint(1, 40) * 3600 if rng.random() < 0.9 else rng.randint(2, 5) * DAY) + ODD
         w.change()
         self.outcome = {s: rng.choices(("ok", "down", "miss"), (0.7, 0.15, 0.15))[0] for s in w.sites}
         self.outage = rng.random() < 0.04
         self.cut_after = rng.randint(0, 3) if rng.random() < 0.05 else None
         self.race, self.raced, self.resolved = rng.random() < 0.15, False, False
+        self.take_back, self.arrived = rng.random() < 0.15, []
         if rng.random() < 0.05:
             self.auto = not self.auto
             self.set(auto_skip_side_stories=self.auto)
@@ -396,15 +513,20 @@ class Sim:
             pass
         finally:
             self.in_pass = False
+        if self.resolved:
+            self.history.append(f"  counts {sorted((k[0][5], k[1], v) for k, v in self.judged.items())}; "
+                                f"junk {sorted(self.plan.junk)}")
+            self.stats["voided junk"] += len(getattr(self.plan, "voided", {}))
         self.check()
         self.act()
         if rng.random() < 0.06:
             self.backup_or_restore()
 
     def describe(self) -> str:
-        return "; ".join(f"{s[5]}: " + ", ".join(f"{n:g}" + (f"={nm!r}" if n != int(n) else "")
-                                                  for n, nm in sorted(self.world.lists[s].items()))
-                         for s in self.world.sites)
+        w = self.world
+        return "; ".join(f"{s[5]}: " + ", ".join(f"{n:g}" + (f"={nm!r}/{w.pages.get((s, n))}p" if n != int(n) else "")
+                                                  for n, nm in sorted(w.lists[s].items()))
+                         for s in w.sites)
 
     def act(self) -> None:
         """What the user does between passes."""
@@ -421,14 +543,14 @@ class Sim:
                 done = stuck.skip(con, self.sid, st.number, "manual", st.verdict, st.waiting) if what == "skip" \
                     else stuck.dismiss(con, self.sid, st.number)
                 if done:
-                    self.model.decide(st.number, what)
+                    self.decide(st.number, what)
                     self.history.append(f"  you: {what} {st.number:g}")
             elif what == "unskip":
                 skipped = [k["number"] for k in stuck.skipped(con, self.sid)]
                 if skipped:
                     n = rng.choice(skipped)
                     if stuck.unskip(con, self.sid, n):
-                        self.model.decide(n, "unskip")
+                        self.decide(n, "unskip")
                         self.history.append(f"  you: un-skip {n:g}")
             elif what == "ignore":
                 todo = [n for n, r in rows.items() if r["status"] in ("wanted", "failed")]
@@ -436,7 +558,7 @@ class Sim:
                     n = rng.choice(todo)
                     db.set_status(con, self.sid, n, "ignored")        # the chapter's Ignore button
                     con.commit()
-                    self.model.decide(n, "ignore")
+                    self.decide(n, "ignore")
                     self.history.append(f"  you: ignore {n:g}")
             elif what == "want":
                 todo = [n for n, r in rows.items() if r["status"] == "ignored"]
@@ -445,7 +567,7 @@ class Sim:
                     db.want_again(con, self.sid, n)                   # the chapter's Want button
                     stuck.forget(con, self.sid, n)
                     con.commit()
-                    self.model.decide(n, "unskip")
+                    self.decide(n, "unskip")
                     self.history.append(f"  you: want {n:g}")
 
     def backup_or_restore(self) -> None:
@@ -467,22 +589,26 @@ class Sim:
         with db.connect() as con:
             self.last_event = con.execute("SELECT COALESCE(MAX(id), 0) FROM event").fetchone()[0]
         self.set(download_in_order=True, auto_skip_side_stories=self.auto)     # the settings as they are now
+        self.stats["restores"] += 1
         self.history.append(f"  restore of the backup after pass {at}")
 
     # -- the invariants -----------------------------------------------------------------------------
 
-    def check_order(self, n: float, rows: dict, arrived: list) -> None:
-        """I2, at the moment chapter n is tried."""
+    def check_order(self, n: float) -> None:
+        """I2, at the moment chapter n is tried (the chapters' states as they are then)."""
         m = self.model
+        with db.connect() as con:
+            rows = db.chapters_by_number(con, self.sid, [k for k in m.last_listed if k < n])
         for k in sorted(m.last_listed):
             if k >= n:
                 break
             r = rows.get(k)
             status = r["status"] if r is not None else None
-            if k in arrived or status in ("have", "ignored", "junk") or m.past_grace(k, self.t):
+            if k in self.arrived or status in ("have", "ignored") or m.past_grace(k, self.t) or m.junk.get(k):
                 continue
             self.fail("I2", f"ch {n:g} tried while ch {k:g} is {status} and not past its grace "
-                            f"(missed {m.missed.get(k, 0)}, last listed {(self.t - m.last_listed[k]) / 3600:.1f} h ago)")
+                            f"(missed {m.missed.get(k, 0)}, last listed {(self.t - m.last_listed[k]) / 3600:.1f} h ago)"
+                            + (" nor junk as I2 says" if status == "junk" else ""))
             return
 
     def check(self) -> None:
@@ -500,6 +626,9 @@ class Sim:
         for n, r in rows.items():
             if r["status"] == "failed":
                 m.failed.add(n)
+            if r["status"] == "junk":
+                self.stats["junk rows after a pass"] += 1
+                self.stats["junk rows with evidence or a decision"] += n in evidence or n in choices
         for n in m.last_listed:
             if n != int(n) and (r := rows.get(n)) is not None and r["status"] != "have" and \
                     m.high_now(self.series, n, chapters, t):
@@ -517,6 +646,7 @@ class Sim:
                     not words[3].startswith("automatically"):
                 continue
             n = float(words[1])
+            self.stats["automatic skips"] += 1
             high = m.high.get(n, [])
             if not self.auto:
                 self.fail("I3a", f"ch {n:g} skipped automatically with the automatic skip off")
@@ -530,8 +660,9 @@ class Sim:
                 self.fail("I3d", f"ch {n:g} skipped automatically while a site that listed it did not answer or "
                                 f"missed the series (listed by {sorted(m.memory.get(n, {}))}, "
                                 f"this pass {self.outcome})")
-            if m.decisions.get(n):
-                self.fail("I3e", f"ch {n:g} skipped automatically over your decision {sorted(m.decisions[n])}")
+            over = sorted(k for k, mark in m.decisions.get(n, {}).items() if mark < e["id"])
+            if over:
+                self.fail("I3e", f"ch {n:g} skipped automatically over your decision {over}")
         # I1
         for n in sorted(m.last_listed):
             r = rows.get(n)
@@ -573,8 +704,8 @@ class Sim:
                 if t - seen > KEEP_DAYS * DAY:
                     continue
                 if s not in names:
-                    self.fail("I4", f"ch {n:g}: {s} listed it {(t - seen) / 3600:.1f} h ago as {name!r}, but its "
-                                    f"evidence has only {names}")
+                    self.fail("I4", f"ch {n:g} ({r['status']}): {s} listed it {(t - seen) / 3600:.1f} h ago as "
+                                    f"{name!r}, but its evidence has only {names}")
                 elif names[s] != name:
                     self.fail("I4", f"ch {n:g}: {s} calls it {name!r}, its evidence says {names[s]!r}")
             failed_on, wholes = set(json.loads(e["failed_on"])), set(json.loads(e["wholes"]))
@@ -593,11 +724,12 @@ class Sim:
                 self.fail("I5", f"ch {n:g}: you {'skipped' if 'skip' in decs else 'ignored'} it, now it is "
                                 f"{r['status']}")
             if "skip" in decs and (k is None or k["skipped"] != "manual"):
-                self.fail("I5", f"ch {n:g}: your skip is gone ({dict(k) if k else None})")
+                self.fail("I5", f"ch {n:g}: your skip is gone ({dict(k) if k else None}; it is {r['status']})")
             if "declined" in decs and (k is None or not k["declined"]):
-                self.fail("I5", f"ch {n:g}: your un-skip is forgotten ({dict(k) if k else None})")
+                self.fail("I5", f"ch {n:g}: your un-skip is forgotten ({dict(k) if k else None}; it is {r['status']})")
             if "wait" in decs and (k is None or not k["dismissed"]):
-                self.fail("I5", f"ch {n:g}: your Keep waiting is gone ({dict(k) if k else None})")
+                self.fail("I5", f"ch {n:g}: your Keep waiting is gone ({dict(k) if k else None}; it is "
+                                f"{r['status']})")
         for text in self.errors:
             self.fail("error", text)
         self.errors.clear()
@@ -617,8 +749,8 @@ class _Errors(logging.Handler):
 
 class PassSimulatorTest(unittest.TestCase):
     def setUp(self):
-        shm = "/dev/shm"                            # a memory file system where there is one: no disk syncs
-        tmp = tempfile.TemporaryDirectory(dir=shm if os.path.isdir(shm) and os.access(shm, os.W_OK) else None)
+        self.shm = os.path.isdir(SHM) and os.access(SHM, os.W_OK)
+        tmp = tempfile.TemporaryDirectory(dir=SHM if self.shm else None)
         self.addCleanup(tmp.cleanup)
         self.tmp = tmp.name
         for p in (mock.patch.object(config, "DB_PATH", os.path.join(self.tmp, "none.db")),   # each Sim has its own
@@ -657,25 +789,40 @@ class PassSimulatorTest(unittest.TestCase):
         settings._cache.clear()
         self.addCleanup(settings._cache.clear)
 
-    def test_random_passes_keep_the_invariants(self):
-        start = time.perf_counter()
-        counts, first, runs = Counter(), {}, 0
-        for seed in range(SCENARIOS):
+    def run_scenarios(self, seeds) -> tuple[Counter, dict, Counter, int]:
+        """(scenarios per invariant broken, the first break of each with its history, what was exercised,
+        passes)."""
+        counts, first, stats, runs = Counter(), {}, Counter(), 0
+        for seed in seeds:
             sim = Sim(seed, self.tmp, self.template)
             self.errors.sim = sim
             found = sim.run()
             runs += sim.pass_no
+            stats.update(sim.stats)
             for inv, text in found:
                 first.setdefault(inv, (text, "\n".join(sim.history)))
             counts.update({inv for inv, _ in found})
             for f in (sim.path, sim.path + ".bak", sim.path + "-wal", sim.path + "-shm"):
                 if os.path.exists(f):
                     os.remove(f)
+        return counts, first, stats, runs
+
+    def test_random_passes_keep_the_invariants(self):
+        start = time.perf_counter()
+        counts, first, stats, runs = self.run_scenarios(range(SCENARIOS))
         took = time.perf_counter() - start
         report = "\n\n".join(f"{inv} ({counts[inv]} scenario(s)): {text}\n{hist}"
                              for inv, (text, hist) in sorted(first.items()))
         self.assertEqual(dict(counts), {}, f"{SCENARIOS} scenarios, {runs} passes, {took:.1f} s\n{report}")
-        self.assertLess(took, 60)
+        # the junk paths are all taken: chapters judged junk by every copy, a short copy left out of a chapter
+        # another site has in full, junk withheld while a site that may have it did not answer, recounts
+        for what, least in (("junk chapters", 100), ("junk as I2 says", 100), ("short copies left out of a chapter", 50),
+                            ("voided junk", 5), ("junk rows with evidence or a decision", 20),
+                            ("page counts Suwayomi did not answer", 10), ("chapters taken back while the download ran", 10),
+                            ("automatic skips", 10), ("restores", 10)):
+            self.assertGreaterEqual(stats[what], least, f"{what}: {dict(stats)}")
+        if self.shm:                            # on a disk, the syncs alone can take longer (about 50 s without it)
+            self.assertLess(took, 60)
 
 
 if __name__ == "__main__":
