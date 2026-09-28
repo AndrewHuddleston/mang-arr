@@ -149,6 +149,7 @@ class SeriesTask:
     plan: Plan
     wanted: list
     steps: downloader.SeriesSteps
+    before: frozenset = frozenset()     # what its download does not wait for (core.not_waited_for)
     seen: set = field(default_factory=set)      # sources that rate-limited it (recorded when it is written)
     told: set = field(default_factory=set)      # chapters already logged as no longer wanted
     want: list = field(default_factory=list)    # the sites it could download from next
@@ -232,11 +233,15 @@ class LanePool:
     # -- the resolve step's side ---------------------------------------------------------------
 
     def submit(self, index: int, series_id: int, title: str, item: dict, plan: Plan, wanted: list,
-               progress: Callable[[str], None] | None = None) -> None:
+               progress: Callable[[str], None] | None = None, before: frozenset | None = None) -> None:
         """Hand over a resolved series with chapters due. The first call
         takes the download lock (waiting for another run like any download
         does: LockBusy, Cancelled). Waits while PIPELINE_MAX_WAITING series
-        already wait for a lane; PoolStopped when the lanes stop meanwhile."""
+        already wait for a lane; PoolStopped when the lanes stop meanwhile.
+        `before`: core.not_waited_for, taken before the chapters due were
+        worked out (core.downloads_due sets Outcome.before); without it, it
+        is taken now, and a chapter you take back in between is not seen as
+        taken back."""
         if self._fd is None:
             self._fd = downloader.acquire_download_lock(should_cancel=self.cancelled, progress=progress)
         with self._cv:
@@ -252,6 +257,7 @@ class LanePool:
         for m in plan.matches:
             task.names.setdefault(downloader.lanes_key(m.source.name), m.source.name)
         with db.connect() as con:
+            task.before = core.not_waited_for(con, series_id, plan) if before is None else frozenset(before)
             gone = self._gone(con, task)
             self._next(task, gone())
         if not task.want:                           # nothing any source can be asked for: written at once
@@ -545,8 +551,8 @@ class LanePool:
         wanted = set(task.wanted)
         dropped = downloader._dropper(lambda: core.dropped_chapters(con, task.series_id, wanted), task.title,
                                       told=task.told)
-        return downloader.waiting(task.steps, dropped, lambda: core.taken_back(con, task.series_id, wanted),
-                                  task.title)
+        return downloader.waiting(task.steps, dropped,
+                                  lambda: core.taken_back(con, task.series_id, wanted, task.before), task.title)
 
     def _step(self, task: SeriesTask, key: str, lane: int) -> tuple[bool, float]:
         """One run of `task` on site `key` (on the lane's thread). Queue

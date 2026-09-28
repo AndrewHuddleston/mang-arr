@@ -367,7 +367,7 @@ def _run_pass(job: jobs.Job, rows, label: str, skippable=()) -> tuple[int, int, 
                                                on_error=lambda sid, e: _record_error(sid, e))
                         fresh.start()              # not one lane could be started: this series fails, the next tries
                         pool = fresh
-                    pool.submit(i, r["id"], r["title"], item, o.plan, due, progress=prog)
+                    pool.submit(i, r["id"], r["title"], item, o.plan, due, progress=prog, before=o.before)
             except core.Gone:
                 item["state"], item["result"] = "cancelled", "series was deleted"
                 continue

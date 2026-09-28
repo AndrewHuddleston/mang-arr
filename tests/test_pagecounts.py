@@ -15,7 +15,7 @@ from mangarr.pagecounts import PageCounts
 from mangarr.suwayomi import Chapter, Client, Source, SuwayomiError, SuwayomiUnreachable
 
 NOTICES = (5.5, 10.5, 15.5, 20.5, 25.5, 30.5, 35.5, 40.5)     # 2 pages each: "next chapter on Friday"
-FIRST_PASS = 12 + 8     # Alpha's copies, and Bravo's of the notices: a short best copy has the others counted too
+FIRST_PASS = 12 + 12    # Alpha's copies, and Bravo's: every copy a pass may download is counted, a fallback too
 EXTRAS = (12.5, 24.5, 36.5, 48.5)                              # real side chapters, 20 pages
 DOWNLOADED = 50.5                                              # in Suwayomi already: never counted
 
@@ -127,10 +127,10 @@ class KeptCountTest(Base):
         said: list[str] = []
         first = self.refresh(said.append)
         best = [cid(1, n) for n in (*NOTICES, *EXTRAS)]             # Alpha provides them; the downloaded one is skipped
-        others = [cid(2, n) for n in NOTICES]                       # Alpha's copy is short: is Bravo's the chapter?
+        others = [cid(2, n) for n in (*NOTICES, *EXTRAS)]           # is Bravo's the chapter? (its fallback, too)
         self.assertEqual(sorted(first), sorted(best + others))
         self.assertIn("counting the pages of fractional chapters (12 of 12)", said)
-        self.assertIn("counting the pages of the other sites' copies (8 of 8)", said)
+        self.assertIn("counting the pages of the other sites' copies (12 of 12)", said)
         after_first = self.statuses()
         self.assertEqual({n for n, s in after_first.items() if s == "junk"}, set(NOTICES))
         self.assertEqual({after_first[n] for n in EXTRAS}, {"wanted"})
@@ -138,7 +138,7 @@ class KeptCountTest(Base):
         said.clear()
         with self.assertLogs("mangarr.resolver", "INFO") as logs:
             second = self.refresh(said.append)
-        self.assertEqual(second, [])                                # 20 probes the pass does not make
+        self.assertEqual(second, [])                                # 24 probes the pass does not make
         self.assertFalse([m for m in said if "counting the pages" in m])
         self.assertTrue(any("probing 0 fractional chapter(s) for junk (< 8 pages); 12 more counted in an earlier "
                             "pass" in line for line in logs.output), logs.output)
@@ -149,9 +149,7 @@ class KeptCountTest(Base):
         self.refresh()
         with db.connect() as con:
             settings.set_many(con, {"min_pages": 25})
-        # no recount for a new minimum: only Bravo's copies of the extras, never needed before (Alpha's were long
-        # enough), are counted now that Alpha's are too short
-        self.assertEqual(sorted(self.refresh()), sorted(cid(2, n) for n in EXTRAS))
+        self.assertEqual(self.refresh(), [])                        # no recount for a new minimum
         status = self.statuses()
         self.assertEqual({status[n] for n in (*NOTICES, *EXTRAS)}, {"junk"})   # ... and 20 pages are below it
 
@@ -265,16 +263,16 @@ class KeptCountTest(Base):
         self.assertEqual(self.statuses()[5.5], "wanted")
 
     def test_ten_days_of_passes(self):
-        """A pass every 6 hours for 10 days: 20 counts in the first pass (Alpha's 12, and Bravo's copies of the 8
-        notices), none in the second (all 20 saved), then only the 16 junk counts again, a day and a week later.
-        Counting every pass is 20 a pass."""
+        """A pass every 6 hours for 10 days: 24 counts in the first pass (Alpha's 12 and Bravo's 12), none in the
+        second (all 24 saved), then only the 16 junk counts again, a day and a week later. Counting every pass is 24
+        a pass."""
         asked = []
         for _ in range(4 * 10):
             asked.append(len(self.refresh()))
             self.age(6)
         self.assertEqual(asked[:2], [FIRST_PASS, 0])
         self.assertEqual(sorted(a for a in asked if a), [16, 16, FIRST_PASS])
-        self.assertEqual((sum(asked), FIRST_PASS * len(asked)), (52, 800))
+        self.assertEqual((sum(asked), FIRST_PASS * len(asked)), (56, 960))
 
     def test_suwayomi_not_answering_is_not_remembered(self):
         extra = cid(1, 36.5)
@@ -293,9 +291,9 @@ class KeptCountTest(Base):
         self.assertEqual(self.refresh(), [])
         self.assertNotIn(cid(1, 40.5), self.rows())
         self.assertNotIn(cid(2, 40.5), self.rows())
-        self.assertEqual(len(self.rows()), 11 + 7)
+        self.assertEqual(len(self.rows()), 11 + 11)
         self.site.src = self.site.src[1:]                           # Alpha is gone altogether: Bravo provides them
-        self.assertEqual(len(self.refresh()), 4)                    # its notices were counted already: its extras
+        self.assertEqual(self.refresh(), [])                        # its copies were counted already
         self.assertEqual(sorted(i // 10_000 for i in self.rows()), [2] * 11)
         self.assertTrue(self.rows())
         with db.connect() as con:                                   # a deleted series: gone with the next save
@@ -375,12 +373,55 @@ class CopyTest(Base):
     def test_a_copy_suwayomi_did_not_count_keeps_the_chapter(self):
         self.site.pages[cid(1, 24.5)] = 2
         self.site.pages[cid(2, 24.5)] = SuwayomiUnreachable("Suwayomi at http://fake unreachable: connection refused")
-        plan = self.plan()                                          # nothing is known of Bravo's copy
-        self.assertEqual([m.source.name for m in plan.candidates[24.5]], ["Bravo"])
+        plan = self.plan()                                          # nothing is known of Bravo's copy: not junk,
+        self.assertEqual((plan.candidates[24.5], plan.uncounted), ([], {24.5: ["Bravo"]}))    # but not tried either
+        self.assertEqual(plan.assignment[24.5].source.name, "Bravo")
         self.assertEqual(self.statuses()[24.5], "wanted")
         del self.site.pages[cid(2, 24.5)]
-        self.plan()
+        plan = self.plan()
         self.assertEqual(self.statuses()[24.5], "wanted")          # counted next time: 20 pages
+        self.assertEqual(([m.source.name for m in plan.candidates[24.5]], plan.uncounted), (["Bravo"], {}))
+
+    def test_a_best_copy_suwayomi_did_not_count_is_not_tried(self):
+        self.site.pages[cid(1, 24.5)] = SuwayomiUnreachable("Suwayomi at http://fake unreachable: connection refused")
+        plan = self.plan()                                          # Bravo's copy is counted instead: 20 pages
+        self.assertEqual(([m.source.name for m in plan.candidates[24.5]], plan.uncounted), (["Bravo"], {24.5: ["Alpha"]}))
+
+    def test_a_fallback_copy_is_counted_before_it_can_be_used(self):
+        # Review: with Alpha's copy counted at full length, Bravo's was never counted; when Alpha's failed, Bravo's
+        # 3-page placeholder was downloaded and linked as the chapter
+        self.site.pages[cid(2, 12.5)] = 3
+        plan = self.plan()
+        self.assertIn(cid(2, 12.5), self.site.asked)
+        self.assertEqual([m.source.name for m in plan.candidates[12.5]], ["Alpha"])
+        self.assertEqual((plan.short[12.5], 12.5 in plan.junk), ({"Bravo": 3}, False))
+        self.assertTrue(db.short_copy(self.listed(12.5)["Bravo"]))
+
+    def test_a_short_count_that_expired_is_counted_again_not_taken_as_unknown(self):
+        # Review: once the kept short count of Bravo's copy expired, the copy was a fallback again, uncounted
+        self.site.pages[cid(2, 12.5)] = 3
+        self.plan()
+        self.set_row(cid(2, 12.5), counted_at=ago(pagecounts.JUNK_RECOUNT_DAYS[0] + 0.01))
+        self.assertEqual(self.refresh(), [cid(2, 12.5)])
+        plan = self.plan()
+        self.assertEqual(([m.source.name for m in plan.candidates[12.5]], plan.short[12.5]), (["Alpha"], {"Bravo": 3}))
+        self.site.pages[cid(2, 12.5)] = 20                          # fixed in place, and counted again a week later
+        self.set_row(cid(2, 12.5), counted_at=ago(pagecounts.JUNK_RECOUNT_DAYS[1] + 0.01))   # (short twice)
+        self.assertEqual([m.source.name for m in self.plan().candidates[12.5]], ["Alpha", "Bravo"])
+
+    def test_the_other_copies_of_a_chapter_on_disk_or_ignored_are_not_counted(self):
+        self.plan()
+        with db.connect() as con:
+            db.set_status(con, self.sid, 12.5, "ignored")
+            con.commit()
+        self.site.names[cid(2, 12.5)] = "Chapter 12.5: Extra"      # listed differently: its count no longer holds
+        self.assertEqual(self.refresh(), [])                        # no pass downloads it: not counted
+        plan = self.plan()
+        self.assertEqual(([m.source.name for m in plan.candidates[12.5]], plan.uncounted[12.5]), (["Alpha"], ["Bravo"]))
+        with db.connect() as con:
+            db.set_status(con, self.sid, 12.5, "wanted")
+            con.commit()
+        self.assertEqual(self.refresh(), [cid(2, 12.5)])            # wanted again: counted before it can be used
 
     def test_not_junk_while_a_site_that_may_have_it_does_not_answer(self):
         self.site.pages[cid(1, 12.5)] = 3                           # Bravo has the chapter

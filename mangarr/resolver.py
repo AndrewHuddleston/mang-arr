@@ -8,8 +8,9 @@
                                      -> union the chapter numbers
                                      -> judge each copy of a fractional
                                         chapter by its pages: leave out the
-                                        short ones, drop a chapter no site
-                                        has at full length (junk)
+                                        short ones and the ones not counted,
+                                        drop a chapter no site has at full
+                                        length (junk)
                                      -> pick a source for each chapter
 """
 import logging
@@ -113,7 +114,8 @@ class Plan:
     # dropped: no site has the chapter at full length (a notice): its best-ranked copy, with its pages
     junk: dict[float, tuple[SourceMatch, int]] = field(default_factory=dict)
     # every usable source per chapter whose copy may be the chapter, best first (the first is used, the rest are
-    # fallbacks); a copy counted at full length comes before one whose pages are not known
+    # fallbacks); of a fractional chapter only copies counted at full length or that the source would not count,
+    # and when one was counted short, the full ones first
     candidates: dict[float, list[SourceMatch]] = field(default_factory=dict)
     # the copies that are not the chapter, per chapter: {number: {source name: pages}}, counted shorter than
     # min_pages, or (None) not countable next to a short one in a junk chapter; left out of its candidates
@@ -121,6 +123,11 @@ class Plan:
     # chapters this resolve found junk that a site which did not answer may still have at full length
     # (db.save_plan takes them out of junk): {number: those sites}
     voided: dict[float, list[str]] = field(default_factory=dict)
+    # the copies of a fractional chapter whose pages are not known this time, per chapter: {number: source names}
+    # (Suwayomi did not answer the count, or it was not asked: the chapter was on disk or ignored); left out of its
+    # candidates until a count says they are the chapter. With none left the chapter is not attempted this pass
+    # (downloader.SeriesSteps), and in order the later ones wait for it
+    uncounted: dict[float, list[str]] = field(default_factory=dict)
     _listing: dict | None = field(default=None, init=False, repr=False, compare=False)
 
     @property
@@ -183,14 +190,17 @@ class Plan:
 
 def resolve(client: Client, series: Series, sources: list[Source] | None = None,
             reliability: dict[str, float] | None = None, should_cancel: Callable[[], bool] | None = None,
-            progress: Callable[[str], None] | None = None, counts: PageCounts | None = None) -> Plan:
+            progress: Callable[[str], None] | None = None, counts: PageCounts | None = None,
+            settled: set[float] | None = None) -> Plan:
     """The plan for a series. Several sites are searched at once
     (search_parallel; _search_parallel), and the plan is the same whatever
     order they answer in. A cancel (should_cancel) is noticed between
     sources and cuts the Suwayomi calls in flight short, raising Cancelled
     with nothing decided; `progress` hears how far the search is. With
     `counts`, fractional chapters counted in an earlier pass are not
-    counted again while their count holds (see pagecounts.py)."""
+    counted again while their count holds (see pagecounts.py). `settled`:
+    the chapters on disk or ignored, which no pass downloads, so only the
+    best copy of each is counted (_prune_junk)."""
     cancel = should_cancel or (lambda: False)
     report = progress or (lambda m: None)
     raw = client
@@ -235,7 +245,7 @@ def resolve(client: Client, series: Series, sources: list[Source] | None = None,
     candidates = _assign(matches)
     assignment = {n: c[0] for n, c in candidates.items()}
     plan = Plan(series, matches, rejected, unreachable, assignment, candidates=candidates)
-    _prune_junk(client, plan, report, counts)
+    _prune_junk(client, plan, report, counts, settled)
     log.info("%s: %d chapters listed from %d source(s), %d on disk per Suwayomi, %d wanted, %d junk",
              series.title, len(plan.chapters), len({m.manga_id for m in assignment.values()}),
              len(plan.have()), len(plan.wanted()), len(plan.junk))
@@ -572,28 +582,35 @@ def _assign(matches: list[SourceMatch]) -> dict[float, list[SourceMatch]]:
 
 
 def _prune_junk(client: Client, plan: Plan, progress: Callable[[str], None] | None = None,
-                counts: PageCounts | None = None) -> None:
+                counts: PageCounts | None = None, settled: set[float] | None = None) -> None:
     """Judge the copies of fractional chapters by their pages: a copy with
     fewer than min_pages is a notice, an ad or a placeholder, not the
     chapter. That is a property of one site's copy, not of the chapter: a
-    site may have a placeholder where another has the chapter. So the
-    best-ranked copy of each fractional chapter is counted, and only when it
-    is short are the other copies counted too (otherwise only their kept
-    counts are looked at). A chapter is junk (dropped) only when none of its
-    copies has min_pages or more and one is short (a copy the source would
-    not count, next to a short one, does not keep it); otherwise it stays,
-    with its full-length copies first and the ones known to be short left
-    out of its candidates (plan.short keeps which), and it is downloaded
-    like any other chapter. A count that fails for the best copy keeps the
-    chapter, as before, and so does any copy Suwayomi itself did not answer
-    for (that says nothing about it). Every fractional chapter is judged,
-    not just single-source ones: aggregators (Bato, Manganato) scrape the
-    same upstream and list the same junk, so agreement between them proves
-    nothing. With `counts`, a count kept from an earlier pass is used while
-    it holds, a copy whose count failed is not known until its retry is
-    due, and only the other copies are counted."""
+    site may have a placeholder where another has the chapter. So every
+    copy of each fractional chapter a pass may download is counted, the
+    fallbacks too, and a copy is downloaded only when its count says it is
+    the chapter (min_pages or more) or its source would not count it at all
+    (a count that fails, as before). A chapter is junk (dropped) only when
+    none of its copies has min_pages or more and its best-ranked copy is
+    short (a copy the source would not count, next to a short one, does not
+    keep it); otherwise it stays, with its full-length copies first, and it
+    is downloaded like any other chapter. The copies known to be short are
+    left out of its candidates (plan.short keeps which), and so are the ones
+    whose pages are not known this time (plan.uncounted): Suwayomi itself
+    did not answer the count (that says nothing about the copy, so it keeps
+    the chapter from being junk; the next pass counts it), or the chapter is
+    in `settled` (on disk or ignored: no pass downloads it, so only its best
+    copy is counted, and the others only behind a short one). Every
+    fractional chapter is judged, not just single-source ones: aggregators
+    (Bato, Manganato) scrape the same upstream and list the same junk, so
+    agreement between them proves nothing. With `counts`, a count kept from
+    an earlier pass is used while it holds; one that no longer holds is
+    counted again, a short one too (never taken as unknown), and a copy
+    whose count failed is kept, as when a count fails, until its retry is
+    due."""
     from . import settings
     min_pages = int(settings.get("min_pages"))
+    settled = settled or set()
     chapters: dict[int, dict[float, Chapter]] = {}
 
     def copy_of(m: SourceMatch, n: float) -> Chapter | None:
@@ -652,36 +669,52 @@ def _prune_junk(client: Client, plan: Plan, progress: Callable[[str], None] | No
         got = pages.get((id(m), n))
         return got is not None and got < min_pages
 
+    def asked(n: float) -> bool:
+        """Whether the other copies of chapter n are counted: a pass may download it (one of them is used when
+        the best fails), or its best copy is short (is another one the chapter?)."""
+        return n not in settled or is_short(plan.candidates[n][0], n)
+
     firsts = [(n, plan.candidates[n][0]) for n in suspects]
     count(firsts, kept(firsts), "counting the pages of fractional chapters",
           "probing %d fractional chapter(s) for junk (< %d pages)%s%s")
     others = [(n, m) for n in suspects for m in plan.candidates[n][1:] if copy_of(m, n) is not None]
-    todo = kept(others)
-    todo = [(n, m) for n, m in todo if is_short(plan.candidates[n][0], n)]     # counted only behind a short one
+    todo = [(n, m) for n, m in kept(others) if asked(n)]
     if todo:
-        count([(n, m) for n, m in others if is_short(plan.candidates[n][0], n)], todo,
-              "counting the pages of the other sites' copies",
-              "counting %d other copies of fractional chapters whose best copy is short (< %d pages)%s%s")
-    left_out = 0
+        count([(n, m) for n, m in others if asked(n)], todo, "counting the pages of the other sites' copies",
+              "counting %d other copies of fractional chapters before any is downloaded (< %d pages: not the "
+              "chapter)%s%s")
+    left_out = blind_to = 0
     for n in suspects:
         cands = plan.candidates[n]
         short = [m for m in cands if is_short(m, n)]
-        if not short:
-            continue
         full = [m for m in cands if (got := pages.get((id(m), n))) is not None and got >= min_pages]
         rest = [m for m in cands if all(m is not x for x in full + short)]
-        if full or not is_short(cands[0], n) or any((id(m), n) in unasked for m in rest):
-            plan.short[n] = {m.source.name: pages[(id(m), n)] for m in short}
-            plan.candidates[n] = full + rest
-            plan.assignment[n] = plan.candidates[n][0]
-            left_out += len(short)
+        if short and not full and is_short(cands[0], n) and not any((id(m), n) in unasked for m in rest):
+            plan.short[n] = {m.source.name: pages.get((id(m), n)) for m in cands}
+            plan.junk[n] = (cands[0], pages[(id(cands[0]), n)])
+            del plan.assignment[n]
+            del plan.candidates[n]
             continue
-        plan.short[n] = {m.source.name: pages.get((id(m), n)) for m in cands}
-        plan.junk[n] = (cands[0], pages[(id(cands[0]), n)])
-        del plan.assignment[n]
-        del plan.candidates[n]
+        # pages not known this time: Suwayomi did not answer, or not asked (a settled chapter's other copies)
+        blind = [m for m in rest if (id(m), n) not in pages or (id(m), n) in unasked]
+        if not short and not blind:
+            continue                            # every copy may be the chapter: ranked as found
+        if short:
+            plan.short[n] = {m.source.name: pages[(id(m), n)] for m in short}
+            left_out += len(short)
+            keep = full + [m for m in rest if all(m is not x for x in blind)]
+        else:
+            keep = [m for m in cands if all(m is not x for x in blind)]
+        if blind:
+            plan.uncounted[n] = [m.source.name for m in blind]
+            blind_to += sum(1 for m in blind if (id(m), n) in unasked)
+        plan.candidates[n] = keep
+        plan.assignment[n] = (keep or blind)[0]     # none known to be it: the one the next pass counts first
     if left_out:
         log.info("left out %d short copies of fractional chapters other sites have", left_out)
+    if blind_to:
+        log.info("left out %d copies of fractional chapters whose pages Suwayomi did not count this time; the next "
+                 "pass counts them", blind_to)
     if plan.junk:
         log.info("dropped %d junk chapter(s): %s", len(plan.junk), ranges(sorted(plan.junk)))
 

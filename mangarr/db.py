@@ -685,6 +685,15 @@ def unlisted_note(row) -> str:
     return UNLISTED_NOTE.format(" or ".join(oneline(k, 60) for k in sites))
 
 
+def with_listing_note(row, reason: str) -> str:
+    """`reason` for a chapter (its row), which when no source listed it in
+    the last resolve and it is still waited for also says so, as the
+    resolve left it (unlisted_note; never the part cut off)."""
+    if row["unlisted"] and row["status"] in ("wanted", "failed") and not past_grace(row):
+        return _with_note(reason, unlisted_note(row))
+    return reason[:300]
+
+
 def _with_note(reason: str | None, note: str, limit: int = 300) -> str:
     """A failed chapter's reason (without the unlisted note an earlier
     resolve added) and then `note`, within `limit` characters: the note is
@@ -779,7 +788,9 @@ def void_junk(con, series_id: int, plan) -> None:
     not junk this time: it is taken out of plan.junk (plan.voided names the
     sites) and waited for like a chapter no site listed (_save_listing,
     core.hold_in_order), until that site answers or its listing is too old
-    to count."""
+    to count. One you skipped or ignored too: you may take it back in this
+    very pass (stuck.update does, when it changes), and it must then hold
+    the chapters after it like any chapter still waited for."""
     junk = getattr(plan, "junk", None)
     if not junk:
         return
@@ -787,7 +798,7 @@ def void_junk(con, series_id: int, plan) -> None:
     rows = chapters_by_number(con, series_id, list(junk))
     for n in list(junk):
         r = rows.get(n)
-        if r is None or r["status"] in ("have", "ignored"):
+        if r is None or r["status"] == "have":
             continue
         silent = [k for k, v in listed_by(r).items() if k not in answered and not short_copy(v)]
         if silent:
@@ -873,10 +884,13 @@ def set_have(con, series_id: int, number: float, staging_path: str | None,
 
 def set_reason(con, series_id: int, number: float, reason: str) -> bool:
     """Say why a chapter is where it is without changing its status (a
-    downloaded file that could not be checked in time). A chapter the
-    library has is left alone. Returns whether a row changed."""
-    cur = con.execute("UPDATE chapter SET reason=?, updated_at=? WHERE series_id=? AND number=? AND status != 'have'",
-                      (reason[:300], now(), series_id, number))
+    downloaded file that could not be checked in time, or not linked). A
+    chapter the library has, one you ignored and a junk one are left alone,
+    and so is a reason that says it already. Returns whether a row
+    changed."""
+    cur = con.execute("UPDATE chapter SET reason=?, updated_at=? WHERE series_id=? AND number=? AND status IN"
+                      " ('wanted','failed','unavailable') AND reason IS NOT ?",
+                      (reason[:300], now(), series_id, number, reason[:300]))
     return cur.rowcount > 0
 
 

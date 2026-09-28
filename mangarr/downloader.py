@@ -284,9 +284,18 @@ def waiting_unlisted_reason(n: float, note: str) -> str:
 def taken_back_reason(n: float) -> str:
     """The reason of a chapter a download left for the next pass because
     chapter n before it was wanted again while it ran (un-skipped, or its
-    Want button), with strict download in order."""
+    Want button: core.taken_back), with strict download in order."""
     return WAITING_START.format(f"{n:g}") + f" and {n:g} was wanted again while this download ran: the next pass " \
         "downloads it first"
+
+
+def uncounted_reason(n: float, names: list[str]) -> str:
+    """The reason of chapter n left for the next pass because no copy of
+    it is known to be the chapter this time: the pages of its copies on
+    `names` are not counted (plan.uncounted: resolver._prune_junk). With
+    strict download in order the later chapters get it too."""
+    return (f"not attempted: the pages of ch {n:g} on {', '.join(names[:3])} are not counted yet (a copy too short "
+            "to be the chapter is never downloaded); the next pass counts them")
 
 
 def waiting_for(reason: str | None) -> str | None:
@@ -349,7 +358,10 @@ class SeriesSteps:
     Otherwise chapters are grouped per source in rounds; the ones that fail
     go to their next source in the next round. A chapter Suwayomi did not
     start goes on to its next source the same way (not_started), but with
-    no source left it is not attempted this time instead of failed.
+    no source left it is not attempted this time instead of failed; so is a
+    fractional chapter none of whose copies is known to be the chapter yet
+    (plan.uncounted: their pages are not counted), and in order the later
+    chapters wait for it.
 
     Each chapter's sources are tried best first (plan.candidates), every one
     of them before the chapter fails; an entry that delivered nothing in a
@@ -369,11 +381,15 @@ class SeriesSteps:
         self.held: dict[float, str] = {}                   # its last source did not start it -> reason if none left
         self.back: float | None = None                     # in order: a chapter before these wanted again meanwhile
         self.finished = False
-        pending = {n for n in wanted if plan.candidates.get(n)}
+        uncounted = getattr(plan, "uncounted", None) or {}
+        pending = {n for n in wanted if plan.candidates.get(n) or uncounted.get(n)}
         for n in wanted - pending:
             self.results[n] = "failed"
             reasons[n] = "no enabled source lists this chapter"
             log.warning("%s: ch %g has no usable source", label, n)
+        for n in pending:
+            if not plan.candidates.get(n):      # no copy known to be the chapter yet: not attempted this time
+                self.held[n] = uncounted_reason(n, uncounted[n])
         self.used: dict[float, set[int]] = {n: set() for n in pending}   # entries (manga ids) tried per chapter
         self.order = sorted(pending)                       # in order
         self.idx = 0
@@ -384,7 +400,7 @@ class SeriesSteps:
         """Chapter n's entries not tried yet for it, best first, the dead
         ones (delivered nothing this run) after the others."""
         used, dead = self.used[n], self.dead
-        left = [c for c in self.plan.candidates[n] if c.manga_id not in used]
+        left = [c for c in self.plan.candidates.get(n, ()) if c.manga_id not in used]
         return [c for c in left if c.manga_id not in dead] + [c for c in left if c.manga_id in dead]
 
     def _next_source(self, n: float):
@@ -454,8 +470,8 @@ class SeriesSteps:
         n = order[self.idx]
         m = self._next_source(n)
         if m is None and n in self.held:
-            log.warning("%s: ch %g was not started on any source left (Suwayomi's queue is busy); it and the "
-                        "later chapters wait for the next pass", self.label, n)
+            log.warning("%s: ch %g: %s; it and the later chapters wait for the next pass", self.label, n,
+                        self.held[n])
             self.stop(self.held[n])
             return []
         if m is None:
@@ -483,8 +499,7 @@ class SeriesSteps:
             m = self._next_source(n)
             if m is None and n in self.held:
                 self.reasons[n] = self.held[n]
-                log.warning("%s: ch %g was not started on any source left (Suwayomi's queue is busy); it waits "
-                            "for the next pass", self.label, n)
+                log.warning("%s: ch %g: %s; it waits for the next pass", self.label, n, self.held[n])
                 continue
             if m is None:
                 cands = plan.candidates[n]
@@ -655,11 +670,13 @@ class SeriesSteps:
     def wait_for(self, k: float | None) -> set[float]:
         """In order: chapter k, before some of these chapters but not one of
         them, is wanted again (you un-skipped it, or wanted it, while they
-        downloaded): the ones after it that have not arrived wait for it, as
-        they would in the next pass (taken_back_reason), and this download
-        ends before them. Returns them, for the chapters to leave out
-        (they stay so, whatever k does later in this download); set() when
-        there are none, or out of order (gaps are allowed then)."""
+        downloaded: core.taken_back, which never names one that was wanted
+        when the download began): the ones after it that have not arrived
+        wait for it, as they would in the next pass (taken_back_reason), and
+        this download ends before them. Returns them, for the chapters to
+        leave out (they stay so, whatever k does later in this download);
+        set() when there are none, or out of order (gaps are allowed
+        then)."""
         if not self.in_order:
             return set()
         if k is not None and (self.back is None or k < self.back):

@@ -1782,6 +1782,126 @@ class PassTest(PassBase, _Offline):
         self.assertEqual([st[n][0] for n in (3.5, 4, 5, 6, 7)], ["wanted", "have", "wanted", "wanted", "wanted"])
         self.assertEqual(st[7.0][1], downloader.taken_back_reason(3.5))
 
+    def test_a_chapter_downloaded_but_not_linked_does_not_stall_the_series(self):
+        # Review: 3 was downloaded, but the library already had another file under its name, so it stayed wanted;
+        # every later pass then took it for a chapter wanted again during its download, and held 7 and 8 behind it
+        # for good (0 downloaded, 0 failed, and no note said why)
+        fake, _, row = self.scenario()
+        fake.broken = set()
+        lib = library.library_dir(row["folder"])
+        os.makedirs(lib, exist_ok=True)
+        with open(os.path.join(lib, library.chapter_filename(3.0)), "wb") as f:
+            f.write(b"not ours")
+        self.run_pass(fake, {"Freedom": [entry(fake, X, 1, "Freedom", [1, 2, 3, 4, 5, 6])]}, row)
+        st = self.status(row["id"])
+        self.assertEqual([st[n][0] for n in (1, 2, 3, 4, 5, 6)], ["have", "have", "wanted", "have", "have", "have"])
+        m = entry(fake, X, 1, "Freedom", [1, 2, 3, 4, 5, 6, 7, 8])
+        for c in m.chapters:
+            c.downloaded = c.number <= 6                                   # as Suwayomi lists them now
+        for i in range(3):
+            self.later(1.1)
+            self.run_pass(fake, {"Freedom": [m]}, row)
+            st = self.status(row["id"])
+            self.assertEqual([st[n][0] for n in (3, 7, 8)], ["wanted", "have", "have"], (i, st[7.0][1]))
+            self.assertEqual(st[3.0][1], f"{X}: downloaded, not linked: the library already has another file at "
+                                         f"{os.path.join(lib, library.chapter_filename(3.0))}, which is never "
+                                         "overwritten; move it away and the next import links this one")
+            if i == 0:
+                with db.connect() as con:
+                    self.assertEqual(con.execute("SELECT message FROM event WHERE kind='downloaded' ORDER BY id DESC"
+                                                 " LIMIT 1").fetchone()[0], "2 chapter(s) downloaded, 0 failed")
+        self.assertEqual(self.enqueued(fake)[-2:], [7.0, 8.0])
+        with db.connect() as con:
+            self.assertEqual(stuck.blockers(con, row["id"]), [])
+        os.remove(os.path.join(lib, library.chapter_filename(3.0)))       # you move the other file away
+        self.run_pass(fake, {"Freedom": [m]}, row)
+        self.assertEqual(self.status(row["id"])[3.0], ("have", None))
+
+    def test_a_failed_chapter_that_arrives_but_cannot_be_linked_holds_nothing(self):
+        # the same, for a chapter that had failed: it arrived after all, so it is wanted again (its retry schedule
+        # is over) with the reason, and the chapters after it are not held behind a retry
+        fake, _, row = self.scenario()
+        fake.broken = {chapter_id(1, 3)}
+        m = entry(fake, X, 1, "Freedom", [1, 2, 3, 4, 5])
+        self.run_pass(fake, {"Freedom": [m]}, row)
+        self.assertEqual(self.status(row["id"])[3.0][0], "failed")
+        with db.connect() as con:
+            con.execute("UPDATE chapter SET next_try=? WHERE series_id=? AND number=3", ("2099-01-01 00:00:00", row["id"]))
+        lib = library.library_dir(row["folder"])
+        with open(os.path.join(lib, library.chapter_filename(3.0)), "wb") as f:
+            f.write(b"not ours")
+        fake.broken.clear()
+        fake.have.add(chapter_id(1, 3))                                    # downloaded meanwhile (a manual download)
+        make_cbz(os.path.join(config.STAGING_ROOT, library.safe_title(X), "Freedom", "Chapter 3.cbz"), 20)
+        for c in m.chapters:
+            c.downloaded = c.number <= 3
+        self.run_pass(fake, {"Freedom": [m]}, row)
+        st = self.status(row["id"])
+        self.assertEqual([st[n][0] for n in (3, 4, 5)], ["wanted", "have", "have"])
+        self.assertIn("downloaded, not linked", st[3.0][1])
+        with db.connect() as con:
+            r = db.chapters_by_number(con, row["id"], [3.0])[3.0]
+        self.assertEqual((r["tries"], r["next_try"], r["failed_since"]), (0, None, None))
+
+    def test_a_skipped_chapter_taken_back_in_a_pass_that_finds_it_short_holds_the_later_ones(self):
+        # Found by the simulator: 3.5 was skipped automatically; in a pass in which only X answered, with a short
+        # copy, it was junk (a skipped chapter was never voided for a site that did not answer), then taken back in
+        # the same pass (its name changed), and strict order went on to 6 and 7 though Site C may still have it
+        fake, plans, row = self.scenario(auto_skip_side_stories=True)
+        x = plans["Freedom"][0]
+        c = self.site(fake, "Site C (EN)", 2, [1, 2, 3, 3.5, 4, 5], "Side Story 1")
+        for _ in range(2):
+            self.run_pass(fake, {"Freedom": [x, c]}, row, pages={})
+            self.later(1.1)
+        self.assertEqual(self.status(row["id"])[3.5][0], "ignored")        # skipped automatically
+        x = entry(fake, X, 1, "Freedom", [1, 2, 3, 3.5, 4, 5, 6, 7])
+        next(ch for ch in x.chapters if ch.number == 3.5).name = "Chapter 3.5: The Duel"
+        before = len(self.enqueued(fake))
+        self.run_pass(fake, {"Freedom": [x]}, row, down=[c], pages={chapter_id(1, 3.5): 4})
+        st = self.status(row["id"])
+        self.assertEqual([st[n][0] for n in (3.5, 6, 7)], ["wanted", "wanted", "wanted"])
+        self.assertEqual(st[6.0][1], downloader.waiting_unlisted_reason(3.5, "not listed by Site C (EN) in the last "
+                                                                             "check; still waiting for it"))
+        self.assertEqual(self.enqueued(fake)[before:], [])
+
+    def test_a_short_fallback_copy_is_never_downloaded(self):
+        # Review: C's 3.5 (25 pages, ranked first) counted in full and failed; X's never counted 4-page placeholder
+        # was then downloaded and linked as 3.5
+        fake, plans, row = self.scenario("Chapter 3.5: The Duel")
+        x = plans["Freedom"][0]
+        c = self.site(fake, "Site C (EN)", 2, [1, 2, 3, 3.5, 4, 5, 6], "Chapter 3.5: The Duel")
+        fake.broken = {chapter_id(2, 3.5)}                                  # X's placeholder itself downloads fine
+        self.run_pass(fake, {"Freedom": [x, c]}, row, pages={chapter_id(1, 3.5): 4})
+        st = self.status(row["id"])
+        self.assertEqual((st[3.5][0], st[4.0][0]), ("failed", "wanted"))
+        self.assertIn(chapter_id(2, 3.5), [e[4] for e in fake.kinds("enqueue")])
+        self.assertNotIn(chapter_id(1, 3.5), [e[4] for e in fake.kinds("enqueue")])
+        with db.connect() as con:
+            listed = db.listed_by(db.chapters_by_number(con, row["id"], [3.5])[3.5])
+        self.assertEqual((db.short_copy(listed[X]), db.short_copy(listed["Site C (EN)"])), (True, False))
+
+    def test_a_copy_counted_short_is_counted_again_before_it_is_used(self):
+        # Review: once X's short count expired (a day), X's placeholder was a fallback again behind C and was
+        # downloaded when C failed
+        fake, _, row = self.scenario("Chapter 3.5: The Duel")
+        x = entry(fake, X, 1, "Freedom", [1, 2, 3, 3.5, 4, 5, 6, 7, 8])
+        c = self.site(fake, "Site C (EN)", 2, [1, 2, 3, 3.5, 4, 5, 6], "Chapter 3.5: The Duel")
+        fake.broken = {chapter_id(2, 3.5)}
+        pages = {chapter_id(1, 3.5): 4}
+        self.run_pass(fake, {"Freedom": [x, c]}, row, pages=pages)          # X ranks first: short, left out
+        self.assertEqual(self.status(row["id"])[3.5][0], "failed")
+        c = self.site(fake, "Site C (EN)", 2, [1, 2, 3, 3.5, 4, 5, 6, 7, 8, 9], "Chapter 3.5: The Duel")
+        self.later(1.2)                                                     # X's short count is due again
+        before = len(fake.kinds("enqueue"))
+        self.run_pass(fake, {"Freedom": [x, c]}, row, pages=pages)          # C ranks first now
+        asked = [e[4] for e in fake.kinds("enqueue")][before:]
+        self.assertEqual(asked, [chapter_id(2, 3.5)])
+        self.assertEqual(self.status(row["id"])[3.5][0], "failed")
+        with db.connect() as con:
+            counted = con.execute("SELECT pages, agreed FROM page_probe WHERE chapter_id=?",
+                                  (chapter_id(1, 3.5),)).fetchone()
+        self.assertEqual(tuple(counted), (4, 2))                            # counted again, and short again
+
 
 # -- the pages and the API --------------------------------------------------------------------
 
