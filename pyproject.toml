@@ -1,6 +1,6 @@
 [project]
 name = "mang-arr"
-version = "0.3.0"
+version = "0.3.1"
 description = "Sonarr for manga, on top of Suwayomi and Komga"
 readme = "README.md"
 license = { text = "MIT" }
