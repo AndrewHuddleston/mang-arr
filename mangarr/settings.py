@@ -11,6 +11,8 @@ through get(), so a change on the Settings page applies to the next job.
     download_lanes       int    3      sources downloading at once in a pass (1-8; Suwayomi's cap wins)
     search_parallel      int    5      sites searched at once while a series is resolved (1-8)
     page_delay_seconds   float  2.5    starting and minimum gap between page requests (page by page)
+    download_in_order    bool   True   strict download in order, per series
+    auto_skip_side_stories bool False  skip a blocking chapter judged a side story or covered (stuck.py)
     pushover_token       str    PUSHOVER_TOKEN
     pushover_user        str    PUSHOVER_USER
     webhook_url          str    WEBHOOK_URL
@@ -50,6 +52,7 @@ log = logging.getLogger(__name__)
 DEFAULTS: dict[str, object] = {
     "refresh_hours": config.REFRESH_HOURS,
     "download_in_order": True,       # per series, strictly in chapter order; a stuck chapter holds only its series
+    "auto_skip_side_stories": False,  # skip a stuck chapter judged a side story or covered, high confidence only
     "recheck_finished_days": 7.0,   # a finished series with nothing missing is re-checked this often
     "min_pages": config.MIN_PAGES,
     "throttled_delay_seconds": 8.0,  # pause between chapters on a rate-limited source (avoids 429 -> long backoff)

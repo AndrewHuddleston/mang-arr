@@ -681,6 +681,30 @@ def verify_archive(src: str | StagedFile) -> tuple[bool | None, str]:
         return False, f"{type(e).__name__}: {e}"[:300]
 
 
+def page_count(path: str) -> int | None:
+    """How many pages (images) the chapter archive at `path` holds, from its
+    directory alone: nothing is decompressed, so it is cheap enough for the
+    chapters a verdict compares (stuck.py). None when it cannot be told: not
+    a regular file (never read through a symlink), not a zip, or a directory
+    too big for a chapter (the limits verify_archive checks first). Never
+    raises. The caller checks that the path is inside the library."""
+    try:
+        with open_staged(path) as f:
+            size = os.fstat(f.fd).st_size
+            if size < 1024:
+                return None
+            snap = _Snapshot(f.fd, size)
+            end = _end_records(snap)
+            if end is None or _directory_limits(snap, *end):
+                return None
+            with zipfile.ZipFile(snap) as z:
+                n = sum(1 for i in z.infolist() if i.filename.lower().endswith(_IMAGE_EXT))
+        return n or None
+    except Exception as e:          # OSError, zipfile.BadZipFile, struct.error ...
+        log.debug("cannot count the pages of %r: %s: %s", path[:300], type(e).__name__, e)
+        return None
+
+
 def _stored_bytes(fd: int, size: int) -> int:
     """The bytes a file really holds: its size less its holes. A sparse file
     (holes that read back as zeros) is far longer than what it stores, and

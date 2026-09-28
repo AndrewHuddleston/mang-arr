@@ -14,7 +14,7 @@ import urllib.error
 import zipfile
 from unittest import mock
 
-from mangarr import config, core, db, downloader, jobs, limits, resolver, suwayomi
+from mangarr import config, core, db, downloader, jobs, limits, resolver, settings, suwayomi
 from mangarr.model import Series
 from mangarr.resolver import Plan, SourceMatch
 from mangarr.suwayomi import Chapter, Client, Source, SuwayomiError, SuwayomiUnreachable
@@ -455,8 +455,12 @@ class CoreTest(TmpData):
             names = {r["source_name"] for r in db.sources(con, sid)}
         self.assertEqual(names, {"A", "B"})                 # A's entry (and staging folder) kept
         self.assertEqual(self.status(sid)[7], "wanted")     # not flipped to 'unavailable'
-        with db.connect() as con:                          # once A answers and no longer lists 7, it is
+        with db.connect() as con:                          # nor when A's search misses the series
             db.save_plan(con, sid, _plan([b]), 2)
+        self.assertEqual(self.status(sid)[7], "wanted")
+        with db.connect() as con:                          # once A answers and no longer lists 7 for its grace, it is
+            for _ in range(db.LISTING_GRACE_RESOLVES):
+                db.save_plan(con, sid, _plan([_match("A", 1, [1]), b]), 2)
         self.assertEqual(self.status(sid)[7], "unavailable")
 
     def test_a_source_down_for_too_long_loses_its_state(self):         # second pass, regression 4
@@ -465,12 +469,16 @@ class CoreTest(TmpData):
         with db.connect() as con:
             con.execute("UPDATE series_source SET seen_at=? WHERE series_id=? AND source_name='A'", (old, sid))
             con.commit()
+            con.execute("UPDATE chapter SET updated_at=? WHERE series_id=?", (old, sid))   # A listed 7 back then
+            con.commit()
         down = [(Source("1", "A", "en"), "search failed: HTTP 403")]      # e.g. blocked for good
         with db.connect() as con:
             dropped = db.save_plan(con, sid, _plan([_match("B", 2, [1])], unreachable=down), 2)
             names = {r["source_name"] for r in db.sources(con, sid)}
-        self.assertEqual(dropped, ["A"])
-        self.assertEqual(names, {"B"})
+            self.assertEqual(dropped, ["A"])
+            self.assertEqual(names, {"B"})
+            for _ in range(db.LISTING_GRACE_RESOLVES - 1):   # its chapters are given up once their grace is over
+                db.save_plan(con, sid, _plan([_match("B", 2, [1])], unreachable=down), 2)
         self.assertEqual(self.status(sid)[7], "unavailable")
 
     def test_a_down_former_primary_leaves_suwayomis_library(self):     # second pass, regression 4
@@ -608,6 +616,10 @@ class CoreSplitTest(TmpData):
             asked["only"] = only
             return {}
         with db.connect() as con:
+            settings.set_many(con, {"download_in_order": False})
+        settings._cache.clear()
+        self.addCleanup(settings._cache.clear)
+        with db.connect() as con:
             con.execute("UPDATE series SET monitored=1 WHERE id=?", (sid,))      # a write left open
             with self.assertLogs("mangarr.core", "INFO") as cm:
                 due = core.downloads_due(con, core.Outcome(sid, plan))
@@ -617,6 +629,19 @@ class CoreSplitTest(TmpData):
         self.assertEqual(due, [4.0, 5.0, 6.0])              # not on disk, not ignored, not failed until later
         self.assertEqual(asked["only"], set(due))
         self.assertIn("1 failed chapter(s) not due", "\n".join(cm.output))
+        # strict order: the chapters after the failed one that is not due yet wait for it (no gap)
+        with db.connect() as con:
+            settings.set_many(con, {"download_in_order": True})
+        settings._cache.clear()
+        with db.connect() as con:
+            with self.assertLogs("mangarr.core", "INFO") as cm:
+                due = core.downloads_due(con, core.Outcome(sid, plan))
+            self.assertFalse(con.in_transaction)            # the reasons it wrote are committed
+            reason = con.execute("SELECT reason FROM chapter WHERE series_id=? AND number=5", (sid,)).fetchone()[0]
+        self.assertEqual(due, [])
+        self.assertEqual(reason, downloader.waiting_reason(3.0))
+        self.assertIn("3 later chapter(s) wait for ch 3, which failed on every source and is not due for another "
+                      "attempt yet (strict download in order)", "\n".join(cm.output))
 
     def test_nothing_due_without_a_usable_source(self):
         sid = self.seed({1: "wanted"})

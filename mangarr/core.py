@@ -10,12 +10,13 @@ import hashlib
 import logging
 import math
 import os
+import re
 import threading
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field, replace
 
-from . import db, downloader, duplicates, komga, library, limits, metadata, metrics
+from . import db, downloader, duplicates, komga, library, limits, metadata, metrics, settings, stuck
 from .matching import oneline
 from .model import Series
 from .pagecounts import PageCounts
@@ -35,6 +36,7 @@ class Outcome:
     plan: Plan
     results: dict = field(default_factory=dict)   # chapter -> ok | failed
     imported: int = 0                             # chapters newly linked into the library
+    before: frozenset | None = None               # what its download does not wait for (downloads_due)
 
     @property
     def downloaded(self) -> int:
@@ -60,18 +62,23 @@ def add_series(con, client: Client, series: Series, download: bool = True, do_im
     if series_id is None:
         duplicates.check_new(con, series)
     counts = PageCounts(con)             # fractional chapters counted in an earlier pass
+    settled = set() if series_id is None else {r[0] for r in con.execute(
+        "SELECT number FROM chapter WHERE series_id=? AND status IN ('have','ignored')", (series_id,))}
     plan = resolve(client, series, reliability=db.reliability(con), should_cancel=should_cancel, progress=progress,
-                   counts=counts)
+                   counts=counts, settled=settled)
     lookups = with_cancel(client, should_cancel)
     if series_id is not None and not db.get_series(con, series_id):
         raise Gone(f"{series.title} was deleted during the refresh")
     series_id = db.upsert_series(con, series)
     p = primary(plan)
+    blocked = stuck.blockers(con, series_id)        # as the last pass left it: save_plan makes these wanted again
     expired = db.save_plan(con, series_id, plan, p.manga_id if p else None)
     counts.save(con, plan)
+    hold_in_order(con, series_id, plan)             # save_plan's reasons for the chapters that still wait
     if expired:
-        log.warning("%s: %s could not be searched for over %d days; its entry is dropped and the chapters "
-                    "only it listed count as unavailable", series.title, ", ".join(expired), db.UNREACHABLE_KEEP_DAYS)
+        log.warning("%s: %s could not be searched for over %d days; its entry is dropped and the chapters only it "
+                    "listed are given up once their grace is over", series.title, ", ".join(expired),
+                    db.UNREACHABLE_KEEP_DAYS)
     # entries kept for a source that could not be searched this time (see save_plan)
     stale = [r["manga_id"] for r in db.sources(con, series_id)
              if r["manga_id"] not in {m.manga_id for m in plan.matches}]
@@ -84,12 +91,15 @@ def add_series(con, client: Client, series: Series, download: bool = True, do_im
     out = Outcome(series_id, plan)
     if p:
         _set_library_entries(lookups, plan, p.manga_id, stale)
+        stuck.update(con, lookups, series_id, series, plan, blocked)    # may skip one: before the chapters due
     if do_import:
         out.imported += import_series(con, series_id, lookups)
     if download and p:
         out.results = download_wanted(con, client, series_id, plan, should_cancel, progress)
         if do_import:
             finish_download(con, lookups, out)          # deleted while it downloaded: links nothing, raises Gone
+        if out.results:
+            stuck.update(con, lookups, series_id, series, plan)     # the chapter this download stopped at, if any
     return out
 
 
@@ -171,6 +181,12 @@ def describe_outcome(con, series_id: int, o: Outcome) -> tuple[str, str]:
     if later:
         nxt = min(r["next_try"] for r in later)[:16]
         parts.append(f"{len(later)} failed chapter(s) waiting for retry (next {nxt})")
+    waits: dict[str, int] = {}
+    for r in rows:
+        if r["status"] == "wanted" and (token := downloader.waiting_for(r["reason"])):
+            waits[token] = waits.get(token, 0) + 1
+    for token, k in list(waits.items())[:3]:
+        parts.append(f"{k} later chapter(s) wait for ch {token} (strict download in order)")
     if unavailable:
         parts.append(f"{unavailable} chapter(s) no source lists")
     if plan.unreachable:
@@ -232,16 +248,58 @@ def _set_library_entries(client: Client, plan: Plan, primary_manga_id: int, stal
 # statuses a background job may overwrite; anything else ('ignored', 'have')
 # was set by the user or an import meanwhile and is left alone
 _JOB_OWNED = ("wanted", "failed", "unavailable")
+# statuses an import may turn 'failed' when the file it finds is bad: not
+# 'ignored' (you skipped it: that stays as you left it) nor 'junk'
+_IMPORT_OWNED = (*_JOB_OWNED, "have")
+
+
+def hold_in_order(con, series_id: int, plan: Plan, rows: dict | None = None) -> float | None:
+    """With strict download in order: the first chapter that holds the
+    series (db.holds_in_order): one that failed and waits for its next
+    attempt, as in the pass that failed it, or one no source listed in this
+    resolve that is still waited for (db.past_grace: the source may only not
+    have answered). Its later wanted chapters wait for it (their reason says
+    so: downloader.waiting_reason, which stuck.blockers finds the series by),
+    so no pass fills in the chapters after it and leaves a gap. Returns its
+    number, or None (in order off, or none). Not committed."""
+    if not settings.get("download_in_order"):
+        return None
+    rows = rows if rows is not None else {r["number"]: r for r in db.chapters(con, series_id)}
+    now_, wanted = db.now(), plan.wanted()
+    listed = set(plan.assignment) | set(plan.junk)
+    later = [n for n, r in rows.items() if db.holds_in_order(r, n in listed, now_)]
+    if not later:
+        return None
+    first = min(later)
+    reason = downloader.waiting_reason(first) if rows[first]["status"] == "failed" else \
+        downloader.waiting_unlisted_reason(first, db.unlisted_note(rows[first]))
+    con.executemany("UPDATE chapter SET reason=?, updated_at=? WHERE series_id=? AND number=?",
+                    [(reason, now_, series_id, n) for n in wanted
+                     if n > first and (r := rows.get(n)) is not None and r["status"] == "wanted"
+                     and r["reason"] != reason])
+    return first
 
 
 def _due(con, series_id: int, plan: Plan) -> list[float]:
     """The plan's wanted chapters that are due now: not on disk, not ignored,
-    and not a failed one waiting for its next attempt."""
+    not a failed one waiting for its next attempt, and with strict download
+    in order none after such a one, or after one no source listed this time
+    that is still waited for (hold_in_order). Commits what it wrote."""
     rows = {r["number"]: r for r in db.chapters(con, series_id)}
     have_on_disk = {n for n, r in rows.items() if r["status"] == "have"}
     ignored = {n for n, r in rows.items() if r["status"] == "ignored"}
     later = {n for n, r in rows.items() if r["status"] == "failed" and r["next_try"] and r["next_try"] > db.now()}
+    first = hold_in_order(con, series_id, plan, rows)
     wanted = [n for n in plan.wanted() if n not in have_on_disk and n not in later and n not in ignored]
+    if first is not None:
+        held = [n for n in wanted if n > first]
+        wanted = [n for n in wanted if n < first]
+        if con.in_transaction:
+            con.commit()
+        if held:
+            log.info("%s: %d later chapter(s) wait for ch %g, which %s (strict download in order)", plan.series.title,
+                     len(held), first, "failed on every source and is not due for another attempt yet"
+                     if first in set(plan.assignment) else "no source listed this time; it is still waited for")
     if later:
         log.info("%s: %d failed chapter(s) not due for another attempt yet", plan.series.title, len(later))
     if ignored & set(plan.wanted()):
@@ -254,11 +312,13 @@ def _due(con, series_id: int, plan: Plan) -> list[float]:
 def downloads_due(con, out: Outcome) -> list[float]:
     """After a refresh without download: the chapters to fetch for it now
     ([] when no source matched). Commits first, so no write is held across
-    the downloads that follow."""
+    the downloads that follow. Sets out.before first (not_waited_for), for
+    the take-backs of that download."""
     if not primary(out.plan):
         return []
     if con.in_transaction:
         con.commit()
+    out.before = not_waited_for(con, out.series_id, out.plan)
     return _due(con, out.series_id, out.plan)
 
 
@@ -268,6 +328,42 @@ def dropped_chapters(con, series_id: int, wanted: set) -> set:
     return {r["number"] for r in con.execute(
         "SELECT number, status FROM chapter WHERE series_id=? AND status IN ('ignored','have')", (series_id,))
         if r["number"] in wanted}
+
+
+def not_waited_for(con, series_id: int, plan: Plan) -> frozenset:
+    """The chapters a download that starts now does not wait for, whatever
+    becomes of them while it runs: the ones wanted or failed now (the
+    chapters due are chosen with them as they are: _due goes past one only
+    when strict order allows it) and the ones Suwayomi has downloaded
+    (plan.have(): there is nothing to download, whether the import could
+    link them or not). Taken before the chapters due are worked out, so a
+    change made in between counts as made during the download
+    (taken_back)."""
+    return frozenset({r[0] for r in con.execute(
+        "SELECT number FROM chapter WHERE series_id=? AND status IN ('wanted','failed')", (series_id,))}
+        | plan.have())
+
+
+def taken_back(con, series_id: int, wanted, before) -> float | None:
+    """The first chapter below the last one of `wanted` (a download's
+    chapters, due when it began) that is wanted or failed now without being
+    one of them, and was neither when the download began nor downloaded by
+    Suwayomi (`before`: not_waited_for): you un-skipped it or wanted it
+    again while the download ran. With strict download in order the
+    chapters of the download after it wait for it
+    (downloader.SeriesSteps.wait_for). A chapter that was wanted all along
+    without being due is not one: Suwayomi has it but the import could not
+    link it (its reason says why: not_linked), and strict order went past
+    it when the download began, as the next pass does. None when there is
+    none. Asked before each chunk, like dropped_chapters."""
+    if not wanted:
+        return None
+    wanted = set(wanted)
+    for r in con.execute("SELECT number FROM chapter WHERE series_id=? AND number<? AND status IN ('wanted','failed')"
+                         " ORDER BY number", (series_id, max(wanted))):
+        if r["number"] not in wanted and r["number"] not in before:
+            return r["number"]
+    return None
 
 
 def record_downloads(con, series_id: int, plan: Plan, wanted: list[float], results: dict, reasons: dict,
@@ -307,6 +403,7 @@ def record_downloads(con, series_id: int, plan: Plan, wanted: list[float], resul
             db.set_status(con, series_id, n, "wanted", reasons.get(n) or
                           "not attempted: the download pass was cancelled or interrupted before this chapter",
                           only_from=_JOB_OWNED)
+    stuck.note_failures(con, series_id, results, attempts)     # the sites a chapter that holds its series failed on
     con.commit()
 
 
@@ -325,6 +422,7 @@ def download_wanted(con, client: Client, series_id: int, plan: Plan,
     """Download the plan's wanted chapters. No write transaction is open while
     the downloader runs (it can take hours); the outcome is written after, and
     never over a status the user set in the meantime (e.g. 'ignored')."""
+    before = not_waited_for(con, series_id, plan)
     wanted = _due(con, series_id, plan)
     if not wanted:
         return {}
@@ -336,7 +434,8 @@ def download_wanted(con, client: Client, series_id: int, plan: Plan,
     attempts: list = []
     results = downloader.download(client, plan, only=wanted_set, should_cancel=should_cancel, reasons=reasons,
                                   progress=progress, throttled=seen_throttle,
-                                  dropped=lambda: dropped_chapters(con, series_id, wanted_set), attempts=attempts)
+                                  dropped=lambda: dropped_chapters(con, series_id, wanted_set), attempts=attempts,
+                                  taken_back=lambda: taken_back(con, series_id, wanted_set, before))
     record_downloads(con, series_id, plan, wanted, results, reasons, seen_throttle, attempts)
     return results
 
@@ -557,6 +656,7 @@ def series_staging_dirs(con, series_id: int) -> list[tuple[str, str, int | None]
 
 
 SETTLE_SECONDS = 120    # a staged file younger than this may still be being written
+_PAGES = re.compile(r"(\d+) pages")      # library.verify_archive's detail for a good archive
 
 
 def import_series(con, series_id: int, client: Client | None = None) -> int:
@@ -656,11 +756,10 @@ def _import_file(con, series_id: int, title: str, folder: str, n: float, prev, f
     to the caller."""
     ok, detail = library.verify_archive(f)
     if ok is None:                          # ran out of time: slow or busy storage, nothing wrong with the file
-        # the status stays (no quarantine, no failure, no source penalty); the
-        # reason says on the series page why the chapter is not in the library
-        db.set_reason(con, series_id, n, f"{source_name}: downloaded, not linked yet: {detail}; checked again at "
-                      "the next import")
-        con.commit()
+        # no quarantine, no failure, no source penalty; the reason says on the
+        # series page why the chapter is not in the library
+        not_linked(con, series_id, n, f"{source_name}: downloaded, not linked yet: {detail}; checked again at the "
+                   "next import")
         log.warning("%s: ch %g from %s could not be checked (%s); trying again at the next import",
                     title, n, source_name, detail)
         return None
@@ -674,8 +773,10 @@ def _import_file(con, series_id: int, title: str, folder: str, n: float, prev, f
         except OSError as e:
             _import_failed(con, series_id, title, n, f"{source_name}: bad file {f.name} not set aside", e)
             return None
-        db.set_status(con, series_id, n, "failed", f"{source_name}: bad file ({detail}); set aside as "
-                      f"{os.path.basename(moved)}, will be fetched again")
+        if not db.set_status(con, series_id, n, "failed", f"{source_name}: bad file ({detail}); set aside as "
+                             f"{os.path.basename(moved)}, will be fetched again", only_from=_IMPORT_OWNED):
+            log.info("%s: ch %g is %s: it stays so, although its file from %s was bad", title, n,
+                     prev["status"] if prev else "not a chapter of the plan", source_name)
         db.record_source_result(con, source_name, "corrupt")
         con.commit()                        # never hold a write across the next file check
         log.warning("%s: ch %g from %s is unusable (%s); quarantined %s", title, n, source_name, detail, moved)
@@ -690,12 +791,33 @@ def _import_file(con, series_id: int, title: str, folder: str, n: float, prev, f
     except OSError as e:
         _import_failed(con, series_id, title, n, f"{source_name}: cannot link {f.name}", e)
         return None
-    if dst is None:
+    if dst is None:                         # another file has its name there (link_into_library logged it)
+        not_linked(con, series_id, n, f"{source_name}: downloaded, not linked: the library already has another "
+                   f"file at {expected}, which is never overwritten; move it away and the next import links this one")
         return None
-    db.set_have(con, series_id, n, f.path, dst, source_name)
+    pages = _PAGES.fullmatch(detail)        # kept for the stuck-behind verdict (verdict.py compares lengths)
+    db.set_have(con, series_id, n, f.path, dst, source_name, pages=int(pages.group(1)) if pages else None)
     con.commit()                            # never hold a write across the next file check
     log.debug("%s: linked ch %g <- %s", title, n, f.path)
     return dst
+
+
+def not_linked(con, series_id: int, n: float, why: str) -> None:
+    """Chapter n is downloaded (its file is in staging) but this import did
+    not link it, for `why`; the next import tries again. The reason says so.
+    One that had failed is wanted again with it: it arrived after all, so
+    its retry schedule is over and it no longer holds the chapters after it
+    as a failed one does. It holds them no more than any chapter Suwayomi
+    has downloaded (_due and taken_back go past it). One no source listed
+    in the last check still says it is waited for (db.with_listing_note). A
+    chapter you skipped or ignored, or that is junk, stays as it is.
+    Committed."""
+    row = db.chapters_by_number(con, series_id, [n]).get(n)
+    if row is not None:
+        why = db.with_listing_note(row, why)
+        if not db.set_status(con, series_id, n, "wanted", why, only_from=("failed",)):
+            db.set_reason(con, series_id, n, why)
+    con.commit()
 
 
 def _still_being_written(f: library.StagedFile, title: str, n: float, source_name: str, detail: str) -> bool:
@@ -719,7 +841,7 @@ def _import_failed(con, series_id: int, title: str, n: float, what: str, e: OSEr
     not held across the checks and Suwayomi calls still to come."""
     why = f"{what}: {type(e).__name__}: {e}"
     log.error("%s: ch %g: %s", title, n, why)
-    db.set_status(con, series_id, n, "failed", why[:500])
+    db.set_status(con, series_id, n, "failed", why[:500], only_from=_IMPORT_OWNED)   # never over your skip
     con.commit()
 
 

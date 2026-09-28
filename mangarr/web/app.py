@@ -44,6 +44,7 @@ from .. import (
     model,
     notify,
     settings,
+    stuck,
     updates,
 )
 from ..suwayomi import BREAKER_SECS, Client, SuwayomiError, SuwayomiUnreachable, with_cancel
@@ -99,6 +100,7 @@ async def lifespan(app: FastAPI):
         log.error("could not open the database at %s: %s", config.DB_PATH, e)
     updates.start_background()
     backup.start_background()
+    stuck.fetcher.start()                    # MangaDex lookups for the chapters series are stuck behind
     lists_routes.init()
     log.info("mang-arr %s web started (staging %s, library %s)", __version__, config.STAGING_ROOT,
              config.LIBRARY_ROOT)
@@ -365,7 +367,7 @@ def _run_pass(job: jobs.Job, rows, label: str, skippable=()) -> tuple[int, int, 
                                                on_error=lambda sid, e: _record_error(sid, e))
                         fresh.start()              # not one lane could be started: this series fails, the next tries
                         pool = fresh
-                    pool.submit(i, r["id"], r["title"], item, o.plan, due, progress=prog)
+                    pool.submit(i, r["id"], r["title"], item, o.plan, due, progress=prog, before=o.before)
             except core.Gone:
                 item["state"], item["result"] = "cancelled", "series was deleted"
                 continue
@@ -475,7 +477,7 @@ def _pass_stopped_text(items: list, reached: int, why: str) -> str:
 def _job_refresh_all(job: jobs.Job):
     with db.connect() as con:
         duplicates.read_links(con)                 # the AniList links of MangaDex series, skipped ones too
-        due = db.chapters_due(con)
+        due = db.chapters_due(con, bool(settings.get("download_in_order")))
         rows, skippable = plan_pass(db.series_rows(con), due)
     log.info("refresh pass: %d series (%d with chapters due first, then %d continuing), and %d complete finished "
              "series last, skipped unless their status changed", len(rows), sum(1 for r in rows if due.get(r["id"])),
@@ -861,6 +863,13 @@ def series_page(request: Request, series_id: int, page_no: int = Query(1, alias=
                              (series_id,)).fetchall()
         size_fn = getattr(db, "series_size", None)          # lands on main; (bytes, files)
         size_bytes, size_files = size_fn(con, series_id) if size_fn else (0, 0)
+        # the chapters it is stuck behind, with their verdicts; a link from another site looks nothing up
+        blocked = stuck.details(con, r, fetch=not _cross_site(request))
+        skips = stuck.skipped(con, series_id)
+    marked = {st.number for st in blocked} | {k["number"] for k in skips}
+    for g in groups:                                # their rows (verdict label, Un-skip) are shown, not folded
+        if any(c["number"] in marked for c in g["chapters"]):
+            g["open"] = True
     if paging["pages"] > 1:
         log.debug("series %d: %d chapter rows, showing page %d of %d", series_id, paging["total"], paging["page"],
                   paging["pages"])
@@ -870,7 +879,10 @@ def series_page(request: Request, series_id: int, page_no: int = Query(1, alias=
                 page_q=f"?page={paging['page']}" if paging["page"] > 1 else "",     # actions come back to this page
                 description=views.plain_description(r["description"]),
                 library_path=library.library_dir(r["folder"] or ""), size_bytes=size_bytes, size_files=size_files,
-                size_human=views.human_size(size_bytes), ref_url=views.ref_url(r))
+                size_human=views.human_size(size_bytes), ref_url=views.ref_url(r), stuck=blocked,
+                stuck_at={st.number: st for st in blocked}, skipped={k["number"]: k for k in skips},
+                skip_notes=skips,
+                auto_skip=bool(settings.get("auto_skip_side_stories") and settings.get("download_in_order")))
 
 
 @app.post("/series/{series_id}/refresh")
@@ -982,9 +994,130 @@ def chapter_ignore(series_id: int, number: float, page_no: int = Query(1, alias=
 @app.post("/series/{series_id}/chapter/{number}/unignore")
 def chapter_unignore(series_id: int, number: float, page_no: int = Query(1, alias="page")):
     with db.connect() as con:
-        db.set_status(con, series_id, number, "wanted")
+        db.want_again(con, series_id, number)
+        stuck.forget(con, series_id, number)          # a skip from a stuck note no longer applies; never automatic
         db.event(con, "ignore", f"chapter {number:g} wanted again", series_id)
     return RedirectResponse(_series_url(series_id, page_no), 303)
+
+
+# -- stuck behind a chapter (stuck.py): Skip it, Un-skip, Keep waiting ------------
+
+def _stuck_verdict(con, series_id: int, number: float):
+    """The verdict on the chapter the series is stuck behind, if it is one
+    (kept with a skip, for the series page and the event)."""
+    r = db.get_series(con, series_id)
+    st = next((b for b in stuck.details(con, r) if b.number == number), None) if r else None
+    return (st.verdict, st.waiting) if st else (None, None)
+
+
+def _skip(series_id: int, number: float) -> tuple[bool, str]:
+    with db.connect() as con:
+        r = db.get_series(con, series_id)
+        if not r:
+            raise HTTPException(404, "no such series")
+        c = con.execute("SELECT status FROM chapter WHERE series_id=? AND number=?", (series_id, number)).fetchone()
+        if not c:
+            raise HTTPException(404, "no such chapter")
+        v, waiting = _stuck_verdict(con, series_id, number)
+        if stuck.skip(con, series_id, number, "manual", v, waiting):
+            log.info("%s: ch %g skipped from the series page", r["title"], number)
+            return True, (f"chapter {number:g} skipped: the chapters after it are downloaded by the next pass "
+                          "(or Search Missing now)")
+    return False, f"chapter {number:g} is {c['status']}: only a wanted, failed or unavailable chapter can be skipped"
+
+
+def _unskip(series_id: int, number: float) -> tuple[bool, str]:
+    with db.connect() as con:
+        r = db.get_series(con, series_id)
+        if not r:
+            raise HTTPException(404, "no such series")
+        c = con.execute("SELECT status FROM chapter WHERE series_id=? AND number=?", (series_id, number)).fetchone()
+        if not c:
+            raise HTTPException(404, "no such chapter")
+        if stuck.unskip(con, series_id, number):
+            log.info("%s: ch %g un-skipped from the series page", r["title"], number)
+            return True, f"chapter {number:g} un-skipped: it is wanted again"
+    return False, f"chapter {number:g} is {c['status']}, not skipped"
+
+
+def _keep_waiting(series_id: int, number: float) -> tuple[bool, str]:
+    with db.connect() as con:
+        if not db.get_series(con, series_id):
+            raise HTTPException(404, "no such series")
+        if stuck.dismiss(con, series_id, number):
+            return True, (f"the series keeps waiting for chapter {number:g}: its note is folded until the chapter "
+                          "changes (another title, or another site lists it), and it is never skipped automatically")
+    return False, f"the series is not stuck behind chapter {number:g}"
+
+
+def _keep_skipped(series_id: int, number: float) -> tuple[bool, str]:
+    with db.connect() as con:
+        if not db.get_series(con, series_id):
+            raise HTTPException(404, "no such series")
+        if stuck.keep_skipped(con, series_id, number):
+            return True, f"chapter {number:g} stays skipped as it is listed now"
+    return False, f"chapter {number:g} is not a skipped chapter"
+
+
+@app.post("/series/{series_id}/chapter/{number}/skip")
+def chapter_skip(series_id: int, number: float, page_no: int = Query(1, alias="page")):
+    return _flash(_series_url(series_id, page_no), _skip(series_id, number)[1])
+
+
+@app.post("/series/{series_id}/chapter/{number}/unskip")
+def chapter_unskip(series_id: int, number: float, page_no: int = Query(1, alias="page")):
+    return _flash(_series_url(series_id, page_no), _unskip(series_id, number)[1])
+
+
+@app.post("/series/{series_id}/chapter/{number}/keep-waiting")
+def chapter_keep_waiting(series_id: int, number: float, page_no: int = Query(1, alias="page")):
+    return _flash(_series_url(series_id, page_no), _keep_waiting(series_id, number)[1])
+
+
+@app.post("/series/{series_id}/chapter/{number}/keep-skipped")
+def chapter_keep_skipped(series_id: int, number: float, page_no: int = Query(1, alias="page")):
+    return _flash(_series_url(series_id, page_no), _keep_skipped(series_id, number)[1])
+
+
+@app.post("/api/v1/series/{series_id}/chapter/{number}/skip")
+def api_chapter_skip(series_id: int, number: float):
+    """Skip a chapter (it becomes ignored; the chapters after it go on). 409
+    when it is not wanted, failed or unavailable."""
+    ok, msg = _skip(series_id, number)
+    if not ok:
+        raise HTTPException(409, msg)
+    return {"ok": True, "number": number, "status": "ignored", "message": msg}
+
+
+@app.post("/api/v1/series/{series_id}/chapter/{number}/unskip")
+def api_chapter_unskip(series_id: int, number: float):
+    """Want a skipped (ignored) chapter again. 409 when it is not ignored."""
+    ok, msg = _unskip(series_id, number)
+    if not ok:
+        raise HTTPException(409, msg)
+    return {"ok": True, "number": number, "status": "wanted", "message": msg}
+
+
+@app.post("/api/v1/series/{series_id}/chapter/{number}/keep-waiting")
+def api_chapter_keep_waiting(series_id: int, number: float):
+    """Fold the stuck note on this chapter away until it changes, and keep
+    the automatic skip off it for good. 409 when the series is not stuck
+    behind it."""
+    ok, msg = _keep_waiting(series_id, number)
+    if not ok:
+        raise HTTPException(409, msg)
+    return {"ok": True, "number": number, "message": msg}
+
+
+@app.post("/api/v1/series/{series_id}/chapter/{number}/keep-skipped")
+def api_chapter_keep_skipped(series_id: int, number: float):
+    """A skipped chapter the sites list differently now stays skipped as it
+    is listed now (the series page stops offering it back). 409 when it is
+    not one skipped from a stuck note."""
+    ok, msg = _keep_skipped(series_id, number)
+    if not ok:
+        raise HTTPException(409, msg)
+    return {"ok": True, "number": number, "status": "ignored", "message": msg}
 
 
 @app.post("/series/{series_id}/delete")
@@ -1175,10 +1308,13 @@ def _job_adopt(chosen: list):
 
 
 @app.get("/wanted")
-def wanted_page(request: Request):
+def wanted_page(request: Request, filter: str = "all"):
     with db.connect() as con:
         rows = db.wanted_all(con)
-    return page(request, "wanted.html", rows=rows)
+        shown = filter if filter in ("all", "failed", "clean", "stuck") else "all"
+        # every stuck series; judged (which reads all their chapters) only for the Stuck filter
+        blocked = stuck.overview(con, fetch=not _cross_site(request), judged=shown == "stuck")
+    return page(request, "wanted.html", rows=rows, stuck=blocked, filter=shown)
 
 
 @app.post("/wanted/search")
@@ -1612,12 +1748,14 @@ API_CHAPTERS = 5000        # chapters per GET /api/v1/series/{id} (default and m
 
 
 @app.get("/api/v1/series/{series_id}")
-def api_series_one(series_id: int, limit: int = API_CHAPTERS, offset: int = 0):
+def api_series_one(request: Request, series_id: int, limit: int = API_CHAPTERS, offset: int = 0):
     """One series with its sources and chapters (by number). The chapters
     come in pages of at most API_CHAPTERS; chapterTotal, limit and offset
     say where this page is, so a client pages on with offset=offset+limit.
     An offset past the end is the end (an empty page): any integer the
-    caller sends stays within what SQLite can bind."""
+    caller sends stays within what SQLite can bind. `stuck` and `skipped`:
+    the chapters it is stuck behind with their verdicts (stuck.Stuck), and
+    the ones skipped from such a note."""
     limit = max(1, min(limit, API_CHAPTERS))
     with db.connect() as con:
         r = db.get_series(con, series_id)
@@ -1627,7 +1765,9 @@ def api_series_one(series_id: int, limit: int = API_CHAPTERS, offset: int = 0):
         offset = min(max(0, offset), total)
         return {"series": dict(r), "sources": [dict(s) for s in db.sources(con, series_id)],
                 "chapters": [dict(c) for c in db.chapters(con, series_id, limit=limit, offset=offset)],
-                "chapterTotal": total, "limit": limit, "offset": offset}
+                "chapterTotal": total, "limit": limit, "offset": offset,
+                "stuck": [st.as_dict() for st in stuck.details(con, r, fetch=not _cross_site(request))],
+                "skipped": stuck.skipped(con, series_id)}
 
 
 @app.post("/api/v1/series")

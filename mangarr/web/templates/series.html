@@ -21,7 +21,44 @@
 {% endblock %}
 
 {% block body_class %}series-details{% endblock %}
+{% block main_attrs %}{% if stuck|rejectattr('dismissed')|selectattr('checking')|list %}data-reload="15000"{% endif %}{% endblock %}
 {% block body %}
+{# -- Stuck behind a chapter (stuck.py): at the top, with the verdict and what to do about it ---------- #}
+{% macro stuck_detail(st, n) %}
+  {% if st.verdict %}{% set vl = verdict_label(st.verdict, st.number) %}{% set why = auto_skip_clause(st, auto_skip) %}
+  <div class="stuck-verdict">{{ m.label(vl.text, vl.kind, 'medium') }} <b>{{ st.verdict.headline }}</b> <span class="muted">({{ st.verdict.confidence }} confidence{% if why %}: {{ why }}{% endif %})</span></div>
+  {% if st.verdict.evidence %}<ul class="stuck-evidence">{% for line in st.verdict.evidence %}<li>{{ line }}</li>{% endfor %}</ul>{% endif %}
+  {% endif %}
+  {% if st.checking and not st.dismissed %}<div class="stuck-checking muted">{{ m.icon('spinner', 'sm') }} checking MangaDex... (this page reloads by itself)</div>{% endif %}
+  {% set mdl = mangadex_line(st) %}{% if mdl %}<div class="stuck-checking muted">{{ mdl }}</div>{% endif %}
+  {% if st.keep_waiting and not st.dismissed %}<div class="stuck-reason muted small">You chose to keep waiting for it, and it has changed since (another title, or another site lists it).</div>{% endif %}
+  {% if st.reason %}<div class="stuck-reason muted small">Last failure: {{ st.reason }}</div>{% endif %}
+  <div class="stuck-actions">
+    {% for site, url in st.urls.items() if url %}{{ m.ext(url, 'Open ' ~ n ~ ' on ' ~ site, 'button', title='the chapter on ' ~ site ~ ' (opens in a new tab)') }}{% endfor %}
+    <form method="post" action="/series/{{ s.id }}/chapter/{{ st.number }}/skip{{ page_q }}" class="inline"><button class="button {{ 'primary' if st.verdict and st.verdict.skippable }}" type="submit">Skip it</button></form>
+    <details class="popover stuck-info"><summary class="iconbtn" title="{{ SKIP_DISCLAIMER }}" aria-label="What skipping means">{{ m.icon('info') }}</summary><div class="popover-body"><div class="popover-text">{{ SKIP_DISCLAIMER }}</div></div></details>
+    {% if not st.dismissed %}<form method="post" action="/series/{{ s.id }}/chapter/{{ st.number }}/keep-waiting{{ page_q }}" class="inline"><button class="button" type="submit" title="Fold this note away and keep waiting for the chapter: the note comes back if the chapter changes (another title, or another site lists it), and it is never skipped automatically">Keep waiting</button></form>{% endif %}
+  </div>
+{% endmacro %}
+{% for st in stuck %}
+{% set n = '%g'|format(st.number) %}
+{% set note = stuck_note(st) %}
+{% if st.dismissed %}
+<details class="alert info compact stuck-note stuck-dismissed" id="stuck-{{ n }}">
+  <summary class="stuck-head">{{ note.head }} <span class="muted">You keep waiting for it (the note is folded until the chapter changes).</span></summary>
+  <div class="stuck-head">{{ note.body }}</div>
+  {{ stuck_detail(st, n) }}
+</details>
+{% else %}
+<div class="alert warning stuck-note" id="stuck-{{ n }}">
+  <div class="stuck-head">{{ m.icon('warning', 'sm') }} <b>{{ note.head }}</b> {{ note.body }}</div>
+  {{ stuck_detail(st, n) }}
+</div>
+{% endif %}
+{% endfor %}
+{% for k in skip_notes %}
+<div class="alert {{ 'warning' if k.changed else 'info' }} compact stuck-skipped" id="skipped-{{ '%g'|format(k.number) }}">{{ skip_note(k) }} - <form method="post" action="/series/{{ s.id }}/chapter/{{ k.number }}/unskip{{ page_q }}" class="inline"><button class="linkbtn" type="submit">{{ 'undo' if k.how == 'auto' and not k.changed else 'Un-skip' }}</button></form>{% if k.changed %} or <form method="post" action="/series/{{ s.id }}/chapter/{{ k.number }}/keep-skipped{{ page_q }}" class="inline"><button class="linkbtn" type="submit" title="It stays skipped as it is listed now, and this warning goes">keep it skipped</button></form>{% endif %}</div>
+{% endfor %}
 {% set kind = series.kind|default('') %}
 {% set language = series.language|default(none) %}
 {% set genres = series.genres|default([]) %}
@@ -146,7 +183,9 @@
           <td class="col-title"><button type="button" class="episode-title-link" data-chapter-url="/api/v1/series/{{ s.id }}/chapter/{{ c.number }}" data-manual="/api/v1/series/{{ s.id }}/chapter/{{ c.number }}/releases" data-download="/series/{{ s.id }}/chapter/{{ c.number }}/download{{ page_q }}" data-search="/series/{{ s.id }}/chapter/{{ c.number }}/search{{ page_q }}" data-number="{{ n }}" data-name="{{ c.name or ('Chapter ' ~ n) }}">{{ c.name or ('Chapter ' ~ n) }}</button></td>
           <td class="col-date nowrap">{{ (c.uploaded or '')[:10] or '-' }}</td>
           <td class="col-source">{{ c.source_name or '' }}</td>
-          <td class="col-status">{{ m.label(cs.text, cs.kind, 'medium', title=(c.reason or '')) }}</td>
+          {% set st = stuck_at.get(c.number) %}{% set sk = skipped.get(c.number) if c.status == 'ignored' else none %}
+          <td class="col-status">{{ m.label('Skipped' if sk else cs.text, cs.kind, 'medium', title=(c.reason or '')) }}
+            {% if st and st.verdict %}{% set vl = verdict_label(st.verdict, st.number) %}{{ m.label(vl.text, vl.kind, 'small', title=('Holds back ' ~ st.waiting ~ ' chapter' ~ ('s' if st.waiting != 1 else '') ~ '.\n' ~ vl.tip), extra='verdict-label') }}{% elif sk and sk.how == 'auto' %}{{ m.label('automatically', 'default', 'small', title=('Skipped automatically: ' ~ (sk.verdict or '')), extra='verdict-label') }}{% endif %}</td>
           {% if c.status == 'have' %}<td class="col-path" title="{{ c.library_path or '' }}">{{ (c.library_path or '')|replace(library_path ~ '/', '') }}</td>
           {% else %}<td class="col-reason {{ 'text-danger' if c.status == 'failed' }}">{{ c.reason or ('waiting for a download pass' if c.status == 'wanted' else '') }}</td>{% endif %}
           <td class="col-actions">
@@ -154,7 +193,9 @@
             <form method="post" action="/series/{{ s.id }}/chapter/{{ c.number }}/search{{ page_q }}" class="iconform"><button class="iconbtn" title="Automatic search: the trusted sources, best first" {% if busy %}disabled{% endif %}>{{ m.icon('search') }}</button></form>
             <button type="button" class="iconbtn" data-interactive data-chapter-url="/api/v1/series/{{ s.id }}/chapter/{{ c.number }}" data-manual="/api/v1/series/{{ s.id }}/chapter/{{ c.number }}/releases" data-download="/series/{{ s.id }}/chapter/{{ c.number }}/download{{ page_q }}" data-search="/series/{{ s.id }}/chapter/{{ c.number }}/search{{ page_q }}" data-number="{{ n }}" data-name="{{ c.name or ('Chapter ' ~ n) }}" title="Interactive search: what every source has for this chapter">{{ m.icon('interactive') }}</button>
             {% endif %}
-            {% if c.status in ['wanted','failed','unavailable'] %}<form method="post" action="/series/{{ s.id }}/chapter/{{ c.number }}/ignore{{ page_q }}" class="iconform"><button class="iconbtn" title="Ignore this chapter (stop trying)">{{ m.icon('ignore') }}</button></form>
+            {% if st %}<form method="post" action="/series/{{ s.id }}/chapter/{{ c.number }}/skip{{ page_q }}" class="iconform"><button class="button small" title="{{ SKIP_DISCLAIMER }}">Skip it</button></form>
+            {% elif c.status in ['wanted','failed','unavailable'] %}<form method="post" action="/series/{{ s.id }}/chapter/{{ c.number }}/ignore{{ page_q }}" class="iconform"><button class="iconbtn" title="Ignore this chapter (stop trying)">{{ m.icon('ignore') }}</button></form>
+            {% elif sk %}<form method="post" action="/series/{{ s.id }}/chapter/{{ c.number }}/unskip{{ page_q }}" class="iconform"><button class="button small" title="Want this chapter again">Un-skip</button></form>
             {% elif c.status == 'ignored' %}<form method="post" action="/series/{{ s.id }}/chapter/{{ c.number }}/unignore{{ page_q }}" class="iconform"><button class="iconbtn" title="Want this chapter again">{{ m.icon('bookmark') }}</button></form>{% endif %}
           </td>
         </tr>
