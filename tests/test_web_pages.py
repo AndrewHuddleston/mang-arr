@@ -359,7 +359,8 @@ class PagesTest(unittest.TestCase):
         self._ok("/settings", 'id="sources"', 'id="scheduling"', 'id="komga"', 'id="notifications"', 'id="security"',
                  "Weeb Central", 'name="refresh_hours"', 'id="api_key"', 'value="test-komga"')
         html = self._ok("/system", 'id="tasks"', 'id="backups"', "Suwayomi", "/system/logs",
-                        'action="/system/backups/create"', 'id="health-table"', 'class="description-list"')
+                        'action="/system/backups/create"', 'id="health-table"', 'class="description-list"',
+                        'action="/system/check-links"', "Check library links")
         self.assertEqual(html.count('id="status"'), 1)                               # the poller's element only
         html = self._ok("/system/logs", 'id="log"', "careful", 'class="ln WARNING"', 'id="log-level"', 'id="log-auto"')
         self.assertIn('class="ln INFO"', html)

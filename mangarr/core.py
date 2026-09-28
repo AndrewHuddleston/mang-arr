@@ -588,31 +588,15 @@ def _delete_library_files(con, series_id: int, title: str, folder: str) -> bool:
     empty. Paths come from the database, which a restored backup can fill
     with anything, so only regular files inside this series' own library
     folder (itself inside LIBRARY_ROOT, symlinks resolved) are touched;
-    anything else is skipped with a warning. Returns whether a file or the
-    folder was removed."""
-    import stat
-    root = library.config.LIBRARY_ROOT
-    d = library.library_dir(folder) if db.valid_folder(folder) else None
-    if d is None or not library.is_within(d, root) or os.path.realpath(d) == os.path.realpath(root):
-        log.warning("%s: library folder %r is not a folder inside %s; no files deleted", title, folder, root)
+    anything else is skipped with a warning (series_library_dir,
+    library_file). Returns whether a file or the folder was removed."""
+    d = series_library_dir(title, folder)
+    if d is None:
         return False
     removed = 0
     for c in db.chapters(con, series_id):
         p = c["library_path"]
-        if not p:
-            continue
-        if not library.is_within(p, d):
-            log.warning("%s: not deleting %s: it is outside the series' library folder %s", title, p, d)
-            continue
-        try:
-            st = os.lstat(p)
-        except FileNotFoundError:
-            continue
-        except OSError as e:
-            log.warning("%s: could not check %s: %s", title, p, e)
-            continue
-        if not stat.S_ISREG(st.st_mode):
-            log.warning("%s: not deleting %s: not a regular file", title, p)
+        if not p or library_file(title, p, d) is None:
             continue
         try:
             os.remove(p)
@@ -627,6 +611,41 @@ def _delete_library_files(con, series_id: int, title: str, folder: str) -> bool:
         log.info("%s: library folder %s kept: %s", title, d, e)
     log.info("%s: removed %d file(s) from %s", title, removed, d)
     return bool(removed) or gone
+
+
+def series_library_dir(title: str, folder) -> str | None:
+    """The series' library folder, when mang-arr may remove files from it:
+    one plain folder name (db.valid_folder) inside LIBRARY_ROOT once
+    symlinks are resolved, and not the root itself. None (logged)
+    otherwise."""
+    root = library.config.LIBRARY_ROOT
+    d = library.library_dir(folder) if db.valid_folder(folder) else None
+    if d is None or not library.is_within(d, root) or os.path.realpath(d) == os.path.realpath(root):
+        log.warning("%s: library folder %r is not a folder inside %s; no files deleted", title, folder, root)
+        return None
+    return d
+
+
+def library_file(title: str, path: str, d: str) -> os.stat_result | None:
+    """The lstat of `path` when mang-arr may remove it: a regular file (not
+    a symlink) inside the series' library folder d (series_library_dir),
+    symlinks resolved. None when it is not there, and (logged) when it is
+    outside d, cannot be checked or is not a regular file."""
+    import stat
+    if not library.is_within(path, d):
+        log.warning("%s: not deleting %s: it is outside the series' library folder %s", title, path, d)
+        return None
+    try:
+        st = os.lstat(path)
+    except FileNotFoundError:
+        return None
+    except OSError as e:
+        log.warning("%s: could not check %s: %s", title, path, e)
+        return None
+    if not stat.S_ISREG(st.st_mode):
+        log.warning("%s: not deleting %s: not a regular file", title, path)
+        return None
+    return st
 
 
 # -- import ------------------------------------------------------------------

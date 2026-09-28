@@ -1,11 +1,11 @@
-"""Command line: search, resolve (dry run), add, refresh, import, adopt, status, show, daemon."""
+"""Command line: search, resolve (dry run), add, refresh, import, adopt, check-links, status, show, daemon."""
 import argparse
 import logging
 import os
 import signal
 import sys
 
-from . import config, core, daemon, db, logsetup, metadata, model
+from . import config, core, daemon, db, logsetup, metadata, model, relink
 from .model import Series
 from .resolver import Plan, primary, ranges, resolve
 from .suwayomi import Client, SuwayomiError
@@ -212,6 +212,20 @@ def cmd_adopt(a):
     return 0
 
 
+def cmd_check_links(a):
+    with db.connect() as con:
+        if a.dry_run:
+            found = relink.find_misreads(relink.links(con))
+            for m in found:
+                out(f"  {m.link.title}: chapter {m.link.number:g} is {m.actual:g}: would remove {m.link.library_path}"
+                    f" (a link of {m.link.staging_path})")
+            out(f"{len(found)} misread link(s)" + (" (dry run: nothing changed)" if found else ""))
+            return 0
+        out(relink.check_links(con, Client()))
+        db.maintenance_done(con, relink.TASK)
+    return 0
+
+
 def cmd_status(a):
     with db.connect() as con:
         rows = db.series_rows(con)
@@ -307,6 +321,10 @@ def main(argv=None):
     s.add_argument("--only", help="folder name fragment")
     s.add_argument("--dry-run", action="store_true")
     s.set_defaults(fn=cmd_adopt)
+
+    s = sub.add_parser("check-links", help="repair chapters linked under a misread number, then import")
+    s.add_argument("--dry-run", action="store_true", help="only list what would be repaired")
+    s.set_defaults(fn=cmd_check_links)
 
     s = sub.add_parser("status", help="tracked series")
     s.set_defaults(fn=cmd_status)

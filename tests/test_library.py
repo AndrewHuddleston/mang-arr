@@ -125,8 +125,16 @@ class ChapterMarkerTest(unittest.TestCase):
         "Oneshot 2020.cbz": 2020.0,
     }
 
+    # real names downloaded after those (11:15 UTC the same day), which 0.3.0 read as chapter 0 (the 0 of "1r0n")
+    later = {
+        "www.natomanga.com_Chapter 16.1_ (1r0n).cbz": 16.1,
+        "www.natomanga.com_Chapter 4.1_ (1r0n).cbz": 4.1,
+        "www.natomanga.com_Chapter 14.1_ (1r0n).cbz": 14.1,
+        "www.natomanga.com_Chapter 49.1_ (1r0n).cbz": 49.1,
+    }
+
     def test_real_names(self):
-        for name, want in self.real.items():
+        for name, want in {**self.real, **self.later}.items():
             with self.subTest(name=name):
                 self.assertEqual(parse_number(name), want)
         self.assertEqual(len(self.real), 17)

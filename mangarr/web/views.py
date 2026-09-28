@@ -388,6 +388,7 @@ EVENT_ICONS = {
     "resolved": ("refresh", "default", "Sources resolved"),
     "downloaded": ("download", "success", "Chapter downloaded"),
     "imported": ("drive", "success", "Chapter imported into the library"),
+    "relinked": ("drive", "warning", "Misread file linked again under its real number"),
     "failed": ("warning", "danger", "Download failed"),
     "deleted": ("delete", "danger", "Series deleted"),
     "review": ("info", "warning", "Needs a decision"),
