@@ -994,6 +994,7 @@ mangarr/
   lanes.py       download lanes: a refresh pass downloads from several sources at once
   pagewarm.py    fetches a chapter's pages one at a time (sources that refuse bursts)
   library.py     staging tree parsing, hard-link library, file names
+  naming.py      series folder and chapter file name formats (tokens, render, validate, preview)
   db.py          SQLite: series, sources, chapters, page counts, events, lists, settings
   core.py        add / refresh / import / adopt / per-chapter download
   lists.py       import lists: fetchers, params, sync
