@@ -1058,7 +1058,7 @@ class LockTest(ApplyBase):
                 t.start()
                 t.join()
                 raise got[-1]
-        self.assertEqual(os.listdir(serieslock.lock_dir()), ["series-7.lock", "series-8.lock"])
+        self.assertEqual(sorted(os.listdir(serieslock.lock_dir())), ["series-7.lock", "series-8.lock"])
         self.assertEqual(os.path.dirname(serieslock.lock_dir()), self.root)
 
     def cancelled_wait(self):
