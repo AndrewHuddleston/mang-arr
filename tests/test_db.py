@@ -1,5 +1,6 @@
 """Database behaviour that has bitten before: folder uniqueness, stale
 wanted rows, migrations on an existing file."""
+import json
 import os
 import sqlite3
 import tempfile
@@ -53,16 +54,50 @@ class DbTest(unittest.TestCase):
         self.assertNotEqual(fa, fb)
 
     def test_stale_wanted_becomes_unavailable_and_returns(self):
+        def three():
+            return {c["number"]: c for c in db.chapters(con, sid)}[3.0]
         with db.connect(self.path) as con:
             sid = db.upsert_series(con, Series(anilist_id=3, english="S"))
             db.save_plan(con, sid, plan_with([1, 2, 3]), 1)
             self.assertEqual(db.wanted(con, sid), [1.0, 2.0, 3.0])
-            db.save_plan(con, sid, plan_with([1, 2]), 1)         # 3 vanished from every source
+            # 3 vanished from every source: still waited for through LISTING_GRACE_RESOLVES resolves ...
+            for i in range(db.LISTING_GRACE_RESOLVES):
+                db.save_plan(con, sid, plan_with([1, 2]), 1)
+                self.assertEqual((three()["status"], three()["reason"], three()["missed"]),
+                                 ("wanted", "not listed by Src in the last check; still waiting for it", i + 1))
+            # ... and LISTING_GRACE_DAYS since a source last listed it
+            con.execute("UPDATE chapter SET listed_at=? WHERE series_id=? AND number=3",
+                        (db.ago(db.LISTING_GRACE_DAYS + 0.1), sid))
+            db.save_plan(con, sid, plan_with([1, 2]), 1)
             self.assertEqual(db.wanted(con, sid), [1.0, 2.0])
-            status = {c["number"]: c["status"] for c in db.chapters(con, sid)}
-            self.assertEqual(status[3.0], "unavailable")
+            self.assertEqual((three()["status"], three()["reason"]),
+                             ("unavailable", "no trusted source lists this chapter any more"))
             db.save_plan(con, sid, plan_with([1, 2, 3]), 1)      # and it is back
             self.assertEqual(db.wanted(con, sid), [1.0, 2.0, 3.0])
+            self.assertEqual((three()["missed"], three()["unlisted"]), (0, 0))
+
+    def test_a_source_that_did_not_answer_or_missed_the_series_does_not_count(self):
+        def three():
+            return {c["number"]: c for c in db.chapters(con, sid)}[3.0]
+        with db.connect(self.path) as con:
+            sid = db.upsert_series(con, Series(anilist_id=5, english="S"))
+            db.save_plan(con, sid, plan_with([1, 2, 3]), 1)
+            con.execute("UPDATE chapter SET listed=?, listed_at=? WHERE series_id=? AND number=3",
+                        (json.dumps({"Src": [db.ago(3), None]}), db.ago(3), sid))
+            src_down = plan_with([])
+            src_down.matches, src_down.unreachable = [], [(Source("1", "Src", "en"), "timed out")]
+            missed = plan_with([])
+            missed.matches = []                                  # Src answered, but its search found nothing
+            for plan in (src_down, missed) * 3:
+                db.save_plan(con, sid, plan, 1)
+                self.assertEqual((three()["status"], three()["missed"]), ("wanted", 0))
+            self.assertEqual(three()["unlisted"], 6)
+            # only a source that listed it within LISTING_KEEP_DAYS counts as one that lists it
+            con.execute("UPDATE chapter SET listed=? WHERE series_id=? AND number=3",
+                        (json.dumps({"Src": [db.ago(db.LISTING_KEEP_DAYS + 1), None]}), sid))
+            for _ in range(db.LISTING_GRACE_RESOLVES):
+                db.save_plan(con, sid, src_down, 1)
+            self.assertEqual((three()["status"], three()["missed"]), ("unavailable", 3))
 
     def test_have_and_ignored_survive_replanning(self):
         with db.connect(self.path) as con:

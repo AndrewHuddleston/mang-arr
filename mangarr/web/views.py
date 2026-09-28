@@ -470,7 +470,11 @@ def auto_skip_clause(st, auto_on: bool) -> str:
     if why == "untried":
         return (f"skipped automatically once a pass has tried it on {_and(st.untried[:3])} too" if st.untried and
                 st.names else "skipped automatically once a pass has tried it on every site that lists it")
-    return "the next pass skips it automatically, unless you keep waiting"
+    if why == "young":
+        return ("skipped automatically once passes have judged it so for a day, in a pass in which every site that "
+                "lists it answers, unless you keep waiting")
+    return ("the next pass in which every site that lists it answers skips it automatically, unless you keep "
+            "waiting")
 
 
 def mangadex_line(st) -> str:

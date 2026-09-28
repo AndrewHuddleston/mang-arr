@@ -274,6 +274,13 @@ def waiting_reason(n: float) -> str:
             "on the series page, or turn off strict download in order, to go on without it)")
 
 
+def waiting_unlisted_reason(n: float, note: str) -> str:
+    """The reason of a chapter that waits, in order, for chapter n, which no
+    source listed in the last resolve and is still waited for (note:
+    db.unlisted_note)."""
+    return WAITING_START.format(f"{n:g}") + f" and {n:g} is {note}"
+
+
 def waiting_for(reason: str | None) -> str | None:
     """The chapter (as waiting_reason wrote its number) a chapter with this
     reason waits for, or None."""

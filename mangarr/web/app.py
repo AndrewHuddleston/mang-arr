@@ -994,7 +994,7 @@ def chapter_ignore(series_id: int, number: float, page_no: int = Query(1, alias=
 @app.post("/series/{series_id}/chapter/{number}/unignore")
 def chapter_unignore(series_id: int, number: float, page_no: int = Query(1, alias="page")):
     with db.connect() as con:
-        db.set_status(con, series_id, number, "wanted")
+        db.want_again(con, series_id, number)
         stuck.forget(con, series_id, number)          # a skip from a stuck note no longer applies; never automatic
         db.event(con, "ignore", f"chapter {number:g} wanted again", series_id)
     return RedirectResponse(_series_url(series_id, page_no), 303)

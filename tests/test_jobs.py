@@ -455,8 +455,12 @@ class CoreTest(TmpData):
             names = {r["source_name"] for r in db.sources(con, sid)}
         self.assertEqual(names, {"A", "B"})                 # A's entry (and staging folder) kept
         self.assertEqual(self.status(sid)[7], "wanted")     # not flipped to 'unavailable'
-        with db.connect() as con:                          # once A answers and no longer lists 7, it is
+        with db.connect() as con:                          # nor when A's search misses the series
             db.save_plan(con, sid, _plan([b]), 2)
+        self.assertEqual(self.status(sid)[7], "wanted")
+        with db.connect() as con:                          # once A answers and no longer lists 7 for its grace, it is
+            for _ in range(db.LISTING_GRACE_RESOLVES):
+                db.save_plan(con, sid, _plan([_match("A", 1, [1]), b]), 2)
         self.assertEqual(self.status(sid)[7], "unavailable")
 
     def test_a_source_down_for_too_long_loses_its_state(self):         # second pass, regression 4
@@ -465,12 +469,16 @@ class CoreTest(TmpData):
         with db.connect() as con:
             con.execute("UPDATE series_source SET seen_at=? WHERE series_id=? AND source_name='A'", (old, sid))
             con.commit()
+            con.execute("UPDATE chapter SET updated_at=? WHERE series_id=?", (old, sid))   # A listed 7 back then
+            con.commit()
         down = [(Source("1", "A", "en"), "search failed: HTTP 403")]      # e.g. blocked for good
         with db.connect() as con:
             dropped = db.save_plan(con, sid, _plan([_match("B", 2, [1])], unreachable=down), 2)
             names = {r["source_name"] for r in db.sources(con, sid)}
-        self.assertEqual(dropped, ["A"])
-        self.assertEqual(names, {"B"})
+            self.assertEqual(dropped, ["A"])
+            self.assertEqual(names, {"B"})
+            for _ in range(db.LISTING_GRACE_RESOLVES - 1):   # its chapters are given up once their grace is over
+                db.save_plan(con, sid, _plan([_match("B", 2, [1])], unreachable=down), 2)
         self.assertEqual(self.status(sid)[7], "unavailable")
 
     def test_a_down_former_primary_leaves_suwayomis_library(self):     # second pass, regression 4

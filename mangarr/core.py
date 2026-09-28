@@ -73,8 +73,9 @@ def add_series(con, client: Client, series: Series, download: bool = True, do_im
     counts.save(con, plan)
     hold_in_order(con, series_id, plan)             # save_plan's reasons for the chapters that still wait
     if expired:
-        log.warning("%s: %s could not be searched for over %d days; its entry is dropped and the chapters "
-                    "only it listed count as unavailable", series.title, ", ".join(expired), db.UNREACHABLE_KEEP_DAYS)
+        log.warning("%s: %s could not be searched for over %d days; its entry is dropped and the chapters only it "
+                    "listed are given up once their grace is over", series.title, ", ".join(expired),
+                    db.UNREACHABLE_KEEP_DAYS)
     # entries kept for a source that could not be searched this time (see save_plan)
     stale = [r["manga_id"] for r in db.sources(con, series_id)
              if r["manga_id"] not in {m.manga_id for m in plan.matches}]
@@ -247,23 +248,25 @@ _JOB_OWNED = ("wanted", "failed", "unavailable")
 
 
 def hold_in_order(con, series_id: int, plan: Plan, rows: dict | None = None) -> float | None:
-    """With strict download in order: the first chapter the plan wants that
-    failed and waits for its next attempt, whose later wanted chapters wait
-    for it until then, as in the pass that failed it (their reason says so:
-    downloader.waiting_reason, which stuck.blockers finds the series by), so
-    no pass fills in the chapters after it and leaves a gap. Returns its
+    """With strict download in order: the first chapter that holds the
+    series (db.holds_in_order): one that failed and waits for its next
+    attempt, as in the pass that failed it, or one no source listed in this
+    resolve that is still waited for (db.past_grace: the source may only not
+    have answered). Its later wanted chapters wait for it (their reason says
+    so: downloader.waiting_reason, which stuck.blockers finds the series by),
+    so no pass fills in the chapters after it and leaves a gap. Returns its
     number, or None (in order off, or none). Not committed."""
     if not settings.get("download_in_order"):
         return None
     rows = rows if rows is not None else {r["number"]: r for r in db.chapters(con, series_id)}
     now_, wanted = db.now(), plan.wanted()
-    listed = set(wanted)
-    later = [n for n, r in rows.items() if n in listed and r["status"] == "failed" and r["next_try"]
-             and r["next_try"] > now_]
+    listed = set(plan.assignment) | set(plan.junk)
+    later = [n for n, r in rows.items() if db.holds_in_order(r, n in listed, now_)]
     if not later:
         return None
     first = min(later)
-    reason = downloader.waiting_reason(first)
+    reason = downloader.waiting_reason(first) if rows[first]["status"] == "failed" else \
+        downloader.waiting_unlisted_reason(first, db.unlisted_note(rows[first]))
     con.executemany("UPDATE chapter SET reason=?, updated_at=? WHERE series_id=? AND number=?",
                     [(reason, now_, series_id, n) for n in wanted
                      if n > first and (r := rows.get(n)) is not None and r["status"] == "wanted"
@@ -274,7 +277,8 @@ def hold_in_order(con, series_id: int, plan: Plan, rows: dict | None = None) -> 
 def _due(con, series_id: int, plan: Plan) -> list[float]:
     """The plan's wanted chapters that are due now: not on disk, not ignored,
     not a failed one waiting for its next attempt, and with strict download
-    in order none after such a one (hold_in_order). Commits what it wrote."""
+    in order none after such a one, or after one no source listed this time
+    that is still waited for (hold_in_order). Commits what it wrote."""
     rows = {r["number"]: r for r in db.chapters(con, series_id)}
     have_on_disk = {n for n, r in rows.items() if r["status"] == "have"}
     ignored = {n for n, r in rows.items() if r["status"] == "ignored"}
@@ -287,8 +291,9 @@ def _due(con, series_id: int, plan: Plan) -> list[float]:
         if con.in_transaction:
             con.commit()
         if held:
-            log.info("%s: %d later chapter(s) wait for ch %g, which failed on every source and is not due for "
-                     "another attempt yet (strict download in order)", plan.series.title, len(held), first)
+            log.info("%s: %d later chapter(s) wait for ch %g, which %s (strict download in order)", plan.series.title,
+                     len(held), first, "failed on every source and is not due for another attempt yet"
+                     if first in set(plan.assignment) else "no source listed this time; it is still waited for")
     if later:
         log.info("%s: %d failed chapter(s) not due for another attempt yet", plan.series.title, len(later))
     if ignored & set(plan.wanted()):
