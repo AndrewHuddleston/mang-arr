@@ -20,6 +20,28 @@
 
 {% block body %}
 {% if squeue.error %}<div class="alert warning">Suwayomi download queue unavailable: {{ squeue.error }}</div>{% endif %}
+{# -- the chapters in flight, one row each (Sonarr's queue) ---------------------------------------- #}
+{% if chapters %}
+{% set now_dl = chapters|selectattr('state', 'equalto', 'downloading')|list %}
+{% set waiting = chapters|selectattr('state', 'equalto', 'queued')|list %}
+<h2 class="section-title" id="chapters">Chapters: {{ now_dl|length }} downloading, {{ waiting|length }} queued</h2>
+<div class="table-container"><table class="table queue chapters" id="chapter-queue">
+<thead><tr><th class="col-icon"></th><th>Series</th><th>Chapter</th><th>Source</th><th>Status</th><th>Progress</th><th class="col-date">Since</th></tr></thead>
+<tbody>
+{% for c in now_dl + waiting[:100] %}
+<tr class="queue-row chapter-{{ c.state }}">
+  <td class="col-icon">{% if c.state == 'downloading' %}{{ m.icon('spinner', 'sm spin') }}{% else %}{{ m.icon('clock', 'sm') }}{% endif %}</td>
+  <td><a href="/series/{{ c.series_id }}">{{ c.title }}</a></td>
+  <td class="nowrap">Chapter {{ '%g'|format(c.number) }}</td>
+  <td class="muted">{{ c.source or '-' }}</td>
+  <td>{{ m.label('Downloading' if c.state == 'downloading' else 'Queued', 'purple' if c.state == 'downloading' else 'default') }}</td>
+  <td class="small message">{{ c.text }}</td>
+  <td class="col-date nowrap">{{ c.since|ago }}</td>
+</tr>
+{% endfor %}
+</tbody></table></div>
+{% if waiting|length > 100 %}<div class="help-text">{{ waiting|length - 100 }} more queued chapters are not shown.</div>{% endif %}
+{% endif %}
 {% if not queue %}
 <div class="alert info">The queue is empty. Nothing has run since start and Suwayomi is not downloading anything.</div>
 {% else %}

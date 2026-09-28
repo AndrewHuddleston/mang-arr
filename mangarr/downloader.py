@@ -38,7 +38,7 @@ from collections.abc import Callable
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 
-from . import config, limits, metrics, pagewarm
+from . import config, inflight, limits, metrics, pagewarm
 from .limits import Cancelled
 from .resolver import Plan, SourceMatch, ranges
 from .suwayomi import BREAKER_SECS, CircuitOpen, Client, SuwayomiError, SuwayomiUnreachable, site_key, with_cancel
@@ -834,6 +834,36 @@ def _page_warm_name(name: str) -> bool:
 
 def _download_source(client, manga_id, todo, batch, label, source_name, patient, cancel, report, memo: RunMemo,
                      stop_on_fail: bool = False, throttled: bool = False, warm: bool = False, gone=set):
+    """_download_chapters, with the chapters shown as they go when the
+    thread downloads for a series (inflight.tracking): waiting at this
+    source, being downloaded (with the progress line), and gone from the
+    list once they arrived or failed. Chapters it did not get to wait on."""
+    series = inflight.current()
+    if series is None:
+        return _download_chapters(client, manga_id, todo, batch, label, source_name, patient, cancel, report, memo,
+                                  stop_on_fail, throttled, warm, gone)
+    sid, title = series
+    numbers = [c.number for c in todo]
+    inflight.queue(sid, title, numbers, source_name, f"next from {source_name}")
+
+    def say(m: str) -> None:
+        inflight.say(sid, source_name, m)
+        report(m)
+    try:
+        return _download_chapters(client, manga_id, todo, batch, label, source_name, patient, cancel, say, memo,
+                                  stop_on_fail, throttled, warm, gone,
+                                  began=lambda chunk: inflight.start(sid, title, [c.number for c in chunk],
+                                                                     source_name),
+                                  ended=lambda nums: inflight.finish(sid, nums))
+    finally:
+        left = [n for n, r in inflight.by_number(sid).items()
+                if n in numbers and r["state"] == inflight.DOWNLOADING and r["source"] == source_name]
+        inflight.queue(sid, title, left, None, "waiting for its next source")
+
+
+def _download_chapters(client, manga_id, todo, batch, label, source_name, patient, cancel, report, memo: RunMemo,
+                       stop_on_fail: bool = False, throttled: bool = False, warm: bool = False, gone=set,
+                       began: Callable | None = None, ended: Callable | None = None):
     """Returns (ok numbers, failed numbers, {number: why it failed}). `report`
     receives one-line progress messages for the Activity page. The pause
     between chapters applies only to a rate-limited source (`throttled`, or
@@ -850,8 +880,21 @@ def _download_source(client, manga_id, todo, batch, label, source_name, patient,
     are fetched one by one before it is queued; one whose pages the image
     server keeps refusing is backed off like a rate limit without ever
     being queued, and one Suwayomi does not build from its cache gets its
-    pages fetched once more (memo.rewarmed)."""
+    pages fetched once more (memo.rewarmed). `began(chunk)` hears
+    which chapters are being downloaded now, `ended(numbers)` which have
+    arrived or failed so far."""
     ok, failed, why = [], [], {}
+    try:
+        return _download_loop(client, manga_id, todo, batch, label, source_name, patient, cancel, report, memo,
+                              stop_on_fail, throttled, warm, gone, began, ended, ok, failed, why)
+    finally:
+        if ended is not None:
+            ended(ok + failed)
+
+
+def _download_loop(client, manga_id, todo, batch, label, source_name, patient, cancel, report, memo, stop_on_fail,
+                   throttled, warm, gone, began, ended, ok: list, failed: list, why: dict):
+    """_download_chapters' work; ok, failed and why are filled as it goes."""
     ops = with_cancel(client, cancel)
     i, size, backoff = 0, batch, 0
     waited = 0                                      # the longest backoff waited since the last success
@@ -878,6 +921,10 @@ def _download_source(client, manga_id, todo, batch, label, source_name, patient,
             break
         status = (f"{source_name}: chapter {ranges([c.number for c in chunk])} ({len(ok)} of {len(todo)} done"
                   + (", rate-limited source: one at a time" if paced and size == 1 else ""))
+        if ended is not None:
+            ended(ok + failed)
+        if began is not None:
+            began(chunk)
         report(status + ")")
         warmed = None
         if warm:

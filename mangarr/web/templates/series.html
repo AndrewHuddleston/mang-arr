@@ -22,6 +22,7 @@
 {% endblock %}
 
 {% block body_class %}series-details{% endblock %}
+{% block body_attrs %} data-series-id="{{ s.id }}"{% endblock %}
 {% block main_attrs %}{% if stuck|rejectattr('dismissed')|selectattr('checking')|list %}data-reload="15000"{% endif %}{% endblock %}
 {% block body %}
 {# -- Stuck behind a chapter (stuck.py): at the top, with the verdict and what to do about it ---------- #}
@@ -179,15 +180,17 @@
         {% for c in g.chapters %}
         {% set cs = chapter_status(c.status) %}
         {% set n = '%g'|format(c.number) %}
-        <tr class="episode-row {{ c.status }}" data-number="{{ n }}" data-status="{{ c.status }}">
+        {% set fl = inflight.get(c.number) if c.status != 'have' else none %}
+        <tr class="episode-row {{ c.status }}{{ ' in-flight' if fl }}" data-number="{{ n }}" data-status="{{ c.status }}"{% if fl %} data-inflight="{{ fl.state }}"{% endif %}>
           <td class="col-number">{{ n }}</td>
           <td class="col-title"><button type="button" class="episode-title-link" data-chapter-url="/api/v1/series/{{ s.id }}/chapter/{{ c.number }}" data-manual="/api/v1/series/{{ s.id }}/chapter/{{ c.number }}/releases" data-download="/series/{{ s.id }}/chapter/{{ c.number }}/download{{ page_q }}" data-search="/series/{{ s.id }}/chapter/{{ c.number }}/search{{ page_q }}" data-number="{{ n }}" data-name="{{ c.name or ('Chapter ' ~ n) }}">{{ c.name or ('Chapter ' ~ n) }}</button></td>
           <td class="col-date nowrap">{{ (c.uploaded or '')[:10] or '-' }}</td>
           <td class="col-source">{{ c.source_name or '' }}</td>
           {% set st = stuck_at.get(c.number) %}{% set sk = skipped.get(c.number) if c.status == 'ignored' else none %}
-          <td class="col-status">{{ m.label('Skipped' if sk else cs.text, cs.kind, 'medium', title=(c.reason or '')) }}
+          <td class="col-status">{% if fl %}{{ m.label('Downloading' if fl.state == 'downloading' else 'Queued', 'purple' if fl.state == 'downloading' else 'info', 'medium', title=fl.text, extra='inflight-label') }}{% else %}{{ m.label('Skipped' if sk else cs.text, cs.kind, 'medium', title=(c.reason or '')) }}{% endif %}
             {% if st and st.verdict %}{% set vl = verdict_label(st.verdict, st.number) %}{{ m.label(vl.text, vl.kind, 'small', title=('Holds back ' ~ st.waiting ~ ' chapter' ~ ('s' if st.waiting != 1 else '') ~ '.\n' ~ vl.tip), extra='verdict-label') }}{% elif sk and sk.how == 'auto' %}{{ m.label('automatically', 'default', 'small', title=('Skipped automatically: ' ~ (sk.verdict or '')), extra='verdict-label') }}{% endif %}</td>
           {% if c.status == 'have' %}<td class="col-path" title="{{ c.library_path or '' }}">{{ (c.library_path or '')|replace(library_path ~ '/', '') }}</td>
+          {% elif fl %}<td class="col-reason">{{ fl.text or ('from ' ~ fl.source if fl.source else '') }}</td>
           {% else %}<td class="col-reason {{ 'text-danger' if c.status == 'failed' }}">{{ c.reason or ('waiting for a download pass' if c.status == 'wanted' else '') }}</td>{% endif %}
           <td class="col-actions">
             {% if c.status in ['wanted','failed','unavailable','ignored'] %}

@@ -292,6 +292,15 @@ MIGRATIONS = [
     CREATE INDEX IF NOT EXISTS rename_log_run ON rename_log(run_id, id);
     CREATE INDEX IF NOT EXISTS rename_log_state ON rename_log(state);
     """,
+    # 19: when every source was last searched by title for the series. A pass
+    #     between two such searches only reads the chapter lists of the entries
+    #     it knows (resolver.resolve, known). Series resolved before this get a
+    #     time spread over a week, so their full searches do not all fall due in
+    #     one pass. (The column is added by _add_last_searched, unless it is
+    #     there: for a database that is migrated to here a second time.)
+    """
+    SELECT 1;
+    """,
 ]
 
 
@@ -351,6 +360,8 @@ def migrate(con: sqlite3.Connection, target: int | None = None) -> None:
                     _backfill_listing(con)
                 if i == 18:
                     _backfill_file_titles(con)
+                if i == 19:
+                    _add_last_searched(con)
                 con.execute(f"PRAGMA user_version = {i}")
                 con.commit()
             except BaseException as e:
@@ -412,6 +423,16 @@ def _backfill_listing(con) -> None:
         missed = (1 if when >= cutoff else LISTING_GRACE_RESOLVES) if gone else 0
         con.execute("UPDATE chapter SET listed=?, listed_at=?, unlisted=?, missed=? WHERE series_id=? AND number=?",
                     (listed, when, int(gone), missed, sid, n))
+
+
+def _add_last_searched(con) -> None:
+    """Migration 19: the column series.last_searched. A series resolved
+    before gets the time of that, less 0 to 6 days by its id: the searches
+    of every source then fall due spread over a week, not in one pass."""
+    if "last_searched" not in {r[1] for r in con.execute("PRAGMA table_info(series)")}:
+        con.execute("ALTER TABLE series ADD COLUMN last_searched TEXT")
+    con.execute("UPDATE series SET last_searched = datetime(last_resolved, '-' || (id % 7) || ' days')"
+                " WHERE last_resolved IS NOT NULL AND last_searched IS NULL")
 
 
 def _backfill_file_titles(con) -> None:
