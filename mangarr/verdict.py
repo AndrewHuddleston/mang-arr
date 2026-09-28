@@ -10,21 +10,31 @@ gives its evidence as plain sentences the user can check:
   * the chapter's name on each source: side story, spin-off, omake,
     afterword, extra (and romanised or native forms) -> a side story; bonus
     and special -> the same, less surely (ordinary words more often); "part
-    2" -> the rest of a chapter; any other title (but chapter N's own) -> a
-    chapter of its own, which outweighs a side story's name elsewhere. These
-    words decide only for a chapter numbered between the story's (7.5): a
-    whole number is the story's own numbering. Notice words ("Hiatus
-    Notice", 公告) are shown but never decide anything: "The Announcement" is
-    a chapter title too.
+    2" -> the rest of a chapter; any other title -> a chapter of its own,
+    which outweighs a side story's name elsewhere. Chapter N's own title
+    (words like "Extra" in it too) marks the site's split of chapter N: no
+    side story, and a real title against one's name on another source. A
+    side-story word the series' whole chapters carry too (every chapter of
+    a spin-off called "... Gaiden Chapter N") is the series' word and
+    decides nothing. These words decide only for a chapter numbered between
+    the story's (7.5): a whole number is the story's own numbering. Notice
+    words ("Hiatus Notice", 公告) are shown but never decide anything: "The
+    Announcement" is a chapter title too.
   * MangaDex's English chapter list (mangadex.english_chapters): it has the
     whole chapter N, goes on with N+1 and lacks this number -> a site's own
     split or duplicate, already covered when you have N at its length; it
     lists this number under a title, or at a chapter's length -> a chapter
-    of its own. A list that ends or skips ahead before the number says
+    of its own; it lists another chapter between N and N+1 that you lack
+    (by any name but a side story's own words: "Special" and "Extra" are
+    titles too) -> this may be that one under another number, whether or
+    not it has N. A list that ends or skips ahead before the number says
     nothing about it.
   * page counts: your N much shorter than MangaDex's N or the series' usual
     chapter -> the site split N, and this is probably the rest of it; the
-    whole chapter only at 85-115% of those (longer, it may hold more)
+    whole chapter only at 85-115% of those (longer, it may hold more). The
+    pieces of N you have count with it; one MangaDex lists as a chapter of
+    its own is compared with MangaDex's copy of it, never added to yours
+    against MangaDex's N alone
   * position: after the last chapter of a finished series, or numbered .5
     -> hints shown with the other signs that never decide (a last chapter
     split in two looks just the same; the last whole chapter itself, even
@@ -35,13 +45,16 @@ Only side_story and covered suggest skipping, as advice with the evidence
 shown, and only a HIGH-confidence one may be skipped automatically:
 
   * side_story: a fractional chapter that a site listing it names a side
-    story, spin-off, afterword, omake or extra, with no title of its own on
-    any other source or on MangaDex (nor a notice's name, which may be one)
+    story, spin-off, afterword, omake or extra (not the series' own word),
+    with no title of its own on any other source or on MangaDex (nor a
+    notice's name, which may be one, nor chapter N's title), and no chapter
+    between N and N+1 on MangaDex you lack that it may be
   * covered: MangaDex has N and goes on with N+1 without this number or
-    another chapter between them you lack; your N (with the pieces of it you
-    have) is 85-115% of MangaDex's N; and your N+1 is from a source that
-    does not list this number either, so the numbering after N is not
-    shifted by it (a site's 7.1 can be MangaDex's 8)
+    another chapter between them you lack (but a side story); your N (with
+    the pieces of it you have) is 85-115% of MangaDex's N (with the same
+    pieces); and your N+1 is from a source that does not list this number
+    either, so the numbering after N is not shifted by it (a site's 7.1
+    can be MangaDex's 8)
 
 Any other verdict is LOW: advice for the "Skip it" button only, with the
 reasons it is not certain among its evidence.
@@ -69,7 +82,7 @@ KINDS = ("side_story", "covered", "rest_of_chapter", "unknown")
 HIGH, LOW = "high", "low"   # confidence; only a HIGH side_story or covered verdict may be skipped automatically
 
 
-@dataclass
+@dataclass(slots=True)
 class Chapter:
     """One chapter row of the series (db.chapters)."""
     number: float
@@ -209,6 +222,53 @@ def sign(name: str | None, series: Series) -> str | None:
     return None
 
 
+def _marks(t: str) -> set[str]:
+    """The side-story, extra, bonus or special words in a cleaned name, each
+    as the first four letters of its words ('side' for "side stories",
+    'gaid', 'extr', 'spec'), so the forms of one word are one mark."""
+    out = {"".join(_WORDS.findall(m.group(0)))[:4] for m in _SIDE.finditer(t)}
+    for p in _PARTS.split(t):
+        w = _WORDS.findall(p)
+        if w and (x := _loose(w)):
+            out.add(x[:4])
+    return out - {""}
+
+
+SERIES_WORD = 2     # whole chapters named with a side-story or extra word that make it the series' own word
+
+
+def _series_word(name: str | None, series: Series, rows: dict, b: float) -> str | None:
+    """When the side-story or extra words of this name are in the names of
+    the series' whole chapters too (SERIES_WORD of them, or chapter N): a
+    spin-off whose every chapter is "... Gaiden Chapter 12", a chapter N
+    called "Extra? No, I'm the Protagonist!". Then they are the series'
+    words and say nothing about this chapter: the clause that says so
+    ('39 of the series' whole chapters ...'); else None. Only the names
+    that hold the word's first letters are cleaned and read."""
+    marks = _marks(_clean(name, series))
+    if not marks:
+        return None
+    whole = float(math.floor(b))
+    found: dict[str, list[float]] = {m: [] for m in marks}
+    for n, c in rows.items():
+        if n == b or n != int(n) or not c.name:
+            continue
+        low = c.name.lower()
+        hits = [m for m in marks if m in low]
+        if hits:
+            theirs = _marks(_clean(c.name, series))
+            for m in hits:
+                if m in theirs:
+                    found[m].append(n)
+    if not all(len(ns) >= SERIES_WORD or whole in ns for ns in found.values()):
+        return None
+    ns = sorted({n for x in found.values() for n in x})
+    if len(ns) == 1:
+        return f"your chapter {_g(ns[0])} has that word in its name too ({_quote(rows[ns[0]].name)})"
+    return (f"{len(ns)} of the series' whole chapters have that word in their names too (like "
+            f"{_quote(rows[ns[-1]].name)})")
+
+
 def _says(name: str | None, pages: int | None, series: Series, min_pages: int) -> str | None:
     """sign() of one copy of a chapter: a notice's name on a copy with at
     least min_pages pages is a chapter's title after all."""
@@ -221,6 +281,8 @@ def _says(name: str | None, pages: int | None, series: Series, min_pages: int) -
 def _num(x) -> float | None:
     """x as a chapter number (rounded as the database keeps it), or None
     when it is not a finite number from 0 up to MAX_NUMBER."""
+    if type(x) is float:                    # what the database gives: checked with two comparisons (NaN fails)
+        return (x if x.is_integer() else round(x, 4)) if 0 <= x < MAX_NUMBER else None
     if isinstance(x, bool) or not isinstance(x, (int, float)) or not math.isfinite(x):
         return None
     return round(float(x), 4) if 0 <= x < MAX_NUMBER else None
@@ -229,6 +291,10 @@ def _num(x) -> float | None:
 def _count(x) -> int | None:
     """x as a page count, or None (not known) when it is not a finite number
     from 1 up to MAX_NUMBER."""
+    if x is None:
+        return None
+    if type(x) is int:
+        return x if 1 <= x < MAX_NUMBER else None
     if isinstance(x, bool) or not isinstance(x, (int, float)) or not math.isfinite(x):
         return None
     return int(x) if 1 <= x < MAX_NUMBER else None
@@ -271,31 +337,42 @@ def _md_near(md: "mangadex.ChapterList | None") -> dict:
     return out
 
 
-def _length(whole: float, b: float, rows: dict, md_base) -> tuple[str, str, bool]:
+def _length(whole: float, b: float, rows: dict, near: dict) -> tuple[str, str, bool]:
     """Is your copy of chapter N (with any pieces of it you have below the
     blocker, 7 and 7.1 for 7.2) the whole chapter? ('normal' | 'short' |
     'long' | 'unclear' | 'unknown', the sentence that says why, whether it
-    was compared with MangaDex's copy of N)."""
+    was compared with MangaDex's copy of N).
+
+    A piece MangaDex lists as a chapter of its own (its 7.1) is compared
+    with MangaDex's copy of it: your 7 and 7.1 with MangaDex's 7 and 7.1,
+    never your 7 and 7.1 with MangaDex's 7 alone, which a short 7 would
+    pass. Against the usual chapter such a piece does not count."""
     base = rows[whole]
     pieces = sorted(n for n, c in rows.items() if whole < n < b and c.status == "have" and c.pages)
     if not base.pages:
         return ("unknown", f"The page count of your chapter {_g(whole)} is not known, so its length cannot be "
                            f"compared.", False)
-    ours = base.pages + sum(rows[n].pages for n in pieces)
-    label = (f"Your chapters {_join([whole, *pieces])} have {_pages(ours)} together" if pieces
-             else f"Your chapter {_g(whole)} has {_pages(ours)}")
-    if md_base is not None and md_base.pages:
-        theirs = md_base.pages
+    md_base = near.get(whole)
+    listed = [n for n in pieces if n in near]           # chapters of their own on MangaDex
+    if md_base is not None and md_base.pages and all(near[n].pages for n in listed):
+        ours = base.pages + sum(rows[n].pages for n in pieces)
+        theirs = md_base.pages + sum(near[n].pages for n in listed)
+        label = (f"Your chapters {_join([whole, *pieces])} have {_pages(ours)} together" if pieces
+                 else f"Your chapter {_g(whole)} has {_pages(ours)}")
+        what = f"MangaDex's chapters {_join([whole, *listed])}" if listed else f"MangaDex's chapter {_g(whole)}"
+        has = "have" if listed else "has"
         if ours > LONG * theirs:
-            return "long", (f"{label} but MangaDex's chapter {_g(whole)} has only {theirs}: yours holds more than "
-                            f"chapter {_g(whole)}."), True
+            return "long", (f"{label} but {what} {has} only {theirs}: yours holds more than chapter "
+                            f"{_g(whole)}."), True
         if ours >= SAME * theirs:
-            return "normal", f"{label}, like MangaDex's chapter {_g(whole)} ({theirs}).", True
+            return "normal", f"{label}, like {what} ({theirs}).", True
         if ours < SHORT * theirs:
-            return "short", (f"{label} but MangaDex's chapter {_g(whole)} has {theirs}: yours is probably only "
-                             f"part of it."), True
-        return "unclear", (f"{label} and MangaDex's chapter {_g(whole)} has {theirs}: close, but not clearly the "
-                           f"same."), True
+            return "short", f"{label} but {what} {has} {theirs}: yours is probably only part of it.", True
+        return "unclear", f"{label} and {what} {has} {theirs}: close, but not clearly the same.", True
+    split = [n for n in pieces if n not in near]        # the site's own pieces of N
+    ours = base.pages + sum(rows[n].pages for n in split)
+    label = (f"Your chapters {_join([whole, *split])} have {_pages(ours)} together" if split
+             else f"Your chapter {_g(whole)} has {_pages(ours)}")
     usual = [c.pages for n, c in rows.items() if n == int(n) and n != whole and c.status == "have" and c.pages]
     if len(usual) < MIN_SAMPLE:
         return "unknown", (f"Too few chapters of this series have a known page count to tell whether your chapter "
@@ -339,7 +416,9 @@ def classify(series: Series, blocker: Blocker, chapters, md: "mangadex.ChapterLi
     for c in chapters:
         n = _num(c.number)
         if n is not None:
-            rows[n] = Chapter(n, c.status, c.name, c.source, _count(c.pages))
+            p = _count(c.pages)
+            rows[n] = c if n == c.number and p == c.pages and type(c) is Chapter else \
+                Chapter(n, c.status, c.name, c.source, p)
     have = {n for n, c in rows.items() if c.status == "have"}
     near = _md_near(md)
     following = _num(md.following) if md is not None else None
@@ -377,11 +456,18 @@ def classify(series: Series, blocker: Blocker, chapters, md: "mangadex.ChapterLi
     pages = mine.pages if mine is not None else None
     base = rows.get(whole) if fractional else None
     base_title = norm(_clean(base.name, series)) if base is not None and base.name else ""
-    plain = []
+    plain, like_base = [], []
     for source, name in names.items():
         who, what = oneline(source, 60), _quote(name)
         s = _says(name, pages, series, min_pages)
-        if s in ("side", "extra", "bonus") and fractional:
+        if base_title and _clean(name, series) and norm(_clean(name, series)) == base_title:
+            # chapter N's own title (words like "Extra" in it included): the site split chapter N
+            like_base.append(f"{who} names it {what}, as your chapter {_g(whole)} is named.")
+            continue
+        own = _series_word(name, series, rows, b) if s in ("side", "extra", "bonus") else None
+        if own:
+            support.append(f"{who} names it {what}, but {own}, so that is the series' word, not this chapter's.")
+        elif s in ("side", "extra", "bonus") and fractional:
             side.append(f"{who} names it {what}, which marks a side story or extra.")
             sure, loose = sure or s != "bonus", loose or s == "bonus"
         elif s in ("side", "extra", "bonus"):
@@ -399,8 +485,6 @@ def classify(series: Series, blocker: Blocker, chapters, md: "mangadex.ChapterLi
             titled.append(f"{who}'s notice-like name for it could be a chapter's own title.")
         elif not _clean(name, series):
             plain.append(what)
-        elif base_title and norm(_clean(name, series)) == base_title:
-            support.append(f"{who} names it {what}, as your chapter {_g(whole)} is named.")
         else:
             story.append(f"{who} names it {what}: a title of its own, so probably a chapter of its own.")
     if plain and len(plain) == len(names):
@@ -453,7 +537,9 @@ def classify(series: Series, blocker: Blocker, chapters, md: "mangadex.ChapterLi
             if n == whole or n in have:
                 continue
             s = _says(c.title, c.pages, series, min_pages)
-            if s in ("side", "extra", "bonus"):
+            if s == "side" and _series_word(c.title, series, rows, b):
+                s = None                    # the series' word, not the chapter's
+            if s == "side":                 # a side story's own words; "extra" and "special" are titles too
                 lines.append(f"{_md_says(c)}, an extra.")
             elif s == "junk" or (not c.title and c.pages is not None and c.pages < min_pages):
                 lines.append(f"{_md_says(c)}, perhaps a notice.")
@@ -483,14 +569,32 @@ def classify(series: Series, blocker: Blocker, chapters, md: "mangadex.ChapterLi
         others = sorted(near)
         notes.append(f"MangaDex's English chapter list has no chapter {_g(whole)}"
                      + (f" (it lists {_join(others)})" if others else "") + ", so it cannot compare.")
+        # but a chapter of its own it lists between N and N+1 that you lack may be this one under another number
+        for n in others:
+            c = near[n]
+            s = _says(c.title, c.pages, series, min_pages)
+            if s == "side" and _series_word(c.title, series, rows, b):
+                s = None                    # the series' word, not the chapter's
+            if whole < n < whole + 1 and n not in have and s not in ("side", "junk") and \
+                    (c.title or c.pages is None or c.pages >= min_pages):
+                lacking.append(n)
+        if lacking:
+            story += [f"{_md_says(near[n])}, which you do not have." for n in lacking[:3]]
+            story.append(f"{_g(b)} may be {'that chapter' if len(lacking) == 1 else 'one of them'} under another "
+                         f"number.")
     elif highest is not None and highest < b:
         notes.append(f"MangaDex's English chapter list ends at {_g(highest)}, before {_g(b)}, so it cannot help.")
     else:
         notes.append(f"MangaDex's English chapter list has no chapter {_g(b)} either.")
 
+    if like_base and (side or md_side):
+        story += [f"{line[:-1]}: a real title, so it may be the rest of chapter {_g(whole)}." for line in like_base]
+    else:
+        support += like_base
+
     length, length_line, against_md = "unknown", "", False
     if fractional and whole in have:
-        length, length_line, against_md = _length(whole, b, rows, near.get(whole))
+        length, length_line, against_md = _length(whole, b, rows, near)
         if length == "short":
             rest.append(length_line)
         elif length != "normal":

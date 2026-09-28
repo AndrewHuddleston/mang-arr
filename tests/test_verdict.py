@@ -319,11 +319,31 @@ class ConservativeTest(unittest.TestCase):
                       v.evidence)
 
     def test_pieces_you_have_count_toward_the_length(self):
+        # the site split chapter 7 into 7 and 7.1; MangaDex has it whole
         rows = [*self.SHORT_7, Chapter(7.1, "have", None, "WC", 14), Chapter(7.2, "failed")]
-        md = md_list(MdChapter(7.0, "Seven", 27), MdChapter(7.1, "Seven, second part", 12), following=8.0)
+        md = md_list(MdChapter(7.0, "Seven", 27), following=8.0)
         v = classify(Series(english="S"), Blocker(7.2, {}), rows, md)
         self.assertEqual((v.kind, v.confidence), ("covered", HIGH))
         self.assertIn("Your chapters 7 and 7.1 have 26 pages together, like MangaDex's chapter 7 (27).", v.evidence)
+
+    def test_a_piece_mangadex_lists_is_compared_with_mangadex_s_copy_of_it(self):
+        # MangaDex has 7.1 as a chapter of its own: your 7 and 7.1 against its 7 and 7.1, not its 7 alone
+        rows = [*have([n for n in range(1, 30) if n != 7], 40), Chapter(7.0, "have", None, "WC", 30),
+                Chapter(7.1, "have", None, "WC", 6), Chapter(7.2, "failed", "Chapter 7.2", "Manganato")]
+        md = md_list(MdChapter(7.0, "Seven", 40), MdChapter(7.1, None, 6), following=8.0)
+        v = classify(Series(english="S"), Blocker(7.2, {"Manganato": "Chapter 7.2"}), rows, md)
+        self.assertEqual((v.kind, v.confidence), ("unknown", LOW))
+        self.assertIn("Your chapters 7 and 7.1 have 36 pages together and MangaDex's chapters 7 and 7.1 have 46: "
+                      "close, but not clearly the same.", v.evidence)
+        rows = [r if r.number != 7 else Chapter(7.0, "have", None, "WC", 39) for r in rows]
+        v = classify(Series(english="S"), Blocker(7.2, {"Manganato": "Chapter 7.2"}), rows, md)
+        self.assertEqual((v.kind, v.confidence), ("covered", HIGH))
+        self.assertIn("Your chapters 7 and 7.1 have 45 pages together, like MangaDex's chapters 7 and 7.1 (46).",
+                      v.evidence)
+        # against the usual length, a piece MangaDex lists is not part of your 7
+        md = md_list(MdChapter(7.0, "Seven", None), MdChapter(7.1, None, 6), following=8.0)
+        v = classify(Series(english="S"), Blocker(7.2, {"Manganato": "Chapter 7.2"}), rows, md)
+        self.assertIn("Your chapter 7 has 39 pages, a usual length for this series (about 40).", v.evidence)
 
     def test_mangadex_lists_a_chapter_you_lack(self):
         md = md_list(MdChapter(7.0, "Seven", 30), MdChapter(7.1, "The Duel", 25), following=8.0)
@@ -331,6 +351,16 @@ class ConservativeTest(unittest.TestCase):
         self.assertEqual(v.kind, "unknown")
         self.assertIn("You do not have 7.1 from that list: 7.2 may be the same chapter under another number.",
                       v.evidence)
+
+    def test_mangadex_extras_by_ordinary_words_you_lack_may_be_this_chapter(self):
+        rows = [*self.ROWS, Chapter(7.2, "failed")]
+        for title in ("Special: The Duel", "Special Chapter: Kaito's Past", "Volume 2 Bonus", "Extra, Extra!"):
+            with self.subTest(title):
+                md = md_list(MdChapter(7.0, "Seven", 30), MdChapter(7.1, title, 30), following=8.0)
+                v = classify(Series(english="S"), Blocker(7.2, {}), rows, md)
+                self.assertEqual((v.kind, v.confidence), ("unknown", LOW))
+                self.assertIn("You do not have 7.1 from that list: 7.2 may be the same chapter under another number.",
+                              v.evidence)
 
     def test_mangadex_extras_you_lack_do_not_matter(self):
         rows = [*self.ROWS, Chapter(7.2, "failed")]
@@ -500,6 +530,36 @@ class ConfidenceTest(unittest.TestCase):
         v = classify(self.S, Blocker(7.2, {"Manganato": "Chapter 7.2 - The Duel"}), rows, md)
         self.assertEqual((v.kind, v.headline), ("unknown", "Unknown: the signs disagree"))
 
+    def test_chapter_n_s_own_title_is_no_side_story_s_name(self):
+        rows = [*[r for r in have(range(1, 30), 30) if r.number != 7],
+                Chapter(7.0, "have", "Episode 7: Extra? No, I'm the Protagonist!", "Weeb Central", 30)]
+        v = classify(self.S, Blocker(7.2, {"Manganato": "Chapter 7.2: Extra? No, I'm the Protagonist!"}), rows)
+        self.assertNotEqual(v.kind, "side_story")
+        self.assertIn('Manganato names it "Chapter 7.2: Extra? No, I\'m the Protagonist!", as your chapter 7 is '
+                      'named.', v.evidence)
+        # ... and a real title that outweighs a side story's name on another source
+        v = classify(self.S, Blocker(7.5, {"Manganato": "Side Story", "Bato": "Chapter 7.5: Extra? No, I'm the "
+                                                                             "Protagonist!"}), rows)
+        self.assertEqual((v.kind, v.headline), ("unknown", "Unknown: the signs disagree"))
+        self.assertIn('Bato names it "Chapter 7.5: Extra? No, I\'m the Protagonist!", as your chapter 7 is named: a '
+                      'real title, so it may be the rest of chapter 7.', v.evidence)
+
+    def test_the_series_own_side_story_word_decides_nothing(self):
+        rows = [*[Chapter(float(n), "have", f"Tensura Nikki Gaiden Chapter {n}", "Weeb Central", 30)
+                  for n in range(1, 40)], Chapter(12.5, "failed", None, "Manganato")]
+        v = classify(SLIME, Blocker(12.5, {"Manganato": "Tensura Nikki Gaiden Chapter 12.5"}), rows)
+        self.assertEqual((v.kind, v.confidence), ("unknown", LOW))
+        self.assertIn('Manganato names it "Tensura Nikki Gaiden Chapter 12.5", but 39 of the series\' whole chapters '
+                      'have that word in their names too (like "Tensura Nikki Gaiden Chapter 39"), so that is the '
+                      'series\' word, not this chapter\'s.', v.evidence)
+        # the chapter's own words beside the series' still decide; one other chapter with the word is no pattern
+        v = classify(SLIME, Blocker(12.5, {"Manganato": "Tensura Nikki Gaiden Chapter 12.5: Omake"}), rows)
+        self.assertEqual((v.kind, v.confidence), ("side_story", HIGH))
+        rows = [*have(range(1, 30), 30), Chapter(20.0, "have", "Side Story: The Knight", "Weeb Central", 30),
+                Chapter(12.5, "failed", None, "Manganato")]
+        v = classify(SLIME, Blocker(12.5, {"Manganato": "Side Story 2"}), rows)
+        self.assertEqual((v.kind, v.confidence), ("side_story", HIGH))
+
 
 # -- the adversarial check's false positives -----------------------------------
 # Real story chapters that the verdict of branch `verdict` (e51072a) called a
@@ -618,13 +678,44 @@ FALSE_POSITIVES = [
 ]
 
 
+SLIME = Series(anilist_id=424244, romaji="Tensei Shitara Slime Datta Ken: Tensura Nikki", english="The Slime Diaries")
+
+# Found by the review of branch stuck: real story chapters still HIGH once hardened
+REVIEW_FALSE_POSITIVES = [
+    # your N and a piece MangaDex lists as a chapter of its own, against MangaDex's N alone
+    ("R-pieces", R, Blocker(7.2, {"Manganato": "Chapter 7.2"}),
+     [*have([n for n in range(1, 30) if n != 7], 40), Chapter(7.0, "have", None, "Weeb Central", 30),
+      Chapter(7.1, "have", None, "Weeb Central", 6), failed(7.2, "Chapter 7.2")],
+     md_at((7.0, "Seven", 40), (7.1, None, 6), following=8.0), "unknown"),
+    # a MangaDex chapter between N and N+1 you lack, set aside as an extra by an ordinary word
+    *[(f"R-offset {t}", R, Blocker(7.2, {"Manganato": "Chapter 7.2"}), story(extra=[failed(7.2, "Chapter 7.2")]),
+       md_at((7.0, "Seven", 30), (7.1, t, 30), following=8.0), "unknown")
+      for t in ("Special: The Duel", "Special Chapter: Kaito's Past", "Volume 2 Bonus", "Extra, Extra!")],
+    # the site's split of chapter N under N's own title, which holds "Extra"
+    ("R-own title", R, Blocker(45.2, {"Manganato": "Chapter 45.2: Extra? No, I'm the Protagonist!"}),
+     story(49, 40, but=[45], extra=[Chapter(45.0, "have", "Episode 45: Extra? No, I'm the Protagonist!",
+                                            "Weeb Central", 40), failed(45.2)]), None, "unknown"),
+    # another source names it like chapter N: a real title against a side story's name
+    ("R-own title elsewhere", R, Blocker(12.5, {"Manganato": "Side Story", "Bato": "Chapter 12.5: The Duel"}),
+     story(but=[12], extra=[Chapter(12.0, "have", "Chapter 12: The Duel", "Weeb Central", 30), failed(12.5)]), None,
+     "unknown"),
+    # the series' own word: a spin-off whose every chapter is "... Gaiden Chapter N"
+    ("R-series word", SLIME, Blocker(12.5, {"Manganato": "Tensura Nikki Gaiden Chapter 12.5"}),
+     [*[Chapter(float(n), "have", f"Tensura Nikki Gaiden Chapter {n}", "Weeb Central", 30) for n in range(1, 40)],
+      failed(12.5, "Tensura Nikki Gaiden Chapter 12.5")], None, "unknown"),
+    # MangaDex lacks N but lists a titled chapter between N and N+1 that you lack
+    ("R-no N", R, Blocker(12.5, {"Manganato": "Side Story"}), story(extra=[failed(12.5)]),
+     md_at((12.1, "The Duel", 30), following=13.0), "unknown"),
+]
+
+
 class FalsePositivesTest(unittest.TestCase):
     def test_the_42_are_all_still_there(self):
         self.assertEqual(len(FALSE_POSITIVES), 42)
         self.assertEqual({c[0][0] for c in FALSE_POSITIVES}, set("ABCDEFGHI"))
 
     def test_none_is_a_certain_side_story_or_covered(self):
-        for label, series, blocker, rows, md, kind in FALSE_POSITIVES:
+        for label, series, blocker, rows, md, kind in FALSE_POSITIVES + REVIEW_FALSE_POSITIVES:
             with self.subTest(label):
                 v = classify(series, blocker, rows, md)
                 self.assertFalse(v.auto_skip, (v.kind, v.confidence, v.evidence))
@@ -632,7 +723,7 @@ class FalsePositivesTest(unittest.TestCase):
                 self.assertEqual(v.confidence, LOW)
 
     def test_the_same_with_the_answers_judge_finds_in_the_cache(self):
-        for label, series, blocker, rows, md, kind in FALSE_POSITIVES:
+        for label, series, blocker, rows, md, kind in FALSE_POSITIVES + REVIEW_FALSE_POSITIVES:
             with self.subTest(label), mock.patch.object(mangadex, "english_chapters", return_value=md) as look:
                 v = verdict.judge(series, blocker, rows, fetch=False)
                 look.assert_called_once_with(series, float(blocker.number), fetch=False)
