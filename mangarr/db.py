@@ -163,18 +163,22 @@ MIGRATIONS = [
     """,
     # 14: chapters a series is stuck behind (stuck.py): when a chapter's
     #     failures began, and per blocker what the sites listing it call it,
-    #     where it is on them, and what was done about it
+    #     where it is on them, which of them it failed on, and what was done
+    #     about it
     """
     ALTER TABLE chapter ADD COLUMN failed_since TEXT;
     CREATE TABLE stuck (
       series_id       INTEGER NOT NULL REFERENCES series(id) ON DELETE CASCADE,
       number          REAL NOT NULL,
       names           TEXT NOT NULL DEFAULT '{}',   -- JSON {source name: its title for the chapter there, or null}
+      seen            TEXT NOT NULL DEFAULT '{}',   -- JSON {source name: when a resolve last saw it list the chapter}
       urls            TEXT NOT NULL DEFAULT '{}',   -- JSON {source name: the chapter's page on that site ('': none)}
+      failed_on       TEXT NOT NULL DEFAULT '[]',   -- JSON [source names a download run failed it on]
       dismissed       TEXT,                   -- "Keep waiting": the chapter's state then (JSON, stuck.state_of)
       skipped         TEXT,                   -- 'manual' | 'auto' once skipped from here
       skipped_state   TEXT,                   -- the chapter's state when it was skipped
       verdict         TEXT,                   -- the verdict's headline then
+      declined        TEXT,                   -- when you un-skipped it or wanted it again: never skipped automatically
       updated_at      TEXT NOT NULL,
       PRIMARY KEY (series_id, number)
     );
@@ -463,15 +467,22 @@ def set_monitored(con, series_id: int, monitored: bool) -> None:
     event(con, "monitor", "monitored" if monitored else "unmonitored", series_id)
 
 
-def chapters_due(con) -> dict[int, int]:
+def chapters_due(con, in_order: bool = False) -> dict[int, int]:
     """Per series id, how many of its chapters a download would fetch now,
     as core._due picks them: wanted ones, and failed ones whose next attempt
-    is due. In order too: a failed chapter waiting for its next attempt
-    holds up the later ones only within the pass that failed it."""
-    now_, out = now(), {}
-    for r in con.execute("SELECT series_id, status, next_try FROM chapter WHERE status IN ('wanted','failed')"):
+    is due. In order (strict download in order) only those before the first
+    failed chapter that waits for its next attempt: the later ones wait for
+    it (core.hold_in_order)."""
+    now_, out, held = now(), {}, set()
+    for r in con.execute("SELECT series_id, status, next_try FROM chapter WHERE status IN ('wanted','failed')"
+                         " ORDER BY series_id, number"):
+        sid = r["series_id"]
+        if sid in held:
+            continue
         if r["status"] == "wanted" or not r["next_try"] or r["next_try"] <= now_:
-            out[r["series_id"]] = out.get(r["series_id"], 0) + 1
+            out[sid] = out.get(sid, 0) + 1
+        elif in_order:
+            held.add(sid)
     return out
 
 

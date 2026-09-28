@@ -16,7 +16,7 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass, field, replace
 
-from . import db, downloader, duplicates, komga, library, limits, metadata, metrics, stuck
+from . import db, downloader, duplicates, komga, library, limits, metadata, metrics, settings, stuck
 from .matching import oneline
 from .model import Series
 from .resolver import Plan, primary, resolve
@@ -67,6 +67,7 @@ def add_series(con, client: Client, series: Series, download: bool = True, do_im
     p = primary(plan)
     blocked = stuck.blockers(con, series_id)        # as the last pass left it: save_plan makes these wanted again
     expired = db.save_plan(con, series_id, plan, p.manga_id if p else None)
+    hold_in_order(con, series_id, plan)             # save_plan's reasons for the chapters that still wait
     if expired:
         log.warning("%s: %s could not be searched for over %d days; its entry is dropped and the chapters "
                     "only it listed count as unavailable", series.title, ", ".join(expired), db.UNREACHABLE_KEEP_DAYS)
@@ -172,6 +173,12 @@ def describe_outcome(con, series_id: int, o: Outcome) -> tuple[str, str]:
     if later:
         nxt = min(r["next_try"] for r in later)[:16]
         parts.append(f"{len(later)} failed chapter(s) waiting for retry (next {nxt})")
+    waits: dict[str, int] = {}
+    for r in rows:
+        if r["status"] == "wanted" and (token := downloader.waiting_for(r["reason"])):
+            waits[token] = waits.get(token, 0) + 1
+    for token, k in list(waits.items())[:3]:
+        parts.append(f"{k} later chapter(s) wait for ch {token} (strict download in order)")
     if unavailable:
         parts.append(f"{unavailable} chapter(s) no source lists")
     if plan.unreachable:
@@ -235,14 +242,49 @@ def _set_library_entries(client: Client, plan: Plan, primary_manga_id: int, stal
 _JOB_OWNED = ("wanted", "failed", "unavailable")
 
 
+def hold_in_order(con, series_id: int, plan: Plan, rows: dict | None = None) -> float | None:
+    """With strict download in order: the first chapter the plan wants that
+    failed and waits for its next attempt, whose later wanted chapters wait
+    for it until then, as in the pass that failed it (their reason says so:
+    downloader.waiting_reason, which stuck.blockers finds the series by), so
+    no pass fills in the chapters after it and leaves a gap. Returns its
+    number, or None (in order off, or none). Not committed."""
+    if not settings.get("download_in_order"):
+        return None
+    rows = rows if rows is not None else {r["number"]: r for r in db.chapters(con, series_id)}
+    now_, wanted = db.now(), plan.wanted()
+    listed = set(wanted)
+    later = [n for n, r in rows.items() if n in listed and r["status"] == "failed" and r["next_try"]
+             and r["next_try"] > now_]
+    if not later:
+        return None
+    first = min(later)
+    reason = downloader.waiting_reason(first)
+    con.executemany("UPDATE chapter SET reason=?, updated_at=? WHERE series_id=? AND number=?",
+                    [(reason, now_, series_id, n) for n in wanted
+                     if n > first and (r := rows.get(n)) is not None and r["status"] == "wanted"
+                     and r["reason"] != reason])
+    return first
+
+
 def _due(con, series_id: int, plan: Plan) -> list[float]:
     """The plan's wanted chapters that are due now: not on disk, not ignored,
-    and not a failed one waiting for its next attempt."""
+    not a failed one waiting for its next attempt, and with strict download
+    in order none after such a one (hold_in_order). Commits what it wrote."""
     rows = {r["number"]: r for r in db.chapters(con, series_id)}
     have_on_disk = {n for n, r in rows.items() if r["status"] == "have"}
     ignored = {n for n, r in rows.items() if r["status"] == "ignored"}
     later = {n for n, r in rows.items() if r["status"] == "failed" and r["next_try"] and r["next_try"] > db.now()}
+    first = hold_in_order(con, series_id, plan, rows)
     wanted = [n for n in plan.wanted() if n not in have_on_disk and n not in later and n not in ignored]
+    if first is not None:
+        held = [n for n in wanted if n > first]
+        wanted = [n for n in wanted if n < first]
+        if con.in_transaction:
+            con.commit()
+        if held:
+            log.info("%s: %d later chapter(s) wait for ch %g, which failed on every source and is not due for "
+                     "another attempt yet (strict download in order)", plan.series.title, len(held), first)
     if later:
         log.info("%s: %d failed chapter(s) not due for another attempt yet", plan.series.title, len(later))
     if ignored & set(plan.wanted()):
@@ -308,6 +350,7 @@ def record_downloads(con, series_id: int, plan: Plan, wanted: list[float], resul
             db.set_status(con, series_id, n, "wanted", reasons.get(n) or
                           "not attempted: the download pass was cancelled or interrupted before this chapter",
                           only_from=_JOB_OWNED)
+    stuck.note_failures(con, series_id, results, attempts)     # the sites a chapter that holds its series failed on
     con.commit()
 
 

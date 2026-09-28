@@ -34,12 +34,14 @@ class DbTest(unittest.TestCase):
         with db.connect(self.path) as con:
             sids = [db.upsert_series(con, Series(anilist_id=i, english=f"S{i}")) for i in range(1, 5)]
             rows = [(sids[0], 1, "wanted", None), (sids[0], 2, "failed", "2000-01-01 00:00:00"),
-                    (sids[1], 1, "failed", soon), (sids[1], 2, "wanted", None),     # 2 is fetched, in order too
+                    (sids[1], 1, "wanted", None), (sids[1], 2, "failed", soon), (sids[1], 3, "wanted", None),
                     (sids[2], 1, "have", None), (sids[2], 2, "failed", None),
-                    (sids[3], 1, "failed", soon)]
+                    (sids[3], 1, "failed", soon), (sids[3], 2, "wanted", None)]
             con.executemany("INSERT INTO chapter (series_id, number, status, next_try, updated_at) VALUES (?, ?, ?, ?,"
                             " '2000-01-01 00:00:00')", rows)
-            self.assertEqual(db.chapters_due(con), {sids[0]: 2, sids[1]: 1, sids[2]: 1})
+            # in order, the chapters after a failed one that waits for its next attempt wait for it
+            self.assertEqual(db.chapters_due(con, in_order=True), {sids[0]: 2, sids[1]: 1, sids[2]: 1})
+            self.assertEqual(db.chapters_due(con), {sids[0]: 2, sids[1]: 2, sids[2]: 1, sids[3]: 1})
 
     def test_same_title_gets_distinct_folders(self):
         with db.connect(self.path) as con:

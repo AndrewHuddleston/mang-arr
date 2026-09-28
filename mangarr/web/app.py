@@ -477,7 +477,7 @@ def _pass_stopped_text(items: list, reached: int, why: str) -> str:
 def _job_refresh_all(job: jobs.Job):
     with db.connect() as con:
         duplicates.read_links(con)                 # the AniList links of MangaDex series, skipped ones too
-        due = db.chapters_due(con)
+        due = db.chapters_due(con, bool(settings.get("download_in_order")))
         rows, skippable = plan_pass(db.series_rows(con), due)
     log.info("refresh pass: %d series (%d with chapters due first, then %d continuing), and %d complete finished "
              "series last, skipped unless their status changed", len(rows), sum(1 for r in rows if due.get(r["id"])),
@@ -866,6 +866,10 @@ def series_page(request: Request, series_id: int, page_no: int = Query(1, alias=
         # the chapters it is stuck behind, with their verdicts; a link from another site looks nothing up
         blocked = stuck.details(con, r, fetch=not _cross_site(request))
         skips = stuck.skipped(con, series_id)
+    marked = {st.number for st in blocked} | {k["number"] for k in skips}
+    for g in groups:                                # their rows (verdict label, Un-skip) are shown, not folded
+        if any(c["number"] in marked for c in g["chapters"]):
+            g["open"] = True
     if paging["pages"] > 1:
         log.debug("series %d: %d chapter rows, showing page %d of %d", series_id, paging["total"], paging["page"],
                   paging["pages"])
@@ -877,7 +881,7 @@ def series_page(request: Request, series_id: int, page_no: int = Query(1, alias=
                 library_path=library.library_dir(r["folder"] or ""), size_bytes=size_bytes, size_files=size_files,
                 size_human=views.human_size(size_bytes), ref_url=views.ref_url(r), stuck=blocked,
                 stuck_at={st.number: st for st in blocked}, skipped={k["number"]: k for k in skips},
-                skip_notes=[k for k in skips if k["how"] == "auto" or k["changed"]],
+                skip_notes=skips,
                 auto_skip=bool(settings.get("auto_skip_side_stories") and settings.get("download_in_order")))
 
 
@@ -991,7 +995,7 @@ def chapter_ignore(series_id: int, number: float, page_no: int = Query(1, alias=
 def chapter_unignore(series_id: int, number: float, page_no: int = Query(1, alias="page")):
     with db.connect() as con:
         db.set_status(con, series_id, number, "wanted")
-        stuck.forget(con, series_id, number)          # a skip from a stuck note no longer applies
+        stuck.forget(con, series_id, number)          # a skip from a stuck note no longer applies; never automatic
         db.event(con, "ignore", f"chapter {number:g} wanted again", series_id)
     return RedirectResponse(_series_url(series_id, page_no), 303)
 
@@ -1041,9 +1045,18 @@ def _keep_waiting(series_id: int, number: float) -> tuple[bool, str]:
         if not db.get_series(con, series_id):
             raise HTTPException(404, "no such series")
         if stuck.dismiss(con, series_id, number):
-            return True, (f"keeping waiting for chapter {number:g}: the note is back when the chapter changes "
-                          "(another title, or another site lists it)")
+            return True, (f"the series keeps waiting for chapter {number:g}: its note is folded, and it is not "
+                          "skipped automatically, until the chapter changes (another title, or another site lists it)")
     return False, f"the series is not stuck behind chapter {number:g}"
+
+
+def _keep_skipped(series_id: int, number: float) -> tuple[bool, str]:
+    with db.connect() as con:
+        if not db.get_series(con, series_id):
+            raise HTTPException(404, "no such series")
+        if stuck.keep_skipped(con, series_id, number):
+            return True, f"chapter {number:g} stays skipped as it is listed now"
+    return False, f"chapter {number:g} is not a skipped chapter"
 
 
 @app.post("/series/{series_id}/chapter/{number}/skip")
@@ -1059,6 +1072,11 @@ def chapter_unskip(series_id: int, number: float, page_no: int = Query(1, alias=
 @app.post("/series/{series_id}/chapter/{number}/keep-waiting")
 def chapter_keep_waiting(series_id: int, number: float, page_no: int = Query(1, alias="page")):
     return _flash(_series_url(series_id, page_no), _keep_waiting(series_id, number)[1])
+
+
+@app.post("/series/{series_id}/chapter/{number}/keep-skipped")
+def chapter_keep_skipped(series_id: int, number: float, page_no: int = Query(1, alias="page")):
+    return _flash(_series_url(series_id, page_no), _keep_skipped(series_id, number)[1])
 
 
 @app.post("/api/v1/series/{series_id}/chapter/{number}/skip")
@@ -1082,12 +1100,23 @@ def api_chapter_unskip(series_id: int, number: float):
 
 @app.post("/api/v1/series/{series_id}/chapter/{number}/keep-waiting")
 def api_chapter_keep_waiting(series_id: int, number: float):
-    """Hide the stuck note on this chapter until it changes. 409 when the
-    series is not stuck behind it."""
+    """Fold the stuck note on this chapter away, and keep the automatic skip
+    off it, until it changes. 409 when the series is not stuck behind it."""
     ok, msg = _keep_waiting(series_id, number)
     if not ok:
         raise HTTPException(409, msg)
     return {"ok": True, "number": number, "message": msg}
+
+
+@app.post("/api/v1/series/{series_id}/chapter/{number}/keep-skipped")
+def api_chapter_keep_skipped(series_id: int, number: float):
+    """A skipped chapter the sites list differently now stays skipped as it
+    is listed now (the series page stops offering it back). 409 when it is
+    not one skipped from a stuck note."""
+    ok, msg = _keep_skipped(series_id, number)
+    if not ok:
+        raise HTTPException(409, msg)
+    return {"ok": True, "number": number, "status": "ignored", "message": msg}
 
 
 @app.post("/series/{series_id}/delete")
@@ -1281,8 +1310,9 @@ def _job_adopt(chosen: list):
 def wanted_page(request: Request, filter: str = "all"):
     with db.connect() as con:
         rows = db.wanted_all(con)
-        blocked = stuck.overview(con, fetch=not _cross_site(request))     # every stuck series, with the verdict
-    shown = filter if filter in ("all", "failed", "clean", "stuck") else "all"
+        shown = filter if filter in ("all", "failed", "clean", "stuck") else "all"
+        # every stuck series; judged (which reads all their chapters) only for the Stuck filter
+        blocked = stuck.overview(con, fetch=not _cross_site(request), judged=shown == "stuck")
     return page(request, "wanted.html", rows=rows, stuck=blocked, filter=shown)
 
 

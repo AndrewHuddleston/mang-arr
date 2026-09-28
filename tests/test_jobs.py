@@ -14,7 +14,7 @@ import urllib.error
 import zipfile
 from unittest import mock
 
-from mangarr import config, core, db, downloader, jobs, limits, resolver, suwayomi
+from mangarr import config, core, db, downloader, jobs, limits, resolver, settings, suwayomi
 from mangarr.model import Series
 from mangarr.resolver import Plan, SourceMatch
 from mangarr.suwayomi import Chapter, Client, Source, SuwayomiError, SuwayomiUnreachable
@@ -608,6 +608,10 @@ class CoreSplitTest(TmpData):
             asked["only"] = only
             return {}
         with db.connect() as con:
+            settings.set_many(con, {"download_in_order": False})
+        settings._cache.clear()
+        self.addCleanup(settings._cache.clear)
+        with db.connect() as con:
             con.execute("UPDATE series SET monitored=1 WHERE id=?", (sid,))      # a write left open
             with self.assertLogs("mangarr.core", "INFO") as cm:
                 due = core.downloads_due(con, core.Outcome(sid, plan))
@@ -617,6 +621,19 @@ class CoreSplitTest(TmpData):
         self.assertEqual(due, [4.0, 5.0, 6.0])              # not on disk, not ignored, not failed until later
         self.assertEqual(asked["only"], set(due))
         self.assertIn("1 failed chapter(s) not due", "\n".join(cm.output))
+        # strict order: the chapters after the failed one that is not due yet wait for it (no gap)
+        with db.connect() as con:
+            settings.set_many(con, {"download_in_order": True})
+        settings._cache.clear()
+        with db.connect() as con:
+            with self.assertLogs("mangarr.core", "INFO") as cm:
+                due = core.downloads_due(con, core.Outcome(sid, plan))
+            self.assertFalse(con.in_transaction)            # the reasons it wrote are committed
+            reason = con.execute("SELECT reason FROM chapter WHERE series_id=? AND number=5", (sid,)).fetchone()[0]
+        self.assertEqual(due, [])
+        self.assertEqual(reason, downloader.waiting_reason(3.0))
+        self.assertIn("3 later chapter(s) wait for ch 3, which failed on every source and is not due for another "
+                      "attempt yet (strict download in order)", "\n".join(cm.output))
 
     def test_nothing_due_without_a_usable_source(self):
         sid = self.seed({1: "wanted"})

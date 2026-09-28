@@ -20,7 +20,7 @@
 {% if not rows %}
 <div class="alert info">No missing chapters. Every listed chapter is on disk.</div>
 {% else %}
-<div class="table-container"><table class="table missing" id="missing-table">
+<div class="table-container"><table class="table missing" id="missing-table" data-verdicts="{{ 1 if filter == 'stuck' else 0 }}">
 <thead><tr>
   <th class="col-select">{{ m.check(none, false, '1', 'select-all', 'primary', {'aria-label': 'Select all'}) }}</th>
   <th>Series</th><th class="num">Missing</th><th>Chapters</th><th class="num">Failed</th><th>Stuck behind</th><th>Last failure</th><th class="col-date">Last Checked</th><th class="col-actions"></th>
@@ -35,7 +35,7 @@
   <td class="num text-danger">{{ r.wanted }}</td>
   <td class="muted chapters">{{ r.numbers }}</td>
   <td class="num {% if r.failed %}text-danger{% endif %}">{{ r.failed or 0 }}</td>
-  <td class="stuck-cell">{% for st in blocked %}{% set n = '%g'|format(st.number) %}<a href="/series/{{ r.id }}#stuck-{{ n }}" title="{{ stuck_note(st).body }}">ch {{ n }}</a> <span class="muted small">({{ st.waiting }} waiting{% if st.dismissed %}, keep waiting{% endif %})</span>{% if st.verdict %}{% set vl = verdict_label(st.verdict, st.number) %} {{ m.label(vl.text, vl.kind, 'small', title=vl.tip) }}{% endif %}{% if not loop.last %}<br>{% endif %}{% endfor %}</td>
+  <td class="stuck-cell">{% for st in blocked %}{% set n = '%g'|format(st.number) %}<a href="/series/{{ r.id }}#stuck-{{ n }}" title="{{ stuck_note(st).body }}">ch {{ n }}</a> <span class="muted small">({{ st.waiting }} waiting{% if st.dismissed %}; you keep waiting{% endif %})</span>{% if st.verdict %}{% set vl = verdict_label(st.verdict, st.number) %} {{ m.label(vl.text, vl.kind, 'small', title=vl.tip) }}{% endif %}{% if not loop.last %}<br>{% endif %}{% endfor %}</td>
   <td class="text-danger small">{{ r.last_reason or '' }}</td>
   <td class="col-date nowrap">{{ r.last_resolved|ago }}</td>
   <td class="col-actions">
@@ -45,6 +45,6 @@
 </tr>
 {% endfor %}
 </tbody></table></div>
-<div class="help-text">The worker fetches wanted chapters on every refresh; a chapter stays here while no reachable source has it. Chapters you do not want can be ignored from the series page. <b>Stuck</b>: series whose chapters download in order and wait for a chapter that failed on every source listing it; its series page tells what it probably is and lets you skip it.</div>
+<div class="help-text">The worker fetches wanted chapters on every refresh; a chapter stays here while no reachable source has it. Chapters you do not want can be ignored from the series page. <b>Stuck</b>: series whose chapters download in order and wait for a chapter that failed on every source listing it, with the verdict on what it probably is; its series page tells why and lets you skip it.</div>
 {% endif %}
 {% endblock %}

@@ -10,7 +10,7 @@ import re
 import secrets
 import urllib.parse
 
-from .. import library, model
+from .. import library, model, stuck
 from ..resolver import ranges
 
 BLOCK = 20                       # chapters per group when a series has no seasons
@@ -423,7 +423,9 @@ def stuck_note(st) -> dict:
     """The texts of the note on a series stuck behind a chapter (a
     stuck.Stuck): {head: 'Stuck behind chapter 7.2 - 372 chapters waiting.',
     body: 'Only Manganato lists it and its images are gone (failed on every
-    try since 2026-09-26).'}."""
+    try since 2026-09-26).'}. Before a resolve has seen which sites list it
+    (a blocker an earlier version left), from its row: its source, and
+    whether its last failure said no other source has it."""
     n = _num(st.number)
     head = f"Stuck behind chapter {n} - {st.waiting} chapter{'s' if st.waiting != 1 else ''} waiting."
     gone = any(k in (st.reason or "") for k in IMAGES_GONE)
@@ -436,9 +438,36 @@ def stuck_note(st) -> dict:
         more = len(st.names) - len(sites)
         who = _and(sites + ([f"{more} more"] if more > 0 else []))
         body = f"Only {who} list{'s' if len(st.names) == 1 else ''} it and {what} ({when})."
+    elif st.source and "no other source has this chapter" in (st.reason or ""):
+        body = f"Only {st.source} lists it and {what} ({when})."
+    elif st.source:
+        body = f"It failed on {st.source} and every other source that lists it" + \
+            (": its images are gone" if gone else "") + f" ({when})."
     else:
         body = f"It failed on every source that lists it ({when})."
     return {"head": head, "body": body}
+
+
+def auto_skip_clause(st, auto_on: bool) -> str:
+    """What the automatic skip does with a blocker (a stuck.Stuck with its
+    verdict), for its note: '' when it is off or the verdict does not
+    suggest skipping."""
+    v = st.verdict
+    if not auto_on or v is None or not v.skippable:
+        return ""
+    why = stuck.why_not_auto(st, v)
+    if why == "verdict":
+        return "too uncertain to skip automatically"
+    if why == "declined":
+        return "not skipped automatically: you un-skipped it or wanted it again"
+    if why == "waiting":
+        return "not skipped automatically while you keep waiting"
+    if why == "untried":
+        return (f"skipped automatically once a pass has tried it on {_and(st.untried[:3])} too" if st.untried and
+                st.names else "skipped automatically once a pass has tried it on every site that lists it")
+    if st.checking:
+        return "the next pass skips it automatically once MangaDex has been checked, unless you keep waiting"
+    return "the next pass skips it automatically, unless you keep waiting"
 
 
 def verdict_label(v, number) -> dict:
@@ -455,15 +484,18 @@ def verdict_label(v, number) -> dict:
 
 def skip_note(k: dict) -> str:
     """The line on a series page for a chapter skipped from a stuck note
-    (stuck.skipped): automatically, or changed since it was skipped."""
+    (stuck.skipped): changed since it was skipped, automatically, or by
+    you."""
     n = _num(k["number"])
     if k["changed"]:
         names = "; ".join(f'{src}: "{name}"' for src, name in list(k["names"].items())[:3] if name)
         who = "was skipped automatically" if k["how"] == "auto" else "you skipped"
         return (f"Chapter {n}, which {who}, is listed differently now" + (f" ({names})" if names else "") +
                 ": it may be a chapter of the story after all.")
-    what = k["verdict"] or "judged skippable"
-    return f"Chapter {n} skipped automatically: {what[:1].lower() + what[1:]}"
+    if k["how"] == "auto":
+        what = k["verdict"] or "judged skippable"
+        return f"Chapter {n} skipped automatically: {what[:1].lower() + what[1:]}"
+    return f"Chapter {n} skipped: the chapters after it download without it"
 
 
 def provider(row_or_series) -> str:
@@ -561,7 +593,8 @@ def install(env) -> None:
                        progress_kind=progress_kind, chapter_status=chapter_status, event_icon=event_icon,
                        provider=provider, network_line=network_line, index_stats=index_stats, human_size=human_size,
                        row_kind=row_kind, row_language=row_language, stuck_note=stuck_note,
-                       verdict_label=verdict_label, skip_note=skip_note, SKIP_DISCLAIMER=SKIP_DISCLAIMER)
+                       verdict_label=verdict_label, skip_note=skip_note, auto_skip_clause=auto_skip_clause,
+                       SKIP_DISCLAIMER=SKIP_DISCLAIMER)
     env.filters["ranges"] = short_ranges
     env.filters["status_label"] = status_label
     env.filters["status_class"] = status_class

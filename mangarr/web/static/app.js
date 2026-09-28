@@ -522,11 +522,14 @@
     });
     const wf = $('#wanted-filter');
     if (wf) wf.addEventListener('menuselect', (e) => {
+      const v = e.detail.value;
+      // the verdicts are worked out only for the Stuck filter (they read every chapter of every stuck series)
+      if (v === 'stuck' && missingTable.dataset.verdicts !== '1') { location.href = '/wanted?filter=stuck'; return; }
       $$('tbody tr', missingTable).forEach((tr) => {
         const failed = Number(tr.dataset.failed) > 0;
-        const v = e.detail.value;
         tr.hidden = v === 'failed' ? !failed : v === 'clean' ? failed : v === 'stuck' ? tr.dataset.stuck !== '1' : false;
       });
+      history.replaceState(null, '', v === 'all' ? '/wanted' : `/wanted?filter=${v}`);
       syncToolbar();
     });
   }
@@ -637,18 +640,21 @@
     const sync = () => { const el = document.getElementById(cb.dataset.hides); if (el) el.hidden = cb.checked; };
     cb.addEventListener('change', sync);
   });
-  // ... and one that shows it while ticked: data-shows="element-id"
-  $$('input[data-shows]').forEach((cb) => {
-    const sync = () => { const el = document.getElementById(cb.dataset.shows); if (el) el.hidden = !cb.checked; };
-    cb.addEventListener('change', sync);
-  });
+  // ... and one that shows it while ticked and usable: data-shows="element-id"
+  const syncShows = (cb) => {
+    const el = document.getElementById(cb.dataset.shows);
+    if (el) el.hidden = !cb.checked || cb.disabled;
+  };
+  $$('input[data-shows]').forEach((cb) => cb.addEventListener('change', () => syncShows(cb)));
   // a checkbox the fields of another element depend on: data-enables="element-id". While it is not ticked
-  // they are disabled (not sent, so what they hold is kept) and greyed out, and its [data-when-off] hint shows.
+  // they are disabled (not sent, so what they hold is kept) and greyed out, what they show is hidden, and its
+  // [data-when-off] hint shows.
   $$('input[data-enables]').forEach((cb) => {
     const sync = () => {
       const g = document.getElementById(cb.dataset.enables);
       if (!g) return;
       $$('input', g).forEach((i) => { i.disabled = !cb.checked; });
+      $$('input[data-shows]', g).forEach(syncShows);
       g.classList.toggle('off', !cb.checked);
       $$('[data-when-off]', g).forEach((el) => { el.hidden = cb.checked; });
     };

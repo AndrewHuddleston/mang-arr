@@ -523,6 +523,8 @@ body.login{display:flex;align-items:center;justify-content:center;min-height:100
 .stuck-note .stuck-checking,.stuck-note .stuck-reason{margin-top:6px}
 .stuck-note .stuck-actions{display:flex;flex-wrap:wrap;align-items:center;gap:8px;margin-top:10px}
 .stuck-note .stuck-actions form{display:inline}
+.stuck-note.stuck-dismissed > summary{cursor:pointer}
+.stuck-note.stuck-dismissed[open] > summary{margin-bottom:6px}
 .stuck-info{align-self:center}.stuck-info > summary{color:var(--text)}
 .stuck-info .popover-body{top:28px;padding:10px 15px}
 .stuck-skipped form{display:inline}
