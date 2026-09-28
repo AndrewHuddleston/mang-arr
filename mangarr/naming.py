@@ -14,10 +14,19 @@ tests/test_naming.py holds it to the code from before (naming_reference.py):
     series folder   {Series Title}                              Yakuza Fiancé_ Raise wa Tanin ga Ii
     chapter file    Chapter {Chapter:000.0}{ - Chapter Title}   Chapter 064.5 - Extra_ The Daily Life.cbz
 
+One deliberate difference: a chapter file name with no title that is longer
+than NAME_MAX bytes (a chapter number of some 240 digits; no real one comes
+close) is now cut to fit like every other name, where 0.2.3 left it too long
+for the file system.
+
 Whatever the options:
-- '/', '\\', NUL and control characters become '_';
-- every name fits NAME_MAX bytes (fit_name: cut, plus a short hash of the
-  whole name so two long names stay apart);
+- '/', '\\', NUL and control characters become '_', in a title taken from
+  an existing file name too;
+- every name fits NAME_MAX bytes. In a chapter file name the titles are cut
+  (the chapter title first), not the chapter number or the format's own
+  text, and a short hash of the whole name goes where the cut is, so two
+  long names stay apart (with the default format that is fit_name, as
+  before);
 - a folder name is NFC, has no leading or trailing dots or spaces, and is
   never another series' folder, ignoring case and normalisation (a taken
   name gets the series ref as a suffix: "Wind Breaker (anilist_12345)");
@@ -94,8 +103,8 @@ class SeriesNames:
 class ChapterInfo:
     """What the chapter tokens are made of. {Chapter Title} comes from
     file_title when it is set (the title as an existing file name carries
-    it, already cleaned: used as it is), else from the source's chapter name
-    (chapter_title)."""
+    it, already cleaned: used as it is, but for the characters no name may
+    hold), else from the source's chapter name (chapter_title)."""
     number: float
     name: str | None = None
     file_title: str | None = None
@@ -356,11 +365,15 @@ def title_value(chapter: ChapterInfo, options: Options = DEFAULTS) -> str:
     """What {Chapter Title} gives for this chapter. A title taken from an
     existing file name is already clean and is kept as it is, so the name
     comes out the same; it is only cut when it is longer than the length
-    setting (a hash tag that fit_name added to that name does not count),
-    and left out when it is only numbers and drop_number_only_titles is on."""
+    setting (a hash tag that a cut added to that name does not count), and
+    left out when it is only numbers and drop_number_only_titles is on.
+    Characters no name may hold are replaced in it all the same (replace_chars:
+    a clean title has none, so this changes nothing a format made), so a
+    file_title from anywhere - a stored one, a restored backup - can never
+    put a '/', NUL or control character in a name."""
     if chapter.file_title is None:
         return chapter_title(chapter.number, chapter.name, options)
-    t = chapter.file_title
+    t = replace_chars(chapter.file_title, options)
     if not t or (options.drop_number_only_titles and number_only(t)):
         return ""
     tag = _FIT_TAG.search(t)
@@ -384,25 +397,67 @@ def render(series: SeriesNames | None, chapter: ChapterInfo | None = None, optio
     EXT, per the options. For a folder, `taken` (the other series' folder
     names) and `suffix` (the series ref) make it unique, as
     library.unique_folder always has: the name, else the name plus
-    " (suffix)", else that plus a counter. Raises FormatError for a format
-    that is not valid for its kind."""
+    " (suffix)", else that plus a counter; a suffix is only needed when the
+    name is taken (ValueError without one then). Raises FormatError for a
+    format that is not valid for its kind."""
     series = series or _NO_SERIES
     if chapter is None:
         if taken is None:
             return next(_folder_candidates(_folder_base(series, options), options, ""))
-        if not suffix:
-            raise ValueError("a unique folder name needs the series ref as its suffix")
         return _unique_folder(series, options, taken, suffix)
-    parts = _parts(options.chapter_file_format, "chapter")
-    out = []
-    for p in parts:
+    segments: list[tuple[str, str]] = []       # (text, "title", "series" or "" for text that is never cut)
+    for p in _parts(options.chapter_file_format, "chapter"):
         if isinstance(p, str):
-            out.append(replace_chars(p, options))
+            segments.append((replace_chars(p, options), ""))
             continue
         v = _chapter_value(p, series, chapter, options)
         if v:
-            out.append(p.prefix + v + p.suffix)
-    return fit_name("".join(out).lstrip(" ."), keep=EXT)
+            kind = "title" if p.name == "Chapter Title" else "series" if p.name in TITLE_TOKENS else ""
+            segments += [(p.prefix, ""), (v, kind), (p.suffix, "")]
+    return _fit_chapter_name(_lstrip(segments))
+
+
+def _lstrip(segments: list[tuple[str, str]]) -> list[tuple[str, str]]:
+    """segments without the leading dots and spaces of the name they make
+    (so a name is never hidden)."""
+    out = list(segments)
+    for i, (text, kind) in enumerate(out):
+        out[i] = (text.lstrip(" ."), kind)
+        if out[i][0]:
+            break
+    return out
+
+
+def _fit_chapter_name(segments: list[tuple[str, str]]) -> str:
+    """The chapter file name the segments make, with EXT, cut to NAME_MAX
+    bytes when it is longer. Only titles are cut - the chapter title first,
+    then the series titles, last one first - so the chapter number and the
+    format's own text stay in the name (and it can still be read back:
+    title_from_name). The hash tag goes where the first cut is. With the
+    default format the title ends the name, so this is fit_name(name,
+    keep=EXT), byte for byte. A name whose titles are not enough to cut is
+    cut as a whole (fit_name)."""
+    full = "".join(text for text, _ in segments)
+    if len((full + EXT).encode("utf-8")) <= NAME_MAX:
+        return full + EXT
+    tag = "~" + hashlib.sha1((full + EXT).encode("utf-8")).hexdigest()[:8]
+    over = len((full + tag + EXT).encode("utf-8")) - NAME_MAX
+    texts = [text for text, _ in segments]
+    order = [i for i, (_, kind) in enumerate(segments) if kind == "title"]
+    order += [i for i in reversed(range(len(segments))) if segments[i][1] == "series"]
+    first = None
+    for i in order:
+        if over <= 0:
+            break
+        raw = texts[i].encode("utf-8")
+        texts[i] = raw[:max(len(raw) - over, 0)].decode("utf-8", "ignore")
+        over -= len(raw) - len(texts[i].encode("utf-8"))
+        first = i if first is None else first
+    if over > 0 or first is None:
+        return fit_name(full, keep=EXT)
+    name = "".join(texts[:first + 1]).rstrip(" .") + tag + "".join(texts[first + 1:]) + EXT
+    log.debug("name longer than %d bytes, shortened: %r -> %r", NAME_MAX, full[:80], name)
+    return name
 
 
 def _parts(fmt: str, kind: str) -> tuple:
@@ -437,7 +492,7 @@ def _folder_base(series: SeriesNames, options: Options) -> str:
     return _nfc(clean("".join(out), options))
 
 
-def _folder_candidates(base: str, options: Options, suffix: str) -> Iterator[str]:
+def _folder_candidates(base: str, options: Options, suffix: str | None) -> Iterator[str]:
     """The folder names a series may have, best first: the format's name
     (base), then with " (suffix)", then with a counter as well (1000 in
     all). Each is cleaned, NFC and fitted to NAME_MAX; the suffix goes on
@@ -447,7 +502,7 @@ def _folder_candidates(base: str, options: Options, suffix: str) -> Iterator[str
         yield fit_name(_nfc(clean(cand, options)))
 
 
-def _unique_folder(series: SeriesNames, options: Options, taken, suffix: str) -> str:
+def _unique_folder(series: SeriesNames, options: Options, taken, suffix: str | None) -> str:
     keys = {folder_key(t) for t in taken if t}
     base = _folder_base(series, options)
     for cand in _folder_candidates(base, options, suffix):
@@ -455,6 +510,8 @@ def _unique_folder(series: SeriesNames, options: Options, taken, suffix: str) ->
             if cand != base:
                 log.info("library folder %r is taken or too long; using %r", base[:120], cand)
             return cand
+        if suffix is None:
+            raise ValueError(f"library folder {cand[:120]!r} is taken, and there is no series ref to add to it")
     raise ValueError(f"no free library folder name for {str(series.title)[:120]!r}")
 
 
@@ -469,8 +526,12 @@ def title_from_name(filename: str, series: SeriesNames | None, number: float,
                     options: Options = DEFAULTS) -> tuple[bool, str | None]:
     """Does `filename` have the shape the chapter file format gives chapter
     `number` (with any title)? Returns (True, title) - title None for a name
-    without one - or (False, None). A name that fit_name cut keeps its hash
-    tag in the title, so rendering that title again gives the same name."""
+    without one - or (False, None). A name whose title was cut to fit keeps
+    its hash tag in the title, so rendering that title again gives the same
+    name. The shape alone can fit more than one format ("Chapter 012.0 - The
+    Storm [2017].cbz" is the default format's with the title "The Storm
+    [2017]"): whoever needs to know which format made a name renders the
+    title again and compares, as renamer.plan does."""
     if not filename.endswith(EXT):
         return False, None
     series = series or _NO_SERIES

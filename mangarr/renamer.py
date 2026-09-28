@@ -14,10 +14,21 @@ are taken) and, when there is something to rename, Komga.
 
 Titles: by default a chapter keeps the title its current file name has, so
 a source that edits a title, or a title that became known after the file was
-linked, renames nothing; use_latest_titles takes the source's latest chapter
-name instead (a chapter with no name on record keeps its file's title). When
-the source's name still gives the very title the file name has, that name
-is used, so a new colon replacement applies to its ':'.
+linked, renames nothing (user decision 1); use_latest_titles takes the
+source's latest chapter name instead (a chapter with no name on record keeps
+its file's title). When the source's name still gives the very title the
+file name has, that name is used, so a new colon replacement applies to its
+':'.
+
+The title is read from the current name with the chosen format, else the
+default one, and a reading only counts when rendering it again gives the
+name back; a name the chosen format made is always read with it, so a
+second preview with the same formats proposes nothing (a format with text
+after the title would otherwise add that text again on every Organize).
+Which title a name carries is only known for names these two formats make:
+mang-arr keeps no record of older formats yet. A name neither made (a file
+organized to a format that has been changed since, say) is left as it is,
+with its reason, unless use_latest_titles gives it the source's title.
 """
 import logging
 import os
@@ -35,13 +46,18 @@ def plan(con, series_id: int, formats=None, use_latest_titles: bool = False) -> 
     chapters    one per chapter the library has, by number: {"number",
                 "old_path", "new_path", "old_name", "new_name", "title",
                 "title_from" ("file" or "source"), "changed", "skip"}; skip
-                says why the file is left as it is (None when it is not)
+                says why the file is left as it is (None when it is not).
+                new_name is the name the formats give (None when there is
+                none to give); new_path is where the file is once the
+                series is organized: for a skipped chapter, under its
+                current name, in the renamed folder when the folder is
+                renamed (a file outside the folder stays where it is)
     renames     how many files get a new name (changed and not skipped)
     collisions  [{"name", "numbers", "message"}]: names two chapters, or a
                 chapter and another file, would share
     warnings    [{"kind", "message"}]: "sort" (names that sort out of order
-                by plain file name) or "title" (current names no known
-                format made: their titles come from the source)
+                by plain file name) or "title" (current names neither the
+                default nor the chosen format made: left as they are)
     komga       {"state", "message", "needs_confirmation"}, or None when
                 nothing is renamed; needs_confirmation: reading progress may
                 be lost, so the rename must be confirmed first
@@ -75,24 +91,29 @@ def plan(con, series_id: int, formats=None, use_latest_titles: bool = False) -> 
     new_dir = old_dir if folder["blocked"] else library.library_dir(new_folder)
 
     listing = _listing(old_dir)
-    unread = []
+    unread, on_disk = [], {}
     for r in con.execute("SELECT number, name, library_path FROM chapter WHERE series_id=? AND status='have'"
                          " ORDER BY number", (series_id,)):
-        item, note = _item(r, series, options, old_dir, new_dir, listing, use_latest_titles)
+        item, state = _item(r, series, options, old_dir, new_dir, listing, use_latest_titles)
         out["chapters"].append(item)
-        if note:
+        if state:
+            on_disk[item["old_name"]] = item
+        if state == "unread":
             unread.append(item["number"])
     items = out["chapters"]
-    out["collisions"] += _same_name(items) + _taken(items, listing or {})
+    out["collisions"] += _same_name(items) + _taken(items, listing or {}, on_disk)
     out["renames"] = sum(1 for it in items if it["changed"] and not it["skip"])
     out["warnings"] = _sort_warnings(items)
     if unread:
+        which = f"chapter {', '.join(_num(n) for n in unread[:5])}{' ...' if len(unread) > 5 else ''}"
         out["warnings"].append({"kind": "title", "message": (
-            f"{len(unread)} current file name(s) were not made by the default or the chosen format "
-            f"(chapter {', '.join(_num(n) for n in unread[:5])}{' ...' if len(unread) > 5 else ''}); "
-            "their titles come from the source")})
-    if out["renames"] or (folder["changed"] and not folder["blocked"]):
-        out["komga"] = komga_check(old_folder)
+            f"{len(unread)} current file name(s) ({which}) were made by neither the default nor the chosen "
+            "format, so the titles in them cannot be told from the rest of the name: those files are left as "
+            "they are." + (" Use the latest titles from sources to rename them with the sources' titles."
+                           if any(it["skip"] == UNREAD for it in items) else ""))})
+    folder_moves = folder["changed"] and not folder["blocked"]
+    if out["renames"] or folder_moves:
+        out["komga"] = komga_check(old_folder, folder_renamed=folder_moves)
     return out
 
 
@@ -147,18 +168,28 @@ def _listing(path: str) -> dict[str, bool] | None:
     return out
 
 
+UNREAD = ("its name was made by neither the default nor the chosen format, so the title in it is not known; "
+          "left as it is (the latest titles from sources would rename it)")
+UNREAD_NO_SOURCE = ("its name was made by neither the default nor the chosen format, and the source has no name "
+                    "for this chapter; left as it is")
+
+
 def _item(r, series: naming.SeriesNames, options: naming.Options, old_dir: str, new_dir: str,
-          listing: dict[str, bool] | None, use_latest_titles: bool) -> tuple[dict, bool]:
-    """One chapter of the preview, and whether its current name was not
-    understood (its title then comes from the source)."""
+          listing: dict[str, bool] | None, use_latest_titles: bool) -> tuple[dict, str | None]:
+    """One chapter of the preview, and what its file is: "read" (a regular
+    file in the series folder, its name understood), "unread" (one whose
+    name neither format made: left as it is) or None (no file there to
+    rename)."""
     n, path = r["number"], r["library_path"]
     item = {"number": n, "old_path": path, "new_path": None, "old_name": None, "new_name": None,
             "title": None, "title_from": None, "changed": False, "skip": None}
     if not path:
         item["skip"] = "no library file is recorded for this chapter"
-        return item, False
+        return item, None
     name = item["old_name"] = os.path.basename(path)
-    if os.path.dirname(os.path.normpath(path)) != os.path.normpath(old_dir):
+    in_folder = os.path.dirname(os.path.normpath(path)) == os.path.normpath(old_dir)
+    item["new_path"] = os.path.join(new_dir, name) if in_folder else path      # a skipped file moves with its folder
+    if not in_folder:
         item["skip"] = "the file is not in the series' library folder; left as it is"
     elif listing is None:
         item["skip"] = "the series' library folder is missing, or not a real folder inside the library"
@@ -167,31 +198,51 @@ def _item(r, series: naming.SeriesNames, options: naming.Options, old_dir: str, 
     elif not listing[name]:
         item["skip"] = "not a regular file (a symlink or a folder); left as it is"
     if item["skip"]:
-        return item, False
-    chap, item["title_from"], unread = _chapter_info(n, name, r["name"], series, options, use_latest_titles)
+        return item, None
+    found = _chapter_info(n, name, r["name"], series, options, use_latest_titles)
+    if found is None:
+        item["skip"] = UNREAD_NO_SOURCE if r["name"] is None else UNREAD
+        return item, "unread"
+    chap, item["title_from"] = found
     new = naming.render(series, chap, options)
     item.update(new_name=new, new_path=os.path.join(new_dir, new), changed=new != name,
                 title=naming.title_value(chap, options) or None)
-    return item, unread
+    return item, "read"
 
 
 def _chapter_info(number: float, file_name: str, source_name: str | None, series: naming.SeriesNames,
-                  options: naming.Options, use_latest_titles: bool) -> tuple[naming.ChapterInfo, str, bool]:
-    """(what to render, where its title comes from, whether the current name
-    was not understood). The title in the current name is read with the
-    format that made it: the default one (every name so far), else the
-    chosen one (a file already renamed)."""
+                  options: naming.Options, use_latest_titles: bool) -> tuple[naming.ChapterInfo, str] | None:
+    """(what to render, where its title comes from), or None when the
+    title in the current name cannot be known.
+
+    The name is read with the chosen format and with the default one (every
+    name so far); a reading counts only when rendering its title with that
+    format gives the name back. A name the chosen format made keeps the
+    chosen format's reading, so it renders to itself again. When the
+    source's name gives the title that was read (with the format that made
+    the name), the source's name is rendered: the same title, but a new
+    colon replacement or title length applies to it."""
     if use_latest_titles and source_name is not None:
-        return naming.ChapterInfo(number, source_name), "source", False
-    for made_with in dict.fromkeys((naming.DEFAULTS, options)):
+        return naming.ChapterInfo(number, source_name), "source"
+    readings = {}
+    for made_with in dict.fromkeys((options, naming.DEFAULTS)):
         found, title = naming.title_from_name(file_name, series, number, made_with)
-        if found:
-            break
-    else:
-        return naming.ChapterInfo(number, source_name), "source", True
-    if title and naming.chapter_title(number, source_name, made_with) == title:
-        return naming.ChapterInfo(number, source_name), "file", False        # the title as the source spells it
-    return naming.ChapterInfo(number, file_title=title or ""), "file", False
+        if found and naming.render(series, naming.ChapterInfo(number, file_title=title or ""),
+                                   made_with) == file_name:
+            readings[made_with] = title or ""
+    if not readings:
+        return None
+    title = next(iter(readings.values()))              # the chosen format's reading, when it has one
+    if any(t == title and naming.chapter_title(number, source_name, m) == title for m, t in readings.items()):
+        return naming.ChapterInfo(number, source_name), "file"          # the title as the source spells it
+    return naming.ChapterInfo(number, file_title=title), "file"
+
+
+def _skip(it: dict, reason: str) -> None:
+    """Leave a chapter that has a new name as it is: it keeps its current
+    name (in the renamed folder, when the folder is renamed)."""
+    it["skip"] = reason
+    it["new_path"] = os.path.join(os.path.dirname(it["new_path"]), it["old_name"])
 
 
 def _same_name(items: list[dict]) -> list[dict]:
@@ -209,24 +260,24 @@ def _same_name(items: list[dict]) -> list[dict]:
         numbers = [it["number"] for it in group]
         for it in group:
             if it["changed"]:
-                it["skip"] = "another chapter would get the same name (chapter " + \
-                    ", ".join(_num(n) for n in numbers if n != it["number"]) + ")"
+                _skip(it, "another chapter would get the same name (chapter "
+                      + ", ".join(_num(n) for n in numbers if n != it["number"]) + ")")
         out.append({"name": group[0]["new_name"], "numbers": numbers,
                     "message": f"Chapters {', '.join(_num(n) for n in numbers)} would all be named "
                                f"{group[0]['new_name']}"})
     return out
 
 
-def _taken(items: list[dict], listing: dict[str, bool]) -> list[dict]:
+def _taken(items: list[dict], listing: dict[str, bool], on_disk: dict[str, dict]) -> list[dict]:
     """New names another file in the folder already has: a file mang-arr did
     not record, or a chapter that keeps its name. A chapter whose own file is
     renamed away first does not count, nor does a change of case only.
     Skipping one chapter keeps its name taken, so this repeats until
-    nothing changes."""
+    nothing changes. on_disk: {name: chapter} for every chapter file in the
+    folder."""
     present: dict[str, list[str]] = {}
     for name in listing:
         present.setdefault(naming.folder_key(name), []).append(name)
-    by_name = {it["old_name"]: it for it in items if it["new_name"]}        # every chapter file that is there
     out: list[dict] = []
     again = True
     while again:
@@ -237,15 +288,15 @@ def _taken(items: list[dict], listing: dict[str, bool]) -> list[dict]:
             for occupant in present.get(naming.folder_key(it["new_name"]), []):
                 if occupant == it["old_name"]:
                     continue
-                other = by_name.get(occupant)
+                other = on_disk.get(occupant)
                 if other is not None and not other["skip"] and other["changed"] \
                         and naming.folder_key(other["new_name"]) != naming.folder_key(occupant):
                     continue
                 if other is None:
-                    it["skip"] = f"{occupant!r} is already in the folder (mang-arr did not make it); not overwritten"
+                    _skip(it, f"{occupant!r} is already in the folder (mang-arr did not make it); not overwritten")
                     numbers = [it["number"]]
                 else:
-                    it["skip"] = f"chapter {_num(other['number'])} keeps that name"
+                    _skip(it, f"chapter {_num(other['number'])} keeps that name")
                     numbers = [it["number"], other["number"]]
                 out.append({"name": it["new_name"], "numbers": numbers, "message": _sentence(it["skip"])})
                 again = True
@@ -269,14 +320,18 @@ def _sort_warnings(items: list[dict]) -> list[dict]:
                                         f"{second} before {first}{more}. Komga goes by the chapter number."}]
 
 
-def komga_check(folder: str) -> dict:
+def komga_check(folder: str, folder_renamed: bool = False) -> dict:
     """Will Komga keep the reading progress of this series' books when their
     files are renamed? {"state", "message", "needs_confirmation"}; states:
     ok, not_in_komga (nothing there to lose), not_configured, hashing_off,
-    not_hashed_yet, ambiguous and error. Only Komga's answer to that is
-    known: a reader app that tracks progress by file path may start the
-    renamed chapters over, which is why every state but the first two needs
-    the user's confirmation."""
+    not_hashed_yet, folder_unverified, ambiguous and error. Only Komga's
+    answer to that is known: a reader app that tracks progress by file path
+    may start the renamed chapters over, which is why every state but the
+    first two needs the user's confirmation. folder_renamed: the series
+    folder is renamed too. Komga pairs a renamed file by its hash, but that
+    it keeps the books of a renamed series folder is not verified yet
+    (media-management proposal 2.2, item 10), so that is folder_unverified
+    where the files alone would be ok."""
     if not komga.configured():
         return _komga("not_configured", "No Komga configured: reading progress in your reader app may be lost.")
     library_id = str(settings.get("komga_library_id") or "")
@@ -286,10 +341,14 @@ def komga_check(folder: str) -> dict:
             return _komga("not_in_komga", "Komga has no books of this series yet, so it has no reading progress to "
                                           "lose.", False)
         lib = komga.library_settings(library_id or found["library_id"])
-    except komga.AmbiguousSeries:
-        return _komga("ambiguous", f"More than one Komga library has a series folder named {folder!r}: reading "
-                                   "progress may be lost. Choose mang-arr's library in Settings -> Komga so it can be "
-                                   "checked.")
+    except komga.AmbiguousSeries as e:
+        if len(e.library_ids) > 1 and not library_id:
+            return _komga("ambiguous", f"More than one Komga library has a series folder named {folder!r}: reading "
+                                       "progress may be lost. Choose mang-arr's library in Settings -> Komga so it "
+                                       "can be checked.")
+        return _komga("ambiguous", f"Komga has more than one series in a folder named {folder!r} in the library "
+                                   f"{e.library_ids[0]!r}, and cannot tell which one is this series: reading "
+                                   "progress may be lost.")
     except Exception as e:          # HTTP or connection error, or an answer that is not what Komga sends
         return _komga("error", f"Could not check Komga ({type(e).__name__}: {str(e)[:200]}): reading progress may "
                                "be lost.")
@@ -303,6 +362,11 @@ def komga_check(folder: str) -> dict:
         return _komga("not_hashed_yet", f"Komga has not hashed {unhashed} of {len(books)} books of this series yet: "
                                         "reading progress of those may be lost. Komga hashes them in the "
                                         "background; try again later.")
+    if folder_renamed:
+        return _komga("folder_unverified", f"Komga keeps the reading progress of renamed files (file hashing is on "
+                                           f"for {lib['name']!r} and all {len(books)} books of this series are "
+                                           "hashed), but that it keeps it when the series folder is renamed has not "
+                                           "been verified yet: reading progress may be lost.")
     return _komga("ok", f"Komga will keep reading progress: file hashing is on for {lib['name']!r} and all "
                         f"{len(books)} books of this series are hashed.", False)
 

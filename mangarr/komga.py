@@ -59,7 +59,13 @@ def library_settings(library_id: str) -> dict:
 
 
 class AmbiguousSeries(ValueError):
-    """Several Komga libraries have a series in a folder of this name."""
+    """More than one Komga series is in a folder of this name: in several
+    libraries, or in sub-folders of one. .library_ids: the libraries they
+    are in, sorted."""
+
+    def __init__(self, message: str, library_ids):
+        super().__init__(message)
+        self.library_ids = sorted(library_ids)
 
 
 def series_books(folder: str, library_id: str | None = None) -> dict | None:
@@ -69,9 +75,10 @@ def series_books(folder: str, library_id: str | None = None) -> dict | None:
     "url", "file_hash"}]}, or None when Komga has no such series (not
     scanned yet). file_hash is "" until Komga has hashed the file. Series
     and books in Komga's trash are left out. library_id is the library to
-    look in; without one every library is searched, and AmbiguousSeries is
-    raised when more than one has the folder. Raises on HTTP and connection
-    errors."""
+    look in; without one every library is searched. When several series
+    have the folder name, the one directly in its library's root folder
+    (where mang-arr's series folders are) is it; AmbiguousSeries is raised
+    when that is not exactly one. Raises on HTTP and connection errors."""
     want = unicodedata.normalize("NFC", folder)
     params = {"deleted": "false", **({"library_id": library_id} if library_id else {})}
     found = [s for s in _pages("/api/v1/series", params)
@@ -80,8 +87,13 @@ def series_books(folder: str, library_id: str | None = None) -> dict | None:
     if not found:
         return None
     if len(found) > 1:
-        libs = ", ".join(sorted({str(s.get("libraryId")) for s in found}))
-        raise AmbiguousSeries(f"Komga libraries {libs} each have a series folder named {folder!r}")
+        libs = {str(s.get("libraryId")) for s in found}
+        roots = {lib: _path(library_settings(lib)["root"]) for lib in sorted(libs)}
+        direct = [s for s in found if _parent(s.get("url")) == roots[str(s.get("libraryId"))]]
+        if len(direct) != 1:
+            raise AmbiguousSeries(f"Komga has {len(found)} series in folders named {folder!r} (libraries "
+                                  f"{', '.join(sorted(libs))})", libs)
+        found = direct
     s = found[0]
     books = [{"id": str(b.get("id") or ""), "name": str(b.get("name") or ""), "url": str(b.get("url") or ""),
               "file_hash": str(b.get("fileHash") or "")}
@@ -113,6 +125,20 @@ def _folder_name(url) -> str | None:
     if not isinstance(url, str) or not url.strip("/\\"):
         return None
     return unicodedata.normalize("NFC", re.split(r"[\\/]", url.rstrip("/\\"))[-1])
+
+
+def _path(path) -> str | None:
+    """A path as Komga shows it, for comparing: NFC, '/' separators, no
+    trailing separator."""
+    if not isinstance(path, str):
+        return None
+    return unicodedata.normalize("NFC", path.replace("\\", "/").rstrip("/"))
+
+
+def _parent(url) -> str | None:
+    """The folder a series folder is in (/library for /library/Berserk)."""
+    p = _path(url)
+    return p.rpartition("/")[0] if p else None
 
 
 def _quote(part: str) -> str:

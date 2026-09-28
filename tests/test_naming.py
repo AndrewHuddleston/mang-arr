@@ -6,6 +6,7 @@ folder names. The rest covers the grammar, the options, validation and
 the live preview."""
 import os
 import random
+import re
 import sys
 import unicodedata
 import unittest
@@ -21,7 +22,7 @@ NFD = "NFD"
 
 NUMBERS = [0, 0.0, 0.1, 0.25, 0.5, 0.99, 1, 1.5, 3.125, 5, 5.25, 7.75, 12, 12.001, 12.05, 12.25, 12.5, 12.95,
            12.99, 12.999, 16.5, 64.5, 72.1, 99, 99.5, 100, 100.25, 131, 999, 999.5, 999.99, 1000, 1000.5, 1234.25,
-           2026, 10000, 123456.5, -1, -0.5]
+           2026, 10000, 123456.5, -1, -0.5, 1e6 + 0.5, 1e9, 1e15, 1e20, 1e100, 1e200]
 _rng = random.Random(20260928)
 NUMBERS += [round(_rng.uniform(0, 3000), _rng.choice((0, 1, 2, 3))) for _ in range(150)]
 
@@ -41,7 +42,7 @@ RANDOM_TITLES = ["".join(_rng.choice(_ALPHABET) for _ in range(_rng.randrange(0,
 FOLDER_TITLES = [t for t in TITLES if t is not None] + [
     None, "Re:Zero", "Re_Zero", "Berserk", "?", "The " + "Very " * 60 + "Long Title", "進撃" * 60,
     unicodedata.normalize(NFD, "Pokémon"), "Wind Breaker", "Yakuza Fiancé: Raise wa Tanin ga Ii"]
-SUFFIXES = ["anilist:1", "manual:Re_Zero", "mangadex:0b5d8e3a-1c2d-4e5f-8a9b-0c1d2e3f4a5b"]
+SUFFIXES = ["anilist:1", "manual:Re_Zero", "mangadex:0b5d8e3a-1c2d-4e5f-8a9b-0c1d2e3f4a5b", ""]
 
 
 def first_differences(pairs, limit=5):
@@ -89,6 +90,23 @@ class GoldenTest(unittest.TestCase):
             got.append(((title, "plain"), render(SeriesNames(title)), ref.unique_folder(title, set(), "x")))
         self.assertGreater(len(got), 1000)
         self.assertEqual(first_differences(got), [])
+
+    def test_the_one_difference_a_name_too_long_without_a_title(self):
+        # 0.2.3 left an untitled name longer than NAME_MAX as it was (a chapter number of ~240 digits; none
+        # is anywhere near): it is cut to fit now, like every other name. With a title it is as it was.
+        old = ref.chapter_filename(1e300)
+        self.assertGreater(len(old.encode()), naming.NAME_MAX)
+        new = library.chapter_filename(1e300)
+        self.assertLessEqual(len(new.encode()), naming.NAME_MAX)
+        self.assertRegex(new, r"^Chapter 1000+\d*~[0-9a-f]{8}\.cbz$")
+        self.assertEqual(library.chapter_filename(1e300, "The Storm"), ref.chapter_filename(1e300, "The Storm"))
+
+    def test_a_suffix_only_when_the_name_is_taken(self):
+        self.assertEqual(library.unique_folder("Berserk", set(), ""), ref.unique_folder("Berserk", set(), ""))
+        self.assertEqual(library.unique_folder("Berserk", {"berserk"}, ""), "Berserk ()")      # as 0.2.3
+        self.assertEqual(render(SeriesNames("Berserk"), None, taken={"Other"}), "Berserk")      # no suffix needed
+        with self.assertRaises(ValueError):
+            render(SeriesNames("Berserk"), None, taken={"BERSERK"})
 
     def test_no_free_folder_name_either_way(self):
         taken = {"Berserk", "Berserk (anilist_1)"} | {f"Berserk (anilist_1) {i}" for i in range(2, 1000)}
@@ -248,6 +266,23 @@ class CharacterTest(unittest.TestCase):
         # separators, NUL and control characters are always replaced
         self.assertEqual(naming.clean("a/b\\c\x00d\x1fe", off), "a_b_c_d_e")
 
+    def test_a_title_from_a_file_name_cannot_hold_a_separator(self):
+        # file_title is used as it is, but for the characters no name may hold, whatever it came from
+        self.assertEqual(render(None, ChapterInfo(1, file_title="../../../etc/cron.d/x")),
+                         "Chapter 001.0 - .._.._.._etc_cron.d_x.cbz")
+        self.assertEqual(render(None, ChapterInfo(1, file_title="a\x00b\nc\\d\x1fe")), "Chapter 001.0 - a_b_c_d_e.cbz")
+        off = Options(colon_replacement="delete", replace_illegal_characters=False)
+        self.assertEqual(render(None, ChapterInfo(1, file_title='a:b?c/d'), off), "Chapter 001.0 - abc_d.cbz")
+        self.assertEqual(render(None, ChapterInfo(1, file_title="../x"), Options(chapter_file_format="{Chapter Title} {Chapter}")),
+                         "_x 1.cbz")                                   # and never a hidden name
+        # a clean title - what a format put in a name - comes out as it went in, whatever the options
+        modes = [Options(colon_replacement=m, replace_illegal_characters=i) for m in naming.COLON_MODES for i in (True, False)]
+        for t in TITLES[1:] + RANDOM_TITLES:
+            for made in modes:
+                title = naming.clean(t, made)[:60]
+                for now in modes:
+                    self.assertEqual(naming.title_value(ChapterInfo(1, file_title=title), now), title, (t, made, now))
+
     def test_literal_text_is_cleaned_too(self):
         self.assertEqual(chapter("Chapter {Chapter:000}: part", 5), "Chapter 005_ part.cbz")
         self.assertEqual(chapter("Chapter {Chapter:000}: part", 5, colon_replacement="delete"), "Chapter 005 part.cbz")
@@ -262,6 +297,39 @@ class TitleTest(unittest.TestCase):
         name = chapter(fmt, 1, "第" * 200, chapter_title_max_chars=255)
         self.assertLessEqual(len(name.encode()), 255)
         self.assertRegex(name, r"^Chapter 001\.0 - 第+~[0-9a-f]{8}\.cbz$")
+
+    def test_long_titles_are_cut_not_the_number(self):
+        # 80 characters of a title can be 320 bytes: the title is cut to what is left, so the chapter number
+        # and the format's own text stay, and the name still reads back to itself
+        s = SeriesNames("Berserk", year=2017)
+        cases = {"{Chapter Title} - Chapter {Chapter:000.0}": " - Chapter 012.5.cbz",
+                 "Chapter {Chapter:000.0}{ - Chapter Title} [{Year}]": " [2017].cbz",
+                 "{Series Title} {Chapter Title} {Chapter:000.0} {Year}": " 012.5 2017.cbz",
+                 "Chapter {Chapter:000.0}{ (Chapter Title)}": ").cbz",
+                 "Chapter {Chapter:000.0}{ - Chapter Title}": ".cbz"}
+        for fmt, end in cases.items():
+            o = Options(chapter_file_format=fmt)
+            for t in ("第" * 80, "😀" * 80, "é" * 20 + "😀" * 60):      # 240 to 320 bytes
+                with self.subTest(fmt=fmt, title=t[:3]):
+                    name = render(s, ChapterInfo(12.5, t), o)
+                    self.assertLessEqual(len(name.encode()), naming.NAME_MAX)
+                    self.assertRegex(name, r"~[0-9a-f]{8}" + re.escape(end) + "$")
+                    self.assertIn("012.5", name)
+                    found, title = naming.title_from_name(name, s, 12.5, o)
+                    self.assertTrue(found, name)
+                    self.assertEqual(render(s, ChapterInfo(12.5, file_title=title), o), name)
+        self.assertEqual(render(s, ChapterInfo(12.5, "第" * 80), Options(chapter_file_format="{Chapter Title} - Chapter "
+                                                                          "{Chapter:000.0}")),
+                         "第" * 75 + "~59f8afb0 - Chapter 012.5.cbz")
+
+    def test_long_series_titles_are_cut_not_the_number(self):
+        long = SeriesNames("進撃" * 80, romaji="Very " * 80)
+        name = render(long, ChapterInfo(12, "第" * 80),
+                      Options(chapter_file_format="{Series Title} - Chapter {Chapter:000}{ - Chapter Title}"))
+        self.assertLessEqual(len(name.encode()), naming.NAME_MAX)
+        self.assertRegex(name, r"^進撃進撃.*- Chapter 012 -~[0-9a-f]{8}\.cbz$")          # no room for a title at all
+        name = render(long, ChapterInfo(12), Options(chapter_file_format="{Series Romaji} {Series Title} {Chapter}"))
+        self.assertRegex(name, r"^Very Very .*~[0-9a-f]{8} 12\.cbz$")          # the last series title is cut first
 
     def test_number_only_titles(self):
         for t in ("Vol.3 chapter 13", "Vol. 1 Ch. 4", "#13", "13", "Volume 2 Episode 5", "Vol.3", "Chapter 13:",

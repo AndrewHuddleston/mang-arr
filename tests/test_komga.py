@@ -81,13 +81,42 @@ class SeriesBooksTest(KomgaBase):
         self.assertIn(("GET", "/api/v1/series?deleted=false&library_id=OLD&page=0&size=200"), self.komga.calls)
 
     def test_every_library_without_one(self):
-        self.komga.add_library("OLD", "Manga")
+        self.komga.add_library("OLD", "Manga", root="/manga")
         self.komga.add_series("S1", "Berserk", ["a.cbz"], library="OLD", root="/manga")
         self.assertEqual(komga.series_books("Berserk")["library_id"], "OLD")
         self.komga.add_series("S2", "Berserk", ["a.cbz"])
         with self.assertRaises(komga.AmbiguousSeries):
             komga.series_books("Berserk")
         self.assertEqual(komga.series_books("Berserk", "LIB1")["series_id"], "S2")
+
+    def test_the_series_directly_in_the_library_folder(self):
+        # a same-named folder deeper in the library is not mang-arr's series folder
+        self.komga.add_series("S1", "Berserk", ["a.cbz"], root="/library/Other")
+        self.komga.add_series("S2", "Berserk", ["a.cbz"])
+        self.assertEqual(komga.series_books("Berserk", "LIB1")["series_id"], "S2")
+        self.assertEqual(komga.series_books("Berserk")["series_id"], "S2")
+        self.komga.series[1]["url"] = "/library/Older/Berserk"             # neither is: no guessing
+        with self.assertRaises(komga.AmbiguousSeries) as e:
+            komga.series_books("Berserk", "LIB1")
+        self.assertEqual(e.exception.library_ids, ["LIB1"])
+        del self.komga.series[1]
+        self.assertEqual(komga.series_books("Berserk", "LIB1")["series_id"], "S1")   # the only one is not dropped
+
+    def test_library_roots_on_any_path_style(self):
+        self.komga.add_library("WIN", "Manga", root="D:\\Manga\\")
+        self.komga.add_series("S1", "Berserk", ["a.cbz"], library="WIN", root="D:\\Manga\\Sub")
+        self.komga.add_series("S2", "Berserk", ["a.cbz"], library="WIN", root="D:\\Manga")
+        for s in self.komga.series:
+            s["url"] = s["url"].replace("/", "\\")
+        self.assertEqual(komga.series_books("Berserk", "WIN")["series_id"], "S2")
+
+    def test_two_libraries_each_with_the_folder(self):
+        self.komga.add_library("OLD", "Manga", root="/manga")
+        self.komga.add_series("S1", "Berserk", ["a.cbz"], library="OLD", root="/manga")
+        self.komga.add_series("S2", "Berserk", ["a.cbz"])
+        with self.assertRaises(komga.AmbiguousSeries) as e:
+            komga.series_books("Berserk")
+        self.assertEqual(e.exception.library_ids, ["LIB1", "OLD"])
 
     def test_trash_is_left_out(self):
         self.komga.add_series("S1", "Berserk", ["a.cbz"], deleted=True)

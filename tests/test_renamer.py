@@ -39,11 +39,12 @@ class PlanBase(unittest.TestCase):
         self.addCleanup(settings._cache.clear)
 
     def add_series(self, chapters, anilist_id=97994, english="Yakuza Fiancé: Raise wa Tanin ga Ii",
-                   romaji="Raise wa Tanin ga Ii", year=2017) -> int:
+                   romaji="Raise wa Tanin ga Ii", year=2017, native=None) -> int:
         """chapters: (number, the source's name now, the label the file got) - or a file name as the
         third item, for a file named some other way. Each file is a hard link to a staged file."""
         with db.connect() as con:
-            sid = db.upsert_series(con, Series(anilist_id=anilist_id, english=english, romaji=romaji, year=year))
+            sid = db.upsert_series(con, Series(anilist_id=anilist_id, english=english, romaji=romaji, year=year,
+                                               native=native))
             folder = db.get_series(con, sid)["folder"]
             d = library.library_dir(folder)
             os.makedirs(d, exist_ok=True)
@@ -68,6 +69,30 @@ class PlanBase(unittest.TestCase):
 
     def names(self, p) -> dict:
         return {c["number"]: c["new_name"] for c in p["chapters"]}
+
+    def organize(self, sid, formats=None, **kw) -> dict:
+        """Carry out a preview as Organize will (the files within the folder, through temporary names
+        since one may free another's name; then the folder; then the rows), and check every chapter file
+        is where its new_path says. Returns the preview."""
+        p = self.plan(sid, formats, **kw)
+        d = self.folder(sid)
+        moves = [c for c in p["chapters"] if c["changed"] and not c["skip"]]
+        for i, c in enumerate(moves):
+            os.rename(c["old_path"], os.path.join(d, f".organize-{i}"))
+        for i, c in enumerate(moves):
+            os.rename(os.path.join(d, f".organize-{i}"), os.path.join(d, c["new_name"]))
+        with db.connect() as con:
+            if p["folder"]["changed"] and not p["folder"]["blocked"]:
+                os.rename(d, library.library_dir(p["folder"]["new"]))
+                con.execute("UPDATE series SET folder=? WHERE id=?", (p["folder"]["new"], sid))
+            for c in p["chapters"]:
+                if c["new_path"] != c["old_path"]:
+                    con.execute("UPDATE chapter SET library_path=? WHERE series_id=? AND number=?",
+                                (c["new_path"], sid, c["number"]))
+        for c in p["chapters"]:
+            if c["old_path"] and c["skip"] != "the file is missing":
+                self.assertTrue(os.path.lexists(c["new_path"]), c)
+        return p
 
     def komga_on(self, library_id="LIB1"):
         with db.connect() as con:
@@ -212,13 +237,27 @@ class FormatChangeTest(PlanBase):
         p = self.plan(sid, fmt)
         self.assertEqual((p["renames"], p["chapters"][0]["title_from"], p["warnings"]), (0, "file", []))
 
-    def test_a_name_no_format_made_takes_the_source_title(self):
-        sid = self.add_series([(3.0, "Chapter 3: The Storm", "Old style 3.cbz")])
+    def test_a_name_neither_format_made_is_left_as_it_is(self):
+        # the title in such a name is not known, and user decision 1 keeps titles as they are: only
+        # use_latest_titles renames it, with the source's title
+        sid = self.add_series([(3.0, "Chapter 3: The Storm", "Old style 3.cbz"), (4.0, None, "Old style 4.cbz")])
         p = self.plan(sid)
-        self.assertEqual(self.names(p), {3.0: "Chapter 003.0 - The Storm.cbz"})
-        self.assertEqual(p["chapters"][0]["title_from"], "source")
-        self.assertEqual(p["warnings"][0]["kind"], "title")
-        self.assertIn("(chapter 3)", p["warnings"][0]["message"])
+        c = {x["number"]: x for x in p["chapters"]}
+        self.assertEqual(c[3.0]["skip"], renamer.UNREAD)
+        self.assertEqual(c[4.0]["skip"], renamer.UNREAD_NO_SOURCE)
+        self.assertEqual([(x["new_name"], x["title_from"], x["changed"]) for x in c.values()], [(None, None, False)] * 2)
+        self.assertEqual(c[3.0]["new_path"], c[3.0]["old_path"])
+        self.assertEqual((p["renames"], p["komga"]), (0, None))
+        self.assertEqual([w["kind"] for w in p["warnings"]], ["title"])
+        self.assertIn("(chapter 3, 4)", p["warnings"][0]["message"])
+        self.assertIn("Use the latest titles from sources", p["warnings"][0]["message"])
+        p = self.plan(sid, use_latest_titles=True)
+        c = {x["number"]: x for x in p["chapters"]}
+        self.assertEqual((c[3.0]["new_name"], c[3.0]["title_from"], c[3.0]["skip"]),
+                         ("Chapter 003.0 - The Storm.cbz", "source", None))
+        self.assertEqual(c[4.0]["skip"], renamer.UNREAD_NO_SOURCE)          # no title to give it either
+        self.assertEqual(p["renames"], 1)
+        self.assertNotIn("Use the latest titles", p["warnings"][0]["message"])
 
     def test_sort_order_warning(self):
         sid = self.add_series([(12.0, None, None), (12.5, None, None), (13.0, None, None)])
@@ -233,6 +272,81 @@ class FormatChangeTest(PlanBase):
         self.assertEqual(self.plan(sid, {"chapter_file_format": "Chapter {Chapter:000.00}"})["warnings"], [])
         p = self.plan(sid, {"chapter_file_format": "Chapter {Chapter:0000.0}"})
         self.assertEqual((p["warnings"], self.names(p)[999.0]), ([], "Chapter 0999.0.cbz"))
+
+
+class OrganizeAgainTest(PlanBase):
+    """A second preview with the formats a series was just organized to proposes nothing, whatever the
+    format: the name is read with the format that made it (review: a format with text after the title,
+    or after the number starting with " - ", added that text again on every Organize)."""
+    FORMATS = [
+        {"chapter_file_format": "Chapter {Chapter:000.0}{ - Chapter Title} [{Year}]"},
+        {"chapter_file_format": "Chapter {Chapter:000.0} - {Series Romaji}{ - Chapter Title}"},
+        {"chapter_file_format": "{Series Title} - Chapter {Chapter:000}{ - Chapter Title}"},
+        {"chapter_file_format": "Chapter {Chapter:000}{ (Chapter Title)}", "series_folder_format": "{Series Romaji}"},
+        {"chapter_file_format": "Ch. {Chapter:00}{ - Chapter Title}", "colon_replacement": "dash"},
+        {"chapter_file_format": "{Chapter Title - }Chapter {Chapter:000.0}", "colon_replacement": "smart"},
+        {"chapter_file_format": "Chapter {Chapter:000.0}{ - Chapter Title}{ - Series Native}",
+         "chapter_title_max_chars": 10, "drop_number_only_titles": True},
+        {"colon_replacement": "delete", "replace_illegal_characters": False},
+    ]
+
+    def test_every_format(self):
+        for i, fmt in enumerate(self.FORMATS):
+            for latest in (False, True):
+                with self.subTest(fmt=fmt, use_latest_titles=latest):
+                    sid = self.add_series(MIXED, anilist_id=1000 + 2 * i + latest, native="来世は他人がいい")
+                    first = self.organize(sid, fmt, use_latest_titles=latest)
+                    self.assertGreater(first["renames"], 0)
+                    again = self.plan(sid, fmt, use_latest_titles=latest)
+                    self.assertEqual([(c["number"], c["new_name"]) for c in again["chapters"] if c["changed"]], [])
+                    self.assertEqual([(c["number"], c["skip"]) for c in again["chapters"] if c["skip"]], [])
+                    self.assertEqual((again["renames"], again["warnings"], again["folder"]["changed"]), (0, [], False))
+
+    def test_text_after_the_title_is_not_added_again(self):
+        fmt = {"chapter_file_format": "Chapter {Chapter:000.0}{ - Chapter Title} [{Year}]"}
+        sid = self.add_series([(12.0, "Chapter 12: The Storm", "Chapter 12: The Storm"), (13.0, None, None)])
+        self.assertEqual(self.names(self.organize(sid, fmt)), {12.0: "Chapter 012.0 - The Storm [2017].cbz",
+                                                              13.0: "Chapter 013.0 [2017].cbz"})
+        p = self.plan(sid, fmt)
+        self.assertEqual((self.names(p)[12.0], p["renames"]), ("Chapter 012.0 - The Storm [2017].cbz", 0))
+
+    def test_a_series_title_after_the_number_is_not_read_as_a_title(self):
+        fmt = {"chapter_file_format": "Chapter {Chapter:000.0} - {Series Romaji}{ - Chapter Title}"}
+        sid = self.add_series([(13.0, None, None)])
+        self.assertEqual(self.names(self.organize(sid, fmt)), {13.0: "Chapter 013.0 - Raise wa Tanin ga Ii.cbz"})
+        for latest in (False, True):
+            p = self.plan(sid, fmt, use_latest_titles=latest)
+            self.assertEqual((self.names(p)[13.0], p["renames"]), ("Chapter 013.0 - Raise wa Tanin ga Ii.cbz", 0))
+
+    def test_a_title_the_source_edited_is_not_taken_on_a_second_preview(self):
+        # the file kept "The Storm" through the first Organize; the source says "The Storm [2017]" now, which is
+        # what the default format would read from the new name: the name is still the chosen format's own
+        fmt = {"chapter_file_format": "Chapter {Chapter:000.0}{ - Chapter Title} [{Year}]"}
+        sid = self.add_series([(12.0, "The Storm [2017]", "The Storm")])
+        self.assertEqual(self.names(self.organize(sid, fmt)), {12.0: "Chapter 012.0 - The Storm [2017].cbz"})
+        self.assertEqual(self.plan(sid, fmt)["renames"], 0)
+        p = self.plan(sid, fmt, use_latest_titles=True)
+        self.assertEqual(self.names(p), {12.0: "Chapter 012.0 - The Storm [2017] [2017].cbz"})
+
+    def test_names_of_a_format_changed_since_keep_their_titles(self):
+        # organized to A, then back to the defaults: the names A made cannot be read, so they are left as they
+        # are rather than given the sources' titles (user decision 1: 448 titles learned after linking and 324
+        # edited ones here)
+        a = {"chapter_file_format": "Chapter {Chapter:000.0}{ (Chapter Title)} [{Year}]"}
+        sid = self.add_series(MIXED)
+        self.organize(sid, a)
+        p = self.plan(sid)
+        c = {x["number"]: x for x in p["chapters"]}
+        self.assertEqual(p["renames"], 0)
+        self.assertEqual((c[12.0]["old_name"], c[12.0]["skip"]), ("Chapter 012.0 [2017].cbz", renamer.UNREAD))
+        self.assertEqual((c[13.0]["old_name"], c[13.0]["skip"]), ("Chapter 013.0 (The Old Title) [2017].cbz",
+                                                                  renamer.UNREAD))
+        self.assertEqual(c[0.99]["skip"], renamer.UNREAD_NO_SOURCE)
+        self.assertEqual([w["kind"] for w in p["warnings"]], ["title"])
+        self.assertTrue(p["warnings"][0]["message"].startswith(f"{len(MIXED)} current file name(s)"))
+        latest = self.names(self.plan(sid, use_latest_titles=True))       # asked for: the sources' titles
+        self.assertEqual((latest[12.0], latest[13.0]), ("Chapter 012.0 - Vol.1 chapter 12.cbz",
+                                                         "Chapter 013.0 - The New Title.cbz"))
 
 
 class FolderTest(PlanBase):
@@ -269,6 +383,45 @@ class FolderTest(PlanBase):
             db.delete_series(con, a)                              # the plain name is free now
         self.assertFalse(self.plan(b)["folder"]["changed"])
 
+    def test_where_skipped_chapters_end_up(self):
+        # the folder is renamed, so every file in it moves along, renamed or not; new_path says where to
+        sid = self.add_series([(1.0, None, None), (2.0, None, None), (3.0, None, None), (4.0, None, None),
+                               (5.0, "Chapter 5: Five", "Five.cbz"), (6.0, None, None),
+                               (6.001, "Chapter 6.001: x", "Chapter 6.001: x")])
+        d = self.folder(sid)
+        os.remove(os.path.join(d, "Chapter 002.0.cbz"))
+        open(os.path.join(d, "Chapter 003.cbz"), "w").close()          # not mang-arr's
+        elsewhere = os.path.join(self.root, "elsewhere", "Chapter 004.0.cbz")
+        os.makedirs(os.path.dirname(elsewhere))
+        os.rename(os.path.join(d, "Chapter 004.0.cbz"), elsewhere)
+        with db.connect() as con:
+            con.execute("UPDATE chapter SET library_path=? WHERE series_id=? AND number=4", (elsewhere, sid))
+            con.execute("UPDATE chapter SET library_path=NULL WHERE series_id=? AND number=6", (sid,))
+        fmt = {"series_folder_format": "{Series Romaji}", "chapter_file_format": "Chapter {Chapter:000}"}
+        p = self.plan(sid, fmt)
+        new = os.path.join(self.library, "Raise wa Tanin ga Ii")
+        self.assertEqual(p["folder"]["new"], "Raise wa Tanin ga Ii")
+        c = {x["number"]: x for x in p["chapters"]}
+        self.assertEqual({n: (x["new_path"], bool(x["skip"])) for n, x in c.items()}, {
+            1.0: (os.path.join(new, "Chapter 001.cbz"), False),
+            2.0: (os.path.join(new, "Chapter 002.0.cbz"), True),                # missing: its row follows the folder
+            3.0: (os.path.join(new, "Chapter 003.0.cbz"), True),                # its new name is taken: keeps its own
+            4.0: (elsewhere, True),                                             # outside the folder: stays there
+            5.0: (os.path.join(new, "Five.cbz"), True),                         # name not read: kept
+            6.0: (None, True),                                                  # no file
+            6.001: (os.path.join(new, "Chapter 006.cbz"), False)})
+        self.assertEqual(c[3.0]["new_name"], "Chapter 003.cbz")                  # the name it would have had
+        self.assertIn("already in the folder", c[3.0]["skip"])
+        self.organize(sid, fmt)                                                  # checks every new_path
+
+    def test_a_chapter_skipped_for_sharing_a_name_moves_with_the_folder(self):
+        sid = self.add_series([(12.0, "Chapter 12", None), (12.001, "Chapter 12.001", "Chapter 012.001.cbz")])
+        fmt = {"series_folder_format": "{Series Romaji}", "chapter_file_format": "Chapter {Chapter:000}"}
+        p = self.organize(sid, fmt, use_latest_titles=True)
+        new = os.path.join(self.library, "Raise wa Tanin ga Ii")
+        self.assertEqual([c["new_path"] for c in p["chapters"]],
+                         [os.path.join(new, "Chapter 012.0.cbz"), os.path.join(new, "Chapter 012.001.cbz")])
+
     def test_a_series_without_a_folder(self):
         sid = self.add_series(MIXED[:1])
         with db.connect() as con:
@@ -278,18 +431,21 @@ class FolderTest(PlanBase):
 
 
 class CollisionTest(PlanBase):
+    # the collision cases below start from names no format made, so the titles come from the sources
+    # (use_latest_titles): a name that cannot be read is otherwise left as it is
+
     def test_two_chapters_one_name(self):
         # 12.001 was linked under a name of its own; without decimals both are Chapter 012
-        sid = self.add_series([(12.0, None, None), (12.001, None, "Chapter 012.001.cbz")])
-        p = self.plan(sid, {"chapter_file_format": "Chapter {Chapter:000}"})
+        sid = self.add_series([(12.0, "Chapter 12", None), (12.001, "Chapter 12.001", "Chapter 012.001.cbz")])
+        p = self.plan(sid, {"chapter_file_format": "Chapter {Chapter:000}"}, use_latest_titles=True)
         self.assertEqual([c["skip"] is not None for c in p["chapters"]], [True, True])
         self.assertEqual(p["collisions"], [{"name": "Chapter 012.cbz", "numbers": [12.0, 12.001],
                                             "message": "Chapters 12, 12.001 would all be named Chapter 012.cbz"}])
         self.assertEqual(p["renames"], 0)
 
     def test_a_chapter_that_has_the_name_keeps_it(self):
-        sid = self.add_series([(12.0, None, None), (12.001, None, "Chapter 012.001.cbz")])
-        p = self.plan(sid)                                    # 12.001 would become Chapter 012.0 too
+        sid = self.add_series([(12.0, "Chapter 12", None), (12.001, "Chapter 12.001", "Chapter 012.001.cbz")])
+        p = self.plan(sid, use_latest_titles=True)            # 12.001 would become Chapter 012.0 too
         c = {x["number"]: x for x in p["chapters"]}
         self.assertIsNone(c[12.0]["skip"])
         self.assertEqual(c[12.001]["skip"], "another chapter would get the same name (chapter 12)")
@@ -307,23 +463,23 @@ class CollisionTest(PlanBase):
 
     def test_a_name_that_is_being_freed_is_not_a_collision(self):
         # chapter 2's file carries the name chapter 1 gets; chapter 2 moves away first
-        sid = self.add_series([(1.0, None, None), (2.0, None, "Chapter 001.cbz")])
-        p = self.plan(sid, {"chapter_file_format": "Chapter {Chapter:000}"})
+        sid = self.add_series([(1.0, "Chapter 1", None), (2.0, "Chapter 2", "Chapter 001.cbz")])
+        p = self.plan(sid, {"chapter_file_format": "Chapter {Chapter:000}"}, use_latest_titles=True)
         self.assertEqual(self.names(p), {1.0: "Chapter 001.cbz", 2.0: "Chapter 002.cbz"})
         self.assertEqual((p["renames"], p["collisions"]), (2, []))
 
     def test_a_skipped_chapter_keeps_its_name_taken(self):
-        sid = self.add_series([(1.0, None, None), (2.0, None, "Chapter 001.cbz")])
+        sid = self.add_series([(1.0, "Chapter 1", None), (2.0, "Chapter 2", "Chapter 001.cbz")])
         open(os.path.join(self.folder(sid), "Chapter 002.cbz"), "w").close()
-        p = self.plan(sid, {"chapter_file_format": "Chapter {Chapter:000}"})
+        p = self.plan(sid, {"chapter_file_format": "Chapter {Chapter:000}"}, use_latest_titles=True)
         c = {x["number"]: x for x in p["chapters"]}
         self.assertIn("'Chapter 002.cbz' is already in the folder", c[2.0]["skip"])
         self.assertEqual(c[1.0]["skip"], "chapter 2 keeps that name")
         self.assertEqual((p["renames"], len(p["collisions"])), (0, 2))
 
     def test_a_change_of_case_only(self):
-        sid = self.add_series([(12.0, None, "chapter 012.0.cbz")])
-        p = self.plan(sid)
+        sid = self.add_series([(12.0, "Chapter 12", "chapter 012.0.cbz")])
+        p = self.plan(sid, use_latest_titles=True)
         self.assertEqual((p["chapters"][0]["new_name"], p["chapters"][0]["skip"]), ("Chapter 012.0.cbz", None))
         self.assertEqual((p["renames"], p["collisions"]), (1, []))
 
@@ -388,6 +544,16 @@ class KomgaTest(PlanBase):
         self.assertTrue(k["message"].startswith("Komga will keep reading progress: file hashing is on for "
                                                 "'Manga (mang-arr)' and all 2 books"), k["message"])
 
+    def test_a_folder_rename_is_not_verified_yet(self):
+        # Komga pairs renamed files by hash; a renamed series folder is not verified on Komga yet (proposal 2.2 #10)
+        self.komga_on()
+        self.komga.add_series("S1", self.folder_name, ["Chapter 001.0.cbz", "Chapter 002.0 - Two.cbz"])
+        k = self.plan(self.sid, {**self.FORMAT, "series_folder_format": "{Series Romaji}"})["komga"]
+        self.assertEqual((k["state"], k["needs_confirmation"]), ("folder_unverified", True))
+        self.assertIn("reading progress may be lost", k["message"])
+        k = self.plan(self.sid, {"series_folder_format": "{Series Romaji}"})["komga"]    # the folder alone
+        self.assertEqual(k["state"], "folder_unverified")
+
     def test_hashing_off(self):
         self.komga_on()
         self.komga.libraries["LIB1"]["hashFiles"] = False
@@ -425,9 +591,22 @@ class KomgaTest(PlanBase):
         self.komga.add_series("S2", self.folder_name, ["Chapter 001.0.cbz"])
         k = self.check()
         self.assertEqual((k["state"], k["needs_confirmation"]), ("ambiguous", True))
+        self.assertIn("Choose mang-arr's library in Settings -> Komga", k["message"])
         self.komga_on(library_id="LIB1")
         settings._cache.clear()
         self.assertEqual(self.check()["state"], "ok")
+
+    def test_a_same_named_folder_deeper_in_the_library(self):
+        self.komga_on()
+        self.komga.add_series("S1", self.folder_name, ["Chapter 001.0.cbz", "Chapter 002.0 - Two.cbz"])
+        self.komga.add_series("S2", self.folder_name, ["x.cbz"], root="/library/Other", hashed=False)
+        self.assertEqual(self.check()["state"], "ok")                     # the one directly in the library
+        self.komga.series[0]["url"] = "/library/Older/" + self.folder_name
+        k = self.check()
+        self.assertEqual((k["state"], k["needs_confirmation"]), ("ambiguous", True))
+        self.assertEqual(k["message"], f"Komga has more than one series in a folder named {self.folder_name!r} in "
+                                       "the library 'LIB1', and cannot tell which one is this series: reading "
+                                       "progress may be lost.")
 
     def test_komga_unreachable(self):
         self.komga_on()
