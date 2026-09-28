@@ -277,6 +277,20 @@ class SeriesStepsTest(unittest.TestCase):
         self.assertIn("A: broken", reasons[2.0])
         self.assertIn("waiting for chapter 2", reasons[3.0])
 
+    def test_a_chapter_no_copy_of_which_is_known_to_be_it_is_not_attempted(self):
+        # a fractional chapter whose copies' pages are not counted this time (plan.uncounted: Suwayomi did not
+        # answer) is left for the next pass, not failed; in order the later chapters wait for it
+        for in_order, results in ((True, {1.0: "ok"}), (False, {1.0: "ok", 2.0: "ok"})):
+            plan = plan_for([match("A", 1, [1, 1.5, 2])])
+            plan.candidates[1.5], plan.uncounted = [], {1.5: ["A"]}
+            reasons = {}
+            steps = downloader.SeriesSteps(plan, {1.0, 1.5, 2.0}, in_order, "T", reasons)
+            with self.assertLogs("mangarr.downloader", "WARNING"):
+                runs = drive(steps, set(), lambda keys, alts: keys[0])
+            self.assertEqual((steps.results, [n for _, nums in runs for n in nums]), (results, sorted(results)))
+            self.assertEqual(reasons[1.5], downloader.uncounted_reason(1.5, ["A"]))
+            self.assertEqual(reasons.get(2.0), downloader.uncounted_reason(1.5, ["A"]) if in_order else None)
+
     def test_take_is_none_when_the_chapter_was_ignored_meanwhile(self):
         steps, _ = steps_for([match("A", 1, [1]), match("B", 2, [2])], [1, 2])
         self.assertEqual(steps.wants(set()), ["a"])

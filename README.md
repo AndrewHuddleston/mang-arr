@@ -38,6 +38,13 @@ Every off-the-shelf "manga *arr" fails on a real library for the same reasons:
   Every chapter that is not on disk carries a reason (why it is wanted,
   why it failed, why it is unavailable or junk). Chapters you do not want
   can be ignored one by one.
+- **Strict download order, with a way past a dead chapter.** Each series
+  downloads in chapter order. When a chapter fails on every source listing
+  it, the series page says so at the top, with a verdict on what the
+  chapter probably is (a side story, a piece of a chapter you already have,
+  the rest of a chapter, or unknown), the evidence for it, a link to the
+  chapter on its site and *Skip it* / *Keep waiting*. Likely side stories
+  can be skipped automatically (off by default).
 - **Per-chapter search.** *Search* fetches one chapter from the best trusted
   source; *Manual* shows what every source entry has for that chapter and
   lets you pick one, including entries the automatic search would not use.
@@ -240,12 +247,13 @@ applies to the next job.
 |---|---|
 | Sources: enabled / one by one | One row per Suwayomi source: *Enabled* (default from `MANGARR_UNUSABLE_SOURCES`), its reliability, the rate limiting detected (default list from `MANGARR_THROTTLED_SOURCES`), and *one by one*: fetch it page by page (default from `MANGARR_PAGE_WARM_SOURCES`; see [How it works](#how-it-works)). A *one by one* entry for a source that is not installed right now is kept. |
 | Refresh every (hours) | The scheduler and the daemon pick a change up within seconds. |
-| Download in order | On by default. Each series downloads strictly in chapter order, one chapter at a time; a chapter that fails is tried on the other sources at once, and if none can deliver it the series waits there (later chapters show "waiting for chapter N") while the pass carries on with the next series. Off: chapters are fetched from whichever source has them, faster but out of order and with possible gaps. |
+| Download order: strict download in order | On by default. Each series downloads strictly in chapter order, one chapter at a time; a chapter that fails is tried on the other sources at once, and if none can deliver it the series waits there (later chapters show "waiting for chapter N") while the pass carries on with the next series. It keeps waiting in the passes after that too: the failed chapter is tried again on its retry schedule (the next pass, then after a day, three days, a week), and no pass downloads the chapters after it in between, so no gap opens in the middle of a book. A chapter no site lists in one check holds them the same way (its site may only not have answered, or its search missed the series): it is still waited for until no site has listed it for 3 checks in a row and 2 days, counting only checks in which every site that had listed it in the last week answered and matched the series; only then is it *unavailable* and the series goes on. A fractional chapter whose best-ranked copy is a short placeholder, while another site has it at full length, is a chapter like any other: it is downloaded from that site and holds the chapters after it the same way. A chapter you un-skip (or *want*) while a download of its series runs holds the chapters of that download after it from then on: they wait for the next pass, which downloads it first. A chapter Suwayomi has downloaded is downloaded, also when the import could not link it (the library already has another file under its name, or checking the file ran out of time): it holds nothing, and its reason says why it is not in the library. The series page says what it is stuck behind (see [Stuck behind a chapter](#stuck-behind-a-chapter)). Off: chapters are fetched from whichever source has them, faster but out of order and with possible gaps. |
+| Download order: automatically skip likely side stories that block downloads | Off by default, and only with strict download in order (greyed out otherwise; its value is kept). A chapter a series is stuck behind is skipped automatically when its verdict is *probably a side story* or *probably already covered by a chapter you have* with high confidence, and passes have given it that verdict for at least a day: never by the pass that first judges it so, and once MangaDex's chapter list has been looked up for it (in the background: a pass never waits for MangaDex); never *unknown* or *the rest of a chapter*, nor a low-confidence verdict. Only once it failed on every site that lists it: a site that starts listing it is tried first (one whose copy is too short to be the chapter is never tried). Only in a pass in which every site that listed it in the last week answered and matched the series (and no site that matched the series before is down): what a missing site calls it could change the verdict. Only with MangaDex's chapter list in the verdict: while MangaDex does not answer, nothing is skipped and the note says when it is asked again. Never a chapter you chose *Keep waiting* for, nor one you un-skipped or wanted again, read again in the same transaction that would skip it: what you decided lasts until the chapter is on disk, or a week after no site lists it any more (a pass in which its only site missed it changes nothing). The chapters after it go on in that pass or the next. Every automatic skip is logged (INFO), recorded in the history and shown on the series page with an *undo*; an undone one stays wanted. The judgement is a best guess from chapter titles and other sites' chapter lists: you might miss parts of the story. |
 | Download lanes | How many sources download at the same time during a refresh pass or *Search all wanted now* (1-8, default 3). Each source serves one series at a time and keeps its pacing, so a slow or rate-limited source holds up only the series that need it, and a series whose next source is busy takes the same chapters from another free source of the same kind (see [How it works](#how-it-works)). Suwayomi's own *max sources in parallel* must allow as many: a pass uses the lower of the two. The field shows Suwayomi's value and, when it is lower, a *Save and let Suwayomi use N* button that changes it in Suwayomi: the only Suwayomi setting mang-arr ever changes, and only on that button. Adding one series, refreshing one and a chapter search still download from one source at a time. |
 | Parallel searches | How many sites are searched at the same time while a series is resolved (1-8, default 5), so a pass gets to its downloads sooner. The sources of one site (its `(EN)` and `(ALL)` variants) are still searched one after the other with the usual spacing (1 s between searches, 3 s on a page-by-page source), and the result does not depend on which site answers first. 1 searches one source after the other. |
 | Page delay (seconds) | Spacing between page requests on sources fetched page by page (default 2.5, 0.5-60). It is the start and the minimum: it widens 1.5× after each busy answer from the image server (up to 30 s) and eases back 0.85× every five pages that arrive. |
 | Re-check complete finished series every (days) | Under `serve`, a scheduled pass (and *Update All*) does series with chapters due first (wanted, or failed with their next try reached), then continuing series, then the rest, so downloads start within its first minute. A complete *finished* or *cancelled* series (chapters on disk, nothing wanted or failed, and its last check found a source) is skipped until this many days (default 7) have passed since its last check: at the end of the pass AniList and MangaDex are asked for the status of all of them at once (no source is searched), and one that goes on after all (continuing again, or another chapter count) is checked in that pass; the others show *skipped: complete and finished; next check in about N day(s)* (or *nothing to download* when some chapters are *unavailable*). A pass that stops early skips them all the same. A series with failed chapters is never skipped, so their retries keep their schedule, nor is one no source matched, and refreshing one series always checks it. 0 re-checks everything every pass. `mangarr daemon` goes through the series in title order and skips none. |
-| Minimum pages for a fractional chapter | A `12.5` with fewer pages than this is treated as a notice image and marked junk. Default 8. |
+| Minimum pages for a fractional chapter | A copy of a `12.5` with fewer pages than this is a notice image or a placeholder, not the chapter: it is never downloaded, and the chapter is marked junk only when no site has it at full length. A copy is downloaded only when its count says it is the chapter, or its site will not count it at all: every copy a pass may download is counted first (a fallback on another site too), and one Suwayomi did not count this time waits for the next pass. Default 8. |
 | Komga URL, API key, library id | When URL and key are set, every import that linked at least one chapter asks Komga to scan (the given library, or all of them). The key comes from Komga's account menu → API keys. *Save & test Komga* lists the libraries it can see; the health check calls the same API. |
 | Notifications | Discord webhook, Telegram bot token + chat id, ntfy topic URL (+ token), Gotify URL + app token, Pushover token + user key, Slack webhook, Notifiarr API key + Discord channel id, SMTP email, Apprise API URL, webhook URL. Every configured channel gets each message; each has a *Test* button that sends to that channel only. *Notify on* picks the events: new chapters, series added, failed downloads (after a pass, with the reasons), health problems (when a check turns red). |
 | Login method | *login page* (a form and a signed session cookie that lasts 30 days, with a *Sign out* button in the top bar) or *browser prompt* (HTTP basic auth, accepted only in this mode; once the prompt's credentials are accepted the browser also gets a session cookie that ends when the browser closes). Only active once a username is set. |
@@ -374,6 +382,79 @@ Then the sources table (every entry that matched, its chapter count and
 highest number, the primary marked with a star, and the note saying why an
 entry is not used) and the last fifteen events for the series.
 
+#### Stuck behind a chapter
+
+With strict download in order, a chapter that failed on every source
+listing it holds back every later chapter of its series. The series page
+then starts with a note:
+
+> **Stuck behind chapter 7.2 - 372 chapters waiting.** Only Manganato lists
+> it and its images are gone (failed on every try since 2026-09-26).
+
+Below it, the verdict on the chapter, with its confidence (high or low)
+and the evidence it rests on, one line each, for example *Probably already
+covered by chapter 7 you have (high confidence)*: *MangaDex's English
+chapter list has 7 and 7.5 but no 7.2; you have both. It goes on with
+chapter 8, so it does not simply end before 7.2. Your chapter 7 has 11
+pages, like MangaDex's chapter 7 (11).* The verdict is one of *probably a
+side story*, *probably already covered by chapter N you have*, *probably
+the rest of chapter N (skipping leaves a gap)* and *unknown*. It comes from
+deterministic signals only: the chapter's name on every site that lists
+it, MangaDex's English chapter list (when MangaDex has the series), the
+page counts of your copy of chapter N and of the series' usual chapter,
+and where the chapter sits (after the last chapter of a finished series,
+numbered .5). Notice words (*Hiatus*, *The Announcement*) never decide
+anything, and a whole-numbered chapter is always taken for a chapter of
+the story. Neither chapter N's own title (a site's second half of *Extra?
+No, I'm the Protagonist!*) nor a word the series' chapters all carry (a
+spin-off's *Gaiden Chapter 12*), in your copies' names or on a site that
+lists this chapter (your copies are often another site's *Chapter 12*, or
+unnamed), makes it a side story, and a chapter
+between N and N+1 on MangaDex that you do not have (by any name but a
+side story's own words: *Special* and *Extra* are titles too) may be this
+one under another number. MangaDex is never asked while a page loads or a pass runs: a
+background lookup, one at a time and paced, fetches its list (kept for a
+week), and the page shows *checking MangaDex...* and reloads itself until
+the answer is in. When MangaDex does not answer, the note says so and when
+it is asked again (within the hour).
+
+The buttons: *Open 7.2 on Manganato* (the chapter on the site, in a new
+tab), *Skip it* and *Keep waiting*. The (i) next to *Skip it* says what
+skipping means: the chapter is not downloaded and the chapters after it
+continue (from the next pass, or *Search Missing* now); if it turns out to
+be part of the story you have a gap. A skipped chapter is an *ignored* one
+that stays listed as *Skipped*, with an *Un-skip* at the top of the page
+and on its row that makes it wanted again; a chapter you un-skip (or take
+back with *want*) is never skipped automatically after that. When a site
+later lists a skipped chapter under another name (a real chapter where a
+notice was) or a new site lists it, the page says so and offers the
+*Un-skip*, or *keep it skipped* (it stays skipped as it is listed now);
+one that was skipped automatically is made wanted again by itself. *Keep
+waiting* folds the note into one line at the top (still with *Skip it*)
+until the chapter changes (another title, or another site lists it: the
+note is back then), and the automatic skip never takes that chapter; the
+series keeps waiting and the chapter keeps its retry schedule. A site that
+does not list the chapter in one resolve (it did not answer, or its search
+missed) is no change: what it called the chapter is kept for a week (also
+from before the chapter got stuck), and the chapter's name in its row (a
+copy of whichever site's is in use) is not compared. A pass in which no
+site lists the chapter at all keeps it failed, still holding the series
+(its reason ends *not listed by Manganato in the last check; still
+waiting for it*), with everything known about it, until its grace is over
+(see *strict download in order* under Settings). Every site that lists
+the chapter is kept, also one whose copy is too short to be the chapter
+(that one is never tried) and while the chapter is junk. What you decided
+(*Skip it*, *Un-skip*, *want*, *Keep waiting*) is kept apart from what the
+sites say, and dropped once the chapter is on disk, or a week after its
+grace is over; never because it is junk for a while (sites still list
+it). The same verdict is on the
+chapter's own row, as a small label with the evidence in its tooltip, and
+the row's *Skip it* replaces the plain *ignore*; the group of chapters
+that holds it is open.
+
+The Missing page's *Stuck* filter lists every series stuck behind a
+chapter, with the chapter, how many chapters wait for it and the verdict.
+
 #### Chapter statuses and reasons
 
 Every chapter a trusted source lists gets a row with one of these statuses.
@@ -382,11 +463,11 @@ Every status except *have* comes with a reason, shown in the chapter table:
 | Status | Meaning | Reason texts |
 |---|---|---|
 | `have` | On disk and linked into the library. The reason column shows the library file name instead. | - |
-| `wanted` | Listed by a trusted source, not on disk yet. Downloaded by the next *Search missing*, *Search all wanted now* or scheduled refresh. | *available on Weeb Central (also MangaDex, Bato); not downloaded yet - waiting for a download pass*, with *(rate-limited source: slow)* or *(images fetched page by page: slow)* after the source's name when it is one of those; *not attempted: the download pass was cancelled or interrupted before this chapter*; *not attempted: Suwayomi did not start this chapter within 30 min (its download queue was busy with other downloads)*. A chapter you just took back with *want* shows *waiting for a download pass*. |
-| `failed` | The last download pass tried and could not get it. It is retried on every refresh: the re-resolve puts it back to wanted, then the download runs again. | One entry per source tried, joined with `;`: *Manganato: Suwayomi reported an error on every try, gave up after 300s of backoff*; *MangaDex: download made no progress, gave up after 60s of backoff*; *Bato: Suwayomi finished the batch without this chapter (download error)*; *Comick (Unoriginal) (EN): the image server refused even paced page requests (0 of 20 pages), gave up after 60s of backoff*; *fetching pages one at a time took over 10 min (12 of 30 pages)* (no backoff suffix when another source lists the chapter: it is not tried again there); *not fetched page by page (its page list has a URL that is not a Suwayomi page path); the normal download failed instantly on every try*; *its pages were fetched one by one, but Suwayomi still could not build the chapter (page cache cleared, or a page kept failing)*; *does not list it* (from a per-chapter search). Prefixed *failed on every source:* when the pass ran out of fallbacks; suffixed *(no other source has this chapter)* when there was only one. *no enabled source lists this chapter* when the only entries that have it are disabled. |
-| `unavailable` | It was wanted or failed, but no trusted source lists it any more (the source dropped it, or the entry was distrusted). It becomes wanted again as soon as a source lists it. | *no trusted source lists this chapter any more* |
-| `junk` | A fractional chapter with fewer pages than *Minimum pages for a fractional chapter*: a notice or an ad. Never downloaded; a file for it in staging is not imported. | *3 page(s) on Manganato: a notice image, not a chapter* |
-| `ignored` | You pressed *ignore*. Kept across refreshes; nothing is downloaded until you press *want*. | - |
+| `wanted` | Listed by a trusted source, not on disk yet. Downloaded by the next *Search missing*, *Search all wanted now* or scheduled refresh. | *available on Weeb Central (also MangaDex, Bato); not downloaded yet - waiting for a download pass*, with *(rate-limited source: slow)* or *(images fetched page by page: slow)* after the source's name when it is one of those; *not attempted: the download pass was cancelled or interrupted before this chapter*; *not attempted: Suwayomi did not start this chapter within 30 min (its download queue was busy with other downloads)*; *not attempted: the pages of ch 12.5 on Bato are not counted yet (a copy too short to be the chapter is never downloaded); the next pass counts them* (Suwayomi did not answer the count; with strict download in order the chapters after it say so too). Downloaded but not in the library yet: *Weeb Central: downloaded, not linked: the library already has another file at …/Chapter 012.0.cbz, which is never overwritten; move it away and the next import links this one*, or *Weeb Central: downloaded, not linked yet: checking it took longer than 30s (slow or busy storage); checked again at the next import*. Downloaded according to Suwayomi, but no file in its download folder is read as the chapter (Suwayomi never downloads it again, so it would wait for good): *Manganato: downloaded as www.natomanga.com_Spin-off one.cbz but its chapter number could not be read; rename it or report the name* (or *... its file is one of 3 whose chapter number could not be read (...)*), *Manganato: reported downloaded, but no file reads as chapter 171.01; www.natomanga.com_Chapter 1.cbz read as chapter 1, which Other_Chapter 1 - Spin-off 1.cbz already is: rename it or report the name* (a file read, or placed by Suwayomi's chapter names, as a number another file already is; with several: *... 13 files read as a chapter another file already is (..., ...): rename them or report the names*), or *Manganato: reported downloaded, but no file in its download folder reads as chapter 171.01; delete the download in Suwayomi to fetch it again*; such a chapter holds nothing, also with strict download in order (it is downloaded). A chapter you just took back with *want* shows *waiting for a download pass*. With strict download in order: *waiting for chapter 7.2: chapters download in order and 7.2 failed on every source (it is retried on schedule; skip it on the series page, or turn off strict download in order, to go on without it)*, and once 7.2 is skipped *no longer waits for chapter 7.2, which was skipped: the next pass downloads it*. *not listed by Manganato in the last check; still waiting for it*: no source listed it in the last check, and it is waited for until its grace is over (see `unavailable`); the chapters after it then say *waiting for chapter 7.2: chapters download in order and 7.2 is not listed by Manganato in the last check; still waiting for it*. |
+| `failed` | The last download pass tried and could not get it. It is retried on schedule (the next refresh, then after a day, three days, a week): the re-resolve puts it back to wanted, then the download runs again. With strict download in order the chapters after it wait for it until then. | One entry per source tried, joined with `;`: *Manganato: Suwayomi reported an error on every try, gave up after 300s of backoff*; *MangaDex: download made no progress, gave up after 60s of backoff*; *Bato: Suwayomi finished the batch without this chapter (download error)*; *Comick (Unoriginal) (EN): the image server refused even paced page requests (0 of 20 pages), gave up after 60s of backoff*; *fetching pages one at a time took over 10 min (12 of 30 pages)* (no backoff suffix when another source lists the chapter: it is not tried again there); *not fetched page by page (its page list has a URL that is not a Suwayomi page path); the normal download failed instantly on every try*; *its pages were fetched one by one, but Suwayomi still could not build the chapter (page cache cleared, or a page kept failing)*; *does not list it* (from a per-chapter search). Prefixed *failed on every source:* when the pass ran out of fallbacks; suffixed *(no other source has this chapter)* when there was only one. *no enabled source lists this chapter* when the only entries that have it are disabled. |
+| `unavailable` | It was wanted or failed, but no trusted source has listed it for 3 checks in a row and 2 days (the source dropped it, or the entry was distrusted); a check in which a source that listed it in the last week did not answer, or did not match the series, does not count. Until then it stays wanted (or failed), with the reason *not listed by Manganato in the last check; still waiting for it*, and with strict download in order the chapters after it wait for it. It becomes wanted again as soon as a source lists it. | *no trusted source lists this chapter any more* |
+| `junk` | A fractional chapter no site has at full length: every site's copy has fewer pages than *Minimum pages for a fractional chapter* (a notice or an ad), or one does and the others' pages cannot be counted. Never downloaded; a file for it in staging is not imported. A short copy on one site while another has the chapter does not make it junk: that copy is only left out. Not junk either while a site that listed it in the last week, with a copy not known to be short, does not answer: it is waited for then, like a chapter no site listed. A junk chapter is still listed: what the series page keeps about it and what you decided about it stay. | *3 page(s) on Manganato (no full copy on Bato either): a notice image, not a chapter* |
+| `ignored` | You pressed *ignore*, or *Skip it* on a stuck note (shown as *Skipped*), or it was skipped automatically. Kept across refreshes (a bad file for it in staging is set aside and it stays ignored); nothing is downloaded until you press *want* (*Un-skip*). | *skipped: the chapters after it download without it (un-skip to want it again)*; *skipped automatically: probably a side story (high confidence)* |
 
 The Missing page counts wanted and failed chapters together, and the
 index's *wanted* number is the same sum.
@@ -472,9 +553,11 @@ across all series.
 #### Missing
 
 Every series with wanted or failed chapters: the count, the chapter ranges,
-how many failed, the most recent failure reason and when the series was
-last checked. *Search all wanted now* queues a `search-wanted` job, a
-download pass over all of them.
+how many failed, the chapter it is stuck behind (with the verdict), the
+most recent failure reason and when the series was last checked. The
+*Filter* menu shows all of them, those with or without failures, or the
+*Stuck* ones (`/wanted?filter=stuck`). *Search all wanted now* queues a
+`search-wanted` job, a download pass over all of them.
 
 #### System
 
@@ -487,7 +570,9 @@ instead of linked, if any. Then:
   detail line. See Monitoring.
 - **Tasks**: the three scheduled tasks (refresh all monitored series,
   update check, database backup) with their interval, next run and a *run
-  now* button, plus the latest release found by the update check.
+  now* button, plus the latest release found by the update check, and
+  *Check library links* (see `mangarr check-links`), which also runs once
+  by itself on the first start after an upgrade that asks for it.
 - **Backups**: the kept backups with size and age, a download link each,
   *restore* and *delete* buttons, *Back up now*, and *Restore from file*
   for an uploaded `.db`. See Backups.
@@ -564,19 +649,21 @@ behind.
 ```
 usage: mangarr [-h] [--debug] [--log-level LOG_LEVEL] [--log-file LOG_FILE]
                [--quiet]
-               {search,resolve,add,refresh,import,adopt,status,show,daemon,serve}
+               {search,resolve,add,refresh,import,adopt,check-links,status,show,daemon,serve}
                ...
 
 Sonarr for manga.
 
 positional arguments:
-  {search,resolve,add,refresh,import,adopt,status,show,daemon,serve}
+  {search,resolve,add,refresh,import,adopt,check-links,status,show,daemon,serve}
     search              database candidates for a title
     resolve             dry run: where each chapter would come from
     add                 track a series and download what is missing
     refresh             re-resolve tracked series and fetch new chapters
     import              link downloaded chapters into the library
     adopt               register what Suwayomi already downloaded
+    check-links         repair chapters linked under a misread number, then
+                        import
     status              tracked series
     show                one series in detail
     daemon              background worker: refresh every N hours
@@ -660,6 +747,36 @@ Registers what Suwayomi already downloaded; `--only` limits it to folders
 whose name contains the fragment; `--dry-run` only prints what would
 happen. See the next section.
 
+#### `mangarr check-links [--dry-run]`
+
+Repairs chapters linked into the library under a number their file name
+was misread as (0.3.0 read `Humane Scans_Ch.17 - Maidens 101_ A Success_`
+as chapter 101, and `Losers in eXile_Ch.150 - Hana to Yume March 2020
+Special` as 2020). A link is only touched when three readings agree that it
+is one of those: 0.3.0's reading of its staging file's name is the number
+it is linked as (so the link came from that reading, not from Suwayomi's
+chapter names), the name reads as another number now, and Suwayomi's own
+chapter list gives the file that new number. When Suwayomi does not answer,
+nothing is changed and the check stays due: it runs again after the next
+refresh pass (the worker: before its next cycle). A link Suwayomi numbers
+otherwise is left as it is and logged. Before the first change the
+database is backed up (*before library link repair*); if that fails,
+nothing is changed. Then the library link is removed (only a regular file
+inside the series' library folder that is the staging file itself;
+staging is never touched), the chapter goes back to wanted (*its file was
+chapter 17 (a misread name); ...*) when a source lists that number or is
+dropped when none does, and every series is imported again, so the file is
+linked under its real number and a file the old reading took for a chapter
+already on disk is linked at last. A chapter marked in the library whose
+library file is gone and that the import cannot link again (a wrong file
+removed by hand, a backup of before the repair restored) goes back to
+wanted (*its library file Chapter 2020.0.cbz was gone; ...*) or is dropped
+the same way, unless the series' whole library folder is missing (a
+library that is not mounted). Each change is logged and shown in History;
+Komga is asked to scan, and once more at the next import or 10 minutes
+later if it did not answer. `--dry-run` only lists what it would do. It
+runs once by itself on the first start after upgrading from 0.3.0.
+
 #### `mangarr status`
 
 One line per tracked series: id, title, have / listed / wanted counts,
@@ -715,8 +832,13 @@ mangarr refresh                  # find and fetch what is missing
 Folders of the same series under different sources merge into one tracked
 series. Chapter numbers are parsed from the file names (`Chapter 12`,
 `Ch.12.5`, `Episode 12`, `#12`, and a dozen other shapes seen in the wild);
-files without a readable number are reported and, unless Suwayomi's
-chapter list can place them (next section), skipped.
+a chapter marker (`Chapter`, `Ch.`, `Episode`, `Ep.`) decides, after
+Suwayomi's `<scanlator>_` prefix too, so `Humane Scans_Ch.17 - Maidens 101`
+is chapter 17. A marker counts only as a word of its own with its number
+(`Ch4os Scans_Chapter 12` is 12, `www.chapter1.com_Chapter 7` is 7), and of
+several the one that starts the chapter name after the prefix wins (`Ch 3
+Scans_Chapter 12` is 12). Files without a readable number are reported and,
+unless Suwayomi's chapter list can place them (next section), skipped.
 
 Note that a refresh keeps only one Suwayomi entry per series (the primary
 source) in Suwayomi's own library, so Suwayomi's update checks one entry
@@ -753,7 +875,8 @@ copies are untouched.
 Komga's periodic scan picks new chapters up on its own. To get them sooner,
 put Komga's URL and an API key on the Settings page: mang-arr then asks
 Komga to scan (one library, or all) after every import that linked
-something.
+something. When Komga does not answer, the scan is asked for once more, at
+the next import or 10 minutes later.
 
 ## Monitoring
 
@@ -862,24 +985,33 @@ or MangaDex (status, chapter and volume counts, synonyms, description,
 genres, year, demographic; the stored record is kept when the provider is
 down). It re-resolves the sources, and rewrites every chapter row that is
 not *have* or *ignored*: chapters a trusted source lists become *wanted*
-with a reason naming the source, fractional chapters that probe as a few
-pages become *junk*, chapters no trusted source lists any more become
-*unavailable*, and each chapter's title and release date are taken from
+with a reason naming the source, fractional chapters that no site has at
+more than a few pages become *junk* (a short copy on one site is left out
+when another site has the chapter), chapters no trusted source lists any more become
+*unavailable* once their grace is over (3 checks and 2 days: see the
+chapter statuses), and each chapter's title and release date are taken from
 the source that lists it. Then it downloads what is wanted and links the
 results.
 
 Counting a fractional chapter's pages asks its source for the page list,
-so the count is kept and not taken again every pass. A chapter is counted
+so the count is kept and not taken again every pass. Every copy a pass
+may download is counted, the other sites' copies too (one of them is
+used when the best-ranked copy fails), so no copy is tried without a
+count; of a chapter on disk or ignored only the best-ranked copy is
+counted, and the others only when it is short. A chapter is counted
 again when its source lists it differently (another name, scanlator or
 release date) and when the count is 30 days old. A count that makes it
 junk is checked again sooner, since a wrong one costs a chapter (an empty
 answer, an upload still in progress, a placeholder the site fixes later):
 a day later, then a week and a month later while it comes out the same,
-and from then on every 90 days. After a count that failed, the chapter is
-kept, as it always was when a count fails, and is counted again in the
-next pass, then a day, three days and a week later while it keeps failing.
-A new *Minimum pages for a fractional chapter* applies to the kept counts
-at once.
+and from then on every 90 days; until then the copy is left out, and once
+the count is due it is taken again before the copy can be used. After a
+count that failed (the site would not say), the chapter is kept, as it
+always was when a count fails, and is counted again in the next pass,
+then a day, three days and a week later while it keeps failing. A copy
+Suwayomi itself did not count is not tried in that pass; the next pass
+counts it. A new *Minimum pages for a fractional chapter* applies to the
+kept counts at once.
 
 The downloader works one source at a time. It queues a batch of its own
 chapter ids in Suwayomi, watches them, and dequeues them if it gives up;
@@ -998,6 +1130,7 @@ mangarr/
   renamer.py     rename preview: old -> new names, collisions, sort order, Komga reading progress
   db.py          SQLite: series, sources, chapters, page counts, events, lists, settings
   core.py        add / refresh / import / adopt / per-chapter download
+  relink.py      one-time repair of links made under a misread chapter number, and of chapters whose library file is gone
   lists.py       import lists: fetchers, params, sync
   jobs.py        job runner + scheduler (web)
   daemon.py      standalone background worker
@@ -1064,7 +1197,7 @@ curl -H "X-Api-Key: $KEY" http://localhost:6789/api/v1/wanted
 | `GET /api/v1/system/backup` | the kept backups: `[{"name", "size", "mtime"}]` |
 | `POST /api/v1/system/backup` | take a backup now; returns `{"name", "size"}` |
 | `GET /api/v1/series` | every tracked series with counts |
-| `GET /api/v1/series/{id}?limit=5000&offset=0` | one series with its sources and chapters by number (each chapter with `status`, `reason`, `name`, `uploaded`, `source_name`, paths), at most 5000 chapters per call; `chapterTotal`, `limit` and `offset` in the answer say where the page is (next page: `offset=offset+limit`) |
+| `GET /api/v1/series/{id}?limit=5000&offset=0` | one series with its sources and chapters by number (each chapter with `status`, `reason`, `name`, `uploaded`, `source_name`, paths), at most 5000 chapters per call; `chapterTotal`, `limit` and `offset` in the answer say where the page is (next page: `offset=offset+limit`). `stuck` lists the chapters the series is stuck behind: `{"number", "waiting", "status", "name", "reason", "tries", "failedSince", "sources": {source: its title there}, "urls": {source: the chapter's page}, "failedOn": [the sites a download run failed it on], "shortOn": [the sites listing it whose copy is too short to be the chapter: never tried], "dismissed" (its note is folded), "keepWaiting" (you chose Keep waiting: never skipped automatically), "declined" (you un-skipped it or wanted it again: never skipped automatically), "checkingMangaDex", "mangaDexWait": null \| "pending" \| "failed" (MangaDex's chapter list is not in the verdict yet: not looked up, or MangaDex did not answer), "highSince" (since when every pass has judged it one the automatic skip may act on; null: none has), "verdict": {"kind": "side_story" \| "covered" \| "rest_of_chapter" \| "unknown", "headline", "confidence": "high" \| "low", "evidence": [...], "skippable", "autoSkip"}}`; `skipped` the chapters skipped from such a note that are still skipped: `{"number", "how": "manual" \| "auto", "verdict", "changed", "names"}` |
 | `POST /api/v1/series` | add. Body: `{"ref": "anilist:123", "download": true}` or `{"ref": "mangadex:<uuid>"}` or `{"ref": "manual", "title": "...", "aliases": ["..."]}`; `download` defaults to true. Returns the job. 400 on a bad reference, 409 when the series is already tracked or already queued. |
 | `POST /api/v1/series/{id}/refresh?download=true` | queue a refresh; returns the job; 409 if one is already queued for the series |
 | `DELETE /api/v1/series/{id}?files=false` | stop tracking, optionally delete the library folder; 409 while a job for the series runs |
@@ -1074,6 +1207,10 @@ curl -H "X-Api-Key: $KEY" http://localhost:6789/api/v1/wanted
 | `POST /series/{id}/chapter/{n}/download` | form route with field `manga_id`: download from that entry (the *Download* button in the Manual panel) |
 | `POST /series/{id}/chapter/{n}/ignore` | mark a chapter ignored (form route; redirects) |
 | `POST /series/{id}/chapter/{n}/unignore` | make an ignored chapter wanted again |
+| `POST /api/v1/series/{id}/chapter/{n}/skip` | skip a chapter (it becomes ignored, shown as *Skipped*; the chapters after it go on); 409 unless it is wanted, failed or unavailable. Form route: `POST /series/{id}/chapter/{n}/skip` |
+| `POST /api/v1/series/{id}/chapter/{n}/unskip` | want a skipped (ignored) chapter again; 409 when it is not ignored. Form route: `POST /series/{id}/chapter/{n}/unskip` |
+| `POST /api/v1/series/{id}/chapter/{n}/keep-waiting` | fold the stuck note on this chapter away until it changes, and keep the automatic skip off it for good; 409 when the series is not stuck behind it. Form route: `POST /series/{id}/chapter/{n}/keep-waiting` |
+| `POST /api/v1/series/{id}/chapter/{n}/keep-skipped` | a skipped chapter the sites list differently now stays skipped as it is listed now (the series page stops offering it back); 409 unless it is one skipped from a stuck note. Form route: `POST /series/{id}/chapter/{n}/keep-skipped` |
 | `GET /api/v1/importlist` | import lists with their params, last sync and result |
 | `POST /api/v1/importlist` | add a list. Body: `{"name", "kind": "anilist_user" \| "anilist_top" \| "url_text", "params": {...}, "enabled": true, "download": true, "monitored": true, "syncHours": 24, "syncNow": false}`; params per kind: `{"username", "statuses": ["CURRENT", "PLANNING"]}`, `{"sort": "TRENDING_DESC", "limit": 50, "country": "KR", "min_chapters": 0}`, `{"url"}`. 400 on bad params. |
 | `POST /api/v1/importlist/{id}/sync` | queue a sync; returns the job; 409 if one is already queued |
@@ -1082,7 +1219,7 @@ curl -H "X-Api-Key: $KEY" http://localhost:6789/api/v1/wanted
 | `GET /api/v1/lookup?term=...` | AniList / MangaDex candidates for a title |
 | `GET /api/v1/wanted` | series with missing chapters |
 | `GET /api/v1/queue` | mang-arr's jobs and Suwayomi's download queue |
-| `POST /api/v1/command` | `{"name": "RefreshAll"}` (refresh every monitored series; returns the existing job if one is already queued) or `{"name": "SearchWanted"}` (download-only pass over series with wanted chapters). 400 for any other name. |
+| `POST /api/v1/command` | `{"name": "RefreshAll"}` (refresh every monitored series; returns the existing job if one is already queued), `{"name": "SearchWanted"}` (download-only pass over series with wanted chapters), `{"name": "RefreshMetadata"}` (metadata only, every series) or `{"name": "CheckLibraryLinks"}` (see `mangarr check-links`). 400 for any other name. |
 | `GET /api/v1/log?lines=200` | tail of the log file (`lines` capped at 5000) |
 | `GET /metrics` | Prometheus exposition; see Monitoring |
 | `GET /system/backup` | take a backup now and download it (`mangarr-<date>-<time>.db`) |

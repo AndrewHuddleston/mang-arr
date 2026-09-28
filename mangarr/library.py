@@ -36,15 +36,41 @@ log = logging.getLogger(__name__)
 
 _EXT = (".cbz", ".cbr", ".zip")
 
-# Chapter number from a Suwayomi file name. The scanlator prefix (up to the
-# first "_") is ignored by matching the chapter keyword anywhere. Keywords
-# come from real names on disk: Chapter, Ch., Episode, #, Page, Day, Mission,
-# Room, Act, Step, bullet ...
+# Chapter number from a Suwayomi file name, which is "<scanlator>_<chapter
+# name>" ("Humane Scans_Ch.17 - Maidens 101_ A Success_", "www.natomanga.com_
+# Chapter 171.01_ Spin-off 1"). A chapter marker (Chapter, Chap, Ch, Episode,
+# Ep; a dot after it optional; after "Vol.N " too) decides: the number right
+# after it is the chapter, never a number from the prefix before it or from
+# the title after it ("... March 2020 Special", "Valentine's Day 2026", "Part
+# 1"). A marker and its number are words of their own, and "_" separates
+# words here: it is what Suwayomi puts between the scanlator (which may itself
+# contain "_", e.g. "_a_nonymous_") and the name, and what it makes of a ':'.
+# So "Ch4os Scans", "Ep1c TL" and "www.chapter1.com" hold no marker, and a
+# marker glued to its number ("Ch17") counts only where it starts the chapter
+# name: not inside a scanlator's name ("The ep2 fans_", "EP9 Group_Day 3").
+# When several markers are there, the one that starts the chapter name wins:
+# the last one right after a "_" (or at the very start), a volume allowed
+# between ("Ch 3 Scans_Chapter 12" is 12, "Scans_Chapter 12 (ch. 11)" and
+# "Chapter 12_ Ch 3 recap" are 12); with none there, the first one ("Day 5 -
+# Chapter 12"). A season episode that starts the name ("Ep 5 TL_S2 - Episode
+# 7") has no global number, whatever the prefix holds. Without a marker, the
+# other keywords from real names on disk count the same way (#, Page, Day,
+# Mission, Room, Act, Step, bullet ...), then the last number in the name.
+_WORD_START = r"(?<![^\W_])"         # not right after a letter or digit ("_" is a separator)
+_MARKER = r"(?:chapter|chap|ch|episode|ep)(?![^\W\d_])\.?"     # "Ch.17", "Ch 17", "Ch17"; not "Chapters"
+_NUMBER = r"\s*(\d+(?:\.\d+)?)"
+_WORD_END = r"(?![^\W_])(?!\.[^\W_])"   # a letter, digit or ".x" right after: part of a word ("Ch4os", "chapter1.com")
 _SEASON = re.compile(r"(?<![A-Za-z])S(\d+)\s*[-–]\s*(?:Episode|Ep\.?|Chapter|Ch\.?)\s*(\d+(?:\.\d+)?)", re.I)
+_CHAPTER = re.compile(_WORD_START + _MARKER + _NUMBER + _WORD_END, re.I)
 _KEYWORD = re.compile(
-    r"(?:\b(?:chapter|chap|ch|episode|ep|page|day|mission|room|act|step|bullet|part|lesson|round|file|case|"
-    r"night|stage)\b\.?|#)\s*(\d+(?:\.\d+)?)", re.I)
+    r"(?:" + _WORD_START + r"(?:page|day|mission|room|act|step|bullet|part|lesson|round|file|case|night|stage)\b\.?"
+    r"|#)" + _NUMBER, re.I)
 _VOLUME_ONLY = re.compile(r"(?<![A-Za-z])vol(?:ume)?\.?\s*\d+", re.I)
+# a volume right before a chapter marker ("_Vol.3 Chapter 21", "_Vol.TBD Ch.5",
+# "_Vol.2 - Ch.7"): looked for only in the few characters before the marker
+_VOLUME_BEFORE = re.compile(_WORD_START + r"vol(?:ume)?\.?\s*(?:\d+(?:\.\d+)?|tbd)\s*(?:-\s*)?\Z", re.I)
+_VOLUME_ROOM = 40
+_SCANLATOR_END = re.compile(r"_(?=[^\s_])")     # "Scans_Day 3", "fans_#3"; a ':' becomes "_ "
 # the last number in the name. Anchored at the start of a digit run and
 # followed only by non-digits: linear, where "(?!.*\d)" rescans the rest of
 # the name from every digit.
@@ -56,21 +82,49 @@ def parse_number(filename: str) -> float | None:
     """Chapter number in a file name, or None when there is none (volume-only
     files are not chapters; season-numbered files such as 'S2 - Episode 5'
     carry no global number - import resolves those through Suwayomi's own
-    chapter listing, see suwayomi_name_map)."""
+    chapter listing, see suwayomi_name_map). A chapter marker wins over
+    every other number in the name (see _CHAPTER and _chapter_marker)."""
     stem = os.path.splitext(os.path.basename(filename))[0][:MAX_PARSE]
-    m = _KEYWORD.search(stem)
-    if m and not (_SEASON.search(stem) and _SEASON.search(stem).start() <= m.start()):
-        return float(m.group(1))
-    if _SEASON.search(stem):
+    season = _SEASON.search(stem)
+    if season and _name_start(stem, season.start()) is not None:
+        return None                     # the name is a season episode; a marker before it is in the prefix
+    for m in (_chapter_marker(stem), _KEYWORD.search(stem)):
+        if m and not (season and season.start() <= m.start()):
+            return float(m.group(1))
+    if season:
         return None
-    if m:
-        return float(m.group(1))
-    if m:
-        return float(m.group(1))
     if _VOLUME_ONLY.search(stem):
         return None
     m = _LASTNUM.search(stem)
     return float(m.group(1)) if m else None
+
+
+def _chapter_marker(stem: str) -> re.Match | None:
+    """The chapter marker (_CHAPTER) that starts the chapter name: the last
+    one that stands right after a "_" or at the start (a volume allowed
+    between), else the first one; None without any. One glued to its number
+    ("Ch17") counts only where it starts the name: right after a "_", or at
+    the start of a name with no scanlator before a "_" after it."""
+    first = last = None
+    for m in _CHAPTER.finditer(stem):
+        at = _name_start(stem, m.start())
+        if stem[m.start(1) - 1].isalpha() and not (
+                at is not None and (at > 0 or not _SCANLATOR_END.search(stem, m.end()))):
+            continue                    # "ep2 fans_Day 3": a scanlator's name, not a chapter marker
+        first = first or m
+        if at is not None:
+            last = m
+    return last or first
+
+
+def _name_start(stem: str, at: int) -> int | None:
+    """Where the chapter name starts when stem[at:] starts it (at most a
+    volume, "Vol.3 ", between): 0, the start of the stem, or right after a
+    "_" (the scanlator's separator). None when stem[at:] does not."""
+    v = _VOLUME_BEFORE.search(stem, max(0, at - _VOLUME_ROOM), at)
+    if v:
+        at = v.start()
+    return at if at == 0 or stem[at - 1] == "_" else None
 
 
 def parse_season(filename: str) -> tuple[int, float] | None:
@@ -98,12 +152,15 @@ def _real_dir(entry: os.DirEntry) -> bool:
         return False
 
 
-def scan_series_dir(path: str, dir_fd: int | None = None) -> tuple[dict[float, str], list[str]]:
+def scan_series_dir(path: str, dir_fd: int | None = None,
+                    doubled: list[str] | None = None) -> tuple[dict[float, str], list[str]]:
     """{chapter number: file path} for one series folder, plus the files
-    whose number could not be read. Duplicate numbers keep the first name.
-    Symlinks and anything that is not a regular file are skipped (logged).
-    With dir_fd (the folder, already open) the folder is listed through it
-    and plain file names come back; path is then only used in log lines."""
+    whose number could not be read. Duplicate numbers keep the first name
+    (the others go into `doubled`, when given, as (name, number, the name
+    that has it)). Symlinks and anything that
+    is not a regular file are skipped (logged). With dir_fd (the folder,
+    already open) the folder is listed through it and plain file names come
+    back; path is then only used in log lines."""
     found: dict[float, str] = {}
     unparsed: list[str] = []
     try:
@@ -126,6 +183,8 @@ def scan_series_dir(path: str, dir_fd: int | None = None) -> tuple[dict[float, s
             unparsed.append(key)
         elif n not in found:
             found[n] = key
+        elif doubled is not None:
+            doubled.append((key, n, found[n]))
     return found, unparsed
 
 
@@ -313,9 +372,9 @@ class StagingFolder:
             os.close(self.fd)
             self.fd = -1
 
-    def scan(self) -> tuple[dict[float, str], list[str]]:
+    def scan(self, doubled: list[str] | None = None) -> tuple[dict[float, str], list[str]]:
         """scan_series_dir, with file names as values."""
-        return scan_series_dir(self.path, dir_fd=self.fd)
+        return scan_series_dir(self.path, dir_fd=self.fd, doubled=doubled)
 
     def prune_quarantine(self) -> int:
         return prune_quarantine(self.path, QUARANTINE_DAYS, dir_fd=self.fd)
@@ -628,6 +687,30 @@ def verify_archive(src: str | StagedFile) -> tuple[bool | None, str]:
         return None, detail
     except Exception as e:      # zlib.error, NotImplementedError, RuntimeError (encrypted), EOFError ...
         return False, f"{type(e).__name__}: {e}"[:300]
+
+
+def page_count(path: str) -> int | None:
+    """How many pages (images) the chapter archive at `path` holds, from its
+    directory alone: nothing is decompressed, so it is cheap enough for the
+    chapters a verdict compares (stuck.py). None when it cannot be told: not
+    a regular file (never read through a symlink), not a zip, or a directory
+    too big for a chapter (the limits verify_archive checks first). Never
+    raises. The caller checks that the path is inside the library."""
+    try:
+        with open_staged(path) as f:
+            size = os.fstat(f.fd).st_size
+            if size < 1024:
+                return None
+            snap = _Snapshot(f.fd, size)
+            end = _end_records(snap)
+            if end is None or _directory_limits(snap, *end):
+                return None
+            with zipfile.ZipFile(snap) as z:
+                n = sum(1 for i in z.infolist() if i.filename.lower().endswith(_IMAGE_EXT))
+        return n or None
+    except Exception as e:          # OSError, zipfile.BadZipFile, struct.error ...
+        log.debug("cannot count the pages of %r: %s: %s", path[:300], type(e).__name__, e)
+        return None
 
 
 def _stored_bytes(fd: int, size: int) -> int:

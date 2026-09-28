@@ -16,6 +16,7 @@ import time
 from contextlib import contextmanager
 
 from . import config, library
+from .matching import oneline
 from .model import Series
 
 log = logging.getLogger(__name__)
@@ -182,11 +183,78 @@ MIGRATIONS = [
       PRIMARY KEY (manga_id, chapter_id)
     );
     """,
+    # 15: chapters a series is stuck behind (stuck.py): when a chapter's
+    #     failures began; per blocker the evidence (what the sites listing it
+    #     call it and their whole chapters with a side-story word, where it is
+    #     on them, which of them it failed on), dropped once it no longer
+    #     blocks; and apart from it what you (or the automatic skip) decided
+    #     about it, kept while it is not listed for a while too: only dropped
+    #     once it is on disk or gone for good
+    """
+    ALTER TABLE chapter ADD COLUMN failed_since TEXT;
+    CREATE TABLE stuck (
+      series_id       INTEGER NOT NULL REFERENCES series(id) ON DELETE CASCADE,
+      number          REAL NOT NULL,
+      names           TEXT NOT NULL DEFAULT '{}',   -- JSON {source name: its title for the chapter there, or null}
+      seen            TEXT NOT NULL DEFAULT '{}',   -- JSON {source name: when a resolve last saw it list the chapter}
+      wholes          TEXT NOT NULL DEFAULT '{}',   -- JSON {source name: {number: name}}: its whole chapters with a
+                                                    --   side-story or extra word in their names (verdict.site_words)
+      urls            TEXT NOT NULL DEFAULT '{}',   -- JSON {source name: the chapter's page on that site ('': none)}
+      failed_on       TEXT NOT NULL DEFAULT '[]',   -- JSON [source names a download run failed it on]
+      updated_at      TEXT NOT NULL,
+      PRIMARY KEY (series_id, number)
+    );
+    CREATE TABLE stuck_choice (
+      series_id       INTEGER NOT NULL REFERENCES series(id) ON DELETE CASCADE,
+      number          REAL NOT NULL,
+      skipped         TEXT,                   -- 'manual' | 'auto' once skipped from a stuck note
+      skipped_state   TEXT,                   -- the chapter's state when it was skipped (JSON, stuck.state_of)
+      verdict         TEXT,                   -- the verdict's headline then
+      dismissed       TEXT,                   -- "Keep waiting": the chapter's state then (never skipped automatically)
+      declined        TEXT,                   -- when you un-skipped it or wanted it again: never skipped automatically
+      gone_since      TEXT,                   -- since when no site lists it (unavailable, junk): dropped after a while
+      updated_at      TEXT NOT NULL,
+      PRIMARY KEY (series_id, number)
+    );
+    """,
+    # 16: when each chapter was last listed, and by which sites (save_plan): a
+    #     chapter no site lists in one resolve is still waited for, and holds
+    #     the chapters after it in order, until none has listed it for a grace
+    #     period in which every site that had listed it answered (past_grace).
+    #     And since when the verdict on a chapter a series is stuck behind is
+    #     one the automatic skip may act on (stuck.py): never on the first
+    #     resolve that says so
+    """
+    ALTER TABLE chapter ADD COLUMN listed TEXT;               -- JSON {source name: [when it last listed it, its name]}
+    ALTER TABLE chapter ADD COLUMN listed_at TEXT;            -- when a resolve last saw any source list it
+    ALTER TABLE chapter ADD COLUMN unlisted INTEGER NOT NULL DEFAULT 0;   -- resolves in a row no source listed it in
+    ALTER TABLE chapter ADD COLUMN missed INTEGER NOT NULL DEFAULT 0;     -- ... of them the ones every source that
+                                                                          --   had listed it answered in
+    ALTER TABLE stuck ADD COLUMN high_since TEXT;
+    """,
+    # 17: one-time maintenance tasks an upgrade schedules, run once on the
+    #     next start (see maintenance_due): the check of the library links
+    #     0.3.0 made under misread chapter numbers (relink.py), for a
+    #     database that has library links (a new one has nothing to check)
+    """
+    CREATE TABLE IF NOT EXISTS maintenance (
+      name            TEXT PRIMARY KEY,       -- the task (relink.TASK)
+      due_at          TEXT NOT NULL,          -- when an upgrade scheduled it
+      done_at         TEXT                    -- when it last ran to the end; NULL: still due
+    );
+    INSERT OR IGNORE INTO maintenance (name, due_at) SELECT 'check-library-links', datetime('now', 'localtime')
+      WHERE EXISTS (SELECT 1 FROM chapter WHERE status = 'have' AND library_path IS NOT NULL);
+    """,
 ]
 
 
 def now() -> str:
     return time.strftime("%Y-%m-%d %H:%M:%S")
+
+
+def ago(days: float) -> str:
+    """now() as it was `days` ago."""
+    return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(time.time() - days * 86400))
 
 
 def _statements(sql: str) -> list[str]:
@@ -230,6 +298,10 @@ def migrate(con: sqlite3.Connection, target: int | None = None) -> None:
                     con.execute(stmt)
                 if i == 3:
                     _backfill_folders(con)
+                if i == 15:
+                    _backfill_failed_since(con)
+                if i == 16:
+                    _backfill_listing(con)
                 con.execute(f"PRAGMA user_version = {i}")
                 con.commit()
             except BaseException as e:
@@ -246,6 +318,70 @@ def _backfill_folders(con) -> None:
         folder = library.unique_folder(r[2], taken, r[1])
         taken.add(folder)
         con.execute("UPDATE series SET folder=? WHERE id=?", (folder, r[0]))
+
+
+def _backfill_failed_since(con) -> None:
+    """failed_since of the chapters that failed before migration 15: the
+    first event naming the chapter among a download's failures ("ch 7.2:
+    ...") or as a failed chapter search ("chapter 7.2: ..."), and at the
+    latest its last update. Events are pruned after a while, so for an old
+    failure this is the oldest one still recorded."""
+    for r in con.execute("SELECT series_id, number, updated_at FROM chapter WHERE status='failed'").fetchall():
+        n = f"{r[1]:g}"
+        first = con.execute("SELECT MIN(at) FROM event WHERE series_id=? AND kind IN ('downloaded','failed') AND"
+                            " (message LIKE ? OR message LIKE ? OR message LIKE ?)",
+                            (r[0], f"%: ch {n}: %", f"%; ch {n}: %", f"chapter {n}: %")).fetchone()[0]
+        con.execute("UPDATE chapter SET failed_since=? WHERE series_id=? AND number=?",
+                    (min((x for x in (first, r[2]) if x), default=None), r[0], r[1]))
+
+
+def _backfill_listing(con) -> None:
+    """What migration 16 knows of the chapters' listings: a wanted or failed
+    chapter was listed by its source at the last resolve of its series (an
+    ignored or junk one at its last update); an unavailable one was listed
+    until it became unavailable, and one that did within the last
+    UNREACHABLE_KEEP_DAYS (perhaps a single resolve that missed it) gets
+    its grace from then (past_grace), an older one none. A chapter a series
+    is stuck behind takes the sites and names its stuck row has seen."""
+    cutoff = ago(UNREACHABLE_KEEP_DAYS)
+    rows = con.execute("SELECT c.series_id, c.number, c.status, c.name, c.source_name, c.updated_at,"
+                       " s.last_resolved, k.names, k.seen FROM chapter c JOIN series s ON s.id=c.series_id"
+                       " LEFT JOIN stuck k ON k.series_id=c.series_id AND k.number=c.number"
+                       " WHERE c.status != 'have'").fetchall()
+    for sid, n, status, name, source, updated, resolved, names, seen in rows:
+        gone = status == "unavailable"
+        when = (updated if gone else resolved if status in ("wanted", "failed") and resolved else updated) or now()
+        sites = {source: [when, name]} if isinstance(source, str) and source else {}
+        try:
+            names, seen = json.loads(names or "{}"), json.loads(seen or "{}")
+        except ValueError:
+            names, seen = {}, {}
+        if isinstance(names, dict) and isinstance(seen, dict):
+            sites.update((k, [seen[k] if isinstance(seen.get(k), str) else when, v]) for k, v in names.items()
+                         if isinstance(k, str) and (v is None or isinstance(v, str)))
+        listed = json.dumps(sites) if sites else None
+        missed = (1 if when >= cutoff else LISTING_GRACE_RESOLVES) if gone else 0
+        con.execute("UPDATE chapter SET listed=?, listed_at=?, unlisted=?, missed=? WHERE series_id=? AND number=?",
+                    (listed, when, int(gone), missed, sid, n))
+
+
+def maintenance_due(con) -> set[str]:
+    """The one-time tasks an upgrade scheduled (migration 17) that have not
+    run to the end yet."""
+    return {r[0] for r in con.execute("SELECT name FROM maintenance WHERE done_at IS NULL")}
+
+
+def maintenance_done(con, name: str) -> None:
+    """A one-time task (or the same task run by hand) ran to the end."""
+    con.execute("INSERT INTO maintenance (name, due_at, done_at) VALUES (?,?,?)"
+                " ON CONFLICT(name) DO UPDATE SET done_at=excluded.done_at", (name, now(), now()))
+
+
+def maintenance_due_again(con, name: str) -> None:
+    """A task that could not do all of its work (a service it needs did not
+    answer) is due again: the next start or pass runs it (maintenance_due)."""
+    con.execute("INSERT INTO maintenance (name, due_at) VALUES (?,?)"
+                " ON CONFLICT(name) DO UPDATE SET done_at=NULL", (name, now()))
 
 
 def valid_folder(folder) -> bool:
@@ -449,16 +585,36 @@ def set_monitored(con, series_id: int, monitored: bool) -> None:
     event(con, "monitor", "monitored" if monitored else "unmonitored", series_id)
 
 
-def chapters_due(con) -> dict[int, int]:
+def chapters_due(con, in_order: bool = False) -> dict[int, int]:
     """Per series id, how many of its chapters a download would fetch now,
-    as core._due picks them: wanted ones, and failed ones whose next attempt
-    is due. In order too: a failed chapter waiting for its next attempt
-    holds up the later ones only within the pass that failed it."""
-    now_, out = now(), {}
-    for r in con.execute("SELECT series_id, status, next_try FROM chapter WHERE status IN ('wanted','failed')"):
-        if r["status"] == "wanted" or not r["next_try"] or r["next_try"] <= now_:
-            out[r["series_id"]] = out.get(r["series_id"], 0) + 1
+    as core._due picks them: wanted ones the last resolve listed, and failed
+    ones whose next attempt is due. In order (strict download in order) only
+    those before the first chapter that holds the series (holds_in_order):
+    the later ones wait for it (core.hold_in_order)."""
+    now_, out, held = now(), {}, set()
+    for r in con.execute("SELECT series_id, status, next_try, unlisted, missed, listed_at FROM chapter"
+                         " WHERE status IN ('wanted','failed','unavailable') ORDER BY series_id, number"):
+        sid = r["series_id"]
+        if sid in held:
+            continue
+        if in_order and holds_in_order(r, not r["unlisted"], now_):
+            held.add(sid)
+        elif r["status"] != "unavailable" and not r["unlisted"] and \
+                (r["status"] == "wanted" or not r["next_try"] or r["next_try"] <= now_):
+            out[sid] = out.get(sid, 0) + 1
     return out
+
+
+def holds_in_order(row, listed: bool, now_: str | None = None) -> bool:
+    """Whether a chapter (its row) holds the later chapters of its series
+    with strict download in order, being neither on disk nor ignored: it
+    failed and waits for its next attempt, or no source listed it in the
+    last resolve (`listed`) and its grace is not over (past_grace)."""
+    if row["status"] not in ("wanted", "failed", "unavailable"):
+        return False
+    if not listed:
+        return not past_grace(row)
+    return row["status"] == "failed" and bool(row["next_try"]) and row["next_try"] > (now_ or now())
 
 
 def wanted_all(con):
@@ -490,6 +646,94 @@ def events(con, limit: int = 50):
 # -- plan / chapters ---------------------------------------------------------
 
 UNREACHABLE_KEEP_DAYS = 7       # how long a source that cannot be searched keeps its entry (see save_plan)
+# A chapter no source lists in a resolve is not taken for gone at once: the
+# source may not have answered, or its search missed the series this time.
+# It stays wanted (or failed) and holds the chapters after it in strict order
+# until no source has listed it for LISTING_GRACE_RESOLVES resolves in a row
+# and LISTING_GRACE_DAYS; a resolve in which a source that listed it in the
+# last LISTING_KEEP_DAYS did not answer, or did not match the series, does
+# not count (past_grace). Only then is it 'unavailable'.
+#
+# A fractional chapter whose copy on every site is too short to be the
+# chapter (resolver._prune_junk) is junk; but not while a site that listed it
+# in the last LISTING_KEEP_DAYS, with a copy not known to be short, did not
+# answer: that site may still have it at full length (void_junk). It is
+# waited for then like a chapter no site listed.
+LISTING_GRACE_RESOLVES = 3
+LISTING_GRACE_DAYS = 2
+LISTING_KEEP_DAYS = UNREACHABLE_KEEP_DAYS
+MAX_LISTED = 12                 # sources a chapter's listing keeps
+MAX_LISTED_NAME = 200
+UNLISTED_NOTE = "not listed by {} in the last check; still waiting for it"
+
+
+def past_grace(row) -> bool:
+    """Whether a chapter (its row) has not been listed for long enough to
+    count as gone: LISTING_GRACE_RESOLVES counted resolves in a row and
+    LISTING_GRACE_DAYS since a source last listed it."""
+    return (row["missed"] or 0) >= LISTING_GRACE_RESOLVES and (row["listed_at"] or "") < ago(LISTING_GRACE_DAYS)
+
+
+def listed_by(row, days: float = LISTING_KEEP_DAYS) -> dict:
+    """{source name: [when it last listed the chapter, its name there]} of
+    the sources that listed it within `days`, from its row; most recent
+    first. An entry has a third item, True, when that source's copy was not
+    the chapter then (short_copy). A row no resolve has written this for
+    (one made another way) has its own source, as of its last update."""
+    keys = row.keys()
+    if row["listed"] is None:
+        source = row["source_name"] if "source_name" in keys else None
+        when = row["listed_at"] or (row["updated_at"] if "updated_at" in keys else None)
+        got = {source: [when, row["name"] if "name" in keys else None]} if source and when else {}
+    else:
+        try:
+            got = json.loads(row["listed"])
+        except (TypeError, ValueError):
+            return {}
+        if not isinstance(got, dict):
+            return {}
+    cutoff = ago(days)
+    out = {k: v for k, v in got.items() if isinstance(k, str) and isinstance(v, list) and len(v) in (2, 3)
+           and isinstance(v[0], str) and v[0] >= cutoff and (v[1] is None or isinstance(v[1], str))
+           and (len(v) == 2 or v[2] is True)}
+    return dict(sorted(out.items(), key=lambda kv: kv[1][0], reverse=True))
+
+
+def short_copy(entry) -> bool:
+    """Whether a listed_by entry says that source's copy was not the chapter
+    when it last listed it: counted shorter than min_pages, or not countable
+    in a chapter every other copy of which was short (plan.short)."""
+    return len(entry) == 3 and entry[2] is True
+
+
+def unlisted_note(row) -> str:
+    """The reason of a chapter no source listed in the last resolve (or only
+    as a copy too short to be it) that is still waited for (UNLISTED_NOTE),
+    naming the sources that listed it, those with a copy that may be the
+    chapter first."""
+    got = listed_by(row)
+    sites = ([k for k, v in got.items() if not short_copy(v)] or list(got))[:3] or \
+        ([row["source_name"]] if row["source_name"] else ["any source"])
+    return UNLISTED_NOTE.format(" or ".join(oneline(k, 60) for k in sites))
+
+
+def with_listing_note(row, reason: str) -> str:
+    """`reason` for a chapter (its row), which when no source listed it in
+    the last resolve and it is still waited for also says so, as the
+    resolve left it (unlisted_note; never the part cut off)."""
+    if row["unlisted"] and row["status"] in ("wanted", "failed") and not past_grace(row):
+        return _with_note(reason, unlisted_note(row))
+    return reason[:300]
+
+
+def _with_note(reason: str | None, note: str, limit: int = 300) -> str:
+    """A failed chapter's reason (without the unlisted note an earlier
+    resolve added) and then `note`, within `limit` characters: the note is
+    never the part cut off."""
+    cut = (reason or "").find("; not listed by ")
+    base = (reason or "")[:cut] if cut >= 0 else (reason or "")
+    room = limit - len(note) - 2
+    return (base if len(base) <= room else base[:max(room - 1, 0)] + "…") + "; " + note
 
 
 def save_plan(con, series_id: int, plan, primary_manga_id: int | None) -> list[str]:
@@ -517,6 +761,7 @@ def save_plan(con, series_id: int, plan, primary_manga_id: int | None) -> list[s
             " VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
             (series_id, m.manga_id, m.source.name, m.title, m.author, m.match, m.author_ok,
              len(m.chapters), m.max, m.note or None, int(m.manga_id == primary_manga_id), now()))
+    void_junk(con, series_id, plan)
     rows = {r["number"]: r for r in con.execute(
         "SELECT number, status, library_path, next_try, source_name FROM chapter WHERE series_id=?", (series_id,))}
     keep = {"have", "ignored"}
@@ -539,7 +784,9 @@ def save_plan(con, series_id: int, plan, primary_manga_id: int | None) -> list[s
             " manga_id=excluded.manga_id, source_name=excluded.source_name, updated_at=excluded.updated_at",
             (series_id, n, "wanted", m.manga_id, m.source.name, reason, now()))
     for n, (m, pages) in plan.junk.items():
-        reason = f"{pages} page(s) on {m.source.name}: a notice image, not a chapter"
+        others = [k for k in (getattr(plan, "short", None) or {}).get(n, {}) if k != m.source.name]
+        reason = f"{pages} page(s) on {m.source.name}" + (f" (no full copy on {', '.join(others[:3])} either)" if
+                                                          others else "") + ": a notice image, not a chapter"
         con.execute(
             "INSERT INTO chapter (series_id, number, status, manga_id, source_name, pages, reason, updated_at)"
             " VALUES (?,?,?,?,?,?,?,?)"
@@ -560,36 +807,122 @@ def save_plan(con, series_id: int, plan, primary_manga_id: int | None) -> list[s
         if ch and (ch.name or ch.uploaded):
             con.execute("UPDATE chapter SET name=COALESCE(?, name), uploaded=COALESCE(?, uploaded)"
                         " WHERE series_id=? AND number=?", (ch.name, ch.uploaded, series_id, n))
-    # a chapter that was wanted but that no trusted source lists any more is
-    # not wanted, it is unavailable - it comes back if a source lists it again
-    still = set(plan.assignment) | set(plan.junk)
-    for n, prev in rows.items():
-        if prev["status"] in ("wanted", "failed") and n not in still and prev["source_name"] not in down:
-            con.execute("UPDATE chapter SET status='unavailable', reason=?, updated_at=?"
-                        " WHERE series_id=? AND number=?",
-                        ("no trusted source lists this chapter any more", now(), series_id, n))
+    _save_listing(con, series_id, plan)
     con.execute("UPDATE series SET last_resolved=?, last_error=NULL WHERE id=?", (now(), series_id))
     return expired
 
 
+def void_junk(con, series_id: int, plan) -> None:
+    """The chapters the resolve found junk (no copy it saw is the chapter)
+    that a site listed in the last LISTING_KEEP_DAYS with a copy not known
+    to be short, which did not answer this time or whose search missed the
+    series: it may still have the chapter at full length. Such a chapter is
+    not junk this time: it is taken out of plan.junk (plan.voided names the
+    sites) and waited for like a chapter no site listed (_save_listing,
+    core.hold_in_order), until that site answers or its listing is too old
+    to count. One you skipped or ignored too: you may take it back in this
+    very pass (stuck.update does, when it changes), and it must then hold
+    the chapters after it like any chapter still waited for."""
+    junk = getattr(plan, "junk", None)
+    if not junk:
+        return
+    answered = {m.source.name for m in plan.matches if m.usable}
+    rows = chapters_by_number(con, series_id, list(junk))
+    for n in list(junk):
+        r = rows.get(n)
+        if r is None or r["status"] == "have":
+            continue
+        silent = [k for k, v in listed_by(r).items() if k not in answered and not short_copy(v)]
+        if silent:
+            del junk[n]
+            plan.voided[n] = silent
+            log.info("ch %g: every copy listed now is short, but %s may still have it; waiting for %s",
+                     n, " or ".join(silent[:3]), "it" if len(silent) == 1 else "them")
+
+
+def _save_listing(con, series_id: int, plan) -> None:
+    """Which sources list each chapter that is not on disk (every one that
+    answered and lists it, whatever its copy is: a short one is kept with
+    its mark, short_copy), and since when none does (see past_grace). A
+    chapter no source lists now, or only with copies too short to be it
+    while another may still have it (plan.voided), is still wanted (a
+    failed one stays failed), its reason says so, until its grace is over;
+    then it is unavailable. It comes back when a source lists it again."""
+    stamp = now()
+    answered = {m.source.name for m in plan.matches if m.usable}
+    short = getattr(plan, "short", None) or {}
+    voided = getattr(plan, "voided", None) or {}
+    listing: dict[float, dict[str, list]] = {}
+    index: dict[int, dict] = {}
+    whole = plan.listing() if callable(getattr(plan, "listing", None)) else \
+        {**{n: list(ms) for n, ms in plan.candidates.items()}, **{n: [m] for n, (m, _) in plan.junk.items()}}
+    for n, ms in whole.items():
+        for m in ms:
+            chapters = index.get(id(m))
+            if chapters is None:
+                chapters = index[id(m)] = {}
+                for c in m.chapters:
+                    chapters.setdefault(c.number, c)
+            c = chapters.get(n)
+            name = oneline(c.name, MAX_LISTED_NAME) if c is not None and isinstance(c.name, str) and c.name else None
+            listing.setdefault(n, {}).setdefault(m.source.name, [stamp, name] + ([True] if m.source.name in
+                                                                                  short.get(n, ()) else []))
+    writes = []
+    for r in con.execute("SELECT * FROM chapter WHERE series_id=? AND status != 'have'", (series_id,)).fetchall():
+        n, status, reason = r["number"], r["status"], r["reason"]
+        kept = listed_by(r)
+        now_listing = listing.get(n)
+        sites = dict(now_listing or {})
+        sites.update((k, v) for k, v in kept.items() if k not in sites)
+        held = n in voided
+        if now_listing and not held:
+            listed_at, unlisted, missed = stamp, 0, 0
+        elif held:                          # listed, if only as a copy too short to be it: its grace starts again,
+            listed_at, unlisted, missed = stamp, (r["unlisted"] or 0) + 1, 0    # but it is not listed in full
+        else:
+            listed_at, unlisted = r["listed_at"], (r["unlisted"] or 0) + 1
+            # counts toward its grace only when every source that listed it answered, and did not list it
+            missed = (r["missed"] or 0) + (not any(k not in answered for k in kept))
+        sites = dict(list(sites.items())[:MAX_LISTED])
+        if (not now_listing or held) and (status in ("wanted", "failed", "unavailable") or
+                                          (held and status == "junk")):
+            row = {**dict(r), "listed": json.dumps(sites), "listed_at": listed_at, "missed": missed}
+            if past_grace(row):
+                status, reason = "unavailable", "no trusted source lists this chapter any more"
+            elif status == "failed":
+                reason = _with_note(reason, unlisted_note(row))
+            else:
+                status, reason = "wanted", unlisted_note(row)
+        changed = status != r["status"] or reason != r["reason"]
+        writes.append((json.dumps(sites), listed_at, unlisted, missed, status, reason, r["updated_at"] if not changed
+                       else stamp, series_id, n))
+    con.executemany("UPDATE chapter SET listed=?, listed_at=?, unlisted=?, missed=?, status=?, reason=?, updated_at=?"
+                    " WHERE series_id=? AND number=?", writes)
+
+
 def set_have(con, series_id: int, number: float, staging_path: str | None,
-             library_path: str | None, source_name: str | None = None) -> None:
+             library_path: str | None, source_name: str | None = None, pages: int | None = None) -> None:
+    """The chapter is on disk (pages: its page count, when it was counted)."""
     con.execute(
-        "INSERT INTO chapter (series_id, number, status, source_name, staging_path, library_path, updated_at)"
-        " VALUES (?,?,'have',?,?,?,?)"
-        " ON CONFLICT(series_id, number) DO UPDATE SET status='have', reason=NULL,"
+        "INSERT INTO chapter (series_id, number, status, source_name, staging_path, library_path, pages, updated_at)"
+        " VALUES (?,?,'have',?,?,?,?,?)"
+        " ON CONFLICT(series_id, number) DO UPDATE SET status='have', reason=NULL, failed_since=NULL,"
         " staging_path=COALESCE(excluded.staging_path, chapter.staging_path),"
         " library_path=COALESCE(excluded.library_path, chapter.library_path),"
-        " source_name=COALESCE(excluded.source_name, chapter.source_name), updated_at=excluded.updated_at",
-        (series_id, number, source_name, staging_path, library_path, now()))
+        " source_name=COALESCE(excluded.source_name, chapter.source_name),"
+        " pages=COALESCE(excluded.pages, chapter.pages), updated_at=excluded.updated_at",
+        (series_id, number, source_name, staging_path, library_path, pages, now()))
 
 
 def set_reason(con, series_id: int, number: float, reason: str) -> bool:
     """Say why a chapter is where it is without changing its status (a
-    downloaded file that could not be checked in time). A chapter the
-    library has is left alone. Returns whether a row changed."""
-    cur = con.execute("UPDATE chapter SET reason=?, updated_at=? WHERE series_id=? AND number=? AND status != 'have'",
-                      (reason[:300], now(), series_id, number))
+    downloaded file that could not be checked in time, or not linked). A
+    chapter the library has, one you ignored and a junk one are left alone,
+    and so is a reason that says it already. Returns whether a row
+    changed."""
+    cur = con.execute("UPDATE chapter SET reason=?, updated_at=? WHERE series_id=? AND number=? AND status IN"
+                      " ('wanted','failed','unavailable') AND reason IS NOT ?",
+                      (reason[:300], now(), series_id, number, reason[:300]))
     return cur.rowcount > 0
 
 
@@ -599,8 +932,9 @@ RETRY_HOURS = (0, 24, 72, 168)      # after the 1st failure: next pass; then 1 d
 def set_status(con, series_id: int, number: float, status: str, reason: str | None = None,
                only_from: tuple[str, ...] | None = None) -> bool:
     """Change a chapter's status with a reason (cleared for have). A failure
-    bumps the try count and schedules the next attempt further out each time;
-    success or a fresh 'wanted' resets the schedule. With only_from, the row
+    bumps the try count and schedules the next attempt further out each time
+    (failed_since keeps when the first of these failures was); success or a
+    fresh 'wanted' resets the schedule. With only_from, the row
     changes only if its current status is one of those (so a background job
     never overwrites what the user set meanwhile, e.g. 'ignored'). Returns
     whether a row changed."""
@@ -617,15 +951,31 @@ def set_status(con, series_id: int, number: float, status: str, reason: str | No
         next_try = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(time.time() + hours * 3600))
         if hours:
             reason = f"{reason or 'download failed'} (failed {tries}x; next attempt after {next_try[:16]})"
-        cur = con.execute("UPDATE chapter SET status='failed', reason=?, tries=?, next_try=?, updated_at=?"
+        stamp = now()
+        cur = con.execute("UPDATE chapter SET status='failed', reason=?, tries=?, next_try=?, updated_at=?,"
+                          " failed_since=CASE WHEN ? = 1 OR failed_since IS NULL THEN ? ELSE failed_since END"
                           " WHERE series_id=? AND number=?" + guard,
-                          ((reason or None) and reason[:300], tries, next_try if hours else None, now(), series_id,
-                           number, *gargs))
+                          ((reason or None) and reason[:300], tries, next_try if hours else None, stamp, tries, stamp,
+                           series_id, number, *gargs))
         return cur.rowcount > 0
-    reset = ", tries=0, next_try=NULL" if status in ("have", "wanted") else ""
+    reset = ", tries=0, next_try=NULL, failed_since=NULL" if status in ("have", "wanted") else ""
     cur = con.execute(f"UPDATE chapter SET status=?, reason=?, updated_at=?{reset} WHERE series_id=? AND number=?"
                       + guard, (status, (reason or None) and reason[:300], now(), series_id, number, *gargs))
     return cur.rowcount > 0
+
+
+def want_again(con, series_id: int, number: float, only_from: tuple[str, ...] | None = None) -> bool:
+    """Make a chapter (an ignored one: Un-skip, Want) wanted again, as the
+    last resolve left it: one no source listed then is still waited for
+    (its reason says so), or unavailable once its grace is over
+    (past_grace). Returns whether a row changed."""
+    row = con.execute("SELECT * FROM chapter WHERE series_id=? AND number=?", (series_id, number)).fetchone()
+    if row is None or not row["unlisted"]:
+        return set_status(con, series_id, number, "wanted", None, only_from=only_from)
+    if past_grace(row):
+        return set_status(con, series_id, number, "unavailable", "no trusted source lists this chapter any more",
+                          only_from=only_from)
+    return set_status(con, series_id, number, "wanted", unlisted_note(row), only_from=only_from)
 
 
 def chapters(con, series_id: int, limit: int | None = None, offset: int = 0):

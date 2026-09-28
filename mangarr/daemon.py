@@ -4,7 +4,7 @@ import logging
 import signal
 import time
 
-from . import config, core, db, downloader, limits, notify
+from . import config, core, db, downloader, limits, notify, relink, stuck
 from .suwayomi import BREAKER_SECS, Client, SuwayomiError, SuwayomiUnreachable
 
 log = logging.getLogger(__name__)
@@ -74,10 +74,16 @@ def run(interval_hours: float = config.REFRESH_HOURS, once: bool = False) -> Non
     signal.signal(signal.SIGTERM, _handle_stop)
     signal.signal(signal.SIGINT, _handle_stop)
     client = Client()
+    stuck.fetcher.start()               # MangaDex lookups for the chapters series are stuck behind
     interval_hours = limits.clamp("refresh_hours", interval_hours)
     log.info("worker started: refresh every %.1fh, suwayomi at %s", interval_hours, config.SUWAYOMI_URL)
     while not _stop:
         started = time.monotonic()
+        try:
+            # once after an upgrade that scheduled it; again before each cycle while Suwayomi did not answer it
+            relink.run_if_due(client, should_cancel=lambda: _stop)
+        except Exception:
+            log.exception("library link check failed; it runs again before the next cycle")
         try:
             cycle(client)
         except Exception:

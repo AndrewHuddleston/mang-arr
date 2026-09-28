@@ -255,9 +255,7 @@ class CompleteSeriesTest(PipelineBase):
 
 
 class DueFirstTest(PipelineBase):
-    def test_a_series_whose_first_missing_chapter_waits_for_its_retry_still_goes_first(self):
-        # in order, ch 1 failed and waits for its next try; the pass still fetches 2 and 3, so the
-        # series has chapters due and goes before a continuing series with nothing due
+    def scenario(self, in_order: bool):
         fake = self.fake()
         plans = {"A continuing": [entry(fake, Y, 1, "A continuing", [1])],
                  "B held": [entry(fake, X, 2, "B held", [1, 2, 3])]}
@@ -266,20 +264,35 @@ class DueFirstTest(PipelineBase):
             b = db.upsert_series(con, Series(english="B held", status="FINISHED"))
             con.execute("INSERT INTO chapter (series_id, number, status, updated_at) VALUES (?, 1, 'have', ?)",
                         (a, db.now()))
-            con.execute("INSERT INTO chapter (series_id, number, status, next_try, reason, updated_at) VALUES"
-                        " (?, 1, 'failed', '2999-01-01 00:00:00', 'broken', ?)", (b, db.now()))
+            con.execute("INSERT INTO chapter (series_id, number, status, tries, next_try, reason, updated_at) VALUES"
+                        " (?, 1, 'failed', 2, '2999-01-01 00:00:00', 'broken', ?)", (b, db.now()))
             for n in (2, 3):
                 con.execute("INSERT INTO chapter (series_id, number, status, updated_at) VALUES (?, ?, 'wanted', ?)",
                             (b, n, db.now()))
             con.commit()
-            settings.set_many(con, {"download_in_order": True})
+            settings.set_many(con, {"download_in_order": in_order})
         settings._cache.clear()
         job = jobs.Job(1, "refresh-all", "all")
         with mock.patch.object(web, "client", fake), mock.patch.object(core, "resolve", resolver_for(fake, plans)), \
                 self.assertLogs("mangarr.web.app", "INFO") as cm:
             web._job_refresh_all(job)
+        return job, "\n".join(cm.output), b
+
+    def test_in_order_the_chapters_after_one_waiting_for_its_retry_wait_too(self):
+        # ch 1 failed and waits for its next try: 2 and 3 wait for it (no gap), so the series has nothing
+        # due and goes after a continuing one; the pass says why
+        job, log, b = self.scenario(in_order=True)
+        self.assertEqual([i["title"] for i in job.items], ["A continuing", "B held"])
+        self.assertIn("refresh pass: 2 series (0 with chapters due first, then 1 continuing)", log)
+        st = self.status(b)
+        self.assertEqual({n: s for n, (s, _) in st.items()}, {1.0: "failed", 2.0: "wanted", 3.0: "wanted"})
+        self.assertEqual(st[2.0][1], downloader.waiting_reason(1.0))
+        self.assertIn("2 later chapter(s) wait for ch 1 (strict download in order)", job.items[1]["result"])
+
+    def test_without_order_the_later_chapters_are_fetched_first(self):
+        job, log, b = self.scenario(in_order=False)
         self.assertEqual([i["title"] for i in job.items], ["B held", "A continuing"])
-        self.assertIn("refresh pass: 2 series (1 with chapters due first, then 1 continuing)", "\n".join(cm.output))
+        self.assertIn("refresh pass: 2 series (1 with chapters due first, then 1 continuing)", log)
         self.assertEqual({n: st for n, (st, _) in self.status(b).items()}, {1.0: "failed", 2.0: "have", 3.0: "have"})
 
 
@@ -492,12 +505,12 @@ class EndTest(PipelineBase):
                                             if t.name.startswith("mangarr-lane-")]))
             go.set()
 
-        def slow_import(con, sid, client=None):
+        def slow_import(con, sid, client=None, downloaded=None):
             if threading.current_thread().name.startswith("mangarr-lane-") and not importing.is_set():
                 importing.set()
                 threading.Timer(1.0, release).start()
                 go.wait(10)
-            return real_import(con, sid, client)
+            return real_import(con, sid, client, downloaded=downloaded)
 
         def resolve(client, series, **kw):
             if series.title == "S1":
