@@ -315,18 +315,23 @@ class StopTest(PipelineBase):
         return {f"S{k}": [entry(fake, sites[k - 1], k, f"S{k}", range(1, chapters + 1))] for k in range(1, n + 1)}
 
     def test_cancel_stops_every_lane(self):
-        fake = self.fake(secs=0.05)
+        """Cancelled once each of the 3 lanes is downloading a series of its own, not after a set number of
+        chapters: the resolve step may not have handed S2 or S3 over by then. The chapters of S1-S3 take 30 s,
+        so no lane is free for S4 before the cancel either, and the pass only ends at once if the cancel cuts
+        their downloads short."""
+        fake = self.fake(secs=0.05, source_secs={f"Site {k}": 30.0 for k in (1, 2, 3)})
         plans = self.many(fake, 4)
         rows = self.seed(*plans)
         job = jobs.Job(1, "refresh-all", "all")
-        seen, at = [], []
+        at = []
+        enqueue = fake.enqueue
 
-        def on_finish(f, cid):
-            seen.append(cid)
-            if len(seen) == 2:
-                at.append(time.perf_counter() - f.t0)
+        def queued(ids):
+            enqueue(ids)
+            if not at and {e[3] for e in fake.kinds("enqueue")} >= {1, 2, 3}:
+                at.append(time.perf_counter() - fake.t0)
                 job.cancel = True
-        fake.on_finish = on_finish
+        fake.enqueue = queued
         job, out = self.run_pass(fake, plans, rows, job=job)
         self.assertLess(self.took, 10)
         late = [e for e in fake.kinds("enqueue") if e[0] > at[0]]
