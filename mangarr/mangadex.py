@@ -231,6 +231,13 @@ class _Cache:
             self._d.move_to_end(key)
             return True, hit[1]
 
+    def left(self, key) -> float | None:
+        """Seconds until `key` expires, while it is cached; else None."""
+        with self._lock:
+            hit = self._d.get(key)
+            left = hit[0] - time.monotonic() if hit is not None else 0
+        return left if left > 0 else None
+
     def put(self, key, value, ttl: float) -> None:
         with self._lock:
             self._d[key] = (time.monotonic() + ttl, value)
@@ -381,6 +388,18 @@ def looked_up(s: Series, number: float) -> bool:
     if not math.isfinite(number) or s.manual:
         return True
     return _cache.get(("near", s.ref, math.floor(number)))[0]
+
+
+def failed_until(s: Series, number: float) -> float | None:
+    """While the failure of a lookup for this series and chapter is kept
+    (FAILED_TTL: english_chapters answers None without asking), when it may
+    be made again (a time.time()); None when no failure is kept."""
+    if not math.isfinite(number) or s.manual:
+        return None
+    key = ("near", s.ref, math.floor(number))
+    hit, value = _cache.get(key)
+    left = _cache.left(key) if hit and value is None else None
+    return time.time() + left if left is not None else None
 
 
 def english_chapters(s: Series, number: float, fetch: bool = True) -> ChapterList | None:

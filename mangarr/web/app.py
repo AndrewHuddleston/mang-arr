@@ -1045,8 +1045,8 @@ def _keep_waiting(series_id: int, number: float) -> tuple[bool, str]:
         if not db.get_series(con, series_id):
             raise HTTPException(404, "no such series")
         if stuck.dismiss(con, series_id, number):
-            return True, (f"the series keeps waiting for chapter {number:g}: its note is folded, and it is not "
-                          "skipped automatically, until the chapter changes (another title, or another site lists it)")
+            return True, (f"the series keeps waiting for chapter {number:g}: its note is folded until the chapter "
+                          "changes (another title, or another site lists it), and it is never skipped automatically")
     return False, f"the series is not stuck behind chapter {number:g}"
 
 
@@ -1100,8 +1100,9 @@ def api_chapter_unskip(series_id: int, number: float):
 
 @app.post("/api/v1/series/{series_id}/chapter/{number}/keep-waiting")
 def api_chapter_keep_waiting(series_id: int, number: float):
-    """Fold the stuck note on this chapter away, and keep the automatic skip
-    off it, until it changes. 409 when the series is not stuck behind it."""
+    """Fold the stuck note on this chapter away until it changes, and keep
+    the automatic skip off it for good. 409 when the series is not stuck
+    behind it."""
     ok, msg = _keep_waiting(series_id, number)
     if not ok:
         raise HTTPException(409, msg)

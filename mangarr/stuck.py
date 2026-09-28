@@ -9,29 +9,37 @@ passes left in the database, earlier ones too. For each blocker this module
 keeps what the verdict (verdict.py) needs, and does what the user or the
 automatic skip decides:
 
-  * evidence: what every source listing the chapter calls it and where it
-    is on their sites (the stuck table, from each resolve's plan: update();
+  * evidence: what every source listing the chapter calls it, which of
+    its whole chapters it names with a side-story or extra word (so a word
+    it gives every chapter is the series', not this one's) and where it is
+    on their sites (the stuck table, from each resolve's plan: update();
     a site missing from one resolve, which may just not have answered,
     keeps its name for KEEP_DAYS), the sites a download run failed it on
     (note_failures), and the page counts of the chapters it is compared
-    with (fill_pages)
+    with (fill_pages). Dropped once the chapter no longer blocks.
+  * decisions, kept apart from the evidence (the stuck_choice table): a
+    resolve whose only site listing the chapter missed it makes it
+    'unavailable' for a pass, and what you decided must outlast that. Kept
+    until the chapter is on disk, or no site has listed it for GONE_DAYS
+    (it is gone for good).
   * skip(): the chapter becomes 'ignored', so the later chapters go on at
     the next pass; unskip() makes it wanted again. A skip keeps the
     chapter's state (state_of: its name on each site), and one whose state
     changed is offered back on the series page: a site may have put a real
     chapter where a notice was. A chapter you un-skip (or want again) is
     never skipped automatically after that (declined)
-  * dismiss() ("Keep waiting"): the note is folded away and the automatic
-    skip leaves the chapter alone until its state changes
+  * dismiss() ("Keep waiting"): the note is folded away until the
+    chapter's state changes, and the automatic skip never takes it: you
+    chose to wait for it
   * automatic skip (Settings, off by default): only a blocker whose verdict
     is a HIGH-confidence side_story or covered (Verdict.auto_skip), that
     failed on every site listing it now (a site that has just started
-    listing it is tried first), and only once MangaDex's chapter list was
-    looked up for it (or cannot be: a manual series); never one you
+    listing it is tried first), and only with MangaDex's chapter list in
+    the verdict (or none to be had: a manual series); never one you
     declined or keep waiting for (why_not_auto). Logged, recorded as an
     event, shown on the series page and undone like any skip; one whose
     state changes is made wanted again by itself, as its verdict no longer
-    holds.
+    holds. When in doubt it does nothing, and the note says why.
 
 A pass never waits for MangaDex and neither does a page: both judge with
 what is cached (verdict.judge(fetch=False)). The Fetcher thread looks
@@ -49,7 +57,7 @@ from dataclasses import dataclass, field
 from . import config, db, downloader, library, limits, mangadex, settings, verdict
 from .matching import oneline
 from .model import Series
-from .suwayomi import SuwayomiError, SuwayomiUnreachable
+from .suwayomi import QueryError
 from .verdict import Verdict
 
 log = logging.getLogger(__name__)
@@ -61,6 +69,8 @@ MAX_URL = 2000
 URL_SITES = 3           # sites whose page for a blocker is looked up (the Open buttons)
 PAGES_NEAR = 15         # whole chapters nearest to N whose pages are counted for "the usual length"
 KEEP_DAYS = db.UNREACHABLE_KEEP_DAYS    # a site no resolve saw list the chapter for this long is dropped
+GONE_DAYS = KEEP_DAYS   # a decision on a chapter no site has listed for this long is dropped: it is gone for good
+GONE = ("junk", "unavailable")          # chapter statuses of one no site lists (as a chapter)
 SKIPPABLE = ("wanted", "failed", "unavailable")
 
 
@@ -79,10 +89,16 @@ class Stuck:
     names: dict = field(default_factory=dict)   # {source: its name for it there}; {} until a resolve saw it
     urls: dict = field(default_factory=dict)    # {source: its page on that site, '' when there is none}
     failed_on: list = field(default_factory=list)   # the sites a download run failed it on
-    dismissed: bool = False             # "Keep waiting", and its state has not changed since
+    wholes: dict = field(default_factory=dict)  # {source: {number: name}}: its whole chapters with a side-story word
+    keep_waiting: bool = False          # you chose "Keep waiting": never skipped automatically
+    dismissed: bool = False             # ... and its state has not changed since: the note is folded
     declined: bool = False              # you un-skipped it or wanted it again: never skipped automatically
     verdict: Verdict | None = None
     checking: bool = False              # MangaDex not looked up for it yet; the Fetcher is on it
+    # why MangaDex's chapter list is not in the verdict: 'pending' (not looked up yet) or 'failed' (MangaDex did
+    # not answer; asked again after md_retry, a time.time()); None when it is, or there is none (a manual series)
+    md_wait: str | None = None
+    md_retry: float | None = None
 
     @property
     def untried(self) -> list[str]:
@@ -96,8 +112,8 @@ class Stuck:
         return {"number": self.number, "waiting": self.waiting, "status": self.status, "name": self.name,
                 "reason": self.reason, "tries": self.tries, "failedSince": self.failed_since,
                 "sources": dict(self.names), "urls": {k: u for k, u in self.urls.items() if u},
-                "failedOn": list(self.failed_on), "dismissed": self.dismissed, "declined": self.declined,
-                "checkingMangaDex": self.checking,
+                "failedOn": list(self.failed_on), "dismissed": self.dismissed, "keepWaiting": self.keep_waiting,
+                "declined": self.declined, "checkingMangaDex": self.checking, "mangaDexWait": self.md_wait,
                 "verdict": None if v is None else {"kind": v.kind, "headline": v.headline, "confidence": v.confidence,
                                                    "evidence": list(v.evidence), "skippable": v.skippable,
                                                    "autoSkip": v.auto_skip}}
@@ -113,23 +129,26 @@ def _loads(text, default):
 
 def state_of(name: str | None, names: dict) -> dict:
     """What "the chapter's state" is for Keep waiting and for a skip: its
-    name in its row and on each site that lists it."""
+    name on each site that lists it, and the name in its row (which is
+    only compared while no resolve has seen which sites list it)."""
     return {"name": name, "names": dict(names)}
 
 
 def same_state(then: dict, now: dict) -> bool:
-    """Whether a state kept earlier still holds: the same name in its row,
-    and every site listing it now lists it under the name it had then. A
-    site that no longer lists it is no change (it may only not have
-    answered), nor are names on the sites that were not known on one side
-    (no resolve had seen the chapter yet); a new site, or a new name on
-    one, is."""
-    if then.get("name") != now.get("name"):
-        return False
+    """Whether a state kept earlier still holds: every site listing it now
+    lists it under the name it had then. A site that no longer lists it is
+    no change (it may only not have answered), and neither is the name in
+    its row, which save_plan copies from whichever site is assigned: two
+    sites that name it differently would flip it. A new site, or a new
+    name on one, is a change. When one side knows no site's name (no
+    resolve had seen the chapter yet), its row's name is compared: the
+    same, or one of the other side's site names, is no change."""
     was, now_names = then.get("names") or {}, now.get("names") or {}
-    if not was or not now_names:
-        return True
-    return all(src in was and was[src] == name for src, name in now_names.items())
+    if was and now_names:
+        return all(src in was and was[src] == name for src, name in now_names.items())
+    if was:
+        return now.get("name") == then.get("name") or now.get("name") in was.values()
+    return then.get("name") == now.get("name") or then.get("name") in now_names.values()
 
 
 def safe_url(url) -> str | None:
@@ -148,15 +167,19 @@ def safe_url(url) -> str | None:
 def why_not_auto(st: Stuck, v: Verdict | None) -> str | None:
     """Why the automatic skip leaves this blocker alone, or None when it may
     skip it: 'verdict' (not a HIGH side_story or covered one), 'declined'
-    (you un-skipped it or wanted it again), 'waiting' (Keep waiting),
-    'untried' (a site listing it has not been tried yet, or no resolve has
-    seen which sites list it)."""
+    (you un-skipped it or wanted it again), 'waiting' (you chose Keep
+    waiting), 'mangadex' (the verdict was made without MangaDex's chapter
+    list: not looked up yet, or MangaDex did not answer), 'untried' (a
+    site listing it has not been tried yet, or no resolve has seen which
+    sites list it)."""
     if v is None or not v.auto_skip:
         return "verdict"
     if st.declined:
         return "declined"
-    if st.dismissed:
+    if st.keep_waiting:
         return "waiting"
+    if st.md_wait:
+        return "mangadex"
     if not st.names or st.untried:
         return "untried"
     return None
@@ -182,29 +205,27 @@ def blockers(con, series_id: int | None = None) -> list[Stuck]:
         failed = {f"{r['number']:g}": r for r in con.execute(
             "SELECT * FROM chapter WHERE series_id=? AND status='failed'", (sid,))}
         stored = {r["number"]: r for r in con.execute("SELECT * FROM stuck WHERE series_id=?", (sid,))}
+        choices = {r["number"]: r for r in con.execute("SELECT * FROM stuck_choice WHERE series_id=?", (sid,))}
         for (s2, token), waiting in counts.items():
             row = failed.get(token) if s2 == sid else None
             if row is not None:
-                out.append(_stuck(row, waiting, stored.get(row["number"])))
+                st = Stuck(row["series_id"], row["number"], waiting, row["status"], row["name"], row["source_name"],
+                           row["reason"], row["tries"] or 0, row["failed_since"])
+                _stored(st, stored.get(row["number"]), choices.get(row["number"]))
+                out.append(st)
     return sorted(out, key=lambda st: (st.series_id, st.number))
 
 
-def _stuck(row, waiting: int, stored) -> Stuck:
-    st = Stuck(row["series_id"], row["number"], waiting, row["status"], row["name"], row["source_name"],
-               row["reason"], row["tries"] or 0, row["failed_since"])
-    if stored is not None:
-        _stored(st, stored)
-    return st
-
-
-def _stored(st: Stuck, stored) -> None:
-    """What the stuck row keeps of the blocker, onto it."""
-    st.names = _loads(stored["names"], {})
-    st.urls = _loads(stored["urls"], {})
-    st.failed_on = [k for k in _loads(stored["failed_on"], []) if isinstance(k, str)]
-    st.declined = bool(stored["declined"])
-    st.dismissed = bool(stored["dismissed"]) and same_state(_loads(stored["dismissed"], {}),
-                                                            state_of(st.name, st.names))
+def _stored(st: Stuck, stored, choice) -> None:
+    """What the stuck row (the evidence) and the stuck_choice row (the
+    decisions) keep of the blocker, onto it; None: nothing."""
+    st.names = _loads(stored["names"], {}) if stored is not None else {}
+    st.urls = _loads(stored["urls"], {}) if stored is not None else {}
+    st.failed_on = [k for k in _loads(stored["failed_on"], []) if isinstance(k, str)] if stored is not None else []
+    st.wholes = _loads(stored["wholes"], {}) if stored is not None else {}
+    st.declined = choice is not None and bool(choice["declined"])
+    st.keep_waiting = choice is not None and bool(choice["dismissed"])
+    st.dismissed = st.keep_waiting and same_state(_loads(choice["dismissed"], {}), state_of(st.name, st.names))
 
 
 def _chapters(con, ids) -> dict[int, list[verdict.Chapter]]:
@@ -232,7 +253,7 @@ def judge(series: Series, st: Stuck, chapters, md=_ASK) -> Verdict:
     or chapter rows), with what is cached of MangaDex only (never waits), or
     with this answer of MangaDex's (md; None: none)."""
     rows = [c if isinstance(c, verdict.Chapter) else verdict.Chapter.from_row(c) for c in chapters]
-    blocker = verdict.Blocker(st.number, dict(st.names), st.reason)
+    blocker = verdict.Blocker(st.number, dict(st.names), st.reason, dict(st.wholes))
     min_pages = int(settings.get("min_pages") or config.MIN_PAGES)
     if md is _ASK:
         return verdict.judge(series, blocker, rows, fetch=False, min_pages=min_pages)
@@ -276,9 +297,24 @@ def overview(con, fetch: bool = True, judged: bool = True) -> dict[int, list[Stu
 
 
 def _judge_now(series: Series, st: Stuck, rows, fetch: bool) -> None:
-    st.verdict = judge(series, st, rows)
-    if fetch and not mangadex.looked_up(series, st.number):
+    st.verdict = judge(series, st, rows, _mangadex(series, st))
+    if fetch and st.md_wait == "pending":
         st.checking = fetcher.request(st.series_id, series, st.number)
+
+
+def _mangadex(series: Series, st: Stuck):
+    """MangaDex's answer for the blocker, as cached (never waits): read once
+    for both the verdict and the automatic skip's check, so a lookup that
+    lands in between changes neither. Sets st.md_wait (and st.md_retry)
+    when there is none yet."""
+    md = mangadex.english_chapters(series, st.number, fetch=False)
+    st.md_wait = st.md_retry = None
+    if md is None and not series.manual and verdict._num(st.number) is not None:
+        if mangadex.looked_up(series, st.number):
+            st.md_wait, st.md_retry = "failed", mangadex.failed_until(series, st.number)
+        else:
+            st.md_wait = "pending"
+    return md
 
 
 def skipped(con, series_id: int) -> list[dict]:
@@ -287,9 +323,10 @@ def skipped(con, series_id: int) -> list[dict]:
     changed (its state is not what it was when it was skipped), names (on
     the sites now)}."""
     out = []
-    for r in con.execute("SELECT s.*, c.name AS chapter_name FROM stuck s JOIN chapter c ON c.series_id=s.series_id AND"
-                         " c.number=s.number WHERE s.series_id=? AND s.skipped IS NOT NULL AND c.status='ignored'"
-                         " ORDER BY s.number", (series_id,)):
+    for r in con.execute("SELECT k.*, c.name AS chapter_name, s.names AS names FROM stuck_choice k JOIN chapter c ON"
+                         " c.series_id=k.series_id AND c.number=k.number LEFT JOIN stuck s ON s.series_id=k.series_id"
+                         " AND s.number=k.number WHERE k.series_id=? AND k.skipped IS NOT NULL AND c.status='ignored'"
+                         " ORDER BY k.number", (series_id,)):
         names = _loads(r["names"], {})
         then = _loads(r["skipped_state"], {})
         out.append({"number": r["number"], "how": r["skipped"], "verdict": r["verdict"], "names": names,
@@ -335,11 +372,11 @@ def skip(con, series_id: int, number: float, how: str = "manual", v: Verdict | N
         msg = f"chapter {n} skipped" + (f" (verdict: {_lower_first(v.headline)})" if v is not None else "")
     if not db.set_status(con, series_id, number, "ignored", reason, only_from=SKIPPABLE):
         return False
-    con.execute("INSERT INTO stuck (series_id, number, names, skipped, skipped_state, verdict, updated_at)"
-                " VALUES (?,?,?,?,?,?,?) ON CONFLICT(series_id, number) DO UPDATE SET skipped=excluded.skipped,"
-                " skipped_state=excluded.skipped_state, verdict=excluded.verdict, dismissed=NULL,"
+    con.execute("INSERT INTO stuck_choice (series_id, number, skipped, skipped_state, verdict, updated_at)"
+                " VALUES (?,?,?,?,?,?) ON CONFLICT(series_id, number) DO UPDATE SET skipped=excluded.skipped,"
+                " skipped_state=excluded.skipped_state, verdict=excluded.verdict, dismissed=NULL, gone_since=NULL,"
                 " updated_at=excluded.updated_at",
-                (series_id, number, json.dumps(names), how, json.dumps(state_of(row["name"], names)),
+                (series_id, number, how, json.dumps(state_of(row["name"], names)),
                  v.headline if v is not None else None, db.now()))
     start, size = _waits_for(number)
     con.execute("UPDATE chapter SET reason=?, updated_at=? WHERE series_id=? AND status='wanted' AND"
@@ -353,12 +390,13 @@ def keep_skipped(con, series_id: int, number: float) -> bool:
     """A skipped chapter the sites list differently now stays skipped as it
     is: its state now is the one it is skipped in, so the series page stops
     offering it back. Returns whether it is one. Committed."""
-    r = con.execute("SELECT s.names, c.name FROM stuck s JOIN chapter c ON c.series_id=s.series_id AND"
-                    " c.number=s.number WHERE s.series_id=? AND s.number=? AND s.skipped IS NOT NULL AND"
-                    " c.status='ignored'", (series_id, number)).fetchone()
+    r = con.execute("SELECT s.names, c.name FROM stuck_choice k JOIN chapter c ON c.series_id=k.series_id AND"
+                    " c.number=k.number LEFT JOIN stuck s ON s.series_id=k.series_id AND s.number=k.number"
+                    " WHERE k.series_id=? AND k.number=? AND k.skipped IS NOT NULL AND c.status='ignored'",
+                    (series_id, number)).fetchone()
     if r is None:
         return False
-    con.execute("UPDATE stuck SET skipped_state=?, updated_at=? WHERE series_id=? AND number=?",
+    con.execute("UPDATE stuck_choice SET skipped_state=?, updated_at=? WHERE series_id=? AND number=?",
                 (json.dumps(state_of(r["name"], _loads(r["names"], {}))), db.now(), series_id, number))
     db.event(con, "skip", f"chapter {number:g} kept skipped, as it is listed now", series_id)
     con.commit()
@@ -384,23 +422,29 @@ def forget(con, series_id: int, number: float, declined: bool = True) -> None:
     """The chapter is wanted again (un-skipped, or its Want button): what
     its skip and Keep waiting kept no longer applies. declined: you wanted
     it, so it is never skipped automatically again (kept until the chapter
-    is on disk or gone)."""
-    con.execute("UPDATE stuck SET skipped=NULL, skipped_state=NULL, verdict=NULL, dismissed=NULL,"
-                " declined=CASE WHEN ? THEN ? ELSE declined END, updated_at=? WHERE series_id=? AND number=?",
-                (int(declined), db.now(), db.now(), series_id, number))
+    is on disk or gone for good)."""
+    if declined:
+        con.execute("INSERT INTO stuck_choice (series_id, number, declined, updated_at) VALUES (?,?,?,?)"
+                    " ON CONFLICT(series_id, number) DO UPDATE SET skipped=NULL, skipped_state=NULL, verdict=NULL,"
+                    " dismissed=NULL, declined=excluded.declined, gone_since=NULL, updated_at=excluded.updated_at",
+                    (series_id, number, db.now(), db.now()))
+    else:
+        con.execute("UPDATE stuck_choice SET skipped=NULL, skipped_state=NULL, verdict=NULL, dismissed=NULL,"
+                    " updated_at=? WHERE series_id=? AND number=?", (db.now(), series_id, number))
 
 
 def dismiss(con, series_id: int, number: float) -> bool:
-    """Keep waiting: fold the note on this blocker away, and keep the
-    automatic skip off it, until its state changes. Returns whether the
+    """Keep waiting: fold the note on this blocker away until its state
+    changes, and keep the automatic skip off it for good (until it is on
+    disk or gone for good): you chose to wait for it. Returns whether the
     series is stuck behind it. Committed."""
     st = next((b for b in blockers(con, series_id) if b.number == number), None)
     if st is None:
         return False
-    con.execute("INSERT INTO stuck (series_id, number, names, dismissed, updated_at) VALUES (?,?,?,?,?)"
-                " ON CONFLICT(series_id, number) DO UPDATE SET dismissed=excluded.dismissed,"
+    con.execute("INSERT INTO stuck_choice (series_id, number, dismissed, updated_at) VALUES (?,?,?,?)"
+                " ON CONFLICT(series_id, number) DO UPDATE SET dismissed=excluded.dismissed, gone_since=NULL,"
                 " updated_at=excluded.updated_at",
-                (series_id, number, json.dumps(st.names), json.dumps(state_of(st.name, st.names)), db.now()))
+                (series_id, number, json.dumps(state_of(st.name, st.names)), db.now()))
     con.commit()
     return True
 
@@ -467,23 +511,28 @@ def _merge(kept: dict, seen: dict, fresh: dict, now: str) -> tuple[dict, dict]:
 
 def _update(con, client, series_id: int, series: Series, plan, found: list[Stuck]) -> None:
     stored = {r["number"]: r for r in con.execute("SELECT * FROM stuck WHERE series_id=?", (series_id,))}
-    if not found and not stored:
+    choices = {r["number"]: r for r in con.execute("SELECT * FROM stuck_choice WHERE series_id=?", (series_id,))}
+    if not found and not stored and not choices:
         return                              # the common case: nothing to keep, nothing to judge
-    rows = db.chapters_by_number(con, series_id, list(stored))
+    rows = db.chapters_by_number(con, series_id, list({*stored, *choices}))
     candidates = getattr(plan, "candidates", None) or {}
     now = db.now()
-    evidence: dict[float, tuple[dict, dict, dict]] = {}      # number -> (names, seen, chapter ids)
-    for n in {st.number for st in found} | {n for n, r in stored.items() if r["skipped"]}:
-        fresh, ids = _names(candidates.get(n) or [], n)
+    evidence: dict[float, tuple[dict, dict, dict, dict]] = {}      # number -> (names, seen, wholes, chapter ids)
+    for n in {st.number for st in found} | {n for n, r in choices.items() if r["skipped"]}:
+        listing = candidates.get(n) or []
+        fresh, ids = _names(listing, n)
         if fresh:                           # a plan that no longer lists it keeps what was known
             r = stored.get(n)
             names, seen = _merge(_loads(r["names"], {}) if r is not None else {},
                                  _loads(r["seen"], {}) if r is not None else {}, fresh, now)
-            evidence[n] = (names, seen, ids)
+            kept = _loads(r["wholes"], {}) if r is not None else {}
+            wholes = {**{k: w for k, w in kept.items() if k in names and k not in fresh},
+                      **_wholes(listing, fresh, n, series)}
+            evidence[n] = (names, seen, wholes, ids)
     if con.in_transaction:
         con.commit()                        # no write is held across the lookups on Suwayomi
     urls = {}
-    for n, (names, _, ids) in evidence.items():
+    for n, (names, _, _, ids) in evidence.items():
         known = _loads(stored[n]["urls"], {}) if n in stored else {}
         urls[n] = {k: u for k, u in known.items() if k in names}
         for src in list(names)[:URL_SITES]:
@@ -491,18 +540,33 @@ def _update(con, client, series_id: int, series: Series, plan, found: list[Stuck
                 u = _url(client, ids[src], series)
                 if u is not None:           # None: Suwayomi did not answer; asked again next time
                     urls[n][src] = u
-    for n, (names, seen, _) in evidence.items():
-        con.execute("INSERT INTO stuck (series_id, number, names, seen, urls, updated_at) VALUES (?,?,?,?,?,?)"
-                    " ON CONFLICT(series_id, number) DO UPDATE SET names=excluded.names, seen=excluded.seen,"
-                    " urls=excluded.urls, updated_at=excluded.updated_at",
-                    (series_id, n, json.dumps(names), json.dumps(seen), json.dumps(urls[n]), now))
-    for n, r in stored.items():
+    for n, (names, seen, wholes, _) in evidence.items():
+        con.execute("INSERT INTO stuck (series_id, number, names, seen, wholes, urls, updated_at)"
+                    " VALUES (?,?,?,?,?,?,?) ON CONFLICT(series_id, number) DO UPDATE SET names=excluded.names,"
+                    " seen=excluded.seen, wholes=excluded.wholes, urls=excluded.urls, updated_at=excluded.updated_at",
+                    (series_id, n, json.dumps(names), json.dumps(seen), json.dumps(wholes), json.dumps(urls[n]), now))
+    # the evidence goes with the blocker; a decision only once the chapter is on disk or gone for good
+    for n in stored:
         c = rows.get(n)
-        if c is None or c["status"] in ("have", "junk", "unavailable") or (c["status"] == "ignored" and
-                                                                           not r["skipped"]):
+        skipped = n in choices and choices[n]["skipped"]
+        if c is None or c["status"] in ("have", *GONE) or (c["status"] == "ignored" and not skipped):
             con.execute("DELETE FROM stuck WHERE series_id=? AND number=?", (series_id, n))
+    cutoff = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(time.time() - GONE_DAYS * 86400))
+    for n, r in choices.items():
+        c = rows.get(n)
+        if c is not None and c["status"] == "have":
+            con.execute("DELETE FROM stuck_choice WHERE series_id=? AND number=?", (series_id, n))
+        elif c is None or c["status"] in GONE:
+            if not r["gone_since"]:         # not listed now: perhaps only for this resolve
+                con.execute("UPDATE stuck_choice SET gone_since=? WHERE series_id=? AND number=?", (now, series_id, n))
+            elif r["gone_since"] < cutoff:
+                con.execute("DELETE FROM stuck_choice WHERE series_id=? AND number=?", (series_id, n))
+                log.debug("%s: ch %g not listed since %s: what was decided about it is dropped",
+                          oneline(series.title, 80), n, r["gone_since"])
+        elif r["gone_since"]:
+            con.execute("UPDATE stuck_choice SET gone_since=NULL WHERE series_id=? AND number=?", (series_id, n))
     con.commit()
-    for n, r in stored.items():
+    for n, r in choices.items():
         c = rows.get(n)
         if r["skipped"] == "auto" and c is not None and c["status"] == "ignored" and n in evidence and \
                 not same_state(_loads(r["skipped_state"], {}), state_of(c["name"], evidence[n][0])):
@@ -514,6 +578,7 @@ def _update(con, client, series_id: int, series: Series, plan, found: list[Stuck
     for st in found:
         fill_pages(con, series_id, st.number)
     now_stored = {r["number"]: r for r in con.execute("SELECT * FROM stuck WHERE series_id=?", (series_id,))}
+    now_choices = {r["number"]: r for r in con.execute("SELECT * FROM stuck_choice WHERE series_id=?", (series_id,))}
     chapters = _chapters(con, [series_id])[series_id]
     current = {c.number: c for c in chapters}
     auto = bool(settings.get("auto_skip_side_stories") and settings.get("download_in_order"))
@@ -521,17 +586,12 @@ def _update(con, client, series_id: int, series: Series, plan, found: list[Stuck
         c = current.get(st.number)
         if c is not None:
             st.status, st.name = c.status, c.name
-        if st.number in now_stored:
-            _stored(st, now_stored[st.number])
-        # one answer of MangaDex's for the check and the verdict: a lookup that lands in between changes neither
-        md = mangadex.english_chapters(series, st.number, fetch=False)
-        if md is None and not mangadex.looked_up(series, st.number):
+        _stored(st, now_stored.get(st.number), now_choices.get(st.number))
+        md = _mangadex(series, st)
+        if st.md_wait == "pending":
             fetcher.request(series_id, series, st.number)
-            continue                        # automatic skipping waits for MangaDex's chapter list
         if not auto or st.status not in ("wanted", "failed"):
             continue
-        if md is None and not series.manual:
-            continue                        # MangaDex could not be asked: tried again later
         v = judge(series, st, chapters, md)
         why = why_not_auto(st, v)
         if why is not None:
@@ -561,25 +621,38 @@ def _names(candidates, number: float) -> tuple[dict, dict]:
     return names, ids
 
 
+def _wholes(candidates, names: dict, number: float, series: Series) -> dict:
+    """{source: {number (as text): name}} for the sources in names (this
+    resolve's): their whole chapters named with a side-story or extra word
+    (verdict.site_words), so the verdict tells a word such a site gives
+    every chapter from this chapter's own."""
+    out: dict[str, dict] = {}
+    for m in candidates:
+        src = getattr(getattr(m, "source", None), "name", None)
+        if src not in names or src in out:
+            continue
+        listed = [(getattr(c, "number", None), getattr(c, "name", None)) for c in getattr(m, "chapters", None) or ()]
+        out[src] = {f"{k:g}": oneline(v, MAX_NAME) for k, v in verdict.site_words(listed, series, number).items()}
+    return out
+
+
 def _url(client, chapter_id: int, series: Series) -> str | None:
     """The chapter's page on its site; '' when there is none to show (no
-    realUrl, one that is not a plain http(s) link, or a Suwayomi that does
-    not know the field): kept, and not asked again. None when Suwayomi did
-    not answer (unreachable, a timeout, its circuit breaker open): asked
-    again at the next update."""
+    realUrl, one that is not a plain http(s) link, or a Suwayomi whose
+    answer says it does not know the field or the chapter): kept, and not
+    asked again. None for any other failure (Suwayomi unreachable, a
+    timeout, its circuit breaker open, an HTTP error such as a proxy's 502
+    while it restarts, an answer that is not JSON): asked again at the next
+    update."""
     try:
         url = client.chapter_url(chapter_id)
     except limits.Cancelled:
         raise
-    except SuwayomiUnreachable as e:
-        log.debug("%s: Suwayomi did not answer for the page of chapter id %d: %s", oneline(series.title, 80),
-                  chapter_id, oneline(e, 200))
-        return None
-    except SuwayomiError as e:              # a GraphQL error: this Suwayomi has no realUrl, or no such chapter
+    except QueryError as e:             # it answered: this Suwayomi has no realUrl, or no such chapter
         log.debug("%s: no page on its site for chapter id %d: %s", oneline(series.title, 80), chapter_id,
                   oneline(e, 200))
         return ""
-    except Exception as e:                  # a timeout, a dropped connection ...
+    except Exception as e:                  # no answer, or none that says anything: asked again next time
         log.debug("%s: could not look up the page of chapter id %d: %s: %s", oneline(series.title, 80), chapter_id,
                   type(e).__name__, oneline(e, 200))
         return None

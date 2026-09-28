@@ -135,6 +135,16 @@ class SignTest(unittest.TestCase):
             with self.subTest(name):
                 self.assertEqual(sign(name, self.S), "bonus")
 
+    def test_the_quick_check_of_site_words_misses_no_mark(self):
+        # site_words reads only the names _MARKLESS finds a word in: every name with a mark must be one of them
+        for name in ("Side Story 3", "Sidestory", "SIDE-STORIES", "Spin-off 1", "Spin Off", "Omake", "Afterwords",
+                     "Gaiden 2", "Bangaihen", "Fanwai 1", "Oejeon 4", "Atogaki", "番外編", "外伝", "外传", "おまけ",
+                     "あとがき", "외전 1", "번외", "Extra 2", "Extras", "Bonus Chapter", "Christmas Special",
+                     "Specials", "Vol.2 Chapter 12: Twitter Extra"):
+            with self.subTest(name):
+                self.assertTrue(verdict._marks(verdict._clean(name, self.S)))
+                self.assertTrue(verdict._MARKLESS.search(name.lower()))
+
     def test_ordinary_words_are_not_extras(self):
         for name in ("Extra Innings", "Special Training", "Bonus Round", "The Spinning Top", "I Mixed It Around",
                      "Just an Extra", "Becoming an Extra", "I'm Not Special", "Nothing Special",
@@ -560,6 +570,54 @@ class ConfidenceTest(unittest.TestCase):
         v = classify(SLIME, Blocker(12.5, {"Manganato": "Side Story 2"}), rows)
         self.assertEqual((v.kind, v.confidence), ("side_story", HIGH))
 
+    def test_the_listing_site_s_own_whole_chapters_count_too(self):
+        # Review: your chapters are often named by another site ("Chapter N") or not at all, so only the site
+        # listing the blocker shows that it gives every chapter of the spin-off its "Gaiden"
+        site = [(float(n), f"Tensura Nikki Gaiden Chapter {n}") for n in range(1, 40)] + \
+            [(12.5, "Tensura Nikki Gaiden Chapter 12.5")]
+        wholes = {"Manganato": verdict.site_words(site, SLIME, 12.5)}
+        self.assertEqual(wholes["Manganato"], {12.0: "Tensura Nikki Gaiden Chapter 12",
+                                               13.0: "Tensura Nikki Gaiden Chapter 13",
+                                               11.0: "Tensura Nikki Gaiden Chapter 11"})    # nearest first, 3 a word
+        blocker = Blocker(12.5, {"Manganato": "Tensura Nikki Gaiden Chapter 12.5"}, wholes=wholes)
+        named = [*[Chapter(float(n), "have", f"Chapter {n}", "Weeb Central", 30) for n in range(1, 40)],
+                 failed(12.5, "Tensura Nikki Gaiden Chapter 12.5")]
+        unnamed = [*have(range(1, 40), 30), failed(12.5)]
+        md = md_at((12.0, None, 30), (12.5, None, 30), following=13.0)
+        for rows, m in ((named, ChapterList(None)), (named, md), (unnamed, None)):
+            with self.subTest(rows=rows[0].name, md=m):
+                v = classify(SLIME, blocker, rows, m)
+                self.assertEqual((v.kind, v.confidence, v.auto_skip), ("unknown", LOW, False), v.evidence)
+                self.assertIn('Manganato names it "Tensura Nikki Gaiden Chapter 12.5", but whole chapters on '
+                              'Manganato have that word in their names too (like "Tensura Nikki Gaiden Chapter 12"), '
+                              'so that is the series\' word, not this chapter\'s.', v.evidence)
+        # as JSON keeps them (numbers as text), and a site that names its chapters plainly decides nothing
+        v = classify(SLIME, Blocker(12.5, dict(blocker.names), wholes={"Manganato": {"12": "Tensura Nikki Gaiden "
+                                                                                           "Chapter 12"}}), named)
+        self.assertIn("but chapter 12 on Manganato has that word in its name too", " ".join(v.evidence))
+        self.assertEqual(v.kind, "unknown")
+        plain = verdict.site_words([(float(n), f"Chapter {n}") for n in range(1, 40)], SLIME, 12.5)
+        self.assertEqual(plain, {})
+        v = classify(SLIME, Blocker(12.5, dict(blocker.names), wholes={"Manganato": plain}), named, ChapterList(None))
+        self.assertEqual((v.kind, v.confidence), ("side_story", HIGH))
+        # the chapter's own word beside the site's still decides
+        v = classify(SLIME, Blocker(12.5, {"Manganato": "Tensura Nikki Gaiden Chapter 12.5: Omake"}, wholes=wholes),
+                     named, ChapterList(None))
+        self.assertEqual((v.kind, v.confidence), ("side_story", HIGH))
+
+    def test_site_words_with_odd_input(self):
+        cases = [(float("nan"), "Side Story"), (float("inf"), "Gaiden"), (-1, "Gaiden"), (1e300, "Gaiden"),
+                 (True, "Gaiden"), ("7", "Gaiden"), (3.0, None), (4.0, 5), (5.0, "x" * 100000 + " Gaiden"),
+                 (6.0, "Gaiden 6"), (7.5, "Gaiden 7.5")]
+        self.assertEqual(verdict.site_words(cases, SLIME, 7.5), {6.0: "Gaiden 6"})
+        self.assertEqual(verdict.site_words(cases, SLIME, float("nan")), {})
+        for wholes in ({"Manganato": {"nan": "Gaiden", "x": "Gaiden", "1e300": "Gaiden", "7.5": "Gaiden"}},
+                       {"Manganato": ["Gaiden"]}, {5: {"6": "Gaiden"}}, ["x"], None):
+            with self.subTest(wholes):
+                v = classify(SLIME, Blocker(7.5, {"Manganato": "Gaiden 7.5"}, wholes=wholes),
+                             [*have(range(1, 30), 30), failed(7.5)], ChapterList(None))
+                self.assertEqual((v.kind, v.confidence), ("side_story", HIGH))
+
 
 # -- the adversarial check's false positives -----------------------------------
 # Real story chapters that the verdict of branch `verdict` (e51072a) called a
@@ -703,6 +761,17 @@ REVIEW_FALSE_POSITIVES = [
     ("R-series word", SLIME, Blocker(12.5, {"Manganato": "Tensura Nikki Gaiden Chapter 12.5"}),
      [*[Chapter(float(n), "have", f"Tensura Nikki Gaiden Chapter {n}", "Weeb Central", 30) for n in range(1, 40)],
       failed(12.5, "Tensura Nikki Gaiden Chapter 12.5")], None, "unknown"),
+    # ... and when your chapters are named by another site, or not at all: the listing site's own chapters say so
+    *[(f"R-series word on the site {i}", SLIME, Blocker(12.5, {"Manganato": "Tensura Nikki Gaiden Chapter 12.5"},
+                                                         wholes={"Manganato": {f"{n}": f"Tensura Nikki Gaiden Chapter {n}"
+                                                                               for n in (11, 12, 13)}}),
+       rows, md, "unknown")
+      for i, (rows, md) in enumerate((
+          ([*[Chapter(float(n), "have", f"Chapter {n}", "Weeb Central", 30) for n in range(1, 40)], failed(12.5)],
+           None),
+          ([*[Chapter(float(n), "have", f"Chapter {n}", "Weeb Central", 30) for n in range(1, 40)], failed(12.5)],
+           md_at((12.0, None, 30), (12.5, None, 30), following=13.0)),
+          ([*have(range(1, 40), 30), failed(12.5)], None)))],
     # MangaDex lacks N but lists a titled chapter between N and N+1 that you lack
     ("R-no N", R, Blocker(12.5, {"Manganato": "Side Story"}), story(extra=[failed(12.5)]),
      md_at((12.1, "The Duel", 30), following=13.0), "unknown"),

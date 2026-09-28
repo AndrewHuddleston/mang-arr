@@ -20,6 +20,13 @@ class SuwayomiError(RuntimeError):
     pass
 
 
+class QueryError(SuwayomiError):
+    """Suwayomi answered, with an error for the query (GraphQL errors: a
+    field this version does not know, no such chapter, a source's failure
+    it reports), as opposed to no answer or one that says nothing (an HTTP
+    error, a proxy's 502, a body that is not JSON)."""
+
+
 class SuwayomiUnreachable(SuwayomiError):
     """Suwayomi itself did not answer (connection refused, DNS, or a hung
     server), as opposed to one source failing behind it. Callers that loop
@@ -162,7 +169,7 @@ class Client:
                     msg = d["errors"][0]["message"].split("\n")[0][:200]
                     log.debug("suwayomi %s %s -> error in %.1fs: %s", op, variables or "",
                               time.monotonic() - t0, msg)
-                    raise SuwayomiError(msg)
+                    raise QueryError(msg)
                 log.debug("suwayomi %s %s -> ok in %.1fs", op, variables or "", time.monotonic() - t0)
                 return d["data"]
             except (SuwayomiError, limits.Cancelled):
@@ -291,8 +298,8 @@ class Client:
     def chapter_url(self, chapter_id: int) -> str | None:
         """The chapter's page on its source's site (Suwayomi's realUrl, from
         the extension; checked by the caller before it is shown), or None
-        when Suwayomi has none. Raises SuwayomiError, also when this
-        Suwayomi does not know the field."""
+        when Suwayomi has none. Raises QueryError when this Suwayomi does
+        not know the field (or the chapter), SuwayomiError otherwise."""
         d = self.gq("query($id: Int!) { chapter(id: $id) { realUrl } }", {"id": chapter_id}, timeout=30, retries=1)
         url = (d.get("chapter") or {}).get("realUrl") if isinstance(d, dict) else None
         return url if isinstance(url, str) and url else None

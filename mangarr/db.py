@@ -183,9 +183,12 @@ MIGRATIONS = [
     );
     """,
     # 15: chapters a series is stuck behind (stuck.py): when a chapter's
-    #     failures began, and per blocker what the sites listing it call it,
-    #     where it is on them, which of them it failed on, and what was done
-    #     about it
+    #     failures began; per blocker the evidence (what the sites listing it
+    #     call it and their whole chapters with a side-story word, where it is
+    #     on them, which of them it failed on), dropped once it no longer
+    #     blocks; and apart from it what you (or the automatic skip) decided
+    #     about it, kept while it is not listed for a while too: only dropped
+    #     once it is on disk or gone for good
     """
     ALTER TABLE chapter ADD COLUMN failed_since TEXT;
     CREATE TABLE stuck (
@@ -193,13 +196,22 @@ MIGRATIONS = [
       number          REAL NOT NULL,
       names           TEXT NOT NULL DEFAULT '{}',   -- JSON {source name: its title for the chapter there, or null}
       seen            TEXT NOT NULL DEFAULT '{}',   -- JSON {source name: when a resolve last saw it list the chapter}
+      wholes          TEXT NOT NULL DEFAULT '{}',   -- JSON {source name: {number: name}}: its whole chapters with a
+                                                    --   side-story or extra word in their names (verdict.site_words)
       urls            TEXT NOT NULL DEFAULT '{}',   -- JSON {source name: the chapter's page on that site ('': none)}
       failed_on       TEXT NOT NULL DEFAULT '[]',   -- JSON [source names a download run failed it on]
-      dismissed       TEXT,                   -- "Keep waiting": the chapter's state then (JSON, stuck.state_of)
-      skipped         TEXT,                   -- 'manual' | 'auto' once skipped from here
-      skipped_state   TEXT,                   -- the chapter's state when it was skipped
+      updated_at      TEXT NOT NULL,
+      PRIMARY KEY (series_id, number)
+    );
+    CREATE TABLE stuck_choice (
+      series_id       INTEGER NOT NULL REFERENCES series(id) ON DELETE CASCADE,
+      number          REAL NOT NULL,
+      skipped         TEXT,                   -- 'manual' | 'auto' once skipped from a stuck note
+      skipped_state   TEXT,                   -- the chapter's state when it was skipped (JSON, stuck.state_of)
       verdict         TEXT,                   -- the verdict's headline then
+      dismissed       TEXT,                   -- "Keep waiting": the chapter's state then (never skipped automatically)
       declined        TEXT,                   -- when you un-skipped it or wanted it again: never skipped automatically
+      gone_since      TEXT,                   -- since when no site lists it (unavailable, junk): dropped after a while
       updated_at      TEXT NOT NULL,
       PRIMARY KEY (series_id, number)
     );

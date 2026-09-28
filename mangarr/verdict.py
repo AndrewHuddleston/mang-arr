@@ -15,8 +15,10 @@ gives its evidence as plain sentences the user can check:
     (words like "Extra" in it too) marks the site's split of chapter N: no
     side story, and a real title against one's name on another source. A
     side-story word the series' whole chapters carry too (every chapter of
-    a spin-off called "... Gaiden Chapter N") is the series' word and
-    decides nothing. These words decide only for a chapter numbered between
+    a spin-off called "... Gaiden Chapter N"), in your copies' names or on
+    a site that lists this one (yours are often another site's "Chapter N",
+    or unnamed), is the series' word and decides nothing. These words
+    decide only for a chapter numbered between
     the story's (7.5): a whole number is the story's own numbering. Notice
     words ("Hiatus Notice", 公告) are shown but never decide anything: "The
     Announcement" is a chapter title too.
@@ -104,6 +106,9 @@ class Blocker:
     # chapter N+1 is not among them
     names: dict[str, str | None] = field(default_factory=dict)
     reason: str | None = None       # why it failed; for the note, the verdict does not depend on it
+    # {source: {number: name}} of the sources listing it: their whole chapters named with a side-story or extra
+    # word (site_words), so a word that site gives all its chapters is the series', not this chapter's
+    wholes: dict = field(default_factory=dict)
 
 
 @dataclass
@@ -148,6 +153,9 @@ _NOTICE_TOO = {"a", "an", "the", "we", "re", "are", "is", "s", "on", "will", "be
                "twitter", "author"}
 _SIDE = re.compile(r"\b(?:side[\s-]*stor(?:y|ies)|spin[\s-]*offs?|omake|afterwords?|atogaki|gaiden"
                    r"|bangai(?:[\s-]*hen)?|fanwai|oejeon)\b|番外|外伝|外传|おまけ|あとがき|외전|번외")
+# every _SIDE and _LOOSE word starts with one of these: a name without any has no mark (_marks), cheaply
+_MARKLESS = re.compile(r"side|spin|omake|afterword|atogaki|gaiden|bangai|fanwai|oejeon|extra|bonus|special"
+                       r"|番外|外伝|外传|おまけ|あとがき|외전|번외")
 _EPILOGUE = re.compile(r"\bepilogue\b|エピローグ|에필로그")
 _PART = re.compile(r"\b(?:part|pt)\.?\s*(?:[2-9]|ii|iii|iv|two|three|b)\b|\bsecond\s+half\b"
                    r"|\(\s*[2-9]\s*/\s*[2-9]\s*\)|\bcont(?:inued|\.)")
@@ -235,38 +243,110 @@ def _marks(t: str) -> set[str]:
 
 
 SERIES_WORD = 2     # whole chapters named with a side-story or extra word that make it the series' own word
+SITE_WORDS = 3      # a site's whole chapters kept per such word (site_words), the nearest to the blocker first
 
 
-def _series_word(name: str | None, series: Series, rows: dict, b: float) -> str | None:
+def _and(items: list[str]) -> str:
+    return items[0] if len(items) == 1 else f"{', '.join(items[:-1])} and {items[-1]}"
+
+
+def _series_word(name: str | None, series: Series, rows: dict, b: float, wholes: dict | None = None) -> str | None:
     """When the side-story or extra words of this name are in the names of
     the series' whole chapters too (SERIES_WORD of them, or chapter N): a
     spin-off whose every chapter is "... Gaiden Chapter 12", a chapter N
     called "Extra? No, I'm the Protagonist!". Then they are the series'
     words and say nothing about this chapter: the clause that says so
-    ('39 of the series' whole chapters ...'); else None. Only the names
-    that hold the word's first letters are cleaned and read."""
+    ('39 of the series' whole chapters ...'); else None. Your chapters are
+    named by whichever site each came from, or not at all, so the whole
+    chapters of the sites listing this one count too (wholes: {source:
+    {number: name}}, as site_words keeps them). Only the names that hold
+    the word's first letters are cleaned and read."""
     marks = _marks(_clean(name, series))
     if not marks:
         return None
     whole = float(math.floor(b))
-    found: dict[str, list[float]] = {m: [] for m in marks}
-    for n, c in rows.items():
-        if n == b or n != int(n) or not c.name:
-            continue
-        low = c.name.lower()
-        hits = [m for m in marks if m in low]
-        if hits:
-            theirs = _marks(_clean(c.name, series))
-            for m in hits:
-                if m in theirs:
-                    found[m].append(n)
-    if not all(len(ns) >= SERIES_WORD or whole in ns for ns in found.values()):
+
+    def carry(pairs) -> dict[str, set]:
+        found: dict[str, set] = {m: set() for m in marks}
+        for n, text in pairs:
+            if n == b or n != int(n) or not isinstance(text, str) or not text:
+                continue
+            low = text.lower()
+            hits = [m for m in marks if m in low]
+            if hits:
+                theirs = _marks(_clean(text, series))
+                for m in hits:
+                    if m in theirs:
+                        found[m].add(n)
+        return found
+
+    def enough(found: dict[str, set]) -> bool:
+        return all(len(ns) >= SERIES_WORD or whole in ns for ns in found.values())
+
+    mine = carry((n, c.name) for n, c in rows.items())
+    if enough(mine):
+        ns = sorted(set().union(*mine.values()))
+        if len(ns) == 1:
+            return f"your chapter {_g(ns[0])} has that word in its name too ({_quote(rows[ns[0]].name)})"
+        return (f"{len(ns)} of the series' whole chapters have that word in their names too (like "
+                f"{_quote(rows[ns[-1]].name)})")
+    sites = {src: carry(got.items()) for src, got in (wholes or {}).items()}
+    if not enough({m: mine[m].union(*(f[m] for f in sites.values())) for m in marks}):
         return None
-    ns = sorted({n for x in found.values() for n in x})
-    if len(ns) == 1:
-        return f"your chapter {_g(ns[0])} has that word in its name too ({_quote(rows[ns[0]].name)})"
-    return (f"{len(ns)} of the series' whole chapters have that word in their names too (like "
-            f"{_quote(rows[ns[-1]].name)})")
+    hits = sorted((abs(n - b), n, src) for src, f in sites.items() for n in set().union(*f.values()))
+    _, n, src = hits[0]
+    where = _and([oneline(k, 60) for k in dict.fromkeys(src for _, _, src in hits)])
+    if len({n for _, n, _ in hits} | set().union(*mine.values())) == 1:
+        return f"chapter {_g(n)} on {where} has that word in its name too ({_quote(wholes[src][n])})"
+    return f"whole chapters on {where} have that word in their names too (like {_quote(wholes[src][n])})"
+
+
+def site_words(chapters, series: Series, b: float) -> dict[float, str]:
+    """Of one site's chapters ((number, name) pairs, as its list has them),
+    the whole ones named with a side-story or extra word: SITE_WORDS per
+    word, the nearest to the blocker b first. What the verdict reads, with
+    your own chapters' names, to tell a word the site gives every chapter
+    (a spin-off's "... Gaiden Chapter 12") from this chapter's own word
+    (Blocker.wholes). Every name is capped first (matching.MAX_TITLE)."""
+    b = _num(b)
+    if b is None:
+        return {}
+    marked = []
+    for n, name in chapters:
+        n = _num(n)
+        if n is None or n != int(n) or not isinstance(name, str) or not name:
+            continue
+        name = oneline(name, MAX_TITLE)
+        if _MARKLESS.search(name.lower()) and (marks := _marks(_clean(name, series))):
+            marked.append((abs(n - b), n, name, marks))
+    out: dict[float, str] = {}
+    kept: dict[str, int] = {}
+    for _, n, name, marks in sorted(marked, key=lambda x: x[:2]):
+        if n not in out and any(kept.get(m, 0) < SITE_WORDS for m in marks):
+            out[n] = name
+            for m in marks:
+                kept[m] = kept.get(m, 0) + 1
+    return out
+
+
+def _wholes(blocker: "Blocker") -> dict[str, dict[float, str]]:
+    """blocker.wholes with its sources, numbers and names checked (kept as
+    JSON, its numbers are text)."""
+    out: dict[str, dict[float, str]] = {}
+    for src, got in (blocker.wholes.items() if isinstance(blocker.wholes, dict) else ()):
+        if not isinstance(src, str) or not isinstance(got, dict):
+            continue
+        keep = {}
+        for k, name in got.items():
+            try:
+                n = _num(float(k)) if not isinstance(k, bool) else None
+            except (TypeError, ValueError):
+                n = None
+            if n is not None and n == int(n) and isinstance(name, str) and name:
+                keep[n] = oneline(name, MAX_TITLE)
+        if keep:
+            out[src] = keep
+    return out
 
 
 def _says(name: str | None, pages: int | None, series: Series, min_pages: int) -> str | None:
@@ -420,6 +500,7 @@ def classify(series: Series, blocker: Blocker, chapters, md: "mangadex.ChapterLi
             rows[n] = c if n == c.number and p == c.pages and type(c) is Chapter else \
                 Chapter(n, c.status, c.name, c.source, p)
     have = {n for n, c in rows.items() if c.status == "have"}
+    wholes = _wholes(blocker)
     near = _md_near(md)
     following = _num(md.following) if md is not None else None
     highest = _num(md.highest) if md is not None else None
@@ -464,7 +545,7 @@ def classify(series: Series, blocker: Blocker, chapters, md: "mangadex.ChapterLi
             # chapter N's own title (words like "Extra" in it included): the site split chapter N
             like_base.append(f"{who} names it {what}, as your chapter {_g(whole)} is named.")
             continue
-        own = _series_word(name, series, rows, b) if s in ("side", "extra", "bonus") else None
+        own = _series_word(name, series, rows, b, wholes) if s in ("side", "extra", "bonus") else None
         if own:
             support.append(f"{who} names it {what}, but {own}, so that is the series' word, not this chapter's.")
         elif s in ("side", "extra", "bonus") and fractional:
@@ -537,7 +618,7 @@ def classify(series: Series, blocker: Blocker, chapters, md: "mangadex.ChapterLi
             if n == whole or n in have:
                 continue
             s = _says(c.title, c.pages, series, min_pages)
-            if s == "side" and _series_word(c.title, series, rows, b):
+            if s == "side" and _series_word(c.title, series, rows, b, wholes):
                 s = None                    # the series' word, not the chapter's
             if s == "side":                 # a side story's own words; "extra" and "special" are titles too
                 lines.append(f"{_md_says(c)}, an extra.")
@@ -573,7 +654,7 @@ def classify(series: Series, blocker: Blocker, chapters, md: "mangadex.ChapterLi
         for n in others:
             c = near[n]
             s = _says(c.title, c.pages, series, min_pages)
-            if s == "side" and _series_word(c.title, series, rows, b):
+            if s == "side" and _series_word(c.title, series, rows, b, wholes):
                 s = None                    # the series' word, not the chapter's
             if whole < n < whole + 1 and n not in have and s not in ("side", "junk") and \
                     (c.title or c.pages is None or c.pages >= min_pages):

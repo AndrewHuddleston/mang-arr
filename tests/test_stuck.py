@@ -328,9 +328,9 @@ class EvidenceTest(StuckBase):
                             for i, (src, name) in enumerate(names.items())]})
 
     def test_names_and_pages_on_the_sites_from_the_plan(self):
-        from mangarr.suwayomi import SuwayomiError
+        from mangarr.suwayomi import QueryError
         client = _Client({100: "https://manganato.example/ch-7.2", 101: "javascript:alert(1)",
-                          102: SuwayomiError("Cannot query field \"realUrl\""), 103: "https://bato.example/7.2"})
+                          102: QueryError("Cannot query field \"realUrl\""), 103: "https://bato.example/7.2"})
         with db.connect() as con:
             sid = seed_dangers(con)
             con.execute("DELETE FROM stuck")
@@ -390,6 +390,128 @@ class EvidenceTest(StuckBase):
             self.assertEqual(stuck.blockers(con, sid)[0].urls, {MN: "https://manganato.example/ch-7.2"})
             stuck.update(con, client, sid, DANGERS, plan)                 # kept: not asked again
         self.assertEqual(client.asked, [100, 100, 100])
+
+    def test_a_page_link_is_asked_again_after_any_error_but_an_answer(self):
+        # Review: an HTTP error (a proxy's 502 while Suwayomi restarts) or an answer that is not JSON stored ''
+        # as if the site had no page, and the Open button was gone for good
+        from mangarr.suwayomi import SuwayomiError
+        client = _Client({100: SuwayomiError("Suwayomi at http://x/api/graphql failed: HTTPError: HTTP Error 502: "
+                                             "Bad Gateway")})
+        with db.connect() as con:
+            sid = seed_dangers(con)
+            con.execute("DELETE FROM stuck")
+            con.commit()
+            plan = self.plan(Manganato="Chapter 7.2")
+            stuck.update(con, client, sid, DANGERS, plan)
+            self.assertEqual(stuck.blockers(con, sid)[0].urls, {})
+            client.urls[100] = SuwayomiError("Suwayomi at http://x/api/graphql failed: JSONDecodeError: Expecting value")
+            stuck.update(con, client, sid, DANGERS, plan)
+            self.assertEqual(stuck.blockers(con, sid)[0].urls, {})
+            client.urls[100] = "https://manganato.example/ch-7.2"
+            stuck.update(con, client, sid, DANGERS, plan)
+            self.assertEqual(stuck.blockers(con, sid)[0].urls, {MN: "https://manganato.example/ch-7.2"})
+            self.assertEqual(client.asked, [100, 100, 100])
+            # Suwayomi's own answer that it has no such field (or chapter): kept, not asked again
+            from mangarr.suwayomi import QueryError
+            con.execute("DELETE FROM stuck")
+            con.commit()
+            client.urls[100] = QueryError('Cannot query field "realUrl" on type "ChapterType".')
+            stuck.update(con, client, sid, DANGERS, plan)
+            stuck.update(con, client, sid, DANGERS, plan)
+            self.assertEqual(stuck.blockers(con, sid)[0].urls, {MN: ""})
+        self.assertEqual(client.asked, [100, 100, 100, 100])
+
+    def test_suwayomi_s_error_answers_are_told_from_no_answer(self):
+        import urllib.error
+
+        from mangarr.suwayomi import Client, QueryError, SuwayomiError
+        c = Client("http://suwayomi.invalid")
+        with mock.patch.object(Client, "_send", return_value={"errors": [{"message": "Cannot query field \"realUrl\""}]}):
+            with self.assertRaises(QueryError):
+                c.chapter_url(1)
+        for e in (urllib.error.HTTPError("http://suwayomi.invalid/api/graphql", 502, "Bad Gateway", {}, None),
+                  ValueError("Expecting value: line 1 column 1 (char 0)")):
+            with self.subTest(e), mock.patch.object(Client, "_send", side_effect=e):
+                with self.assertRaises(SuwayomiError) as cm:
+                    c.chapter_url(1)
+                self.assertNotIsInstance(cm.exception, QueryError)
+
+    def test_the_listing_site_s_whole_chapters_are_kept(self):
+        spin = Series(anilist_id=424244, romaji="Tensei Shitara Slime Datta Ken: Tensura Nikki",
+                      english="The Slime Diaries")
+        site = [_Chapter(1000 + n, float(n), f"Tensura Nikki Gaiden Chapter {n}") for n in range(1, 40)]
+        plan = _Plan({12.5: [_Match(MN, [*site, _Chapter(1125, 12.5, "Tensura Nikki Gaiden Chapter 12.5")]),
+                             _Match("Bato", [_Chapter(2000 + n, float(n), f"Chapter {n}") for n in (12, 12.5, 13)])]})
+        with db.connect() as con:
+            sid = self.seed_spin_off(con, spin)
+            stuck.update(con, None, sid, spin, plan)
+            st = stuck.blockers(con, sid)[0]
+            self.assertEqual(st.wholes, {MN: {"12": "Tensura Nikki Gaiden Chapter 12",
+                                              "13": "Tensura Nikki Gaiden Chapter 13",
+                                              "11": "Tensura Nikki Gaiden Chapter 11"}, "Bato": {}})
+            # a resolve without Manganato keeps them with its name; one without the site's list keeps them too
+            stuck.update(con, None, sid, spin, _Plan({12.5: [plan.candidates[12.5][1]]}))
+            stuck.update(con, None, sid, spin, None)
+            self.assertEqual(stuck.blockers(con, sid)[0].wholes[MN]["12"], "Tensura Nikki Gaiden Chapter 12")
+
+    @staticmethod
+    def seed_spin_off(con, spin) -> int:
+        """A spin-off stuck behind 12.5: your chapters are Weeb Central's ("Chapter N"), and only Manganato
+        lists 12.5, named as it names every chapter."""
+        sid = db.upsert_series(con, spin)
+        for n in range(1, 40):
+            add(con, sid, n, "have", f"Chapter {n}", WC, pages=30)
+        add(con, sid, 12.5, "failed", "Tensura Nikki Gaiden Chapter 12.5", MN, reason=GONE, tries=1,
+            failed_since=SINCE)
+        for n in range(40, 50):
+            add(con, sid, n, "wanted", reason=downloader.waiting_reason(12.5))
+        con.commit()
+        return sid
+
+    def test_what_was_decided_outlasts_a_resolve_that_missed_it(self):
+        # Review: a resolve in which the only site listing the blocker missed it (not unreachable: its search
+        # answered without it) made it 'unavailable', and the stuck row went with everything decided about it
+        def resolve(status):
+            con.execute("UPDATE chapter SET status=? WHERE series_id=? AND number=7.2", (status, sid))
+            stuck.update(con, None, sid, DANGERS, None, found=[])
+
+        def count(table):
+            return con.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+        with db.connect() as con:
+            sid = seed_dangers(con)
+            stuck.dismiss(con, sid, 7.2)
+            resolve("unavailable")
+            self.assertEqual((count("stuck"), count("stuck_choice")), (0, 1))    # the evidence goes, not the choice
+            resolve("failed")
+            st = stuck.blockers(con, sid)[0]
+            self.assertEqual((st.keep_waiting, st.dismissed), (True, True))
+            self.assertIsNone(con.execute("SELECT gone_since FROM stuck_choice").fetchone()[0])
+            # gone for good: no site has listed it for GONE_DAYS
+            resolve("unavailable")
+            since = con.execute("SELECT gone_since FROM stuck_choice").fetchone()[0]
+            self.assertIsNotNone(since)
+            resolve("junk")
+            self.assertEqual(con.execute("SELECT gone_since FROM stuck_choice").fetchone()[0], since)
+            old = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(time.time() - (stuck.GONE_DAYS + 1) * 86400))
+            con.execute("UPDATE stuck_choice SET gone_since=?", (old,))
+            resolve("unavailable")
+            self.assertEqual(count("stuck_choice"), 0)
+            # on disk: nothing left to decide
+            resolve("failed")
+            stuck.dismiss(con, sid, 7.2)
+            db.set_have(con, sid, 7.2, None, None)
+            stuck.update(con, None, sid, DANGERS, None, found=[])
+            self.assertEqual((count("stuck"), count("stuck_choice")), (0, 0))
+            # a skip is kept while the chapter is skipped, and an un-skip (declined) like Keep waiting
+            add(con, sid, 7.2, "failed", "Chapter 7.2", MN, reason=GONE)
+            stuck.skip(con, sid, 7.2)
+            stuck.update(con, None, sid, DANGERS, None, found=[])
+            stuck.unskip(con, sid, 7.2)
+            resolve("unavailable")
+            resolve("failed")
+            con.execute("UPDATE chapter SET reason=? WHERE series_id=? AND status='wanted'",
+                        (downloader.waiting_reason(7.2), sid))                  # the next pass holds them again
+            self.assertTrue(stuck.blockers(con, sid)[0].declined)
 
     def test_what_a_download_run_failed_it_on_is_kept(self):
         with db.connect() as con:
@@ -511,7 +633,37 @@ class ActionsTest(StuckBase):
         self.assertTrue(stuck.same_state(then, {"name": "x", "names": {MN: "a"}}))
         self.assertFalse(stuck.same_state(then, {"name": "x", "names": {MN: "a", "Bato": "c"}}))
         self.assertFalse(stuck.same_state(then, {"name": "x", "names": {MN: "a", "Bato": "b", "Comick": None}}))
-        self.assertFalse(stuck.same_state(then, {"name": "y", "names": {MN: "a"}}))
+        self.assertTrue(stuck.same_state(then, {"name": "y", "names": {MN: "a"}}))     # the row's name: a site's
+        # while one side knows no site's name, the row's name is what there is
+        self.assertTrue(stuck.same_state({"name": "a", "names": {}}, {"name": "b", "names": {MN: "a", "Bato": "b"}}))
+        self.assertFalse(stuck.same_state({"name": "a", "names": {}}, {"name": "c", "names": {MN: "c"}}))
+        self.assertTrue(stuck.same_state({"name": "b", "names": {MN: "a", "Bato": "b"}}, {"name": "a", "names": {}}))
+        self.assertFalse(stuck.same_state({"name": "b", "names": {MN: "b"}}, {"name": "c", "names": {}}))
+        self.assertFalse(stuck.same_state({"name": "a", "names": {}}, {"name": "c", "names": {}}))
+
+    def test_two_sites_naming_it_differently_are_no_change_without_one(self):
+        # Review: the chapter row's name is copied from whichever site is assigned, so a resolve without one of
+        # two sites that name it differently renamed the row, and that counted as a change
+        both = _Plan({7.2: [_Match(MN, [_Chapter(1, 7.2, "Chapter 7.2")]),
+                            _Match("Bato", [_Chapter(2, 7.2, "Side Story: Picnic")])]})
+        bato = _Plan({7.2: [_Match("Bato", [_Chapter(2, 7.2, "Side Story: Picnic")])]})
+
+        def resolve(plan, name):
+            con.execute("UPDATE chapter SET name=? WHERE series_id=? AND number=7.2", (name, sid))    # save_plan
+            stuck.update(con, None, sid, DANGERS, plan)
+        with db.connect() as con:
+            sid = seed_dangers(con)
+            resolve(both, "Chapter 7.2")
+            stuck.dismiss(con, sid, 7.2)
+            resolve(bato, "Side Story: Picnic")
+            self.assertTrue(stuck.blockers(con, sid)[0].dismissed)
+            resolve(both, "Chapter 7.2")
+            self.assertTrue(stuck.blockers(con, sid)[0].dismissed)
+            stuck.skip(con, sid, 7.2)
+            resolve(bato, "Side Story: Picnic")
+            self.assertFalse(stuck.skipped(con, sid)[0]["changed"])
+            resolve(both, "Chapter 7.2")
+            self.assertFalse(stuck.skipped(con, sid)[0]["changed"])
 
     def test_a_skipped_chapter_that_changes_is_offered_back(self):
         with db.connect() as con:
@@ -542,8 +694,10 @@ class ActionsTest(StuckBase):
             stuck.update(con, None, sid, DANGERS, more)
             self.assertFalse(stuck.blockers(con, sid)[0].dismissed)
             stuck.dismiss(con, sid, 7.2)
-            con.execute("UPDATE chapter SET name='The Duel' WHERE series_id=? AND number=7.2", (sid,))
-            self.assertFalse(stuck.blockers(con, sid)[0].dismissed)          # renamed
+            renamed = _Plan({7.2: [_Match(MN, [_Chapter(1, 7.2, "The Duel")]), _Match("Bato", [_Chapter(2, 7.2, None)])]})
+            stuck.update(con, None, sid, DANGERS, renamed)
+            st = stuck.blockers(con, sid)[0]
+            self.assertEqual((st.dismissed, st.keep_waiting), (False, True))  # renamed: the note is back
 
     def test_names_learnt_after_keep_waiting_are_no_change(self):
         with db.connect() as con:
@@ -653,7 +807,7 @@ class AutoSkipTest(StuckBase):
                 con.commit()
                 cache_md(series, blocker.number, md if md is not None else ChapterList(None))
                 st = stuck.Stuck(sid, float(blocker.number), 1, "failed", None, MN, "boom", 1, None, dict(blocker.names),
-                                 failed_on=list(blocker.names))
+                                 failed_on=list(blocker.names), wholes=dict(blocker.wholes))
                 with self.assertNoLogs("mangarr.stuck", "WARNING"):
                     stuck.update(con, None, sid, series, None, [st])
                 self.assertNotEqual(self.chapter(sid, float(blocker.number))["status"], "ignored")
@@ -708,7 +862,7 @@ class AutoSkipTest(StuckBase):
         self.run_update(DANGERS, other)
         self.assertEqual(self.chapter(other, 7.2)["status"], "failed")
 
-    def test_keep_waiting_keeps_it_off_until_the_chapter_changes(self):
+    def test_keep_waiting_keeps_it_off_for_good(self):
         with db.connect() as con:
             sid = seed_freedom(con)
             self.assertTrue(stuck.dismiss(con, sid, 171.01))
@@ -716,11 +870,75 @@ class AutoSkipTest(StuckBase):
         cache_md(FREEDOM, 171.01, ChapterList(None))
         self.run_update(FREEDOM, sid)
         self.assertEqual(self.chapter(sid, 171.01)["status"], "failed")
-        # the site renames it: the note is back, and the automatic skip judges what it is now
+        # the site renames it: the note is back, but you chose to wait for this chapter: only you skip it
         with db.connect() as con:
             stuck.update(con, None, sid, FREEDOM, _Plan({171.01: [_Match(MN, [_Chapter(1, 171.01, "Spin-off 1: "
                                                                                                 "Picnic")])]}))
-        self.assertEqual(self.chapter(sid, 171.01)["status"], "ignored")
+            st = stuck.details(con, db.get_series(con, sid))[0]
+        self.assertEqual(self.chapter(sid, 171.01)["status"], "failed")
+        self.assertEqual((st.dismissed, st.keep_waiting, st.verdict.auto_skip), (False, True, True))
+        self.assertEqual(stuck.why_not_auto(st, st.verdict), "waiting")
+
+    def test_not_a_word_the_listing_site_gives_every_chapter(self):
+        # Review: only Manganato lists 12.5 and names every chapter "Tensura Nikki Gaiden Chapter N"; your
+        # chapters come from Weeb Central ("Chapter N"), so they did not show that "Gaiden" is the series' word
+        self.set(auto_skip_side_stories=True)
+        spin = Series(anilist_id=424244, romaji="Tensei Shitara Slime Datta Ken: Tensura Nikki",
+                      english="The Slime Diaries")
+        for label, named in (("the spin-off's word", "Tensura Nikki Gaiden Chapter {}"), ("a plain site", "Chapter {}")):
+            with self.subTest(label), db.connect() as con:
+                for r in db.series_rows(con):
+                    db.delete_series(con, r["id"])
+                sid = EvidenceTest.seed_spin_off(con, spin)
+                names_of(con, sid, 12.5, {MN: "Tensura Nikki Gaiden Chapter 12.5"})
+                con.commit()
+                cache_md(spin, 12.5, ChapterList(None))
+                site = [_Chapter(1000 + n, float(n), named.format(n)) for n in range(1, 40)]
+                plan = _Plan({12.5: [_Match(MN, [*site, _Chapter(1125, 12.5, "Tensura Nikki Gaiden Chapter 12.5")])]})
+                with self.assertNoLogs("mangarr.stuck", "WARNING"):
+                    stuck.update(con, None, sid, spin, plan)
+                if named.startswith("Chapter"):             # the control: a site's own side-story word decides
+                    self.assertEqual(self.chapter(sid, 12.5)["status"], "ignored")
+                    continue
+                self.assertEqual(self.chapter(sid, 12.5)["status"], "failed")
+                v = stuck.details(con, db.get_series(con, sid))[0].verdict
+                self.assertEqual((v.kind, v.confidence), ("unknown", "low"))
+                self.assertIn("but whole chapters on Manganato have that word in their names too", " ".join(v.evidence))
+
+    def test_mangadex_not_answering_holds_it_and_the_note_says_so(self):
+        # Review: while MangaDex's failure is kept, a HIGH verdict from the name alone said "the next pass skips
+        # it automatically", but no pass skips anything before MangaDex has answered
+        self.set(auto_skip_side_stories=True)
+        with db.connect() as con:
+            sid = seed_freedom(con)
+        cache_md(FREEDOM, 171.01, None)                        # asked, and MangaDex did not answer
+        before = time.time()
+        self.run_update(FREEDOM, sid)
+        self.assertEqual(self.chapter(sid, 171.01)["status"], "failed")
+        with db.connect() as con:
+            st = stuck.details(con, db.get_series(con, sid))[0]
+        self.assertEqual((st.verdict.kind, st.verdict.confidence, st.md_wait, st.checking),
+                         ("side_story", HIGH, "failed", False))
+        self.assertEqual(stuck.why_not_auto(st, st.verdict), "mangadex")
+        self.assertTrue(before + mangadex.FAILED_TTL - 60 < st.md_retry <= time.time() + mangadex.FAILED_TTL)
+        self.assertEqual(self.fetcher.pending(), 0)            # nothing to look up before the failure expires
+        if views is not None:
+            self.assertEqual(views.auto_skip_clause(st, True), "not skipped automatically while MangaDex does not "
+                                                               "answer: its chapter list may change this verdict")
+            self.assertEqual(views.mangadex_line(st), "MangaDex did not answer, so its chapter list is not in this "
+                             "verdict yet: it is asked again after "
+                             f"{time.strftime('%H:%M', time.localtime(st.md_retry))}.")
+        # not looked up yet: the same, and the Fetcher is asked
+        mangadex._cache.clear()
+        with db.connect() as con:
+            st = stuck.details(con, db.get_series(con, sid))[0]
+        self.assertEqual((st.md_wait, st.checking), ("pending", True))
+        if views is not None:
+            self.assertEqual(views.auto_skip_clause(st, True), "not skipped automatically before MangaDex's chapter "
+                                                               "list is checked, which may change this verdict")
+            self.assertEqual(views.mangadex_line(st), "")
+        # a manual series has no MangaDex list to wait for
+        self.assertIsNone(mangadex.failed_until(Series(english="By hand"), 1.5))
 
     def test_a_site_that_just_started_listing_it_is_tried_first(self):
         self.set(auto_skip_side_stories=True)
@@ -985,6 +1203,86 @@ class PassTest(PassBase, _Offline):
         self.assertEqual(self.enqueued(fake).count(3.5), tried)            # never taken back and tried again
         self.assertEqual(len(self.skip_events(row["id"])), 1)
 
+    def test_an_undo_outlasts_a_pass_in_which_the_site_missed_it(self):
+        # Review: one pass in which the only site listing it answered without it made it 'unavailable', its stuck
+        # row was deleted with the undo, and when the site listed it again it was skipped automatically again
+        fake, plans, row = self.scenario(auto_skip_side_stories=True)
+        y = entry(fake, "Site Y (EN)", 2, "Freedom", [1, 2, 3])
+        both, only = {"Freedom": [plans["Freedom"][0], y]}, {"Freedom": [y]}
+        self.run_pass(fake, both, row)
+        self.assertEqual(self.status(row["id"])[3.5][0], "ignored")
+        with db.connect() as con:
+            self.assertTrue(stuck.unskip(con, row["id"], 3.5))
+        self.run_pass(fake, both, row)
+        self.assertEqual(self.status(row["id"])[3.5][0], "failed")
+        self.run_pass(fake, only, row)                                     # Site X's search missed it
+        st = self.status(row["id"])
+        self.assertEqual((st[3.5][0], st[4.0][0], st[5.0][0]), ("unavailable",) * 3)
+        with db.connect() as con:
+            con.execute("UPDATE chapter SET next_try=NULL WHERE series_id=? AND number=3.5", (row["id"],))
+        self.run_pass(fake, both, row)
+        self.assertEqual(self.status(row["id"])[3.5][0], "failed")
+        self.assertEqual(self.skip_events(row["id"]), [
+            "chapter 3.5 skipped automatically: probably a side story (high confidence); it held back 2 chapters",
+            "chapter 3.5 un-skipped: wanted again"])
+
+    def test_keep_waiting_outlasts_a_pass_in_which_the_site_missed_it(self):
+        fake, plans, row = self.scenario()
+        y = entry(fake, "Site Y (EN)", 2, "Freedom", [1, 2, 3])
+        both, only = {"Freedom": [plans["Freedom"][0], y]}, {"Freedom": [y]}
+        self.run_pass(fake, both, row)
+        with db.connect() as con:
+            self.assertTrue(stuck.dismiss(con, row["id"], 3.5))
+            settings.set_many(con, {"auto_skip_side_stories": True})
+        self.run_pass(fake, only, row)
+        self.assertEqual(self.status(row["id"])[3.5][0], "unavailable")
+        with db.connect() as con:
+            con.execute("UPDATE chapter SET next_try=NULL WHERE series_id=? AND number=3.5", (row["id"],))
+        self.run_pass(fake, both, row)
+        st = self.status(row["id"])
+        self.assertEqual((st[3.5][0], st[4.0][0]), ("failed", "wanted"))
+        with db.connect() as con:
+            b = stuck.blockers(con, row["id"])[0]
+        self.assertEqual((b.number, b.keep_waiting, b.dismissed), (3.5, True, True))
+        self.assertEqual(self.skip_events(row["id"]), [])
+
+    def test_two_sites_naming_it_differently_and_a_pass_without_one(self):
+        # Review: the row's name flipped with the site assigned, and each flip took the automatic skip back, tried
+        # the chapter again and held the series back for another pass
+        fake, plans, row = self.scenario(auto_skip_side_stories=True)
+        y = entry(fake, "Site Y (EN)", 2, "Freedom", [1, 2, 3, 3.5, 4, 5])
+        next(c for c in y.chapters if c.number == 3.5).name = "Side Story: Picnic"
+        fake.broken.add(chapter_id(2, 3.5))
+        both, only = {"Freedom": [plans["Freedom"][0], y]}, {"Freedom": [y]}
+        self.run_pass(fake, both, row)
+        self.assertEqual(self.status(row["id"])[3.5][0], "ignored")
+        tried = self.enqueued(fake).count(3.5)
+        self.run_pass(fake, only, row)
+        with db.connect() as con:
+            self.assertEqual(db.chapters_by_number(con, row["id"], [3.5])[3.5]["name"], "Side Story: Picnic")
+        self.run_pass(fake, both, row)
+        self.assertEqual({n: s for n, (s, _) in self.status(row["id"]).items()},
+                         {1.0: "have", 2.0: "have", 3.0: "have", 3.5: "ignored", 4.0: "have", 5.0: "have"})
+        self.assertEqual(self.enqueued(fake).count(3.5), tried)
+        self.assertEqual(len(self.skip_events(row["id"])), 1)
+
+    def test_not_a_word_the_only_listing_site_gives_every_chapter(self):
+        # your chapters come from Site A ("Chapter N"); only Site X lists 3.5, and it names every chapter
+        # "Freedom Gaiden Chapter N": that is the series' word, not a side story's
+        fake, plans, row = self.scenario("Freedom Gaiden Chapter 3.5", auto_skip_side_stories=True)
+        x = plans["Freedom"][0]
+        for c in x.chapters:
+            c.name = f"Freedom Gaiden Chapter {c.number:g}"
+        a = entry(fake, "Site A (EN)", 3, "Freedom", [1, 2, 3, 4, 5, 6, 7])  # more chapters: ranked first
+        self.run_pass(fake, {"Freedom": [x, a]}, row)
+        st = self.status(row["id"])
+        self.assertEqual((st[3.0][0], st[3.5][0], st[4.0][0]), ("have", "failed", "wanted"))
+        with db.connect() as con:
+            self.assertEqual(db.chapters_by_number(con, row["id"], [3.0])[3.0]["name"], "Chapter 3")
+            blocked = stuck.details(con, db.get_series(con, row["id"]))
+        self.assertEqual([(b.number, b.verdict.kind, b.verdict.confidence) for b in blocked], [(3.5, "unknown", "low")])
+        self.assertEqual(self.skip_events(row["id"]), [])
+
     def test_an_uncertain_one_keeps_the_series_waiting(self):
         fake, plans, row = self.scenario("Bonus Chapter", auto_skip_side_stories=True)
         self.run_pass(fake, plans, row)
@@ -1057,6 +1355,27 @@ class PagesTest(WebBase, _Offline):
         self.assertNotIn("data-reload", html)
         self.assertIn("<b>Probably already covered by chapter 7 you have</b>", self.note(html))
 
+    def test_mangadex_not_answering_is_said(self):
+        cache_md(DANGERS, 7.2, None)
+        with db.connect() as con:
+            settings.set_many(con, {"auto_skip_side_stories": True})
+        settings._cache.clear()
+        html = self.page()
+        self.assertIn("MangaDex did not answer, so its chapter list is not in this verdict yet: it is asked again "
+                      "after ", self.note(html))
+        self.assertNotIn("checking MangaDex", html)
+        self.assertNotIn("data-reload", html)
+        self.assertEqual(self.fetcher.pending(), 0)
+        # a certain side story from its name alone: the note does not promise a skip no pass makes
+        with db.connect() as con:
+            sid = seed_freedom(con)
+        cache_md(FREEDOM, 171.01, None)
+        note = self.note(self.page(f"/series/{sid}"))
+        self.assertIn("<b>Probably a side story</b> <span class=\"muted\">(high confidence: not skipped automatically "
+                      "while MangaDex does not answer: its chapter list may change this verdict)</span>", note)
+        self.assertNotIn("the next pass skips it", note)
+        self.assertIn("MangaDex did not answer", note)
+
     def test_a_link_from_another_site_looks_nothing_up(self):
         for path in (f"/series/{self.sid}", "/wanted", f"/api/v1/series/{self.sid}"):
             with self.subTest(path):
@@ -1105,21 +1424,23 @@ class PagesTest(WebBase, _Offline):
         settings._cache.clear()
         note = self.note(self.page())
         self.assertIn("(high confidence: the next pass skips it automatically, unless you keep waiting)", note)
-        self.assertIn('title="Fold this note away and keep waiting for the chapter until it changes (another title, or '
-                      'another site lists it); it is not skipped automatically meanwhile">Keep waiting', note)
+        self.assertIn('title="Fold this note away and keep waiting for the chapter: the note comes back if the chapter '
+                      'changes (another title, or another site lists it), and it is never skipped automatically">Keep '
+                      'waiting', note)
         with db.connect() as con:
             names_of(con, self.sid, 7.2, {MN: "Chapter 7.2", "Bato": "Chapter 7.2"}, failed_on=[MN])
         self.assertIn("(high confidence: skipped automatically once a pass has tried it on Bato too)",
                       self.note(self.page()))
         with db.connect() as con:
-            con.execute("UPDATE stuck SET declined=?", (db.now(),))
+            con.execute("INSERT INTO stuck_choice (series_id, number, declined, updated_at) VALUES (?, 7.2, ?, ?)",
+                        (self.sid, db.now(), db.now()))
         self.assertIn("(high confidence: not skipped automatically: you un-skipped it or wanted it again)",
                       self.note(self.page()))
         self.client.post(f"/series/{self.sid}/chapter/7.2/keep-waiting")
         self.assertIn("not skipped automatically: you un-skipped it", self.page())
         with db.connect() as con:
-            con.execute("UPDATE stuck SET declined=NULL")
-        self.assertIn("(high confidence: not skipped automatically while you keep waiting)", self.page())
+            con.execute("UPDATE stuck_choice SET declined=NULL")
+        self.assertIn("(high confidence: not skipped automatically: you chose to keep waiting for it)", self.page())
 
     def test_keep_waiting_folds_the_note(self):
         self.client.post(f"/series/{self.sid}/chapter/7.2/keep-waiting")
@@ -1281,7 +1602,8 @@ class PagesTest(WebBase, _Offline):
         self.client.post(f"/series/{self.sid}/chapter/7.2/unignore")
         with db.connect() as con:
             self.assertEqual(stuck.skipped(con, self.sid), [])
-            self.assertIsNone(con.execute("SELECT skipped FROM stuck").fetchone()[0])
+            self.assertIsNone(con.execute("SELECT skipped FROM stuck_choice").fetchone()[0])
+            self.assertIsNotNone(con.execute("SELECT declined FROM stuck_choice").fetchone()[0])
 
 
 @unittest.skipIf(views is None, "web extras not installed")

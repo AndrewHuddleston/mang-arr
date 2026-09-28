@@ -30,12 +30,14 @@
   {% if st.verdict.evidence %}<ul class="stuck-evidence">{% for line in st.verdict.evidence %}<li>{{ line }}</li>{% endfor %}</ul>{% endif %}
   {% endif %}
   {% if st.checking and not st.dismissed %}<div class="stuck-checking muted">{{ m.icon('spinner', 'sm') }} checking MangaDex... (this page reloads by itself)</div>{% endif %}
+  {% set mdl = mangadex_line(st) %}{% if mdl %}<div class="stuck-checking muted">{{ mdl }}</div>{% endif %}
+  {% if st.keep_waiting and not st.dismissed %}<div class="stuck-reason muted small">You chose to keep waiting for it, and it has changed since (another title, or another site lists it).</div>{% endif %}
   {% if st.reason %}<div class="stuck-reason muted small">Last failure: {{ st.reason }}</div>{% endif %}
   <div class="stuck-actions">
     {% for site, url in st.urls.items() if url %}{{ m.ext(url, 'Open ' ~ n ~ ' on ' ~ site, 'button', title='the chapter on ' ~ site ~ ' (opens in a new tab)') }}{% endfor %}
     <form method="post" action="/series/{{ s.id }}/chapter/{{ st.number }}/skip{{ page_q }}" class="inline"><button class="button {{ 'primary' if st.verdict and st.verdict.skippable }}" type="submit">Skip it</button></form>
     <details class="popover stuck-info"><summary class="iconbtn" title="{{ SKIP_DISCLAIMER }}" aria-label="What skipping means">{{ m.icon('info') }}</summary><div class="popover-body"><div class="popover-text">{{ SKIP_DISCLAIMER }}</div></div></details>
-    {% if not st.dismissed %}<form method="post" action="/series/{{ s.id }}/chapter/{{ st.number }}/keep-waiting{{ page_q }}" class="inline"><button class="button" type="submit" title="Fold this note away and keep waiting for the chapter until it changes (another title, or another site lists it); it is not skipped automatically meanwhile">Keep waiting</button></form>{% endif %}
+    {% if not st.dismissed %}<form method="post" action="/series/{{ s.id }}/chapter/{{ st.number }}/keep-waiting{{ page_q }}" class="inline"><button class="button" type="submit" title="Fold this note away and keep waiting for the chapter: the note comes back if the chapter changes (another title, or another site lists it), and it is never skipped automatically">Keep waiting</button></form>{% endif %}
   </div>
 {% endmacro %}
 {% for st in stuck %}

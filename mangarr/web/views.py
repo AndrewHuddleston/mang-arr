@@ -8,6 +8,7 @@ import html
 import itertools
 import re
 import secrets
+import time
 import urllib.parse
 
 from .. import library, model, stuck
@@ -461,13 +462,27 @@ def auto_skip_clause(st, auto_on: bool) -> str:
     if why == "declined":
         return "not skipped automatically: you un-skipped it or wanted it again"
     if why == "waiting":
-        return "not skipped automatically while you keep waiting"
+        return "not skipped automatically: you chose to keep waiting for it"
+    if why == "mangadex":
+        return ("not skipped automatically before MangaDex's chapter list is checked, which may change this verdict"
+                if st.md_wait == "pending" else
+                "not skipped automatically while MangaDex does not answer: its chapter list may change this verdict")
     if why == "untried":
         return (f"skipped automatically once a pass has tried it on {_and(st.untried[:3])} too" if st.untried and
                 st.names else "skipped automatically once a pass has tried it on every site that lists it")
-    if st.checking:
-        return "the next pass skips it automatically once MangaDex has been checked, unless you keep waiting"
     return "the next pass skips it automatically, unless you keep waiting"
+
+
+def mangadex_line(st) -> str:
+    """The note's line while MangaDex's chapter list is missing from its
+    verdict because MangaDex did not answer (a stuck.Stuck), with when it
+    is asked again; '' otherwise (a lookup under way has the page's
+    "checking MangaDex..." instead)."""
+    if st.md_wait != "failed":
+        return ""
+    when = time.strftime("%H:%M", time.localtime(st.md_retry)) if st.md_retry else ""
+    return ("MangaDex did not answer, so its chapter list is not in this verdict yet: it is asked again "
+            + (f"after {when}." if when else "later."))
 
 
 def verdict_label(v, number) -> dict:
@@ -594,6 +609,7 @@ def install(env) -> None:
                        provider=provider, network_line=network_line, index_stats=index_stats, human_size=human_size,
                        row_kind=row_kind, row_language=row_language, stuck_note=stuck_note,
                        verdict_label=verdict_label, skip_note=skip_note, auto_skip_clause=auto_skip_clause,
+                       mangadex_line=mangadex_line,
                        SKIP_DISCLAIMER=SKIP_DISCLAIMER)
     env.filters["ranges"] = short_ranges
     env.filters["status_label"] = status_label

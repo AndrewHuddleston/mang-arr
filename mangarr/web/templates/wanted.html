@@ -35,7 +35,7 @@
   <td class="num text-danger">{{ r.wanted }}</td>
   <td class="muted chapters">{{ r.numbers }}</td>
   <td class="num {% if r.failed %}text-danger{% endif %}">{{ r.failed or 0 }}</td>
-  <td class="stuck-cell">{% for st in blocked %}{% set n = '%g'|format(st.number) %}<a href="/series/{{ r.id }}#stuck-{{ n }}" title="{{ stuck_note(st).body }}">ch {{ n }}</a> <span class="muted small">({{ st.waiting }} waiting{% if st.dismissed %}; you keep waiting{% endif %})</span>{% if st.verdict %}{% set vl = verdict_label(st.verdict, st.number) %} {{ m.label(vl.text, vl.kind, 'small', title=vl.tip) }}{% endif %}{% if not loop.last %}<br>{% endif %}{% endfor %}</td>
+  <td class="stuck-cell">{% for st in blocked %}{% set n = '%g'|format(st.number) %}<a href="/series/{{ r.id }}#stuck-{{ n }}" title="{{ stuck_note(st).body }}">ch {{ n }}</a> <span class="muted small">({{ st.waiting }} waiting{% if st.keep_waiting %}; you keep waiting{% endif %})</span>{% if st.verdict %}{% set vl = verdict_label(st.verdict, st.number) %} {{ m.label(vl.text, vl.kind, 'small', title=vl.tip) }}{% endif %}{% if not loop.last %}<br>{% endif %}{% endfor %}</td>
   <td class="text-danger small">{{ r.last_reason or '' }}</td>
   <td class="col-date nowrap">{{ r.last_resolved|ago }}</td>
   <td class="col-actions">
