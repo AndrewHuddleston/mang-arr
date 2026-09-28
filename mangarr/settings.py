@@ -13,6 +13,12 @@ through get(), so a change on the Settings page applies to the next job.
     page_delay_seconds   float  2.5    starting and minimum gap between page requests (page by page)
     download_in_order    bool   True   strict download in order, per series
     auto_skip_side_stories bool False  skip a blocking chapter judged a side story or covered (stuck.py)
+    series_folder_format str    {Series Title}                              names of new series folders ...
+    chapter_file_format  str    Chapter {Chapter:000.0}{ - Chapter Title}   ... and of new chapter files
+    colon_replacement    str    underscore   what a ':' becomes: underscore, delete, dash, space_dash, smart
+    replace_illegal_characters bool True     ? * " < > | become '_' (off: removed)
+    chapter_title_max_chars int 80     a chapter title in a file name is cut to this many characters (1-255)
+    drop_number_only_titles bool False leave out titles that are only numbers ("Vol.3 chapter 13")
     pushover_token       str    PUSHOVER_TOKEN
     pushover_user        str    PUSHOVER_USER
     webhook_url          str    WEBHOOK_URL
@@ -23,6 +29,11 @@ through get(), so a change on the Settings page applies to the next job.
     auth_password        str    ""     stored as a salted PBKDF2 hash, never in clear
     api_key              str    ""     X-Api-Key; generated on first start, rotatable
     allowed_hosts        list   []     extra Host names the web UI answers to
+
+The naming settings (NAMING_KEYS, see naming.py) name files and folders made
+from then on; existing ones keep their names until they are renamed
+(renamer.py). A naming value that cannot be used is refused with the reason,
+never mended or clamped: nothing is stored then.
 
 Secrets (SECRET_KEYS) are masked in the UI and the API and logged as ***.
 A secret is bound to its destination: when komga_url, gotify_url, ntfy_url
@@ -45,7 +56,7 @@ import time
 import urllib.parse
 from collections.abc import Callable
 
-from . import config
+from . import config, naming
 
 log = logging.getLogger(__name__)
 
@@ -59,6 +70,8 @@ DEFAULTS: dict[str, object] = {
     "download_lanes": 3,             # sources downloading at once in a pass, one series each (see limits.RANGES)
     "search_parallel": 5,            # sites searched at once while a series is resolved, one search each
     "page_delay_seconds": 2.5,       # gap between page requests on a page-by-page source (grows when it is busy)
+    # how new library folders and files are named (naming.py); existing ones change only through a rename
+    **{k: getattr(naming.DEFAULTS, k) for k in naming.OPTION_KEYS},
     "unusable_sources": sorted(config.UNUSABLE_SOURCES),
     "throttled_sources": sorted(config.THROTTLED_SOURCES),
     "page_warm_sources": sorted(config.PAGE_WARM_SOURCES),
@@ -106,6 +119,7 @@ SECRET_KEYS = {"pushover_token", "pushover_user", "komga_api_key", "auth_passwor
                # the key itself and URLs whose path is the credential (webhook ids, ntfy topics, Apprise keys)
                "api_key", "webhook_url", "apprise_url", "ntfy_url", "session_secret"}
 INTERNAL_KEYS = {"session_secret", "session_epoch", "revoked_sessions", "leftover_queue_ids"}
+NAMING_KEYS = naming.OPTION_KEYS
 ID_LIST_KEYS = {"leftover_queue_ids"}      # lists of integer ids, kept in the order given
 MASK = "********"        # what the UI shows for a stored secret; submitting it unchanged keeps the value
 # a secret belongs to the destination it was entered for: change the destination
@@ -387,6 +401,11 @@ def _changes(con: sqlite3.Connection, current: dict, values: dict, internal: boo
             raise KeyError(k)
         if v is None:
             raise ValueError(f"{k}: a value is required (send \"\" to clear it)")
+        if k in NAMING_KEYS:
+            v = _naming_value(k, v)                     # refused when it cannot be used, never mended
+            if v != current.get(k) or type(v) is not type(current.get(k)):
+                new[k] = v
+            continue
         if k in SECRET_KEYS and isinstance(v, str):
             if v.strip() == MASK or (v == current.get(k)):
                 continue
@@ -408,6 +427,8 @@ def _changes(con: sqlite3.Connection, current: dict, values: dict, internal: boo
     notices = _unbind_moved_secrets(current, values, new)
     if any(k in new for k in ("auth_user", "auth_password", "auth_method")):
         _validate({**current, **new})
+    if any(k in new for k in NAMING_KEYS):
+        _validate_naming({**current, **new}, new)
     if "auth_password" in new and new["auth_password"]:
         new["auth_password"] = hash_password(str(new["auth_password"]))
     if not current.get("auth_user") and new.get("auth_user"):
@@ -512,6 +533,84 @@ def _validate(v: dict) -> None:
                              "(clear the username to turn the login off)")
     if v.get("auth_method") not in ("forms", "basic"):
         raise ValueError("auth_method: must be 'forms' or 'basic'")
+
+
+_ON, _OFF = ("1", "true", "on", "yes"), ("0", "false", "off", "no", "")
+NAMING_LABELS = {"series_folder_format": "Series Folder Format", "chapter_file_format": "Chapter File Format",
+                 "colon_replacement": "Colon Replacement", "replace_illegal_characters": "Replace Illegal Characters",
+                 "chapter_title_max_chars": "Chapter Title Length", "drop_number_only_titles": "Number-only Titles"}
+
+
+def _naming_value(key: str, v):
+    """A naming setting as its type, from a form field or JSON: a format as
+    typed (not trimmed: text around the tokens is part of the name), on/off,
+    a whole number. ValueError when it is not that; whether the value can be
+    used is checked on all naming settings together (_validate_naming)."""
+    d = DEFAULTS[key]
+    label = NAMING_LABELS[key]
+    if isinstance(d, bool):
+        if isinstance(v, bool):
+            return v
+        text = str(v).strip().lower() if isinstance(v, (str, int)) else None
+        if text in _ON or text in _OFF:
+            return text in _ON
+        raise ValueError(f"{key}: {label} must be on or off")
+    if isinstance(d, int):
+        try:
+            if isinstance(v, bool) or not isinstance(v, (str, int, float)):
+                raise ValueError
+            n = int(v.strip()) if isinstance(v, str) else v
+            if n != int(n):
+                raise ValueError
+            return int(n)
+        except (ValueError, OverflowError):
+            raise ValueError(f"{key}: {label} must be a whole number from 1 to {naming.TITLE_MAX}") from None
+    if not isinstance(v, str):
+        raise ValueError(f"{key}: {label} must be text")
+    return v.strip().lower() if key == "colon_replacement" else v
+
+
+def _validate_naming(merged: dict, new: dict) -> None:
+    """The naming settings as they would be after this write must be usable
+    (naming.check_options); ValueError with every reason otherwise. Only
+    what this write changes is held to it, so a value an older version or a
+    restored backup left unusable does not block saving the others."""
+    labels = {NAMING_LABELS[k] for k in new if k in NAMING_KEYS}
+    errors = [m for m in naming.check_options(naming.as_options(merged))
+              if any(m.startswith(label) for label in labels)]
+    if errors:
+        log.warning("rejected naming settings: %s", " ".join(errors))
+        raise ValueError(" ".join(errors))
+
+
+_naming_warned: set = set()
+
+
+def naming_options(con: sqlite3.Connection | None = None, values: dict | None = None) -> naming.Options:
+    """The naming settings as naming.Options, for naming a new file or
+    folder. Stored values that cannot be used (written by hand, or by a
+    restored backup) never stop an import: the defaults are used instead,
+    and the log says so once. See checked_naming_options for a rename."""
+    options, errors = checked_naming_options(con, values)
+    if errors:
+        key = tuple(errors)
+        if key not in _naming_warned:
+            _naming_warned.add(key)
+            log.error("the stored naming settings cannot be used (%s); new files and folders get the default "
+                      "names until they are corrected in Settings -> Media Management", " ".join(errors))
+        return naming.DEFAULTS
+    return options
+
+
+def checked_naming_options(con: sqlite3.Connection | None = None,
+                           values: dict | None = None) -> tuple[naming.Options, list[str]]:
+    """(the naming settings, what is wrong with them: [] when usable)."""
+    values = values if values is not None else all_values(con)
+    try:
+        options = naming.as_options({k: values[k] for k in NAMING_KEYS if k in values})
+        return options, naming.check_options(options)
+    except Exception as e:          # a value of a type check_options cannot even look at
+        return naming.DEFAULTS, [f"{type(e).__name__}: {e}"]
 
 
 # Settings holding a URL that mang-arr sends requests to: http(s) only (urllib

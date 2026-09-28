@@ -466,7 +466,7 @@ _COPY_ERRNOS = (errno.EXDEV, errno.EPERM, errno.EMLINK)
 
 
 def link_into_library(src: str | StagedFile, folder: str, number: float, root: str | None = None,
-                      replace: bool = False, label: str | None = None) -> str | None:
+                      replace: bool = False, label: str | None = None, name: str | None = None) -> str | None:
     """Hard-link a staged chapter into the library. Copies when the two
     trees are on different filesystems or mounts (logged once). Returns the
     library path, or None when a different file already sits there and
@@ -476,18 +476,23 @@ def link_into_library(src: str | StagedFile, folder: str, number: float, root: s
     copied is that open file, whatever its name points at by now; it goes
     to a hidden temporary name first and only then gets its real name, so
     the library never shows a half-written copy. An OSError names the
-    staged file and the library path."""
+    staged file and the library path. name: the file's name in the library
+    (one the naming formats made, naming.render); without it, the default
+    format's name for the number and label."""
     global COPIED
     if isinstance(src, str):
         try:
             with open_staged(src) as f:
-                return link_into_library(f, folder, number, root, replace, label)
+                return link_into_library(f, folder, number, root, replace, label, name)
         except NotRegularFile:
             log.error("%s is not a regular file (symlink or special file); not linking it", src)
             return None
     d = library_dir(folder, root)
     os.makedirs(d, exist_ok=True)
-    name = chapter_filename(number, label)
+    if name is None:
+        name = chapter_filename(number, label)
+    elif name in ("", ".", "..") or os.path.basename(name) != name or "\0" in name:
+        raise ValueError(f"not a file name: {name!r}")
     dst = os.path.join(d, name)
     dir_fd = os.open(d, _DIR_FLAGS)
     try:

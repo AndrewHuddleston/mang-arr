@@ -36,7 +36,7 @@ import time
 import urllib.parse
 from collections.abc import Callable
 
-from . import config, db, library
+from . import config, db, library, serieslock
 
 log = logging.getLogger(__name__)
 
@@ -537,6 +537,15 @@ def _sanitise_paths(con) -> list[str]:
             cleared += 1
     if cleared:
         notes.append(f"{cleared} stored path(s) outside the library/staging folders cleared")
+    # the rename journal (renamer.py) is acted on too (repair, undo): only steps inside the library stay
+    dropped = 0
+    for r in con.execute("SELECT id, old_path, new_path FROM rename_log").fetchall():
+        if not (library.is_within(r["old_path"], config.LIBRARY_ROOT)
+                and library.is_within(r["new_path"], config.LIBRARY_ROOT)):
+            dropped += con.execute("DELETE FROM rename_log WHERE id=?", (r["id"],)).rowcount
+    if dropped:
+        log.warning("restore: %d rename journal row(s) with paths outside %s dropped", dropped, config.LIBRARY_ROOT)
+        notes.append(f"{dropped} rename journal row(s) outside the library folder dropped")
     return notes
 
 
@@ -573,6 +582,67 @@ def _carry_settings(path: str, current: dict[str, str], keys: tuple[str, ...] = 
         con.commit()
     finally:
         con.close()
+
+
+RENAME_JOURNAL = ("rename_run", "rename_log")
+
+
+def _carry_rename_journal(path: str) -> bool:
+    """Put the live database's rename journal into the database about to be
+    restored, in place of the backup's: the library's files have the names
+    the renames since the backup gave them, whatever the restored rows say,
+    and the journal is how the rows catch up after the swap
+    (renamer.reconcile) and how those renames can still be undone. False
+    (logged; the backup's journal stays) when it cannot be read."""
+    try:
+        live = sqlite3.connect(config.DB_PATH, timeout=30)
+        try:
+            rows = {}
+            for t in RENAME_JOURNAL:
+                cur = live.execute(f"SELECT * FROM {t} ORDER BY id")
+                rows[t] = ([d[0] for d in cur.description], cur.fetchall())
+        finally:
+            live.close()
+        con = sqlite3.connect(path)
+        try:
+            for t, (cols, values) in rows.items():
+                have = {r[1] for r in con.execute(f"PRAGMA table_info({_q(t)})")}
+                if not set(cols) <= have:
+                    raise sqlite3.DatabaseError(f"table {t} has other columns")
+                con.execute(f"DELETE FROM {_q(t)}")
+                marks = ", ".join("?" for _ in cols)
+                con.executemany(f"INSERT INTO {_q(t)} ({', '.join(_q(c) for c in cols)}) VALUES ({marks})", values)
+            con.commit()
+        finally:
+            con.close()
+        return True
+    except sqlite3.Error as e:
+        log.warning("restore: cannot carry the rename journal over (%s); the backup's own is used", e)
+        return False
+
+
+def _follow_renames(notes: list[str]) -> None:
+    """After the swap: the restored rows follow the renames done since the
+    backup was written (renamer.reconcile)."""
+    from . import renamer  # imported here: renamer imports this module
+    try:
+        with db.connect() as con:
+            n = renamer.reconcile(con)
+        if n:
+            notes.append(f"{n} chapter path(s) and folder(s) follow the renames done since the backup")
+    except Exception as e:
+        log.error("restore: could not follow the renames done since the backup: %s: %s", type(e).__name__, e)
+
+
+@contextlib.contextmanager
+def _no_rename_run():
+    """Hold the rename lock while the database is swapped: a rename writes
+    its journal and the chapters' paths step by step."""
+    try:
+        with serieslock.rename_run(0.0):
+            yield
+    except serieslock.Busy as e:
+        raise RestoreError(f"{e}; try again when that has finished") from e
 
 
 @contextlib.contextmanager
@@ -655,9 +725,10 @@ def restore(source, keep_auth: bool = True, still_allowed: Callable[[dict], bool
             if not ok:
                 raise RestoreError(msg)
             version, notes = _rebuild(staged, fresh, _page_size())
-            with _no_download_run():
+            with _no_rename_run(), _no_download_run():
                 # read only now: every change to them happens under the download lock
                 _carry_settings(fresh, _current_settings(LIVE_SETTINGS) or {}, LIVE_SETTINGS)
+                _carry_rename_journal(fresh)        # no rename runs now: the journal is complete
                 try:
                     safety = create("before restore", prune_after=False)
                     with settings.write_lock:
@@ -690,6 +761,7 @@ def restore(source, keep_auth: bool = True, still_allowed: Callable[[dict], bool
         finally:
             shutil.rmtree(work, ignore_errors=True)
         db.restrict_permissions(config.DB_PATH)
+        _follow_renames(notes)
         with db.connect() as con:
             settings.refresh(con)                        # the middleware must see the restored settings now
             n = con.execute("SELECT COUNT(*) FROM series").fetchone()[0]

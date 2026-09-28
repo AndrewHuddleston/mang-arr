@@ -345,20 +345,66 @@ def chapter_title(number: float, name: str | None, options: Options = DEFAULTS) 
     without a leading repeat of the number otherwise ('Chapter 12: The
     Storm' -> 'The Storm'), cleaned and cut to chapter_title_max_chars.
     With the defaults this is library.chapter_label (with "" for None)."""
-    if not name:
+    # capped and whitespace-collapsed first (raw_title), so the patterns
+    # (anchored, no nested quantifiers) stay cheap on a hostile source's chapter name
+    n = raw_title(number, name)
+    if n is None or (options.drop_number_only_titles and number_only(n)):
         return ""
-    # capped and whitespace-collapsed first, so the patterns below (anchored,
-    # no nested quantifiers) stay cheap on a hostile source's chapter name
+    return clean(n, options)[:options.chapter_title_max_chars]
+
+
+def raw_title(number: float, name: str | None) -> str | None:
+    """A source's chapter name as chapter_title reads it, before it is
+    cleaned and cut: whitespace made single spaces, a leading repeat of the
+    number taken off ('Chapter 12: Extra: The Storm' -> 'Extra: The Storm');
+    None for no name and for one that only repeats the number."""
+    if not name:
+        return None
     n = _WS.sub(" ", name[:MAX_PARSE]).strip()
     plain = _PLAIN_NAME.fullmatch(n)
     if plain and float(plain.group(1)) == number:
-        return ""
+        return None
     lead = _LEAD_NAME.match(n)
     if lead and float(lead.group(1)) == number:
         n = lead.group(2).strip()
-    if options.drop_number_only_titles and number_only(n):
-        return ""
-    return clean(n, options)[:options.chapter_title_max_chars]
+    return n
+
+
+def stored_title(chapter: ChapterInfo, options: Options = DEFAULTS) -> str:
+    """What chapter.file_title records for the name render() gives this
+    chapter: the title that name carries ("" when it has none). A chapter
+    rendered from a stored title keeps it. One rendered from the source's
+    name stores that name's own spelling of the title (raw_title: its ':'
+    still a ':'), so a colon replacement or title length chosen later
+    applies to it - but only when that spelling renders to the very title
+    in the name; otherwise the title as the name has it."""
+    if chapter.file_title is not None:
+        return chapter.file_title
+    return title_to_store(chapter.number, chapter.name, chapter_title(chapter.number, chapter.name, options), options)
+
+
+def title_to_store(number: float, source_name: str | None, title: str, made_with: Options = DEFAULTS) -> str:
+    """chapter.file_title for a file whose name carries `title` and was made
+    with the options `made_with`: the source's own spelling of it
+    (raw_title) when that renders to exactly this title, else the title as
+    it is (see stored_title)."""
+    raw = raw_title(number, source_name)
+    if raw and chapter_title(number, source_name, made_with) == title \
+            and title_value(ChapterInfo(number, file_title=raw), made_with) == title:
+        return raw
+    return title
+
+
+def read_title(filename: str, series: SeriesNames | None, number: float,
+               options: Options = DEFAULTS) -> str | None:
+    """The title in a chapter file name these options made ("" when it has
+    none), or None when they did not make it: the name must have the
+    format's shape (title_from_name) and rendering the title again must
+    give the name back."""
+    found, title = title_from_name(filename, series, number, options)
+    if found and render(series, ChapterInfo(number, file_title=title or ""), options) == filename:
+        return title or ""
+    return None
 
 
 def title_value(chapter: ChapterInfo, options: Options = DEFAULTS) -> str:
