@@ -45,7 +45,8 @@ a model that keeps what the passes saw:
      last listed it. A chapter Suwayomi has downloaded is on disk, linked
      or not. A copy of a fractional chapter is tried only when the counts
      the resolve went by say it is the chapter (min_pages or more), or its
-     site would not count it (I2-short): never one counted short, one whose
+     site would not count it and never has (I2-short; a count that fails
+     is judged by the copy's last count that worked): never one counted short, one whose
      count expired, one never counted (a fallback behind a full best copy)
      or one Suwayomi did not count this time. (A copy its site changed in
      place since a count still kept is not seen before that count is due
@@ -389,6 +390,15 @@ class Sim:
                     self.judged[self.copy_of(ch.id)] = got[1]
                 return got
             counts.lookup = kept
+            record = counts.record
+
+            def recorded(manga_id, ch, pages):
+                # a count that failed is judged by the copy's last count that worked, if it has one
+                # (pagecounts.py): what the resolve went by is what record() answers, not the failure
+                got = record(manga_id, ch, pages)
+                self.judged[self.copy_of(ch.id)] = got
+                return got
+            counts.record = recorded
         resolver._prune_junk(client, plan, None, counts, kw.get("settled"))
         self.model.observe(self.t, w, answered, self.judged)
         self.last_judged.update((k, copy_state(v)) for k, v in self.judged.items())

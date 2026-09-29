@@ -477,9 +477,7 @@ class SeriesSteps:
         if m is None:
             cands = self.plan.candidates[n]
             results[n] = "failed"
-            only_one = len(cands) == 1
-            self.reasons[n] = "; ".join(self.tried.get(n) or [c.source.name for c in cands]) + \
-                (" (no other source has this chapter)" if only_one else "")
+            self.reasons[n] = "; ".join(self.tried.get(n) or [c.source.name for c in cands]) + self._others_note(n)
             waiting = [x for x in order[self.idx + 1:] if results.get(x) != "ok" and x not in skip]
             for x in waiting:
                 self.reasons[x] = waiting_reason(n)
@@ -634,10 +632,20 @@ class SeriesSteps:
                 self.pending.add(n)
             else:
                 self.results[n] = "failed"
-                only_one = len(plan.candidates[n]) == 1
-                self.reasons[n] = ("; ".join(self.tried[n]) +
-                                   (" (no other source has this chapter)" if only_one else ""))
+                self.reasons[n] = "; ".join(self.tried[n]) + self._others_note(n)
                 log.warning("%s: ch %g failed: %s", self.label, n, self.reasons[n])
+
+    def _others_note(self, n: float) -> str:
+        """What a failed chapter's reason says of its other copies: that
+        there are none, or that the ones there are were left out this pass
+        because their pages were not counted (plan.uncounted), which the
+        next pass does. Nothing when it failed on more than one source."""
+        left_out = (getattr(self.plan, "uncounted", None) or {}).get(n)
+        if left_out:
+            return (f" (its cop{'y' if len(left_out) == 1 else 'ies'} on {', '.join(left_out[:3])} "
+                    f"{'was' if len(left_out) == 1 else 'were'} not counted this pass; the next pass counts "
+                    f"{'it' if len(left_out) == 1 else 'them'})")
+        return " (no other source has this chapter)" if len(self.plan.candidates[n]) == 1 else ""
 
     def _delivered_nothing(self, m: SourceMatch) -> None:
         """A run of entry m delivered nothing: the other entries get its
@@ -956,7 +964,7 @@ def _download_loop(client, manga_id, todo, batch, label, source_name, patient, c
                 except Cancelled:
                     unsure = True                   # cut short in flight: it may still land after the dequeue
                     raise
-                ops.start()
+                _start(ops, label, source_name)
                 outcome = _wait(client, ids, cancel, every=2 if len(ids) == 1 else 5,
                                 moved=lambda share, status=status: report(f"{status}, this batch {share:.0%})"))
             except Cancelled:
@@ -1078,6 +1086,26 @@ def _download_loop(client, manga_id, todo, batch, label, source_name, patient, c
         if limits.pause(pace if pace and i < len(todo) else 2, cancel):
             break
     return ok, failed, why
+
+
+def _start(ops, label: str, source_name: str) -> None:
+    """Ask Suwayomi to start its downloader. When it answers that it timed
+    out doing so (it does at times when several lanes start downloads at
+    once: "Timed out waiting for 30000 ms"), that is no verdict on the
+    series or the source: the chapters are queued, the downloader is often
+    running already, and the wait that follows sees whether the queue
+    moves (and takes the chapters back out when it does not). Any other
+    error is raised."""
+    try:
+        ops.start()
+    except (SuwayomiUnreachable, Cancelled):
+        raise
+    except SuwayomiError as e:
+        if "timed out" not in str(e).lower():
+            raise
+        metrics.record_start_timeout(source_name)
+        log.warning("%s: Suwayomi timed out starting its downloader for %s (%s); going on: the queue is watched",
+                    label, source_name, str(e)[:120])
 
 
 def _enqueue(ops, ids: list[int]) -> None:

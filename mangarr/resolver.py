@@ -652,8 +652,8 @@ def _prune_junk(client: Client, plan: Plan, progress: Callable[[str], None] | No
     agreement between them proves nothing. With `counts`, a count kept from
     an earlier pass is used while it holds; one that no longer holds is
     counted again, a short one too (never taken as unknown), and a copy
-    whose count failed is kept, as when a count fails, until its retry is
-    due."""
+    whose count failed is judged by its last count that worked, if it has
+    one, until its retry is due (pagecounts.py)."""
     from . import settings
     min_pages = int(settings.get("min_pages"))
     settled = settled or set()

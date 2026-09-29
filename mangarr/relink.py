@@ -206,7 +206,10 @@ class Lists:
         if self.client is None:
             raise SuwayomiError("no Suwayomi client")
         if manga_id not in self._lists:
-            self._lists[manga_id] = list(self.client.chapters(manga_id))
+            # every group's copy of a number, not one per number (Client.chapters): the file of
+            # another group than the one with the widest coverage is a chapter Suwayomi lists too
+            ask = getattr(self.client, "chapters_all", None) or self.client.chapters
+            self._lists[manga_id] = list(ask(manga_id))
         return self._lists[manga_id]
 
     def listed(self) -> set:
@@ -268,18 +271,23 @@ def number_in(chapters, filename: str) -> float | None:
 
 def _confirm(title: str, items: list[Misread], lists: Lists, result: Result) -> tuple[list[Misread], set | None]:
     """The misreads Suwayomi confirms (its number for the file is the new
-    reading), and the numbers the series' sources list. Those it numbers
-    otherwise or does not list are left (counted in result.left, logged);
-    when it cannot be asked, all of them wait for a later run
-    (result.deferred): ([], None)."""
+    reading), and the numbers the series' sources list (None when not
+    every source entry could be listed: the rows decide then, _listed).
+    Those it numbers otherwise or does not list are left (counted in
+    result.left, logged); when it cannot be asked about the files
+    themselves, all of them wait for a later run (result.deferred):
+    ([], None)."""
     try:
         numbers = [lists.number_of(m.link.staging_path) for m in items]
-        listed = lists.listed()
     except SuwayomiError as e:
         result.deferred += len(items)
         log.warning("%s: %d link(s) look misread, but Suwayomi cannot be asked for its chapter numbers (%s); "
                     "nothing changed, the check runs again later", title, len(items), e)
         return [], None
+    # Which numbers the series' sources list only decides what becomes of the row a repair sets back
+    # (wanted, or gone). It asks every source entry, and one that cannot be listed (a stale entry
+    # Suwayomi no longer has) must not put a confirmed repair off for good: the rows decide then.
+    listed = _listed_numbers(lists, title)
     confirmed = []
     for m, n in zip(items, numbers, strict=True):
         if n == m.actual:
@@ -333,8 +341,10 @@ def check_links(con, client: Client | None = None, progress: Callable[[str], Non
             con.commit()
         with serieslock.hold(sid, should_cancel=should_cancel):     # its files are not renamed meanwhile
             _check_series(con, client, r, i, len(rows), lists, confirmed, listed, guard, result, say)
-    if (result.repaired or result.healed) and not result.imported:
-        komga.scan_retrying()           # a link went and none came: import_series did not ask
+    if result.repaired or result.healed:
+        # links went: one scan after the last of them. An import asks for a scan of its own, but that
+        # of an earlier series comes before the links of a later one are removed.
+        komga.scan_retrying()
     log.info("check library links: %s", result.message)
     return result
 

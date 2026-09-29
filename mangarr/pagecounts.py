@@ -17,9 +17,11 @@ again only when it may have changed:
   each time it comes out the same, up to every 90 days (junk is most of
   what is counted);
 - the last count failed: it is tried again after RETRY_HOURS, further out
-  after each failure, not every pass. Until then the chapter is kept, as
-  when a count fails, whatever an older count said: a count that was due
-  again and failed is not judged by.
+  after each failure, not every pass. Until then the copy is judged by the
+  last count that worked for the same listing, when there is one: a copy
+  that was short stays out (one refused request must not turn a notice
+  image into a chapter), one that was full stays in. A copy that was never
+  counted is kept, as when a count fails.
 
 Suwayomi itself not answering says nothing about a chapter: nothing is kept,
 and the next resolve counts it. The junk decision itself (fewer pages than
@@ -131,8 +133,10 @@ class PageCounts:
 
     def lookup(self, manga_id: int, ch: Chapter, min_pages: int) -> tuple[bool, int | None]:
         """(True, the count to judge by) when the kept count holds, (False,
-        None) when the chapter is to be counted now. The count is None for a
-        chapter whose last count failed and is not due again: it is kept."""
+        None) when the chapter is to be counted now. For a chapter whose
+        last count failed and is not due again the count is the last one
+        that worked for this listing, or None when there is none: it is
+        kept."""
         self._load(manga_id)
         c = self.known.get((manga_id, ch.id))
         if c is None or c.listing != listing(ch):
@@ -141,7 +145,7 @@ class PageCounts:
             # (a time further out than any retry is a clock that went back, or a restored file: due now)
             if c.next_try and _stamp() < c.next_try <= _stamp(RETRY_HOURS[-1] * 3600):
                 self.reused += 1
-                return True, None                       # not yet tried again: kept, as when a count fails
+                return True, c.pages                    # not yet tried again: as its last count said, if any
             return False, None
         if c.pages is None or not c.counted_at:
             return False, None
@@ -157,9 +161,8 @@ class PageCounts:
     def record(self, manga_id: int, ch: Chapter, pages: int | None) -> int | None:
         """Keep what counting the chapter gave: its page count, or None when
         the source would not say. Returns the count to judge by: this one,
-        or None after a failure (the chapter is kept, whatever an older
-        count said; that count stays in the row only so that a later count
-        that agrees with it is trusted longer)."""
+        or after a failure the last one that worked for the same listing
+        (None when there is none: the chapter is kept)."""
         self._load(manga_id)
         key, now_listing = (manga_id, ch.id), listing(ch)
         self.counted += 1
@@ -174,7 +177,7 @@ class PageCounts:
         hours = RETRY_HOURS[min(tries, len(RETRY_HOURS)) - 1]
         last = (prev.pages, prev.counted_at, prev.agreed) if same else (None, None, 0)
         self.known[key] = Count(now_listing, *last, tries, _stamp(hours * 3600))
-        return None
+        return last[0]
 
     def save(self, con, plan) -> None:
         """Write the counts taken in this resolve, and forget the chapters

@@ -134,6 +134,30 @@ class FallbackTest(unittest.TestCase):
 
 
 class DownloadOneTest(unittest.TestCase):
+    def test_a_timeout_starting_the_downloader_is_not_a_failure(self):
+        # backlog 11: Suwayomi sometimes answers startDownloader with a timeout when several lanes start
+        # downloads at once; the chapters are queued all the same
+        from mangarr.suwayomi import QueryError, SuwayomiError
+
+        class Slow(FakeClient):
+            def start(self):
+                super().start()
+                raise QueryError("Exception while fetching data (/startDownloader) : Timed out waiting for 30000 ms")
+        a = match("A", 1, [1, 2])
+        with mock.patch("mangarr.downloader.limits.pause", lambda *x, **k: False), \
+                self.assertLogs("mangarr.downloader", "WARNING") as logs:
+            ok, failed, why = downloader._download_source(Slow(), 1, a.chapters, 2, "T", "A", True, lambda: False,
+                                                          lambda m: None, downloader.RunMemo())
+        self.assertEqual((ok, failed, why), ([1.0, 2.0], [], {}))
+        self.assertIn("timed out starting its downloader", logs.output[0])
+
+        class Refused(FakeClient):
+            def start(self):
+                raise SuwayomiError("HTTP error 500")               # anything else is still an error
+        with self.assertRaisesRegex(SuwayomiError, "500"):
+            downloader._download_source(Refused(), 1, a.chapters, 2, "T", "A", True, lambda: False, lambda m: None,
+                                        downloader.RunMemo())
+
     def test_download_one(self):
         with tempfile.TemporaryDirectory() as tmp, \
              mock.patch("mangarr.downloader.time.sleep", lambda s: None), \
@@ -411,6 +435,22 @@ class SeriesStepsTest(unittest.TestCase):
         self.assertEqual(runs, [("C", [1.0]), ("B", [2.0]), ("B", [1.0])])
         self.assertEqual(steps.results, {1.0: "ok", 2.0: "failed"})
         self.assertEqual(reasons[2.0], "B: broken (no other source has this chapter)")
+
+    def test_a_failed_chapter_says_when_its_other_copies_were_not_counted(self):
+        # backlog 10c: "(no other source has this chapter)" was said of a chapter other sites list, when
+        # their copies were only left out this pass because their pages were not counted
+        for in_order in (True, False):
+            with self.subTest(in_order=in_order):
+                steps, reasons = steps_for([match("X", 1, [3, 3.5, 4])], [3, 3.5, 4], in_order=in_order)
+                steps.plan.uncounted = {3.5: ["C", "D"]}
+                drive(steps, {("X", 3.5)}, lambda keys, alts: keys[0])
+                self.assertEqual(steps.results[3.5], "failed")
+                self.assertEqual(reasons[3.5], "X: broken (its copies on C, D were not counted this pass; the next "
+                                               "pass counts them)")
+        steps, reasons = steps_for([match("X", 1, [3.5])], [3.5])
+        steps.plan.uncounted = {3.5: ["C"]}
+        drive(steps, {("X", 3.5)}, lambda keys, alts: keys[0])
+        self.assertEqual(reasons[3.5], "X: broken (its copy on C was not counted this pass; the next pass counts it)")
 
     def test_a_source_that_delivered_nothing_is_asked_last(self):
         a, b = match("A", 1, [1, 2]), match("B", 2, [1, 2])

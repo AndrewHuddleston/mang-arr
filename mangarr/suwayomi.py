@@ -295,6 +295,17 @@ class Client:
                     timeout=60, retries=2)
         return dedupe(d["manga"]["chapters"]["nodes"])
 
+    def chapters_all(self, manga_id: int) -> list[Chapter]:
+        """Every chapter Suwayomi lists for a source entry, from its cache:
+        each scanlation group's copy of a number, where chapters() keeps one
+        per number. For telling which chapter a downloaded file is."""
+        d = self.gq('query($id: Int!) { manga(id: $id) { chapters { nodes'
+                    ' { id name chapterNumber scanlator isDownloaded uploadDate } } } }', {"id": manga_id},
+                    timeout=60, retries=2)
+        return [Chapter(c["id"], float(c["chapterNumber"]), c.get("name"), c.get("scanlator"),
+                        bool(c.get("isDownloaded")), _iso_date(c.get("uploadDate")))
+                for c in d["manga"]["chapters"]["nodes"] if float(c["chapterNumber"]) >= 0]
+
     def chapter_url(self, chapter_id: int) -> str | None:
         """The chapter's page on its source's site (Suwayomi's realUrl, from
         the extension; checked by the caller before it is shown), or None

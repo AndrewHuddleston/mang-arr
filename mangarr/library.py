@@ -70,6 +70,10 @@ _VOLUME_ONLY = re.compile(r"(?<![A-Za-z])vol(?:ume)?\.?\s*\d+", re.I)
 # "_Vol.2 - Ch.7"): looked for only in the few characters before the marker
 _VOLUME_BEFORE = re.compile(_WORD_START + r"vol(?:ume)?\.?\s*(?:\d+(?:\.\d+)?|tbd)\s*(?:-\s*)?\Z", re.I)
 _VOLUME_ROOM = 40
+# what follows the number of the marker that starts a chapter name: the end, or a separator before the
+# title (" - Title", ": Title" which Suwayomi writes "_ Title", "(v2)", "[END]"); a word right after it
+# ("Ch 3 Scans") is a scanlator's name going on
+_TITLE_NEXT = re.compile(r"\s*(?:\Z|[-\u2013\u2014:(\[]|_\s)")
 _SCANLATOR_END = re.compile(r"_(?=[^\s_])")     # "Scans_Day 3", "fans_#3"; a ':' becomes "_ "
 # the last number in the name. Anchored at the start of a digit run and
 # followed only by non-digits: linear, where "(?!.*\d)" rescans the rest of
@@ -100,11 +104,17 @@ def parse_number(filename: str) -> float | None:
 
 
 def _chapter_marker(stem: str) -> re.Match | None:
-    """The chapter marker (_CHAPTER) that starts the chapter name: the last
-    one that stands right after a "_" or at the start (a volume allowed
-    between), else the first one; None without any. One glued to its number
-    ("Ch17") counts only where it starts the name: right after a "_", or at
-    the start of a name with no scanlator before a "_" after it."""
+    """The chapter marker (_CHAPTER) that starts the chapter name. Of the
+    ones that stand right after a "_" or at the start (a volume allowed
+    between): the first whose number is followed by what follows a chapter
+    number in a name (the end, or a separator before its title:
+    _TITLE_NEXT), so a "_" in the title, which is what Suwayomi makes of a
+    character a file name cannot hold, does not start the name over
+    ("Chapter 12 - Part 1_Ch.3" is chapter 12); else the last of them (a
+    scanlator called "Ch 3 Scans", before "_Chapter 12"). Else the first
+    marker anywhere; None without any. One glued to its number ("Ch17")
+    counts only where it starts the name: right after a "_", or at the
+    start of a name with no scanlator before a "_" after it."""
     first = last = None
     for m in _CHAPTER.finditer(stem):
         at = _name_start(stem, m.start())
@@ -113,6 +123,8 @@ def _chapter_marker(stem: str) -> re.Match | None:
             continue                    # "ep2 fans_Day 3": a scanlator's name, not a chapter marker
         first = first or m
         if at is not None:
+            if _TITLE_NEXT.match(stem, m.end()):
+                return m                # "Chapter 12 - Part 1_Ch.3": the name started here; the rest is its title
             last = m
     return last or first
 

@@ -12,6 +12,8 @@
     mangarr_lane_seconds_total{source}   time lanes spent on each source (rate() near 1: the bottleneck)
     mangarr_download_unstarted_total{source}
                                          chunks Suwayomi did not start within 30 min (its queue busy)
+    mangarr_downloader_start_timeouts_total{source}
+                                         times Suwayomi timed out starting its downloader (gone on regardless)
     mangarr_page_fetches_total{source,result}
                                          page requests on page-by-page sources (ok/busy/timeout/gone/error)
     mangarr_page_warmups_total{source,result}
@@ -49,6 +51,8 @@ if AVAILABLE:
     LANE_SECONDS = Counter("mangarr_lane_seconds_total", "time download lanes spent on each source", ["source"])
     UNSTARTED = Counter("mangarr_download_unstarted_total", "download chunks Suwayomi did not start in time",
                         ["source"])
+    START_TIMEOUTS = Counter("mangarr_downloader_start_timeouts_total",
+                             "times Suwayomi timed out starting its downloader", ["source"])
     PAGE_FETCHES = Counter("mangarr_page_fetches_total", "page requests on page-by-page sources",
                            ["source", "result"])
     PAGE_WARMUPS = Counter("mangarr_page_warmups_total", "chapters fetched page by page", ["source", "result"])
@@ -83,6 +87,11 @@ def record_lane_time(source: str, secs: float) -> None:
 def record_unstarted(source: str) -> None:
     if AVAILABLE:
         UNSTARTED.labels(source=source).inc()
+
+
+def record_start_timeout(source: str) -> None:
+    if AVAILABLE:
+        START_TIMEOUTS.labels(source=source).inc()
 
 
 def record_page(source: str, result: str) -> None:
