@@ -9,6 +9,7 @@ than half a migration that every later start trips over.
 """
 import json
 import logging
+import math
 import os
 import sqlite3
 import threading
@@ -843,6 +844,57 @@ def _with_note(reason: str | None, note: str, limit: int = 300) -> str:
     return (base if len(base) <= room else base[:max(room - 1, 0)] + "…") + "; " + note
 
 
+PART_REASON = "not wanted: a part or extra of chapter {whole:g}, which is on disk (Settings, Downloading)"
+_PART_PREFIX = "not wanted: a part or extra of chapter "
+
+
+def _whole_of(n: float) -> float | None:
+    """The whole chapter a fractional one belongs to (12.5 -> 12, 0.5 -> 0);
+    None for a whole number."""
+    whole = float(math.floor(n))
+    return None if whole == n else whole
+
+
+def parts_on_disk(con, series_id: int, numbers, rows: dict, skip: bool) -> set[float]:
+    """The setting "fractional chapters of a chapter on disk are not
+    wanted", applied to the chapters a resolve lists: with it on, every
+    fractional chapter whose whole chapter is on disk, and which is neither
+    on disk nor ignored nor one you wanted again yourself, is set to ignored
+    with PART_REASON; with it off, the ones it had set so are wanted again.
+    Returns the chapters it holds ignored now. Many sites list a chapter in
+    parts (5.1, 5.2) where the others list chapter 5; extras (12.5) go the
+    same way, which is why this is a choice."""
+    held = {n for n, r in rows.items() if r["status"] == "ignored" and (r["reason"] or "").startswith(_PART_PREFIX)}
+    if not skip:
+        for n in held:
+            con.execute("UPDATE chapter SET status='wanted', reason=?, updated_at=? WHERE series_id=? AND number=?"
+                        " AND status='ignored'", ("not downloaded yet - waiting for a download pass", now(),
+                                                  series_id, n))
+        if held:
+            log.info("series #%d: %d fractional chapter(s) are wanted again (the setting is off)", series_id,
+                     len(held))
+        return set()
+    declined = {r[0] for r in con.execute("SELECT number FROM stuck_choice WHERE series_id=? AND declined IS NOT"
+                                          " NULL", (series_id,))}
+    fresh = []
+    for n in numbers:
+        whole = _whole_of(n)
+        prev = rows.get(n)
+        if whole is None or n in held or n in declined or (prev and prev["status"] in ("have", "ignored")):
+            continue
+        if whole in rows and rows[whole]["status"] == "have":
+            con.execute(
+                "INSERT INTO chapter (series_id, number, status, reason, updated_at) VALUES (?,?,'ignored',?,?)"
+                " ON CONFLICT(series_id, number) DO UPDATE SET status='ignored', reason=excluded.reason,"
+                " tries=0, next_try=NULL, failed_since=NULL, updated_at=excluded.updated_at",
+                (series_id, n, PART_REASON.format(whole=whole), now()))
+            fresh.append(n)
+    if fresh:
+        log.info("series #%d: %d fractional chapter(s) not wanted, their whole chapter is on disk: %s", series_id,
+                 len(fresh), ", ".join(f"{n:g}" for n in sorted(fresh)[:20]) + (" ..." if len(fresh) > 20 else ""))
+    return held | set(fresh)
+
+
 def save_plan(con, series_id: int, plan, primary_manga_id: int | None) -> list[str]:
     """Store a resolve's outcome. Returns the names of sources whose entry
     was dropped because they have not been searchable for too long."""
@@ -870,11 +922,16 @@ def save_plan(con, series_id: int, plan, primary_manga_id: int | None) -> list[s
              len(m.chapters), m.max, m.note or None, int(m.manga_id == primary_manga_id), now()))
     void_junk(con, series_id, plan)
     rows = {r["number"]: r for r in con.execute(
-        "SELECT number, status, library_path, next_try, source_name FROM chapter WHERE series_id=?", (series_id,))}
+        "SELECT number, status, library_path, next_try, source_name, reason FROM chapter WHERE series_id=?",
+        (series_id,))}
+    parts = parts_on_disk(con, series_id, list(plan.assignment), rows, bool(settings.get("skip_parts_on_disk")))
+    rows = {r["number"]: r for r in con.execute(
+        "SELECT number, status, library_path, next_try, source_name, reason FROM chapter WHERE series_id=?",
+        (series_id,))}
     keep = {"have", "ignored"}
     for n, m in plan.assignment.items():
         prev = rows.get(n)
-        if prev and prev["status"] in keep:
+        if n in parts or (prev and prev["status"] in keep):
             continue                         # on disk already, or told to ignore; keep as is
         if prev and prev["status"] == "failed" and prev["next_try"] and prev["next_try"] > now():
             continue                         # scheduled for a later attempt; leave it alone
