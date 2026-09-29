@@ -20,7 +20,7 @@ import urllib.parse
 import urllib.request
 from dataclasses import asdict, dataclass
 
-from . import config, duplicates, komga, limits, notify, settings
+from . import config, db, duplicates, komga, limits, notify, settings
 from .matching import oneline
 from .suwayomi import Client, SuwayomiError
 
@@ -179,6 +179,8 @@ def _compute(client: Client) -> list[Check]:
     except SuwayomiError as e:
         out.append(Check("error", "Suwayomi", f"unreachable at {config.SUWAYOMI_URL}: {e}"))
 
+    out.extend(_conversion())
+
     # -- the job runner --
     stalled = stalled_job()
     if stalled:
@@ -295,6 +297,50 @@ def duplicate_series() -> Check | None:
     (duplicates.pairs), so the extra one can be deleted."""
     detail = duplicates.health_detail()
     return Check("warning", "Duplicate series", detail) if detail else None
+
+
+def _conversion() -> list[Check]:
+    """E-reader conversion, once it is switched on: can it run, is it
+    running, and what is waiting or failed."""
+    from . import conversions, convert
+    if not conversions.enabled():
+        return []
+    out: list[Check] = []
+    try:
+        with db.connect() as con:
+            every = conversions.targets(con)
+            st = conversions.service.status(con)
+    except Exception as e:
+        return [Check("warning", "Conversion", f"its queue could not be read: {type(e).__name__}: {e}")]
+    if not every:
+        return [Check("warning", "Conversion", "switched on, but there is no target: nothing is converted "
+                                               "(Settings, Media Management)")]
+    ok, detail = convert.available()
+    if not ok:
+        return [Check("error", "Conversion", f"on for {len(every)} target(s) but {detail}; nothing is converted")]
+    problem = conversions.root_problem()
+    if problem:
+        return [Check("error", "Conversion", problem)]
+    try:
+        os.makedirs(conversions.root(), exist_ok=True)
+        if not os.access(conversions.root(), os.W_OK | os.X_OK):
+            return [Check("error", "Conversion", f"the output folder {conversions.root()} cannot be written")]
+    except OSError as e:
+        return [Check("error", "Conversion", f"the output folder {conversions.root()} cannot be used: "
+                                             f"{e.strerror or e}")]
+    if not st["alive"]:
+        out.append(Check("error", "Conversion", "the conversion service is not running; restart mang-arr"))
+    elif st["paused"]:
+        out.append(Check("warning", "Conversion", "paused by you (Activity: Resume)"))
+    elif st["held"] and st["waiting"]:
+        out.append(Check("warning", "Conversion", st["held"]))
+    if st["failed"]:
+        out.append(Check("warning", "Conversion", f"{st['failed']} chapter(s) could not be converted (Activity: "
+                                                  "E-reader conversions)"))
+    if not out:
+        out.append(Check("ok", "Conversion", f"{detail}; {st['done']} done, {st['waiting']} waiting in "
+                                             f"{len(every)} target(s), output folder {conversions.root()}"))
+    return out
 
 
 def summary(client: Client, wait: float = 5) -> dict:

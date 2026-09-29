@@ -19,6 +19,12 @@
     mangarr_page_warm_downloads_total{source,result}
                                          downloads after that (ok/rewarm: page cache cleared/failed_after_warm)
     mangarr_page_delay_seconds{source}   current spacing of page requests
+    mangarr_conversions_total{format,result}
+                                         e-reader copies made or not (done/failed/timeout/memory)
+    mangarr_conversion_seconds_total{format}
+                                         time spent converting
+    mangarr_conversion_output_bytes_total{format}
+    mangarr_conversion_queue{status}     the conversion queue by status
 """
 import logging
 
@@ -50,6 +56,11 @@ if AVAILABLE:
                                   ["source", "result"])
     PAGE_DELAY = Gauge("mangarr_page_delay_seconds", "spacing of page requests on a page-by-page source",
                        ["source"])
+    CONVERSIONS = Counter("mangarr_conversions_total", "e-reader copies by outcome", ["format", "result"])
+    CONVERSION_SECONDS = Counter("mangarr_conversion_seconds_total", "time spent converting", ["format"])
+    CONVERSION_BYTES = Counter("mangarr_conversion_output_bytes_total", "size of the e-reader copies made",
+                               ["format"])
+    CONVERSION_QUEUE = Gauge("mangarr_conversion_queue", "the conversion queue by status", ["status"])
 
 
 def record_download(source: str, result: str) -> None:
@@ -94,6 +105,15 @@ def set_page_delay(source: str, secs: float) -> None:
         PAGE_DELAY.labels(source=source).set(secs)
 
 
+def record_conversion(fmt: str, result: str, seconds: float, size: int) -> None:
+    """fmt and result come from fixed sets, never from user text."""
+    if AVAILABLE:
+        CONVERSIONS.labels(format=fmt, result=result).inc()
+        CONVERSION_SECONDS.labels(format=fmt).inc(max(0.0, seconds))
+        if size > 0:
+            CONVERSION_BYTES.labels(format=fmt).inc(size)
+
+
 def record_job(kind: str, status: str) -> None:
     if AVAILABLE:
         JOBS.labels(kind=kind, status=status).inc()
@@ -113,4 +133,10 @@ def render(con, suwayomi_ok: bool) -> tuple[bytes, str]:
         CHAPTERS.labels(status=status).set(
             con.execute("SELECT COUNT(*) FROM chapter WHERE status=?", (status,)).fetchone()[0])
     SUWAYOMI_UP.set(1 if suwayomi_ok else 0)
+    try:
+        found = {r[0]: r[1] for r in con.execute("SELECT status, COUNT(*) FROM conversion GROUP BY status")}
+    except Exception:                       # a database from before the conversion tables
+        found = {}
+    for status in ("pending", "running", "done", "failed", "skipped"):
+        CONVERSION_QUEUE.labels(status=status).set(found.get(status, 0))
     return generate_latest(), CONTENT_TYPE_LATEST

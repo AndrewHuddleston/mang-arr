@@ -66,6 +66,7 @@
 </tr>
 {% endfor %}
 </tbody></table></div>
+
 {% if pass_job %}
 {% if pass_job.lanes %}
 {% set busy = pass_job.lanes|selectattr('source')|list|length %}
@@ -117,6 +118,28 @@
 </tbody></table></div>
 {% endif %}
 <div class="help-text">Suwayomi's own download queue is {{ squeue.state|lower }} ({{ squeue.count }} item{{ 's' if squeue.count != 1 }}). This page refreshes every 10 s while something runs.</div>
+{% endif %}
+{# -- e-reader conversions (conversions.py) ------------------------------------------------------- #}
+{% if conv.any %}
+{% set cs = conv.status %}
+<h2 class="section-title" id="conversions">E-reader conversions: {{ cs.waiting }} waiting{% if conv.eta %} ({{ conv.eta }}){% endif %}, {{ cs.done }} done, {{ cs.failed }} failed</h2>
+{% if cs.held %}<div class="alert {{ 'info' if cs.paused else 'warning' }} small">Nothing is being converted: {{ cs.held }}.</div>{% endif %}
+{% if cs.current %}
+<div class="table-container"><table class="table queue"><thead><tr><th class="col-icon"></th><th>Series</th><th>Chapter</th><th>Target</th><th>Progress</th><th class="col-date">Since</th></tr></thead>
+<tbody><tr class="queue-row"><td class="col-icon">{{ m.icon('spinner', 'sm spin') }}</td><td><a href="/series/{{ cs.current.series_id }}">{{ cs.current.title }}</a></td><td class="nowrap">Chapter {{ '%g'|format(cs.current.number) }}</td><td class="muted">{{ cs.current.target }}</td><td class="small">{% if cs.current.pages %}page {{ cs.current.page }} of {{ cs.current.pages }}{% else %}starting{% endif %}</td><td class="col-date nowrap">{{ cs.current.since|ago }}</td></tr></tbody></table></div>
+{% endif %}
+<div class="inline-form">
+  {% if cs.paused %}<form method="post" action="/activity/conversions/resume"><button class="button small">Resume</button></form>
+  {% else %}<form method="post" action="/activity/conversions/pause"><button class="button small">Pause</button></form>{% endif %}
+  {% if cs.current %}<form method="post" action="/activity/conversions/cancel-current"><button class="button small">Stop this one</button></form>{% endif %}
+  {% if cs.failed %}<form method="post" action="/activity/conversions/retry-failed"><button class="button small">Try the failed ones again</button></form>{% endif %}
+</div>
+{% if conv.failed %}
+<details class="fieldset"><summary class="legend">Failed conversions <span class="legend-note">the last {{ conv.failed|length }}</span></summary>
+<div class="table-container"><table class="table"><thead><tr><th>Series</th><th>Chapter</th><th>Target</th><th>Why</th><th>Next try</th></tr></thead><tbody>
+{% for f in conv.failed %}<tr><td><a href="/series/{{ f.series_id }}">{{ f.title }}</a></td><td class="nowrap">{{ '%g'|format(f.number) }}</td><td class="muted">{{ f.target }}</td><td class="small">{{ f.reason }}</td><td class="nowrap">{{ f.next_try or 'not again by itself' }}</td></tr>{% endfor %}
+</tbody></table></div></details>
+{% endif %}
 {% endif %}
 {% endblock %}
 {% block main_attrs %}data-reload="10000"{% endblock %}

@@ -226,6 +226,28 @@ def cmd_check_links(a):
     return 0
 
 
+def cmd_convert(a):
+    """Make the e-reader copies that are due, in the foreground."""
+    from . import conversions, convert
+    ok, detail = convert.available()
+    if not ok:
+        out(detail)
+        return 1
+    if not conversions.enabled():
+        out("e-reader conversion is switched off (Settings -> Media Management)")
+        return 1
+    with db.connect() as con:
+        if not conversions.targets(con, enabled_only=True):
+            out("there is no conversion target (Settings -> Media Management)")
+            return 1
+        if a.again:
+            n = conversions.queue_existing(con, series_id=a.series, again=True)
+            out(f"{n} chapter(s) queued again")
+    got = conversions.run_until_empty(said=out)
+    out(f"{got['done']} converted, {got['failed']} failed")
+    return 1 if got["failed"] else 0
+
+
 def cmd_status(a):
     with db.connect() as con:
         rows = db.series_rows(con)
@@ -326,6 +348,10 @@ def main(argv=None):
     s.add_argument("--dry-run", action="store_true", help="only list what would be repaired")
     s.set_defaults(fn=cmd_check_links)
 
+    s = sub.add_parser("convert", help="make the e-reader copies that are due (EPUB ...), in the foreground")
+    s.add_argument("--series", type=int, help="with --again: only this series id")
+    s.add_argument("--again", action="store_true", help="make the copies that exist again too")
+    s.set_defaults(fn=cmd_convert)
     s = sub.add_parser("status", help="tracked series")
     s.set_defaults(fn=cmd_status)
     s = sub.add_parser("show", help="one series in detail")

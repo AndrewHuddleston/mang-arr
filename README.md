@@ -214,6 +214,7 @@ is clamped to it; both are logged at start-up.
 | `MANGARR_LOG_LEVEL` | `INFO` | `DEBUG`, `INFO`, `WARNING` or `ERROR`. |
 | `MANGARR_LOG_FILE` * | unset (`serve`: `$MANGARR_DATA/mangarr.log`) | Also log to this file, rotated at 10 MB, five kept. The Logs page tails it. |
 | `MANGARR_LOG_JSON` | unset | `1` writes one JSON object per log line (`ts`, `level`, `logger`, `msg`, `exc`, `thread`) instead of the human format, for Loki/Promtail/Vector. |
+| `MANGARR_CONVERTED` | `/data/converted` in Docker (`$MANGARR_DATA/converted` otherwise) | Where e-reader copies go, one folder per conversion target. Must be outside the library and staging folders. |
 | `MANGARR_REFRESH_HOURS` | `6` | Default for the refresh interval (see Settings). |
 | `MANGARR_FIRST_REFRESH_MIN` | `5` | Minutes after start-up before the first scheduled refresh. |
 | `MANGARR_BACKUP_HOURS` | `24` | Hours between scheduled database backups (`serve` only). |
@@ -651,6 +652,17 @@ What a rename does, in this order:
 A rename that is interrupted (a kill, a power cut) is settled from the
 journal at the next start. A finished rename can be undone for 7 days from
 Activity → History or the Rename Files page.
+
+### E-reader conversion
+
+Off by default. **Settings → Media Management → E-reader Conversion** makes
+a copy of every chapter as an e-book (EPUB, Kobo KEPUB, CBZ or PDF) for
+reader apps and devices, in a folder of its own outside the library. Turning
+it on adds the target *Generic EPUB (any reader)*; chapters are converted as
+they arrive, and the ones you already have when you press *Convert existing
+chapters*. Every book carries its series in its metadata, and copies are
+renamed together with their library files. See
+[docs/CONVERSION.md](docs/CONVERSION.md).
 
 ### Backups
 
@@ -1296,6 +1308,13 @@ curl -H "X-Api-Key: $KEY" http://localhost:6789/api/v1/wanted
 | `POST /api/v1/rename` | the same for several series as one job: `{"seriesIds": [1, 2], "useLatestTitles": false, "confirmed": false}` |
 | `GET /api/v1/rename/history?seriesId=` | the renames and undos so far, newest first, each with `can_undo` |
 | `POST /api/v1/rename/{run}/undo` | undo a finished rename (7 days, once): `{"confirmed": true}` when Komga would not keep reading progress; 409 when it cannot be undone, 404 for an unknown one |
+| `GET /api/v1/conversion` | the conversion service: whether it can run, what it is converting, what waits, counts per target |
+| `GET` / `POST /api/v1/conversion/target`, `PUT` / `DELETE /api/v1/conversion/target/{id}` | the conversion targets: `{"name", "profile", "format", "folder", "scope": "all" \| "new", "enabled", "options"}`; `DELETE ...?files=true` removes the copies too |
+| `GET /api/v1/conversion/profile` | the reader profiles a target can be made for |
+| `POST /api/v1/conversion/{pause\|resume\|cancel-current\|retry-failed\|reconcile}` | control the queue |
+| `POST /api/v1/series/{id}/convert?mode=missing\|all` | convert a series' chapters now |
+| `PUT /api/v1/series/{id}/convert` | how a series is read: `{"readingDirection": "auto" \| "rtl" \| "ltr", "layout": "auto" \| "paged" \| "webtoon", "enabled": true}` |
+| `GET /series/{id}/chapter/{n}/converted/{target}` | download a converted copy |
 | `GET /api/v1/log?lines=200` | tail of the log file (`lines` capped at 5000) |
 | `GET /metrics` | Prometheus exposition; see Monitoring |
 | `GET /system/backup` | take a backup now and download it (`mangarr-<date>-<time>.db`) |

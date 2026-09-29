@@ -147,6 +147,23 @@
     </dl>
   </details>
 
+  {# -- E-reader copies: how this series is read (conversions.py) ------------ #}
+  {% if conv.any_target %}
+  <details class="fieldset" id="ereader">
+    <summary class="legend">E-reader copies</summary>
+    <form method="post" action="/series/{{ s.id }}/convert/settings" class="form">
+      {% call m.form_group('Reading Direction', 'Auto is ' ~ conv.auto_direction ~ '. A webtoon always reads left to right.', 'reading_direction') %}<select class="input select" id="reading_direction" name="reading_direction">{% for k, text in conv.directions %}<option value="{{ k }}" {% if conv.reading_direction == k %}selected{% endif %}>{{ text }}</option>{% endfor %}</select>{% endcall %}
+      {% call m.form_group('Layout', 'Auto decides from the pages: a series of tall strips is cut into screens.', 'layout') %}<select class="input select" id="layout" name="layout">{% for k, text in conv.layouts %}<option value="{{ k }}" {% if conv.layout == k %}selected{% endif %}>{{ text }}</option>{% endfor %}</select>{% endcall %}
+      {% call m.form_group('Convert This Series') %}<input type="hidden" name="convert_enabled" value="0"><label class="inline-check">{{ m.check('convert_enabled', conv.convert_enabled, '1') }} Make e-reader copies of its chapters</label>{% endcall %}
+      <div class="form-actions"><button class="button primary">Save</button>
+        <button class="button" form="convert-missing" title="Convert the chapters of this series that have no copy yet, ahead of the others">Convert missing</button>
+        <button class="button" form="convert-all" title="Make every copy of this series again">Convert all again</button></div>
+    </form>
+    <form method="post" action="/series/{{ s.id }}/convert" id="convert-missing"><input type="hidden" name="mode" value="missing"></form>
+    <form method="post" action="/series/{{ s.id }}/convert" id="convert-all" data-confirm="Make every e-reader copy of this series again?"><input type="hidden" name="mode" value="all"></form>
+  </details>
+  {% endif %}
+
   {# -- Chapter groups (Sonarr SeriesDetailsSeason) ------------------------ #}
   {# a long chapter list is paged (views.page_summary); the counts above cover all of it #}
   {% macro paging_nav(where) %}
@@ -189,7 +206,7 @@
           {% set st = stuck_at.get(c.number) %}{% set sk = skipped.get(c.number) if c.status == 'ignored' else none %}
           <td class="col-status">{% if fl %}{{ m.label('Downloading' if fl.state == 'downloading' else 'Queued', 'purple' if fl.state == 'downloading' else 'info', 'medium', title=fl.text, extra='inflight-label') }}{% else %}{{ m.label('Skipped' if sk else cs.text, cs.kind, 'medium', title=(c.reason or '')) }}{% endif %}
             {% if st and st.verdict %}{% set vl = verdict_label(st.verdict, st.number) %}{{ m.label(vl.text, vl.kind, 'small', title=('Holds back ' ~ st.waiting ~ ' chapter' ~ ('s' if st.waiting != 1 else '') ~ '.\n' ~ vl.tip), extra='verdict-label') }}{% elif sk and sk.how == 'auto' %}{{ m.label('automatically', 'default', 'small', title=('Skipped automatically: ' ~ (sk.verdict or '')), extra='verdict-label') }}{% endif %}</td>
-          {% if c.status == 'have' %}<td class="col-path" title="{{ c.library_path or '' }}">{{ (c.library_path or '')|replace(library_path ~ '/', '') }}</td>
+          {% if c.status == 'have' %}<td class="col-path" title="{{ c.library_path or '' }}">{{ (c.library_path or '')|replace(library_path ~ '/', '') }}{% for k in conv.copies.get(c.number, []) %} {% if k.url %}<a class="label success small copy-link" href="{{ k.url }}" title="{{ k.target }}: {{ k.tip }}">{{ k.format }}</a>{% else %}<span class="label {{ 'danger' if k.status == 'failed' else 'default' }} small" title="{{ k.target }}: {{ k.tip }}">{{ k.format }}{{ ' failed' if k.status == 'failed' else ' waiting' }}</span>{% endif %}{% endfor %}</td>
           {% elif fl %}<td class="col-reason">{{ fl.text or ('from ' ~ fl.source if fl.source else '') }}</td>
           {% else %}<td class="col-reason {{ 'text-danger' if c.status == 'failed' }}">{{ c.reason or ('waiting for a download pass' if c.status == 'wanted' else '') }}</td>{% endif %}
           <td class="col-actions">

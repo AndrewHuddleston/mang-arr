@@ -66,6 +66,9 @@ services:
       - MANGARR_SUWAYOMI_URL=http://suwayomi:4567
       - MANGARR_STAGING=/data/staging
       - MANGARR_LIBRARY=/data/library
+      # e-reader copies (EPUB ...), made once conversion is switched on in Settings -> Media Management.
+      # Share ./data/converted with Syncthing, Calibre-Web or KOReader to get them onto a device.
+      - MANGARR_CONVERTED=/data/converted
       # optional:
       # - MANGARR_REFRESH_HOURS=6
       # - MANGARR_LOG_LEVEL=INFO

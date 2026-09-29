@@ -26,6 +26,8 @@
 #   MANGARR_IMAGE  image for mang-arr                                    (default ghcr.io/andrewhuddleston/mang-arr:latest)
 #   CONTAINER_PREFIX  prefix for the three container names (default none)
 #   SOURCES        Suwayomi extensions to install, comma-separated pkgName suffixes (see DEFAULT_SOURCES)
+#   CONVERT_EPUB   1: also make an EPUB copy of every chapter for e-reader apps and devices, in
+#                  <DATA_DIR>/converted/epub (default 0: asked when there is a terminal)
 #   YES=1          no prompts
 #
 # Everything runs inside main(), called on the last line: a download cut short runs nothing.
@@ -172,6 +174,7 @@ check_inputs() {
   if [[ ! "$TZ" =~ ^[A-Za-z0-9_+/-]+$ ]]; then warn "TZ '$TZ' is not a timezone name; using UTC"; TZ=UTC; fi
   [[ "$CONTAINER_PREFIX" =~ ^[A-Za-z0-9_.-]*$ ]] || die "CONTAINER_PREFIX may only hold letters, digits, '_', '.' and '-'"
   [[ "$MANGARR_IMAGE" =~ ^[A-Za-z0-9._/:@-]+$ ]] || die "MANGARR_IMAGE '$MANGARR_IMAGE' is not an image reference"
+  [[ "$CONVERT_EPUB" =~ ^[01]$ ]] || die "CONVERT_EPUB must be 0 or 1 (got '$CONVERT_EPUB')"
   [[ "$SOURCES" =~ ^[A-Za-z0-9_]+(\.[A-Za-z0-9_]+)*(,[A-Za-z0-9_]+(\.[A-Za-z0-9_]+)*)*$ ]] \
     || die "SOURCES must be comma-separated pkgName suffixes such as en.weebcentral,all.mangadex"
   # mang-arr refuses a user name with ':' (basic auth splits user:password there): say so now, not
@@ -186,9 +189,10 @@ valid_email() { [[ "$1" =~ ^[^@[:space:][:cntrl:]]+@[^@[:space:][:cntrl:]]+\.[^@
 # make_dirs: create the folders, and chown only the ones this run created, never recursively: --data
 # may point at an existing share that other programs use. Existing folders are reported, not changed.
 make_dirs() {
-  local d uid created=()
+  local d uid created=() extra=()
+  [[ "$CONVERT_EPUB" != 1 ]] || extra=("$DATA_DIR/converted")
   for d in "$STACK_DIR" "$STACK_DIR/config" "$STACK_DIR/config/mangarr" "$STACK_DIR/config/suwayomi" \
-           "$STACK_DIR/config/komga" "$DATA_DIR" "$DATA_DIR/staging" "$DATA_DIR/library"; do
+           "$STACK_DIR/config/komga" "$DATA_DIR" "$DATA_DIR/staging" "$DATA_DIR/library" "${extra[@]}"; do
     [[ ! -d "$d" ]] || continue
     mkdir -p -- "$d" || die "cannot create $d"
     created+=("$d")
@@ -263,6 +267,9 @@ services:
       - MANGARR_SUWAYOMI_URL=http://suwayomi:4567
       - MANGARR_STAGING=/data/staging
       - MANGARR_LIBRARY=/data/library
+      # e-reader copies (EPUB ...), made once conversion is switched on in Settings -> Media Management.
+      # Share $DATA_DIR/converted with Syncthing, Calibre-Web or KOReader to get them onto a device.
+      - MANGARR_CONVERTED=/data/converted
       # host names you open mang-arr by, other than IPs, localhost, single-label names and *.lan/.local/.home.arpa:
       # - MANGARR_ALLOWED_HOSTS=manga.example.com
     volumes:
@@ -705,6 +712,26 @@ print(json.dumps(b))' >"$WORK/mangarr.json"
   [[ -z "$KOMGA_KEY" ]] || ok "mang-arr knows Komga (scan after every import)"
 }
 
+# Switch e-reader conversion on with the target any reader can open (CONVERT_EPUB=1). A target that
+# is there already is left as it is.
+configure_conversion() {
+  local st
+  [[ "$CONVERT_EPUB" == 1 ]] || return 0
+  st=$(req GET "$MANGARR/api/v1/conversion/target" "$MA_HDR")
+  if [[ "$st" != 2* ]]; then warn "this mang-arr has no e-reader conversion (HTTP $st); nothing set up"; return 0; fi
+  if [[ "$(resp | python3 -c 'import json,sys;print(len(json.load(sys.stdin)))' 2>/dev/null)" == 0 ]]; then
+    printf '%s' '{"name": "Generic EPUB (any reader)", "profile": "generic", "format": "epub", "folder": "epub", "scope": "all"}' >"$WORK/target.json"
+    st=$(req POST "$MANGARR/api/v1/conversion/target" "$MA_HDR" "$WORK/target.json")
+    rm -f -- "$WORK/target.json"
+    if [[ "$st" != 2* ]]; then warn "mang-arr did not take the EPUB target (HTTP $st: $(resp | head -c 200)); add it in Settings -> Media Management"; return 0; fi
+  fi
+  printf '%s' '{"convert_enabled": true}' >"$WORK/convert.json"
+  st=$(req PUT "$MANGARR/api/v1/settings" "$MA_HDR" "$WORK/convert.json")
+  rm -f -- "$WORK/convert.json"
+  if [[ "$st" == 2* ]]; then ok "e-reader conversion is on: EPUB copies go to $DATA_DIR/converted/epub"
+  else warn "e-reader conversion could not be switched on (HTTP $st); do it in Settings -> Media Management"; fi
+}
+
 # After the PUT mang-arr must refuse a request without the key, and show the key this run holds (and the
 # user it set) to one with it. Anything else means something else on the network changed its settings
 # while it had no login: stop rather than report a protected mang-arr, holding the Komga key, that is not.
@@ -747,6 +774,7 @@ main() {
   CONTAINER_PREFIX="${CONTAINER_PREFIX:-}"
   YES="${YES:-0}"
   SOURCES="${SOURCES:-$DEFAULT_SOURCES}"
+  CONVERT_EPUB="${CONVERT_EPUB:-}"
 
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -779,6 +807,13 @@ main() {
     if [[ ! -f "$STACK_DIR/docker-compose.yml" ]] \
        && [[ "$(ask "Let phones, tablets and other computers on your network read from Komga? [y/N] " n)" =~ ^[Yy] ]]; then
       KOMGA_BIND=0.0.0.0
+    fi
+  fi
+  if [[ -z "$CONVERT_EPUB" ]]; then
+    CONVERT_EPUB=0
+    if [[ ! -f "$STACK_DIR/docker-compose.yml" ]] \
+       && [[ "$(ask "Also make EPUB copies of chapters for e-reader apps and devices? [y/N] " n)" =~ ^[Yy] ]]; then
+      CONVERT_EPUB=1
     fi
   fi
   check_inputs
@@ -846,6 +881,7 @@ main() {
     komga_key_and_library || warn "add a Komga API key yourself later: mang-arr -> Settings -> Komga"
   fi
   [[ $MA_OK == 0 ]] || configure_mangarr
+  [[ $MA_OK == 0 ]] || configure_conversion
   # every mang-arr call from here on carries the current key (the new one after the rotation above)
   if [[ "$(req GET "$MANGARR/api/v1/health" "$MA_HDR")" == 2* && "$(resp | jsonget ok 2>/dev/null)" =~ ^[Tt]rue$ ]]; then
     ok "mang-arr health: ok"

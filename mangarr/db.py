@@ -302,6 +302,46 @@ MIGRATIONS = [
     """
     SELECT 1;
     """,
+    # 20: e-reader conversion (conversions.py). convert_target: what to make
+    #     (a reader profile, a format) and the folder under CONVERTED_ROOT it
+    #     goes to. conversion: one row per chapter and target, the queue and
+    #     the record of what was made. No foreign key to chapter: the output
+    #     file is removed before its row, so no file is left behind unseen.
+    #     The series columns are added by _add_convert_columns, unless they
+    #     are there.
+    """
+    CREATE TABLE IF NOT EXISTS convert_target (
+      id              INTEGER PRIMARY KEY AUTOINCREMENT,
+      name            TEXT NOT NULL,
+      enabled         INTEGER NOT NULL DEFAULT 1,
+      profile         TEXT NOT NULL,
+      format          TEXT NOT NULL,
+      folder          TEXT NOT NULL UNIQUE,   -- one path component under CONVERTED_ROOT
+      options         TEXT NOT NULL DEFAULT '{}',
+      scope           TEXT NOT NULL DEFAULT 'all',      -- all | new (only chapters imported after it was added)
+      created_at      TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS conversion (
+      series_id       INTEGER NOT NULL REFERENCES series(id) ON DELETE CASCADE,
+      number          REAL NOT NULL,
+      target_id       INTEGER NOT NULL REFERENCES convert_target(id) ON DELETE CASCADE,
+      status          TEXT NOT NULL,          -- pending | running | done | failed | skipped
+      priority        INTEGER NOT NULL DEFAULT 2,       -- 0 asked by you, 1 a new chapter, 2 the back catalogue
+      source_path     TEXT,                   -- the library file it was made from
+      source_sig      TEXT,                   -- "inode:size:mtime_ns" of it then
+      options_hash    TEXT,
+      engine          INTEGER,
+      output_path     TEXT,
+      pages           INTEGER, bytes INTEGER, seconds REAL, rtl INTEGER, webtoon INTEGER, decided TEXT,
+      reason          TEXT,
+      tries           INTEGER NOT NULL DEFAULT 0,
+      next_try        TEXT,
+      claimed_at      TEXT, queued_at TEXT,
+      updated_at      TEXT NOT NULL,
+      PRIMARY KEY (series_id, number, target_id)
+    );
+    CREATE INDEX IF NOT EXISTS conversion_due ON conversion(status, priority, queued_at);
+    """,
 ]
 
 
@@ -363,6 +403,8 @@ def migrate(con: sqlite3.Connection, target: int | None = None) -> None:
                     _backfill_file_titles(con)
                 if i == 19:
                     _add_last_searched(con)
+                if i == 20:
+                    _add_convert_columns(con)
                 con.execute(f"PRAGMA user_version = {i}")
                 con.commit()
             except BaseException as e:
@@ -424,6 +466,18 @@ def _backfill_listing(con) -> None:
         missed = (1 if when >= cutoff else LISTING_GRACE_RESOLVES) if gone else 0
         con.execute("UPDATE chapter SET listed=?, listed_at=?, unlisted=?, missed=? WHERE series_id=? AND number=?",
                     (listed, when, int(gone), missed, sid, n))
+
+
+def _add_convert_columns(con) -> None:
+    """Migration 20: how a series is read and laid out for e-reader copies
+    (auto: decided from its country of origin and its pages), and whether
+    it is converted at all."""
+    have = {r[1] for r in con.execute("PRAGMA table_info(series)")}
+    for name, ddl in (("reading_direction", "TEXT NOT NULL DEFAULT 'auto'"),       # auto | rtl | ltr
+                      ("layout", "TEXT NOT NULL DEFAULT 'auto'"),                  # auto | paged | webtoon
+                      ("convert_enabled", "INTEGER NOT NULL DEFAULT 1")):
+        if name not in have:
+            con.execute(f"ALTER TABLE series ADD COLUMN {name} {ddl}")
 
 
 def _add_last_searched(con) -> None:
