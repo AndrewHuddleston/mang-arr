@@ -13,7 +13,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from fake_suwayomi import PassBase, entry  # noqa: E402
 
-from mangarr import core, db, downloader, inflight, jobs, resolver, settings  # noqa: E402
+from mangarr import core, db, downloader, inflight, jobs, resolver, settings, stuck  # noqa: E402
 from mangarr.model import Series  # noqa: E402
 from mangarr.suwayomi import Source, SuwayomiError  # noqa: E402
 
@@ -45,6 +45,7 @@ class QuickBase(PassBase):
             self.reads.append(manga_id)
             return real_manga(manga_id)
         self.suwayomi.manga = manga
+        self.suwayomi.page_count = lambda cid: 20       # fractional chapters are counted: none is a notice image
 
         def resolve(client, series, **kw):             # the real one, with the fake's sources
             return resolver.resolve(client, series, sources=self.sources, **kw)
@@ -165,6 +166,90 @@ class QuickCheckTest(QuickBase):
         self.assertEqual({n: s for n, (s, _) in self.status(sid).items()}, {1.0: "have", 2.0: "have", 3.0: "have"})
         self.assertEqual(inflight.rows(), [])                           # nothing is left in flight after a pass
         self.assertIn("full_search_days", web.ADVANCED_SETTINGS["downloading"])
+
+
+class PartsOnDiskTest(QuickBase):
+    """Settings -> Downloading -> Fractional Chapters."""
+
+    def setUp(self):
+        super().setUp()
+        self.suwayomi.listing[2] = []                                   # Bravo lists nothing at first
+        with db.connect() as con:
+            self.sid = core.add_series(con, self.suwayomi, Series(english="T"), download=True).series_id
+        self.suwayomi.listing[1] = [1.0, 2.0, 3.0, 4.0]                 # 4 is new: not on disk
+        self.suwayomi.listing[2] = [1.0, 1.1, 1.2, 2.5, 4.5]            # Bravo lists parts and extras
+
+    def turn(self, on: bool):
+        with db.connect() as con:
+            settings.set_many(con, {"skip_parts_on_disk": on})
+        settings._cache.clear()
+
+    def check(self) -> dict:
+        with db.connect() as con:
+            core.refresh_series(con, self.suwayomi, self.sid, download=False)
+        return {n: s for n, (s, _) in self.status(self.sid).items()}
+
+    def test_off_by_default_everything_listed_is_wanted(self):
+        self.assertFalse(settings.DEFAULTS["skip_parts_on_disk"])
+        self.assertEqual(self.check(), {1.0: "have", 2.0: "have", 3.0: "have", 4.0: "wanted", 1.1: "wanted",
+                                        1.2: "wanted", 2.5: "wanted", 4.5: "wanted"})
+
+    def test_on_a_part_of_a_chapter_on_disk_is_not_wanted(self):
+        self.check()
+        self.turn(True)
+        got = self.check()
+        self.assertEqual(got, {1.0: "have", 2.0: "have", 3.0: "have", 4.0: "wanted", 1.1: "ignored",
+                               1.2: "ignored", 2.5: "ignored", 4.5: "wanted"})     # 4 is not on disk: 4.5 is wanted
+        self.assertEqual(self.status(self.sid)[1.1][1], db.PART_REASON.format(whole=1))
+        with db.connect() as con:
+            self.assertEqual(core._due(con, self.sid, core.resolve(self.suwayomi, Series(english="T"))), [4.0, 4.5])
+        self.assertEqual(self.check(), got)                             # and stays so
+
+    def test_one_you_want_anyway_is_left_alone(self):
+        self.turn(True)
+        self.check()
+        with db.connect() as con:                                       # its Want button on the series page
+            db.want_again(con, self.sid, 1.1)
+            stuck.forget(con, self.sid, 1.1)
+        got = self.check()
+        self.assertEqual((got[1.1], got[1.2]), ("wanted", "ignored"))
+
+    def test_off_again_what_it_held_back_is_wanted_and_your_own_ignores_stay(self):
+        self.check()
+        with db.connect() as con:
+            db.set_status(con, self.sid, 4.5, "ignored", "ignored by you")
+        self.turn(True)
+        self.assertEqual(self.check()[2.5], "ignored")
+        self.turn(False)
+        got = self.check()
+        self.assertEqual((got[1.1], got[1.2], got[2.5], got[4.5]), ("wanted", "wanted", "wanted", "ignored"))
+
+    def test_a_part_that_is_on_disk_stays(self):
+        self.check()
+        with db.connect() as con:
+            con.execute("UPDATE chapter SET status='have' WHERE series_id=? AND number=1.1", (self.sid,))
+        self.turn(True)
+        self.assertEqual(self.check()[1.1], "have")
+
+    @unittest.skipIf(web is None, "web extras not installed")
+    def test_the_setting_is_on_the_downloading_page_with_its_warning(self):
+        from mangarr import health
+        with mock.patch.object(web, "ui_client", self.suwayomi), \
+                mock.patch.object(health, "_ping", lambda name, url, timeout=8: health.Check("ok", name, "stub")), \
+                mock.patch.dict(health._cache, {"at": 0.0, "checks": []}):
+            self.suwayomi.sources_list = []
+            with mock.patch.object(self.suwayomi, "sources", lambda *a, **k: [], create=True):
+                client = TestClient(web.app)
+                self.addCleanup(client.close)
+                html = client.get("/settings/downloading").text
+                self.assertIn('name="skip_parts_on_disk"', html)
+                self.assertIn('id="parts-warning" hidden', html)
+                self.assertNotIn("skip_parts_on_disk", web.ADVANCED_SETTINGS["downloading"])
+                r = client.post("/settings", data={"page": "downloading", "skip_parts_on_disk": ["0", "1"]},
+                                follow_redirects=False)
+                self.assertEqual(r.status_code, 303)
+        settings._cache.clear()
+        self.assertTrue(settings.get("skip_parts_on_disk"))
 
 
 class InFlightTest(QuickBase):
