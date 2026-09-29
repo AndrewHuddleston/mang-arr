@@ -1,0 +1,6 @@
+# The e-reader conversion extra (mangarr/convert/). Keep identical to
+# [project.optional-dependencies] convert in pyproject.toml (pip install .[convert]).
+# Pillow decodes images from any source, so the floor follows its security
+# releases; 12.3 is also the release the converter was tested with
+# (mangarr.convert.PILLOW_MIN).
+Pillow>=12.3

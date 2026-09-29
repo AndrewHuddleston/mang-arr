@@ -23,6 +23,10 @@ RANGES: dict[str, tuple[float, float]] = {
     "throttled_delay_seconds": (0.0, 600.0),    # pause between chapters on a rate-limited source
     "recheck_finished_days": (0.0, 365.0),      # 0 = always re-check finished series
     "full_search_days": (0.0, 90.0),            # 0 = search every source for every series every pass
+    "convert_threads": (1.0, 8.0),              # pages worked on at once inside one conversion
+    "convert_memory_mb": (512.0, 8192.0),       # memory limit of one conversion
+    "convert_timeout_minutes": (1.0, 120.0),    # a conversion is stopped after this long
+    "convert_min_free_gb": (0.0, 1000.0),       # the conversion queue pauses below this much free space
     "download_lanes": (1.0, 8.0),               # sources downloading at once in a pass
     "search_parallel": (1.0, 8.0),              # sites searched at once while a series is resolved
     "page_delay_seconds": (0.5, 60.0),          # gap between page requests on a page-by-page source

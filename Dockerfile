@@ -7,16 +7,19 @@ FROM python:3.14.6-slim-trixie@sha256:7bec7ddcddeff7975d6ba9b4be7dd6f6b2f55e7491
 #   /config            database, lock, log
 #   /data/staging      Suwayomi's download tree (<Source>/<Series>/*.cbz), read
 #   /data/library      the per-series tree built for Komga, written
+#   /data/converted    e-reader copies (EPUB ...), written when conversion is switched on
 ENV PYTHONUNBUFFERED=1 \
     MANGARR_DATA=/config \
     MANGARR_LOG_FILE=/config/mangarr.log \
     MANGARR_STAGING=/data/staging \
     MANGARR_LIBRARY=/data/library \
+    MANGARR_CONVERTED=/data/converted \
     MANGARR_SUWAYOMI_URL=http://suwayomi:4567
 
 WORKDIR /app
-COPY requirements.txt pyproject.toml README.md LICENSE ./
-RUN pip install --no-cache-dir -r requirements.txt
+COPY requirements.txt requirements-convert.txt pyproject.toml README.md LICENSE ./
+# Pillow (requirements-convert.txt) is for e-reader conversion, which is off until it is switched on
+RUN pip install --no-cache-dir -r requirements.txt -r requirements-convert.txt
 COPY mangarr ./mangarr
 RUN pip install --no-cache-dir --no-deps . \
  && mkdir -p /config /data && chown 1000:1000 /config /data

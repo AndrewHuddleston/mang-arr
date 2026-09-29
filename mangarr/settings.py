@@ -12,6 +12,11 @@ through get(), so a change on the Settings page applies to the next job.
     search_parallel      int    5      sites searched at once while a series is resolved (1-8)
     full_search_days     float  7      days between searches of every source for a series (0 = every pass)
     skip_parts_on_disk   bool   False  fractional chapters of a chapter that is on disk are not wanted
+    convert_enabled      bool   False  make e-reader copies (EPUB, KEPUB, CBZ, PDF) of library chapters
+    convert_threads      int    2      pages worked on at once inside one conversion (1-8)
+    convert_memory_mb    int    1536   memory limit of one conversion (512-8192)
+    convert_timeout_minutes float 10   a conversion is stopped after this long (1-120)
+    convert_min_free_gb  float  2      the queue pauses below this much free space (0-1000)
     page_delay_seconds   float  2.5    starting and minimum gap between page requests (page by page)
     download_in_order    bool   True   strict download in order, per series
     auto_skip_side_stories bool False  skip a blocking chapter judged a side story or covered (stuck.py)
@@ -72,6 +77,13 @@ DEFAULTS: dict[str, object] = {
     "full_search_days": 7.0,
     # a fractional chapter (5.1, 12.5) is not wanted while its whole chapter (5, 12) is on disk
     "skip_parts_on_disk": False,
+    # e-reader conversion (conversions.py): off until switched on; the rest is tuning
+    "convert_enabled": False,
+    "convert_threads": 2,            # pages worked on at once inside one conversion
+    "convert_memory_mb": 1536,       # the most memory one conversion may take
+    "convert_timeout_minutes": 10.0,  # a conversion that takes longer is stopped
+    "convert_min_free_gb": 2.0,      # the queue pauses while the output folder has less free space
+    "convert_paused": False,         # Pause / Resume on the Activity page
     "min_pages": config.MIN_PAGES,
     "throttled_delay_seconds": 8.0,  # pause between chapters on a rate-limited source (avoids 429 -> long backoff)
     "download_lanes": 3,             # sources downloading at once in a pass, one series each (see limits.RANGES)
@@ -125,7 +137,7 @@ SECRET_KEYS = {"pushover_token", "pushover_user", "komga_api_key", "auth_passwor
                "telegram_token", "ntfy_token", "gotify_token", "smtp_password", "notifiarr_api_key",
                # the key itself and URLs whose path is the credential (webhook ids, ntfy topics, Apprise keys)
                "api_key", "webhook_url", "apprise_url", "ntfy_url", "session_secret"}
-INTERNAL_KEYS = {"session_secret", "session_epoch", "revoked_sessions", "leftover_queue_ids"}
+INTERNAL_KEYS = {"session_secret", "session_epoch", "revoked_sessions", "leftover_queue_ids", "convert_paused"}
 NAMING_KEYS = naming.OPTION_KEYS
 ID_LIST_KEYS = {"leftover_queue_ids"}      # lists of integer ids, kept in the order given
 MASK = "********"        # what the UI shows for a stored secret; submitting it unchanged keeps the value

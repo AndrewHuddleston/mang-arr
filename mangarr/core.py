@@ -17,6 +17,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field, replace
 
 from . import (
+    conversions,
     db,
     downloader,
     duplicates,
@@ -638,6 +639,10 @@ def delete_series(con, client: Client, series_id: int, delete_library: bool = Fa
             folder = row["folder"]      # a rename may have given it another one meanwhile
         if delete_library and folder:
             removed = _delete_library_files(con, series_id, title, folder)
+            try:                        # its e-reader copies go with its library files
+                conversions.remove_series_outputs(con, series_id)
+            except Exception as e:
+                log.warning("%s: its converted copies could not be removed: %s: %s", title, type(e).__name__, e)
         db.delete_series(con, series_id)
         db.event(con, "deleted", f"{title} removed" + (" with library files" if delete_library else ""))
         con.commit()
@@ -774,7 +779,10 @@ def import_series(con, series_id: int, client: Client | None = None, downloaded:
     if con.in_transaction:
         con.commit()                    # never hold a write while waiting for the lock
     with serieslock.hold(series_id):
-        return _import_series(con, series_id, client, downloaded)
+        linked = _import_series(con, series_id, client, downloaded)
+    if linked:
+        conversions.service.notify(series_id)       # e-reader copies of what is new (does nothing when off)
+    return linked
 
 
 def _import_series(con, series_id: int, client: Client | None, downloaded: dict | None) -> int:

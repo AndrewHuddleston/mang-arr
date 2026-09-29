@@ -5,14 +5,19 @@ Thanks for looking. mang-arr is small on purpose; please keep it that way.
 ## Ground rules
 
 - **The core stays stdlib-only.** Everything under `mangarr/` except
-  `mangarr/web/` must import nothing outside the Python 3.10 standard
-  library. `urllib`, `sqlite3`, `argparse`, `dataclasses` and friends are
+  `mangarr/web/` and `mangarr/convert/engine.py` must import nothing
+  outside the Python 3.10 standard library. `urllib`, `sqlite3`, `argparse`, `dataclasses` and friends are
   enough; a CLI or daemon install must work with `pip install .` and no
   extras.
 - **The web UI is an optional extra.** FastAPI, uvicorn, Jinja2 and
   python-multipart live only in `mangarr/web/` and are installed with
   `pip install .[web]`. `requirements.txt` mirrors that extra for the Docker
   image; keep the two lists identical.
+- **E-reader conversion is an optional extra too.** Pillow is imported by
+  `mangarr/convert/engine.py` only, and nothing imports that module until a
+  conversion runs; the rest of `mangarr/convert/` is stdlib-only, so the
+  server can list profiles without Pillow. `pip install .[convert]`;
+  `requirements-convert.txt` mirrors the extra.
 - **Do not change behaviour in a "cleanup" change.** Refactors and
   behaviour changes go in separate commits so each can be reviewed and
   reverted on its own.
@@ -119,6 +124,9 @@ mangarr/
   komga.py       Komga scan trigger after imports and the connection test
   notify.py      Pushover and webhook notifications
   metrics.py     Prometheus metrics for /metrics (optional prometheus-client)
+  convert/       e-reader copies of a chapter (EPUB, KEPUB, CBZ, PDF):
+                 profiles (the screens), source (reading the CBZ),
+                 writers (the formats), engine (the page work, Pillow)
   logsetup.py    console + rotating file logging (text or JSON lines)
   __main__.py    the CLI
   web/

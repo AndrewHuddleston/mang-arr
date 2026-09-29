@@ -66,7 +66,7 @@ import os
 import stat
 from collections.abc import Callable
 
-from . import backup, config, core, db, komga, library, naming, serieslock, settings
+from . import backup, config, conversions, core, db, komga, library, naming, serieslock, settings
 
 log = logging.getLogger(__name__)
 
@@ -490,12 +490,11 @@ def _checkpoint(name: str) -> None:
 
 
 def converted_steps(con, series_id: int, files: list[dict]) -> list[dict]:
-    """The hook for e-reader conversion (0.5.0): the converted copies that
-    are renamed together with these library files (user decision 2), as
-    journal steps of kind "converted" ({"number", "old_path", "new_path"},
-    inside the conversion target's folder), and the conversion rows' source
-    paths with them. There is no conversion yet, so there are none; a
-    "converted" step in a journal is left alone by this version."""
+    """Converted copies are renamed together with their library files, but
+    not as journal steps of their own: each one follows its library file
+    right after that file's rename is recorded (conversions.follow_file,
+    follow_folder), and one that could not is put right by the conversion
+    queue's next reconcile. So there are no steps of kind "converted"."""
     return []
 
 
@@ -1080,6 +1079,10 @@ def _record_file(con, row) -> None:
     con.commit()
     if isinstance(row, dict):
         row["state"] = "done"
+    # its e-reader copies get the matching name (never fails the rename; what it
+    # cannot rename the next reconcile of the conversion queue sees)
+    conversions.follow_file(con, row["series_id"], row["number"], row["new_path"])
+    con.commit()
 
 
 def _check_folder(con, series_id: int, root_fd: int, row: dict) -> str | None:
@@ -1170,6 +1173,8 @@ def _record_folder(con, row, state: str = "done", detail: str | None = None) -> 
             con.execute("UPDATE chapter SET library_path=? WHERE series_id=? AND number=?",
                         (os.path.join(new_dir, os.path.basename(c["library_path"])), row["series_id"], c["number"]))
     con.execute("UPDATE rename_log SET state=?, detail=?, done_at=? WHERE id=?", (state, detail, db.now(), row["id"]))
+    con.commit()
+    conversions.follow_folder(con, row["series_id"], os.path.basename(old_dir), os.path.basename(new_dir))
     con.commit()
 
 

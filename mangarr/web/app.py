@@ -29,6 +29,7 @@ from .. import (
     __version__,
     backup,
     config,
+    conversions,
     core,
     db,
     downloader,
@@ -53,7 +54,7 @@ from .. import (
     updates,
 )
 from ..suwayomi import BREAKER_SECS, Client, SuwayomiError, SuwayomiUnreachable, with_cancel
-from . import lists_routes, security, uploads, views
+from . import convert_routes, lists_routes, security, uploads, views
 
 log = logging.getLogger(__name__)
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -109,6 +110,7 @@ async def lifespan(app: FastAPI):
     backup.start_background()
     stuck.fetcher.start()                    # MangaDex lookups for the chapters series are stuck behind
     lists_routes.init()
+    convert_routes.init()                    # the e-reader conversion service (idle until it is switched on)
     log.info("mang-arr %s web started (staging %s, library %s)", __version__, config.STAGING_ROOT,
              config.LIBRARY_ROOT)
     yield
@@ -143,6 +145,7 @@ templates = Jinja2Templates(directory=os.path.join(HERE, "templates"))
 templates.env.filters["ago"] = lambda ts: _ago(ts)
 views.install(templates.env)
 app.include_router(lists_routes.router)
+app.include_router(convert_routes.router)
 
 
 def _ago(ts) -> str:
@@ -908,6 +911,7 @@ def series_page(request: Request, series_id: int, page_no: int = Query(1, alias=
         # the chapters it is stuck behind, with their verdicts; a link from another site looks nothing up
         blocked = stuck.details(con, r, fetch=not _cross_site(request))
         skips = stuck.skipped(con, series_id)
+        conv = convert_routes.series_context(con, r, [c["number"] for g in groups for c in g["chapters"]])
     marked = {st.number for st in blocked} | {k["number"] for k in skips}
     for g in groups:                                # their rows (verdict label, Un-skip) are shown, not folded
         if any(c["number"] in marked for c in g["chapters"]):
@@ -925,7 +929,7 @@ def series_page(request: Request, series_id: int, page_no: int = Query(1, alias=
                 stuck_at={st.number: st for st in blocked}, skipped={k["number"]: k for k in skips},
                 skip_notes=skips,
                 auto_skip=bool(settings.get("auto_skip_side_stories") and settings.get("download_in_order")),
-                progress_lost=renamer.PROGRESS_LOST, inflight=inflight.by_number(series_id))
+                progress_lost=renamer.PROGRESS_LOST, inflight=inflight.by_number(series_id), conv=conv)
 
 
 @app.post("/series/{series_id}/refresh")
@@ -1378,8 +1382,10 @@ def activity_page(request: Request):
     jobs_, squeue = runner.jobs()[:50], _suwayomi_queue()
     passes = [j for j in jobs_ if j.items]
     current = next((j for j in passes if j.status == "running"), passes[0] if passes else None)
+    with db.connect() as con:
+        conv = convert_routes.activity_context(con)
     return page(request, "activity.html", jobs=jobs_, squeue=squeue, queue=views.queue_rows(jobs_, squeue),
-                pass_job=current, chapters=inflight.rows())
+                pass_job=current, chapters=inflight.rows(), conv=conv)
 
 
 @app.get("/activity/history")
@@ -1928,7 +1934,8 @@ def api_rename_undo(run_id: int, body: dict | None = None):
 SETTINGS_PAGES = dict(views.SETTINGS_PAGES)
 # the settings shown only with Show Advanced on, by page (media-management proposal, section 1)
 ADVANCED_SETTINGS = {
-    "media-management": ("replace_illegal_characters", "chapter_title_max_chars", "drop_number_only_titles"),
+    "media-management": ("replace_illegal_characters", "chapter_title_max_chars", "drop_number_only_titles",
+                         "convert_threads", "convert_memory_mb", "convert_timeout_minutes", "convert_min_free_gb"),
     "sources": ("page_warm_sources",),
     "downloading": ("throttled_delay_seconds", "download_lanes", "search_parallel", "page_delay_seconds",
                     "recheck_finished_days", "full_search_days", "min_pages"),
@@ -2008,8 +2015,9 @@ def settings_page(request: Request, slug: str):
         with db.connect() as con:
             n = con.execute("SELECT COUNT(*) AS files, COUNT(DISTINCT series_id) AS series FROM chapter"
                             " WHERE status='have' AND library_path IS NOT NULL").fetchone()
+            conv = convert_routes.page_context(con)
         ctx.update(examples=_naming_examples({}), library={"files": n["files"], "series": n["series"]},
-                   komga_on=komga.configured(),
+                   komga_on=komga.configured(), conv=conv,
                    folders={"library": config.LIBRARY_ROOT, "staging": config.STAGING_ROOT,
                             "copied": library.COPIED})
     advanced = ADVANCED_SETTINGS.get(slug, ())
@@ -2063,6 +2071,10 @@ def _settings_save(request: Request, form) -> Response:
         return _flash(back, f"could not save (database busy?): {e}")
     action = str(form.get("action", ""))
     after = settings.all_values()
+    if after["convert_enabled"] and not before["convert_enabled"]:
+        notices = [*notices, _conversion_switched_on()]
+    if after["convert_enabled"] != before["convert_enabled"]:
+        conversions.service.reconcile_soon()
     if any(after[k] != before[k] for k in settings.NAMING_KEYS):
         notices = [*notices, "new files and folders use the new naming; the files already in the library keep "
                              "their names until you rename them (Existing Files, Preview Rename)"]
@@ -2070,6 +2082,18 @@ def _settings_save(request: Request, form) -> Response:
     if settings.all_values()["session_epoch"] != epoch:
         _reissue_session(request, resp)                # changed the password: keep this browser signed in
     return resp
+
+
+def _conversion_switched_on() -> str:
+    """Turning conversion on for the first time makes the target any reader
+    can open; it converts chapters as they arrive, and the chapters already
+    in the library when you ask for it (Convert existing chapters)."""
+    with db.connect() as con:
+        if conversions.targets(con):
+            return "e-reader conversion is on"
+        conversions.add_target(con, conversions.default_target())
+    return ("e-reader conversion is on: Generic EPUB (any reader) was added and converts chapters as they arrive; "
+            "press Convert existing chapters for the ones you already have")
 
 
 def _settings_action(action: str, notice: str, back: str = "/settings") -> Response:

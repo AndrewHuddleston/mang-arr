@@ -75,6 +75,9 @@ STAGING_ROOT = os.environ.get("MANGARR_STAGING", os.path.join(DATA_DIR, "staging
 # The clean per-series tree Komga reads: <LIBRARY_ROOT>/<Series>/Chapter 012.0.cbz.
 # Must be on the same filesystem AND mount as STAGING_ROOT for hard links.
 LIBRARY_ROOT = os.environ.get("MANGARR_LIBRARY", os.path.join(DATA_DIR, "library"))
+# E-reader copies (conversions.py): <CONVERTED_ROOT>/<target folder>/<Series>/<Series> - Chapter 012.0.epub.
+# Must be outside the library and staging trees: Komga would show every copy as a second book.
+CONVERTED_ROOT = os.environ.get("MANGARR_CONVERTED", os.path.join(DATA_DIR, "converted"))
 
 # The worker re-checks every monitored series this often, starting this many
 # minutes after launch. (The interval range is the one limits.RANGES enforces.)

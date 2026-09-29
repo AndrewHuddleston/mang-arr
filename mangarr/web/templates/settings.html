@@ -66,6 +66,22 @@
   {% call m.form_group('Staging Folder', "Suwayomi's downloads; never renamed (MANGARR_STAGING)") %}<input class="input read-only" readonly value="{{ folders.staging }}" aria-label="Staging folder">{% endcall %}
   {% call m.form_group('Hard Links', 'A library file is a second name for the downloaded file, so it takes no extra space. When staging and library are on different filesystems or mounts a link is impossible and the file is copied.', advanced=true) %}<span class="{{ 'text-warning' if folders.copied else '' }}">{% if folders.copied %}copying: {{ folders.copied }} chapter{{ 's' if folders.copied != 1 }} copied since start{% else %}working (0 copies since start){% endif %}</span>{% endcall %}
 </fieldset>
+
+<fieldset class="fieldset" id="conversion">
+  <legend class="legend">E-reader Conversion</legend>
+  <div class="help-text">Makes a copy of every chapter as an e-book for reader apps and devices: Apple Books, Google Play Books, KOReader, Moon+ Reader, Calibre, Kobo, PocketBook, Boox, Tolino and anything else that opens EPUB. The library itself is only read. {{ conv.kindle_note }}</div>
+  {% call m.form_group('Convert Chapters', none, 'convert_enabled') %}
+    <input type="hidden" name="convert_enabled" value="0"><label class="inline-check">{{ m.check('convert_enabled', v.convert_enabled, '1', 'convert_enabled', 'primary') }} Make e-book copies (EPUB, KEPUB, CBZ, PDF)</label>
+    <div class="help-text">Turning it on for the first time adds the target "Generic EPUB (any reader)": colour kept, pages only made smaller when they are larger than a big tablet screen. It converts chapters as they arrive; the chapters you already have are converted when you press Convert existing chapters.</div>
+  {% endcall %}
+  {% call m.form_group('Engine') %}<span class="{{ '' if conv.available else 'text-warning' }}">{{ conv.engine }}{{ ' ready' if conv.available else '' }}</span>{% if not conv.available %}<div class="help-text">The Docker image has it. Without it nothing is converted.</div>{% endif %}{% endcall %}
+  {% call m.form_group('Output Folder', 'Every target has a folder of its own in here, with one folder per series (MANGARR_CONVERTED). It must be outside the library. To put a target on another disk or share, mount that place at its folder.') %}<input class="input read-only" readonly value="{{ conv.root }}" aria-label="Output folder">{% if conv.problem %}<div class="help-text text-danger">{{ conv.problem }}.</div>{% endif %}{% endcall %}
+  {% if conv.status.held and v.convert_enabled %}<div class="alert warning small">Nothing is being converted: {{ conv.status.held }}.</div>{% endif %}
+  {% call m.form_group('Threads per Conversion', 'Pages worked on at once inside one conversion (1-8)', 'convert_threads', advanced=true, default='2') %}<input class="input" id="convert_threads" name="convert_threads" value="{{ v.convert_threads }}">{% endcall %}
+  {% call m.form_group('Memory Limit', 'The most memory one conversion may take (512-8192); one that needs more is tried once more with one thread', 'convert_memory_mb', advanced=true, default='1536') %}<input class="input" id="convert_memory_mb" name="convert_memory_mb" value="{{ v.convert_memory_mb }}"><span class="input-unit">MB</span>{% endcall %}
+  {% call m.form_group('Timeout', 'A conversion that takes longer is stopped and tried again later (1-120)', 'convert_timeout_minutes', advanced=true, default='10') %}<input class="input" id="convert_timeout_minutes" name="convert_timeout_minutes" value="{{ v.convert_timeout_minutes }}"><span class="input-unit">minutes</span>{% endcall %}
+  {% call m.form_group('Minimum Free Space', 'The queue pauses while the output folder has less free space, and goes on by itself when there is room again', 'convert_min_free_gb', advanced=true, default='2') %}<input class="input" id="convert_min_free_gb" name="convert_min_free_gb" value="{{ v.convert_min_free_gb }}"><span class="input-unit">GB</span>{% endcall %}
+</fieldset>
 {% elif sp == 'sources' %}
 <fieldset class="fieldset" id="sources">
   <legend class="legend">Sources</legend>
@@ -189,6 +205,77 @@
   {% if sp == 'notifications' %}<button name="action" value="test-notify" class="button">Save &amp; send test notification</button>{% endif %}
 </div>
 </form>
+
+{% if sp == 'media-management' %}
+{# -- the conversion targets: forms of their own, outside the settings form ------------------------ #}
+{% macro target_fields(t, prefix) %}
+  {% call m.form_group('Name', none, prefix ~ '-name') %}<input class="input" id="{{ prefix }}-name" name="name" value="{{ t.name }}" maxlength="60" required>{% endcall %}
+  {% call m.form_group('Device', 'What the pages are made for. Generic suits any reader app or device; the others size the pages for one screen.', prefix ~ '-profile') %}
+    <select class="input select" id="{{ prefix }}-profile" name="profile">{% for group, items in conv.profile_groups.items() %}<optgroup label="{{ group }}">{% for p in items %}<option value="{{ p.key }}" {% if t.profile == p.key %}selected{% endif %}>{{ p.name }} - {{ p.size }}, {{ 'colour' if p.colour else 'grey' }}</option>{% endfor %}</optgroup>{% endfor %}</select>{% endcall %}
+  {% call m.form_group('Format', 'Kobo KEPUB is offered for the Kobo devices only.', prefix ~ '-format') %}
+    <select class="input select" id="{{ prefix }}-format" name="format">{% for f, text in conv.format_labels.items() %}<option value="{{ f }}" {% if t.format == f %}selected{% endif %}>{{ text }}</option>{% endfor %}</select>{% endcall %}
+  {% call m.form_group('Folder', 'Its folder inside ' ~ conv.root ~ ': one plain folder name', prefix ~ '-folder') %}<input class="input" id="{{ prefix }}-folder" name="folder" value="{{ t.folder }}" maxlength="100">{% endcall %}
+  {% call m.form_group('Enabled') %}<input type="hidden" name="enabled" value="0"><label class="inline-check">{{ m.check('enabled', t.enabled, '1') }} Convert for this target</label>{% endcall %}
+  {% set o = t.options %}
+  {% call m.form_group('Double Pages', 'A page twice as wide as it is high, on a portrait screen', advanced=true, default='split') %}<select class="input select" name="spreads">{% for k, text in [('split', 'Split into two pages'), ('rotate', 'Rotate'), ('both', 'Both: the whole page, then its halves'), ('keep', 'Keep as one page')] %}<option value="{{ k }}" {% if o.get('spreads', 'split') == k %}selected{% endif %}>{{ text }}</option>{% endfor %}</select>{% endcall %}
+  {% call m.form_group('Crop Margins', none, advanced=true, default='on') %}<input type="hidden" name="crop" value="0"><label class="inline-check">{{ m.check('crop', o.get('crop', true), '1') }} Cut plain margins off the pages</label>{% endcall %}
+  {% call m.form_group('Colour', none, advanced=true, default='auto') %}<select class="input select" name="colour">{% for k, text in [('auto', 'Auto: colour pages stay colour where the device shows colour'), ('grey', 'Always grey')] %}<option value="{{ k }}" {% if o.get('colour', 'auto') == k %}selected{% endif %}>{{ text }}</option>{% endfor %}</select>{% endcall %}
+  {% call m.form_group('Contrast', 'E-ink grey pages only: above 1 darkens the mid-tones (0.5-3)', advanced=true, default='1') %}<input class="input" name="gamma" value="{{ o.get('gamma', 1.0) }}">{% endcall %}
+  {% call m.form_group('JPEG Quality', '50-95; empty: what suits the device', advanced=true, default='the device\'s') %}<input class="input" name="quality" value="{{ o.get('quality') or '' }}">{% endcall %}
+  {% call m.form_group('Upscale Small Pages', none, advanced=true, default='off') %}<input type="hidden" name="upscale" value="0"><label class="inline-check">{{ m.check('upscale', o.get('upscale', false), '1') }} Enlarge pages smaller than the screen</label>{% endcall %}
+  {% call m.form_group('Pad Pages', none, advanced=true, default='off') %}<input type="hidden" name="pad" value="0"><label class="inline-check">{{ m.check('pad', o.get('pad', false), '1') }} Make every page exactly the screen size</label>{% endcall %}
+{% endmacro %}
+<fieldset class="fieldset" id="conversion-targets">
+  <legend class="legend">Conversion Targets</legend>
+  <div class="help-text">What to make and where to put it. Each target has a folder of its own, with one folder per series in it; every book also carries its series in its metadata, so apps that ignore folders still group the chapters.</div>
+  <div class="table-container"><table class="table" id="targets">
+  <thead><tr><th>Name</th><th>Device</th><th>Format</th><th>Folder</th><th>On</th><th class="num">Done</th><th class="num">Waiting</th><th class="num">Failed</th><th>Size</th><th class="col-actions"></th></tr></thead>
+  <tbody>
+  {% for t in conv.targets %}
+  <tr><td>{{ t.name }}</td><td class="muted">{{ t.device }}</td><td>{{ t.format_label }}</td><td><code>{{ t.path }}</code></td>
+    <td>{{ m.label('on', 'success', 'small') if t.enabled else m.label('off', 'disabled', 'small') }}</td>
+    <td class="num">{{ t.counts.get('done', 0) }}</td><td class="num">{{ t.counts.get('pending', 0) + t.counts.get('running', 0) }}</td>
+    <td class="num {{ 'text-danger' if t.counts.get('failed') }}">{{ t.counts.get('failed', 0) }}</td><td class="nowrap">{{ t.size }}</td>
+    <td class="col-actions nowrap">
+      <button type="button" class="button small" data-open-modal="target-{{ t.id }}">Edit</button>
+      <form method="post" action="/settings/convert/targets/{{ t.id }}/queue" class="inline"><input type="hidden" name="mode" value="missing"><button class="button small" title="Convert the chapters you already have that have no copy yet: {{ conv.estimate.chapters }} chapters take {{ conv.estimate.time }} of computing, and up to about {{ conv.estimate.size }} of disk space">Convert existing chapters</button></form>
+    </td></tr>
+  {% endfor %}
+  {% if not conv.targets %}<tr><td colspan="10" class="muted">No targets yet. Turn Convert Chapters on and save, or add one.</td></tr>{% endif %}
+  </tbody></table></div>
+  {% if conv.targets|length < conv.max_targets %}<p><button type="button" class="button" data-open-modal="target-new">Add Target</button></p>{% endif %}
+</fieldset>
+
+{% call m.modal('target-new', 'medium') %}
+<form method="post" action="/settings/convert/targets" class="form">
+  <div class="modal-header" id="target-new-title">Add Conversion Target</div>
+  <div class="modal-body">
+    {{ target_fields(conv.default_target, 'new') }}
+    {% call m.form_group('Existing Chapters', 'Converting all ' ~ conv.estimate.chapters ~ ' chapters you have takes ' ~ conv.estimate.time ~ ' of computing in the background, and up to about ' ~ conv.estimate.size ~ ' of disk space. You can also start it later with Convert existing chapters.') %}
+      <label class="inline-check"><input type="radio" name="scope" value="new" checked> Only chapters that arrive from now on</label><br>
+      <label class="inline-check"><input type="radio" name="scope" value="all"> Convert the chapters I already have too</label>
+    {% endcall %}
+  </div>
+  <div class="modal-footer"><button type="button" class="button" data-close-modal>Cancel</button><button type="submit" class="button primary">Add</button></div>
+</form>
+{% endcall %}
+{% for t in conv.targets %}
+{% call m.modal('target-' ~ t.id, 'medium') %}
+<form method="post" action="/settings/convert/targets/{{ t.id }}" class="form">
+  <div class="modal-header" id="target-{{ t.id }}-title">Edit - {{ t.name }}</div>
+  <div class="modal-body">
+    {{ target_fields(t, 't' ~ t.id) }}
+    <input type="hidden" name="scope" value="{{ t.scope }}">
+    <div class="help-text">Changing the device, the format or an option makes the copies again, in the background. Renaming the folder moves the copies with it.</div>
+  </div>
+  <div class="modal-footer">
+    <button type="submit" class="button danger delete-button" form="target-{{ t.id }}-delete">Delete</button>
+    <button type="button" class="button" data-close-modal>Cancel</button><button type="submit" class="button primary">Save</button></div>
+</form>
+<form method="post" action="/settings/convert/targets/{{ t.id }}/delete" id="target-{{ t.id }}-delete" data-confirm="Remove the target {{ t.name }}? Its {{ t.counts.get('done', 0) }} converted file(s) are deleted with it."><input type="hidden" name="files" value="1"></form>
+{% endcall %}
+{% endfor %}
+{% endif %}
 {% if sp == 'general' %}
 <form method="post" action="/settings/api-key/regenerate" id="regenerate-api-key" data-confirm="Regenerate the API key? Scripts using the old key stop working and every browser is signed out."></form>
 <form method="post" action="/settings/logout-all" id="logout-all" data-confirm="Sign every browser out, including this one?"></form>
