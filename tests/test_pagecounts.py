@@ -204,18 +204,18 @@ class KeptCountTest(Base):
         self.assertEqual((row["pages"], row["tries"], row["next_try"]), (22, 0, None))
         self.assertEqual(self.refresh(), [])
 
-    def test_a_failed_recount_keeps_the_chapter(self):
+    def test_a_failed_recount_of_a_short_copy_keeps_it_out(self):
         self.refresh()
         notice = cid(1, 15.5)
         self.set_row(notice, agreed=4, counted_at=ago(pagecounts.JUNK_RECOUNT_DAYS[-1] + 1))
         self.site.pages[notice] = None                              # the source will not say this time
         self.assertEqual(self.refresh(), [notice])
-        self.assertEqual(self.statuses()[15.5], "wanted")          # kept, as whenever a count fails: the old
-        row = self.rows()[notice]                                   # count is not judged by ...
+        self.assertEqual(self.statuses()[15.5], "junk")            # one refused request does not make a notice
+        row = self.rows()[notice]                                   # image a chapter: its last count stands ...
         self.assertEqual((row["pages"], row["agreed"], row["tries"]), (2, 4, 1))
         self.assertEqual(self.refresh(), [notice])
-        self.assertEqual(self.refresh(), [])                        # ... nor while the retry is not due
-        self.assertEqual(self.statuses()[15.5], "wanted")
+        self.assertEqual(self.refresh(), [])                        # ... also while the retry is not due
+        self.assertEqual(self.statuses()[15.5], "junk")
         self.site.pages[notice] = 2
         self.set_row(notice, next_try=ago(0.01))
         self.assertEqual(self.refresh(), [notice])
@@ -318,6 +318,49 @@ class KeptCountTest(Base):
         resolver.resolve(self.site, Series(english="Title"))          # the CLI's dry run, as before
         self.assertEqual(len(self.site.asked), 2 * n)
         self.assertEqual(set(first.junk), set(NOTICES))
+
+
+class ChapterSearchTest(Base):
+    """The Search button of one chapter: its automatic source choice goes by the page counts too."""
+
+    def setUp(self):
+        super().setUp()
+        self.site.chapters = lambda manga_id: self.site.manga(manga_id)[1]
+        self.refresh()
+
+    def test_the_automatic_choice_never_takes_a_copy_counted_short(self):
+        self.assertEqual(self.statuses()[15.5], "junk")             # 2 pages on Alpha and on Bravo
+        called = []
+
+        def one(client, manga_id, ch, *a, **kw):
+            called.append(manga_id)
+            return True, [], {}
+        with db.connect() as con, mock.patch.object(core.downloader, "download_one", one), \
+                mock.patch.object(core, "import_series", lambda *a, **k: 0):
+            msg = core.download_chapter(con, self.site, self.sid, 15.5)
+            self.assertEqual(called, [])
+            self.assertIn("chapter 15.5 failed", msg)
+            self.assertEqual(msg.count("its copy has 2 page(s): a notice image, not the chapter"), 2)
+            self.assertIn("Charlie: does not list it", msg)
+            # picking the entry yourself still overrides
+            msg = core.download_chapter(con, self.site, self.sid, 15.5, manga_id=1)
+            self.assertEqual(called, [1])
+            self.assertIn("downloaded from Alpha", msg)
+
+    def test_a_full_copy_a_whole_chapter_and_a_copy_listed_differently_are_taken(self):
+        called = []
+
+        def one(client, manga_id, ch, *a, **kw):
+            called.append((manga_id, ch.number))
+            return True, [], {}
+        with db.connect() as con, mock.patch.object(core.downloader, "download_one", one), \
+                mock.patch.object(core, "import_series", lambda *a, **k: 0):
+            core.download_chapter(con, self.site, self.sid, 12.5)   # an extra: 20 pages
+            core.download_chapter(con, self.site, self.sid, 7.0)    # a whole chapter is never counted
+            self.site.names[cid(1, 15.5)] = "Chapter 15.5: now the real one"    # its count is of another listing
+            core.download_chapter(con, self.site, self.sid, 15.5)
+        self.assertEqual([n for _, n in called], [12.5, 7.0, 15.5])
+        self.assertEqual(called[2][0], 1)
 
 
 class CopyTest(Base):

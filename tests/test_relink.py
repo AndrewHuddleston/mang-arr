@@ -13,7 +13,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from test_import_reasons import MN, NATO, FakeSuwayomi, Tree, inode, make_cbz  # noqa: E402
 
 from mangarr import backup, core, db, jobs, komga, library, relink  # noqa: E402
-from mangarr.suwayomi import Chapter  # noqa: E402
+from mangarr.suwayomi import Chapter, QueryError  # noqa: E402
 
 try:
     from fastapi.testclient import TestClient
@@ -466,6 +466,83 @@ class CrossCheckTest(Tree):
                           ("Official_S2 - Episode 5.cbz", None), ("Unknown_Vol.15 Ch.88.5.cbz", 88.5)):
             with self.subTest(name=name):
                 self.assertEqual(relink._parse_030(name), old)
+
+
+class LeftoversTest(LiveBox):
+    """Backlog 12 (b), (c) and (d): what the verification of 0.3.1 left."""
+
+    def test_a_source_entry_that_cannot_be_listed_does_not_put_a_repair_off(self):
+        class Stale(FakeSuwayomi):
+            def chapters(self, manga_id):
+                if manga_id == 12:                  # Kamisama Kiss on Weeb Central: Suwayomi no longer has it
+                    self.asked.append(manga_id)
+                    raise QueryError("no such manga")
+                return super().chapters(manga_id)
+        with db.connect() as con:
+            fake = self.build(con)
+            stale = Stale(fake.lists)
+            con.execute("INSERT INTO maintenance (name, due_at) VALUES (?, ?)", (relink.TASK, db.now()))
+            con.commit()
+        msg = relink.run_if_due(stale)
+        self.assertIn("3 misread link(s) repaired", msg)
+        self.assertNotIn("left for a later run", msg)
+        with db.connect() as con:
+            rows = self.rows(con, self.ids["Kamisama Kiss"])
+            self.assertNotIn(2020.0, rows)
+            self.assertEqual(rows[150.0]["status"], "have")
+            self.assertEqual(db.maintenance_due(con), set())        # done: it does not run before every cycle
+
+    def test_suwayomi_not_answering_about_the_files_still_puts_it_off(self):
+        with db.connect() as con:
+            fake = self.build(con)
+            fake.down = True
+            result = relink.check_links(con, fake)
+            self.assertEqual((result.repaired, result.deferred), ([], 3))
+            self.assertIn(2020.0, self.rows(con, self.ids["Kamisama Kiss"]))
+
+    def test_komga_is_asked_to_scan_after_the_last_link_is_removed(self):
+        order = []
+        real = relink._unlink
+
+        def unlink(m):
+            order.append("remove")
+            return real(m)
+        with db.connect() as con, mock.patch.object(relink, "_unlink", unlink), \
+                mock.patch.object(komga, "scan", lambda *a: order.append("scan") or True):
+            fake = self.build(con)
+            result = relink.check_links(con, fake)
+        self.assertGreater(result.imported, 0)          # imports asked for scans of their own, earlier
+        self.assertEqual(order.count("remove"), 3)
+        self.assertEqual(order[-1], "scan")
+        self.assertGreater(len(order) - 1 - order[::-1].index("remove"), -1)
+        self.assertLess(max(i for i, x in enumerate(order) if x == "remove"), len(order) - 1)
+
+    def test_a_file_of_another_group_than_the_one_suwayomi_keeps_is_found(self):
+        class Groups(FakeSuwayomi):
+            """chapters() keeps one chapter per number, as Client.chapters does (the first listed here);
+            chapters_all() lists every group's."""
+
+            def chapters_all(self, manga_id):
+                return super().chapters(manga_id)
+
+            def chapters(self, manga_id):
+                kept = {}
+                for c in super().chapters(manga_id):
+                    kept.setdefault(c.number, c)
+                return list(kept.values())
+        with db.connect() as con:
+            fake = self.build(con)
+            big = [Chapter(11900 + n, float(n), f"Ch.{n}", "Big Group", True) for n in (88.5, 149, 150)]
+            lists = dict(fake.lists)
+            lists[11] = big + lists[11]             # Big Group's chapter 150 is listed first: the one kept
+            groups = Groups(lists)
+            self.assertIsNone(relink.number_in(groups.chapters(11), LOSERS))       # what went wrong
+            self.assertEqual(relink.number_in(groups.chapters_all(11), LOSERS), 150.0)
+            msg = relink.check_links(con, groups).message
+            self.assertIn("3 misread link(s) repaired", msg)
+            rows = self.rows(con, self.ids["Kamisama Kiss"])
+            self.assertNotIn(2020.0, rows)
+            self.assertEqual(rows[150.0]["status"], "have")
 
 
 class GoneFileTest(LiveBox):

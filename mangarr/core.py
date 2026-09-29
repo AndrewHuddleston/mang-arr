@@ -540,6 +540,11 @@ def download_chapter(con, client: Client, series_id: int, number: float, manga_i
             continue
         if s["note"] and manga_id is None:
             continue
+        if manga_id is None and (short := _counted_short(con, s["manga_id"], ch)) is not None:
+            # the automatic choice never takes a copy a pass left out as a notice image; picking the
+            # entry yourself (Manual) still overrides
+            tried.append(f"{s['source_name']}: its copy has {short} page(s): a notice image, not the chapter")
+            continue
         inflight.queue(series_id, title, [number], s["source_name"], "waiting for the download to start")
         try:
             with serieslock.hold(series_id, shared=True, should_cancel=cancel), \
@@ -571,6 +576,28 @@ def download_chapter(con, client: Client, series_id: int, number: float, manga_i
     con.commit()
     log.warning("%s: chapter %g: %s", title, number, reason)
     return f"chapter {number:g} failed: {reason}"
+
+
+def _counted_short(con, manga_id: int, ch) -> int | None:
+    """The page count of a source's copy of a fractional chapter when the
+    last count that worked says it is too short to be the chapter (fewer
+    than min_pages, as the source lists it now), else None: not fractional,
+    never counted, listed differently since, or long enough."""
+    if float(ch.number) == int(ch.number):
+        return None
+    try:
+        r = con.execute("SELECT number, name, scanlator, uploaded, pages FROM page_probe WHERE manga_id=? AND"
+                        " chapter_id=?", (manga_id, ch.id)).fetchone()
+    except Exception as e:                  # a database without the table: nothing is known
+        log.debug("page counts not read: %s", e)
+        return None
+    if r is None or not isinstance(r["pages"], int):
+        return None
+    from . import pagecounts
+    if (float(r["number"]), r["name"] or None, r["scanlator"] or None, r["uploaded"] or None) \
+            != pagecounts.listing(ch):
+        return None
+    return r["pages"] if r["pages"] < int(settings.get("min_pages")) else None
 
 
 def _search_order(con, series_id: int, number: float, entries: list) -> list:
