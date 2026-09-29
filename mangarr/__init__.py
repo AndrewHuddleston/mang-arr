@@ -1,3 +1,3 @@
 """mang-arr: Sonarr for manga, on top of Suwayomi and Komga."""
 
-__version__ = "0.5.0"
+__version__ = "0.6.0"
