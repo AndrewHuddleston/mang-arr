@@ -132,6 +132,20 @@ class RunnerTest(unittest.TestCase):
         r.submit("x", "new", lambda j: None)
         self.assertEqual([j.title for j in r.jobs()], ["new", "5", "4", "3"])
 
+    def test_finished_jobs_leave_after_keep_hours(self):
+        r = jobs.Runner(history=50, keep_hours=24)
+        old = r.submit("refresh", "yesterday", lambda j: None)
+        old.status, old.finished_at = "done", time.time() - 25 * 3600
+        stale = r.submit("refresh", "never started", lambda j: None)   # cancelled while queued: no finished_at
+        stale.status, stale.queued_at = "cancelled", time.time() - 25 * 3600
+        fresh = r.submit("refresh", "today", lambda j: None)
+        fresh.status, fresh.finished_at = "done", time.time() - 23 * 3600
+        waiting = r.submit("refresh", "still queued", lambda j: None)
+        waiting.queued_at = time.time() - 48 * 3600                   # queued jobs are never aged out
+        self.assertEqual([j.title for j in r.jobs()], ["still queued", "today"])   # with nothing submitted since
+        self.assertIsNone(r.get(old.id))
+        self.assertIs(r.get(waiting.id), waiting)
+
     def test_queue_is_bounded(self):
         r = jobs.Runner(max_queued=3)
         for i in range(3):

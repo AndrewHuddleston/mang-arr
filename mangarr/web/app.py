@@ -1385,7 +1385,7 @@ def activity_page(request: Request):
     with db.connect() as con:
         conv = convert_routes.activity_context(con)
     return page(request, "activity.html", jobs=jobs_, squeue=squeue, queue=views.queue_rows(jobs_, squeue),
-                pass_job=current, chapters=inflight.rows(), conv=conv)
+                pass_job=current, chapters=inflight.rows(), conv=conv, keep_hours=runner.keep_hours)
 
 
 @app.get("/activity/history")

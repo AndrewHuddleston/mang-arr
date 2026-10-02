@@ -117,7 +117,7 @@
 {% endfor %}
 </tbody></table></div>
 {% endif %}
-<div class="help-text">Suwayomi's own download queue is {{ squeue.state|lower }} ({{ squeue.count }} item{{ 's' if squeue.count != 1 }}). This page refreshes every 10 s while something runs.</div>
+<div class="help-text">Suwayomi's own download queue is {{ squeue.state|lower }} ({{ squeue.count }} item{{ 's' if squeue.count != 1 }}). Finished jobs stay here for {{ '%g'|format(keep_hours) }} h; <a href="/activity/history">History</a> is the log. This page refreshes every 10 s while something runs.</div>
 {% endif %}
 {# -- e-reader conversions (conversions.py) ------------------------------------------------------- #}
 {% if conv.any %}

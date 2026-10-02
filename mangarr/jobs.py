@@ -20,7 +20,10 @@ from . import config, limits, metrics
 
 log = logging.getLogger(__name__)
 
-HISTORY = 300          # finished jobs kept for the Activity page and the API
+HISTORY = 300          # finished jobs kept at most for the Activity page and the API
+# ... and for how long: a finished job leaves the Activity queue after this many hours
+# (a bad value: see config.env_number)
+KEEP_HOURS = config.env_number("MANGARR_JOBS_KEEP_HOURS", 24.0, 1.0, 24.0 * 365)
 MAX_QUEUED = 500       # queued jobs at most; beyond this submit() refuses (QueueFull)
 ACTIVE = ("queued", "running")
 
@@ -69,7 +72,7 @@ class Job:
 
 
 class Runner:
-    def __init__(self, max_queued: int = MAX_QUEUED, history: int = HISTORY):
+    def __init__(self, max_queued: int = MAX_QUEUED, history: int = HISTORY, keep_hours: float = KEEP_HOURS):
         # (job, fn) waiting to run, oldest first. A plain deque under _lock
         # rather than a queue.Queue, so that cancelling a queued job takes it
         # out at once: cancelled entries never pile up behind a long job.
@@ -78,7 +81,7 @@ class Runner:
         self._lock = threading.Lock()
         self._ready = threading.Condition(self._lock)      # signalled when _pending gains an entry
         self._next = 1
-        self.max_queued, self.history = max_queued, history
+        self.max_queued, self.history, self.keep_hours = max_queued, history, keep_hours
         self.current: Job | None = None
         self._thread = threading.Thread(target=self._loop, name="mangarr-jobs", daemon=True)
 
@@ -113,15 +116,22 @@ class Runner:
     def _trim(self) -> None:
         """Keep every queued/running job (they still run, so they must stay
         visible, cancellable and deduplicated) and the newest `history`
-        finished ones. Caller holds _lock."""
+        finished ones from the last keep_hours: the Activity queue is what is
+        going on and what just happened, not a log (History is the log).
+        Caller holds _lock."""
+        old = time.time() - self.keep_hours * 3600
         finished = [j for j in self._jobs if j.status not in ACTIVE]
-        drop = len(finished) - self.history
+        gone = {id(j) for j in finished if (j.finished_at or j.started_at or j.queued_at) < old}
+        kept = [j for j in finished if id(j) not in gone]
+        drop = len(kept) - self.history
         if drop > 0:
-            gone = {id(j) for j in finished[:drop]}
+            gone |= {id(j) for j in kept[:drop]}
+        if gone:
             self._jobs = [j for j in self._jobs if id(j) not in gone]
 
     def jobs(self) -> list[Job]:
         with self._lock:
+            self._trim()                                    # a quiet day still ages the finished ones out
             return list(reversed(self._jobs))
 
     def get(self, job_id: int) -> Job | None:

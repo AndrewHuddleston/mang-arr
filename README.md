@@ -222,6 +222,7 @@ is clamped to it; both are logged at start-up.
 | `MANGARR_BACKUP_UPLOAD_MAX_MB` | `512` | Largest backup file accepted by *Restore from file* (raised to twice the current database when that is larger). |
 | `MANGARR_UPLOAD_MIN_KBPS` | `128` | *Restore from file* cuts off an upload that averages fewer KB a second than this (it gets `MANGARR_UPLOAD_IDLE_SECS` plus one second per this many KB). Lower it for a slow link, or copy the file (named `mangarr-<date>-<time>.db`, as downloaded) into the backups folder and restore it from the list. |
 | `MANGARR_UPLOAD_IDLE_SECS` | `30` | ... and one that sends nothing for this many seconds (5 to 3600). |
+| `MANGARR_JOBS_KEEP_HOURS` | `24` | How long a finished job (refresh, search, add, chapter download) stays in the Activity queue. The queue shows what is going on and what just happened; the History page is the log. |
 | `MANGARR_EVENTS_KEEP_DAYS` | `90` | Days of event history (Activity, series pages) kept; older events are pruned before each scheduled backup. |
 | `MANGARR_EVENTS_KEEP_ROWS` | `100000` | Size ceiling for the event history. Above it the oldest routine *Sources resolved* / *Needs a decision* events go first, so chapter history (downloaded, imported, failed) keeps its full `MANGARR_EVENTS_KEEP_DAYS`; only if that is not enough are older events of any kind removed (logged). A library refreshed often with many hundreds of series may need more. |
 | `MANGARR_PUSHOVER_TOKEN` | unset | Default Pushover application token. Notifications are sent only when both Pushover values are set. |
