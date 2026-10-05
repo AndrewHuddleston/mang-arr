@@ -341,8 +341,10 @@ format, chapters and volumes expected), the authors and the description
 (clipped, with a *more* button). Buttons: *Search missing* (re-resolve the
 sources and download what is wanted), *Re-check sources only* (re-resolve
 without downloading), *Monitor* / *Unmonitor*, and *Delete* with two
-checkboxes: *also delete library folder* (only the links mang-arr made;
-Suwayomi's files are never deleted) and *exclude from import lists*. Delete
+checkboxes: *delete files* (the library folder, which holds the links
+mang-arr made, and the chapter files Suwayomi downloaded for the series,
+which Suwayomi itself deletes on mang-arr's request; an entry another
+tracked series uses keeps its downloads) and *exclude from import lists*. Delete
 is refused while a job for the series is queued or running.
 
 The details panel, in the style of Radarr's, lists the library path, the

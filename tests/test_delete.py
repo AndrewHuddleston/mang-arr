@@ -116,5 +116,74 @@ class DeleteScanTest(unittest.TestCase):
             self.assertIsNone(db.get_series(con, self.sid))
 
 
+class FakeSuwayomi:
+    """Records what the delete asks Suwayomi; downloaded = {manga_id: [chapter ids]}."""
+    def __init__(self, downloaded: dict, broken: bool = False):
+        self.downloaded, self.broken, self.calls = downloaded, broken, []
+
+    def downloaded_chapter_ids(self, manga_id, timeout=60):
+        if self.broken:
+            from mangarr.suwayomi import SuwayomiError
+            raise SuwayomiError("Suwayomi down")
+        return list(self.downloaded.get(manga_id, []))
+
+    def delete_downloads(self, ids, timeout=120):
+        self.calls.append(("delete_downloads", list(ids)))
+
+    def set_in_library(self, manga_id, v, retries=3, timeout=60):
+        self.calls.append(("set_in_library", manga_id, v))
+
+
+class DeleteDownloadsTest(DeleteScanTest):
+    """Delete with files also deletes, through Suwayomi, the chapter files it downloaded for the series' entries:
+    that is where the bytes are (library files are hard links), and mang-arr mounts Suwayomi's folder read-only."""
+    def add_source(self, series_id, manga_id, name):
+        with db.connect() as con:
+            con.execute("INSERT INTO series_source (series_id, manga_id, source_name, title, author, match_level,"
+                        " author_level, chapter_count, max_chapter, is_primary, seen_at)"
+                        " VALUES (?,?,?,?,?,1,1,10,10,1,'2026-10-05 00:00:00')", (series_id, manga_id, name, "It's Mine", None))
+            con.commit()
+
+    def test_downloads_deleted_with_the_files(self):
+        self.add_source(self.sid, 501, "Weeb Central (EN)")
+        client = FakeSuwayomi({501: [9001, 9002]})
+        with db.connect() as con, self.assertLogs("mangarr.core", "INFO") as logs:
+            core.delete_series(con, client, self.sid, delete_library=True)
+        self.assertEqual(client.calls, [("delete_downloads", [9001, 9002]), ("set_in_library", 501, False)])
+        self.assertTrue(any("2 downloaded chapter file(s) of the Weeb Central (EN) entry deleted" in m for m in logs.output))
+        with db.connect() as con:
+            self.assertIn("with its library files and downloads", db.events(con, 5)[0]["message"])
+
+    def test_downloads_kept_without_the_files_option(self):
+        self.add_source(self.sid, 501, "Weeb Central (EN)")
+        client = FakeSuwayomi({501: [9001]})
+        with db.connect() as con:
+            core.delete_series(con, client, self.sid, delete_library=False)
+        self.assertEqual(client.calls, [("set_in_library", 501, False)])
+        self.assertTrue(os.path.exists(self.file))
+
+    def test_entry_shared_with_another_series_keeps_its_downloads(self):
+        with db.connect() as con:
+            other = db.upsert_series(con, Series(anilist_id=118602, english="It's Mine Too"))
+            con.commit()
+        self.add_source(self.sid, 501, "Weeb Central (EN)")
+        self.add_source(other, 501, "Weeb Central (EN)")
+        client = FakeSuwayomi({501: [9001]})
+        with db.connect() as con:
+            core.delete_series(con, client, self.sid, delete_library=True)
+        self.assertEqual(client.calls, [])
+        self.assertFalse(os.path.exists(self.file))     # the library links still go
+
+    def test_suwayomi_down_does_not_block_the_delete(self):
+        self.add_source(self.sid, 501, "Weeb Central (EN)")
+        client = FakeSuwayomi({501: [9001]}, broken=True)
+        with db.connect() as con, self.assertLogs("mangarr.core", "WARNING") as logs:
+            core.delete_series(con, client, self.sid, delete_library=True)
+        self.assertIn("were not deleted: Suwayomi down (delete them in Suwayomi)", logs.output[0])
+        self.assertFalse(os.path.exists(self.file))
+        with db.connect() as con:
+            self.assertIsNone(db.get_series(con, self.sid))
+
+
 if __name__ == "__main__":
     unittest.main()

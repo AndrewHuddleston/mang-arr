@@ -431,6 +431,20 @@ class Client:
                 ' updateManga(input: {id: $id, patch: {inLibrary: $v}}) { manga { id } } }',
                 {"id": manga_id, "v": in_library}, timeout=timeout, retries=retries)
 
+    def downloaded_chapter_ids(self, manga_id: int, timeout: int = 60) -> list[int]:
+        """Ids of the chapters Suwayomi holds downloaded files for, from its cache (no source fetch)."""
+        d = self.gq('query($id: Int!) { manga(id: $id) { chapters { nodes { id isDownloaded } } } }',
+                    {"id": manga_id}, timeout=timeout, retries=1)
+        return [c["id"] for c in d["manga"]["chapters"]["nodes"] if c["isDownloaded"]]
+
+    def delete_downloads(self, chapter_ids: list[int], timeout: int = 120) -> None:
+        """Delete the downloaded files of these chapters. Suwayomi removes them
+        from its download folder itself: it is the only writer there (mang-arr
+        mounts that folder read-only)."""
+        if chapter_ids:
+            self.gq('mutation($ids: [Int!]!) { deleteDownloadedChapters(input: {ids: $ids}) { clientMutationId } }',
+                    {"ids": chapter_ids}, timeout=timeout, retries=1)
+
     # -- downloader -------------------------------------------------------
     # Only our own chapter ids are ever touched: Suwayomi's queue is shared
     # with its own library updates and whatever the user queued in its UI.

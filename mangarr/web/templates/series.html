@@ -313,10 +313,10 @@
     {% call m.form_group('Add List Exclusion', 'Prevent series from being added to mang-arr by import lists', 'delete-exclude') %}
       {{ m.check('exclude', false, '1', 'delete-exclude') }}
     {% endcall %}
-    {% call m.form_group(('Delete ' ~ size_files ~ ' Chapter Files') if size_files else 'Delete Series Folder', 'Delete the series folder and its contents', 'delete-files') %}
+    {% call m.form_group(('Delete ' ~ size_files ~ ' Chapter Files') if size_files else 'Delete Series Folder', 'Delete the series folder and its contents, and the chapter files Suwayomi downloaded for it', 'delete-files') %}
       {{ m.check('files', false, '1', 'delete-files', 'danger') }}
     {% endcall %}
-    <div class="delete-files-message" hidden>The series folder <b>{{ library_path }}</b> and all of its contents will be deleted.{% if size_files %}<div class="delete-count">{{ size_files }} chapter files totaling {{ size_human }}</div>{% endif %}</div>
+    <div class="delete-files-message" hidden>The series folder <b>{{ library_path }}</b> and all of its contents will be deleted, and Suwayomi deletes the chapter files it downloaded for this series.{% if size_files %}<div class="delete-count">{{ size_files }} chapter files totaling {{ size_human }}</div>{% endif %}</div>
   </div>
   <div class="modal-footer">
     <button type="button" class="button" data-close-modal>Close</button>

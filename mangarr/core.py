@@ -636,11 +636,14 @@ DELETE_WAIT_SECS = 15       # a delete is a web request: it waits this long for 
 
 
 def delete_series(con, client: Client, series_id: int, delete_library: bool = False) -> None:
-    """Stop tracking. Optionally remove the library folder (only the links
-    this series recorded; Suwayomi's staging files are never touched). The
-    Suwayomi entries are taken out of its library so it stops auto-updating
-    them, except one another series uses too (the one kept when a series
-    tracked twice is cleaned up); a Suwayomi outage does not block the delete.
+    """Stop tracking. Optionally remove the files: the library folder (only
+    the links this series recorded) and, through Suwayomi, the chapter files
+    it downloaded for the series' source entries (mang-arr never writes in
+    Suwayomi's download folder itself). The Suwayomi entries are taken out
+    of its library so it stops auto-updating them. An entry another series
+    uses too (the one kept when a series tracked twice is cleaned up) keeps
+    its downloads and its library flag; a Suwayomi outage does not block the
+    delete, the files it holds are then left for the user.
     Komga is asked to scan once library files are gone, so the series leaves
     it now rather than at its next scheduled scan; the scan request runs on a
     thread of its own, so the delete does not wait for Komga's answer.
@@ -653,6 +656,16 @@ def delete_series(con, client: Client, series_id: int, delete_library: bool = Fa
                        (s["manga_id"], series_id)).fetchone():
             log.info("%s: %s entry left in Suwayomi's library: another series uses it", title, s["source_name"])
             continue
+        if delete_library:
+            try:
+                ids = client.downloaded_chapter_ids(s["manga_id"])
+                client.delete_downloads(ids)
+                if ids:
+                    log.info("%s: %d downloaded chapter file(s) of the %s entry deleted by Suwayomi",
+                             title, len(ids), s["source_name"])
+            except SuwayomiError as e:
+                log.warning("%s: the downloads of the %s entry were not deleted: %s (delete them in Suwayomi)",
+                            title, s["source_name"], e)
         try:
             client.set_in_library(s["manga_id"], False, retries=1, timeout=10)
         except SuwayomiError as e:
@@ -671,7 +684,8 @@ def delete_series(con, client: Client, series_id: int, delete_library: bool = Fa
             except Exception as e:
                 log.warning("%s: its converted copies could not be removed: %s: %s", title, type(e).__name__, e)
         db.delete_series(con, series_id)
-        db.event(con, "deleted", f"{title} removed" + (" with library files" if delete_library else ""))
+        db.event(con, "deleted",
+                 f"{title} removed" + (" with its library files and downloads" if delete_library else ""))
         con.commit()
     log.info("%s: no longer tracked", title)
     if removed and komga.configured():
