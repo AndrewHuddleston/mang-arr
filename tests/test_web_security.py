@@ -672,7 +672,10 @@ class ThrottleBurstTest(WebBase):
         """The verifier's repro: 1000 simultaneous wrong logins from one address, each a different guess
         (a password list), reach the hash only as often as sequential guesses do."""
         allowed = self.security.Throttle.FREE + 1                  # what sequential guesses get before 429
-        with self.assertLogs("mangarr.web.app", logging.WARNING) as logs:
+        # the budget is per minute of the clock: a burst that straddles a minute boundary would get two
+        # budgets (seen in CI: 26 lines), which is correct behaviour and not what this test is about
+        with self.assertLogs("mangarr.web.app", logging.WARNING) as logs, \
+                mock.patch.object(self.security.LogBudget, "_minute", staticmethod(lambda: 7)):
             codes, checked = self.burst(1000, lambda ac, i: ac.post("/login", data={"username": "andy",
                                                                                     "password": f"guess{i}"}))
         self.assertEqual(checked, allowed)

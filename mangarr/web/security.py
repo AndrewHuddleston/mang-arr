@@ -102,8 +102,12 @@ class LogBudget:
         self._lock = threading.Lock()
         self._d: dict[str, list[int]] = {}      # address -> [minute, lines]
 
+    @staticmethod
+    def _minute() -> int:
+        return int(time.monotonic() // 60)
+
     def allow(self, key: str) -> bool:
-        minute = int(time.monotonic() // 60)
+        minute = self._minute()
         with self._lock:
             if len(self._d) > 4096:
                 self._d.clear()
