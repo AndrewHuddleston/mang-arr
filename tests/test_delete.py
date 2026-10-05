@@ -174,6 +174,32 @@ class DeleteDownloadsTest(DeleteScanTest):
         self.assertEqual(client.calls, [])
         self.assertFalse(os.path.exists(self.file))     # the library links still go
 
+    def test_entry_a_chapter_was_downloaded_from_is_cleaned_too(self):
+        """Live 2026-10-04: My Boss Is A Goddess had been re-resolved to LikeManga, so its 69 files from the earlier
+        Mangakakalot.fun entry (no longer a source of the series) stayed in Suwayomi after the delete."""
+        self.add_source(self.sid, 501, "LikeManga (EN)")
+        with db.connect() as con:
+            con.execute("UPDATE chapter SET manga_id=777, source_name='Mangakakalot.fun (EN)' WHERE series_id=?",
+                        (self.sid,))
+            con.commit()
+        client = FakeSuwayomi({501: [9001], 777: [7001, 7002, 7003]})
+        with db.connect() as con:
+            core.delete_series(con, client, self.sid, delete_library=True)
+        self.assertEqual(client.calls, [("delete_downloads", [9001]), ("set_in_library", 501, False),
+                                        ("delete_downloads", [7001, 7002, 7003]), ("set_in_library", 777, False)])
+
+    def test_entry_another_series_downloaded_from_is_kept(self):
+        with db.connect() as con:
+            other = db.upsert_series(con, Series(anilist_id=118602, english="It's Mine Too"))
+            db.set_have(con, other, 1.0, None, os.path.join(self.library, "x", "Chapter 001.0.cbz"))
+            con.execute("UPDATE chapter SET manga_id=777 WHERE series_id=?", (other,))
+            con.commit()
+        self.add_source(self.sid, 777, "Mangakakalot.fun (EN)")
+        client = FakeSuwayomi({777: [7001]})
+        with db.connect() as con:
+            core.delete_series(con, client, self.sid, delete_library=True)
+        self.assertEqual(client.calls, [])
+
     def test_suwayomi_down_does_not_block_the_delete(self):
         self.add_source(self.sid, 501, "Weeb Central (EN)")
         client = FakeSuwayomi({501: [9001]}, broken=True)

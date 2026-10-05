@@ -651,25 +651,33 @@ def delete_series(con, client: Client, series_id: int, delete_library: bool = Fa
     and that does not end in DELETE_WAIT_SECS: nothing is deleted then."""
     row = db.get_series(con, series_id)
     title, folder = row["title"], row["folder"]
-    for s in db.sources(con, series_id):
-        if con.execute("SELECT 1 FROM series_source WHERE manga_id=? AND series_id!=?",
-                       (s["manga_id"], series_id)).fetchone():
-            log.info("%s: %s entry left in Suwayomi's library: another series uses it", title, s["source_name"])
+    # the entries it uses now, plus the ones its chapters were downloaded from:
+    # a resolve can drop an entry from the source list while Suwayomi still
+    # holds everything that was downloaded from it
+    entries = {s["manga_id"]: s["source_name"] for s in db.sources(con, series_id)}
+    for c in con.execute("SELECT DISTINCT manga_id, source_name FROM chapter"
+                         " WHERE series_id=? AND manga_id IS NOT NULL", (series_id,)):
+        entries.setdefault(c["manga_id"], c["source_name"] or "unknown source")
+    for manga_id, source_name in entries.items():
+        if con.execute("SELECT 1 FROM series_source WHERE manga_id=? AND series_id!=?"
+                       " UNION SELECT 1 FROM chapter WHERE manga_id=? AND series_id!=?",
+                       (manga_id, series_id, manga_id, series_id)).fetchone():
+            log.info("%s: %s entry left in Suwayomi's library: another series uses it", title, source_name)
             continue
         if delete_library:
             try:
-                ids = client.downloaded_chapter_ids(s["manga_id"])
+                ids = client.downloaded_chapter_ids(manga_id)
                 client.delete_downloads(ids)
                 if ids:
                     log.info("%s: %d downloaded chapter file(s) of the %s entry deleted by Suwayomi",
-                             title, len(ids), s["source_name"])
+                             title, len(ids), source_name)
             except SuwayomiError as e:
                 log.warning("%s: the downloads of the %s entry were not deleted: %s (delete them in Suwayomi)",
-                            title, s["source_name"], e)
+                            title, source_name, e)
         try:
-            client.set_in_library(s["manga_id"], False, retries=1, timeout=10)
+            client.set_in_library(manga_id, False, retries=1, timeout=10)
         except SuwayomiError as e:
-            log.warning("%s: could not unset library flag on %s entry: %s", title, s["source_name"], e)
+            log.warning("%s: could not unset library flag on %s entry: %s", title, source_name, e)
     removed = False
     if con.in_transaction:
         con.commit()                    # never hold a write while waiting for the lock
