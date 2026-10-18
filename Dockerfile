@@ -1,6 +1,6 @@
 # Base image pinned to an exact release and digest, so every build starts from the same layers;
 # Dependabot (.github/dependabot.yml) proposes the updates, and CI rebuilds the image weekly.
-FROM python:3.14.6-slim-trixie@sha256:7bec7ddcddeff7975d6ba9b4be7dd6f6b2f55e7491539145e2978f7f97ce9144
+FROM python:3.14.8-slim-trixie@sha256:a2b82f3c48559aa0a8446d9af49826b6e2b2016f4cd2afabfe6013ec53729170
 
 # One data mount holds both trees so hard links work (link(2) fails across
 # separate mounts even on the same filesystem):
